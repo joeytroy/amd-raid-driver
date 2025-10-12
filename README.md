@@ -53,6 +53,24 @@ AMD mainboards with RAID capabilities based on the following chipsets:
 
 - **[📖 Installation Guide](INSTALL.md)** - Complete installation instructions for all distributions
 - **[🔧 Kernel Compatibility](docs/KERNEL_COMPATIBILITY.md)** - Version compatibility details
+- **[🛠️ Troubleshooting Guide](TROUBLESHOOTING.md)** - Common issues and solutions
+
+## Quick Start
+
+For a quick build and installation:
+
+```bash
+# Clone the repository
+git clone https://github.com/joeytroy/amd-raid-driver.git
+cd amd-raid-driver
+
+# Install dependencies
+sudo apt install build-essential linux-headers-$(uname -r) dkms
+
+# Build and install
+./build.sh
+sudo make install-dkms
+```
 
 ## Contributing
 

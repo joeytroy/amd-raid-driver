@@ -158,12 +158,13 @@ TESTS_DIR := $(PWD)/tests
 all: module
 
 module:
-	$(MAKE) -C $(KDIR) M=$(PWD) src=$(SRC_DIR)
+	$(MAKE) -C $(KDIR) M=$(PWD)
 
 clean:
 	$(RM) -f *.o *.ko vers.c .*.cmd .*.d
 	$(RM) -f rcraid.mod.c Module.symvers Modules.symvers
 	$(RM) -rf .tmp_versions Module.markers modules.order
+	$(RM) -f src/*.o src/.*.cmd src/.*.d
 
 test:
 	@echo "Running rcraid driver tests..."
@@ -220,12 +221,12 @@ uninstall:
 
 obj-m := rcraid.o
 
-rcraid-objs := rc_init.o \
-               rc_msg.o \
-               rc_mem_ops.o \
-               rc_event.o \
-               rc_config.o \
-               rcblob.${PLATFORM}.o \
+rcraid-objs := src/rc_init.o \
+               src/rc_msg.o \
+               src/rc_mem_ops.o \
+               src/rc_event.o \
+               src/rc_config.o \
+               src/rcblob.${PLATFORM}.o \
 	       vers.o
 
 .PHONY:	$(obj)/vers.c
