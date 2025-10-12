@@ -180,7 +180,7 @@ rc_cfg_change_detect_tasklet( unsigned long arg)
 	spin_unlock_irqrestore(&tp->cfg_change_detect.lock, irql);
 }
 
-static void
+void
 rc_cfg_change_detect(rc_uint32_t type, rc_uint32_t bus, int update_mode)
 {
 	unsigned int i, j;

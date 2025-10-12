@@ -138,6 +138,7 @@ void rc_event_shutdown(void);
 void rc_shutdown_host(struct Scsi_Host *host_ptr);
 void rcraid_shutdown_one(struct pci_dev *pdev);
 void rc_init_proc(void);
+void rc_cfg_change_detect(rc_uint32_t type, rc_uint32_t bus, int flags);
 u32 rc_ahci_regread(void *context, u32 offset);
 void rc_ahci_regwrite(void *context, u32 offset, u32 value);
 int32_t rc_vprintf(uint32_t severity, const char *format, va_list ar);
