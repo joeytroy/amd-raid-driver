@@ -206,8 +206,11 @@ install-dkms: module
 	@if command -v dkms >/dev/null 2>&1; then                       \
 	    echo "Removing any existing rcraid DKMS entries...";        \
 	    dkms remove -m rcraid -v 8.1.0 --all 2>/dev/null || true;  \
-	    echo "Adding rcraid-8.1.0 to DKMS from $(PWD)";            \
-	    dkms add -m rcraid -v 8.1.0 $(PWD) --force;                \
+	    echo "Creating DKMS source directory...";                   \
+	    mkdir -p /usr/src/rcraid-8.1.0;                            \
+	    cp -r $(PWD)/* /usr/src/rcraid-8.1.0/;                     \
+	    echo "Adding rcraid-8.1.0 to DKMS...";                     \
+	    dkms add -m rcraid -v 8.1.0;                               \
 	    echo "Building rcraid-8.1.0 with DKMS...";                 \
 	    dkms build -m rcraid -v 8.1.0;                             \
 	    echo "Installing rcraid-8.1.0 with DKMS...";               \
