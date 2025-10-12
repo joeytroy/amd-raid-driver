@@ -238,9 +238,4 @@ $(obj)/vers.c:
 rcblob.${PLATFORM}.o: src/rcblob.${PLATFORM}
 	@echo "Processing binary blob: src/rcblob.${PLATFORM}"
 	@cp src/rcblob.${PLATFORM} rcblob.${PLATFORM}.o
-
-# hack to avoid warning about missing .rcblob.cmd file when modpost tries to
-# find all the sources
-.PHONY: $(obj)/rcblob.${PLATFORM}.o
-$(obj)/rcblob.${PLATFORM}.o:
 	@( echo "cmd_$@ := true"; echo "dep_$@ := \\"; echo "	$@ \\"; echo "" ) > $(obj)/.`basename $@`.cmd
