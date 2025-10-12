@@ -827,9 +827,12 @@ rc_init_host(struct pci_dev *pdev)
 
 	rc_state.host_ptr = host_ptr;
     rc_state.is_suspended = 0;
+	
+	// TRX50-specific: Force SCSI host creation for RAID arrays
+	rc_printk(RC_DEBUG, "rc_init_host: TRX50 forcing SCSI host creation\n");
 	scsi_scan_host(host_ptr);
-
-	// Force array discovery for all buses
+	
+	// TRX50-specific: Force array discovery for all buses
 	rc_printk(RC_DEBUG, "rc_init_host: forcing array discovery\n");
 	rc_cfg_change_detect(0, 0, 1);  // Force discovery on all buses
 	
@@ -844,6 +847,10 @@ rc_init_host(struct pci_dev *pdev)
 	// TRX50-specific: Force another enumeration after delay
 	rc_printk(RC_DEBUG, "rc_init_host: second TRX50 RAID enumeration\n");
 	rc_trx50_enum_raid_arrays();
+	
+	// TRX50-specific: Force final SCSI rescan
+	rc_printk(RC_DEBUG, "rc_init_host: TRX50 final SCSI rescan\n");
+	scsi_scan_host(host_ptr);
 
 	rc_printk(RC_DEBUG, "rc_init_host: completed\n");
 	return 0;
@@ -915,6 +922,17 @@ rc_trx50_enum_raid_arrays(void)
 			rc_printk(RC_DEBUG, "rc_trx50_enum_raid_arrays: forcing block device creation for host %d\n", i);
 			// Force a rescan that should create block devices
 			rc_cfg_change_detect(1, i, 1);  // Force update mode
+		}
+	}
+	
+	// TRX50-specific: Force creation of additional SCSI hosts for RAID arrays
+	rc_printk(RC_DEBUG, "rc_trx50_enum_raid_arrays: forcing additional SCSI host creation\n");
+	{
+		int i;
+		for (i = 1; i < rc_state.num_hba; i++) {
+			rc_printk(RC_DEBUG, "rc_trx50_enum_raid_arrays: creating SCSI host for adapter %d\n", i);
+			// Force creation of SCSI host for each adapter
+			rc_cfg_change_detect(1, i, 1);  // Force update mode for each adapter
 		}
 	}
 	
