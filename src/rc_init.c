@@ -852,6 +852,49 @@ rc_init_host(struct pci_dev *pdev)
 	rc_printk(RC_DEBUG, "rc_init_host: TRX50 final SCSI rescan\n");
 	scsi_scan_host(host_ptr);
 
+	// TRX50-specific: Force creation of SCSI hosts for all adapters
+	rc_printk(RC_DEBUG, "rc_init_host: TRX50 forcing SCSI host creation for all adapters\n");
+	{
+		int i;
+		for (i = 0; i < rc_state.num_hba; i++) {
+			rc_printk(RC_DEBUG, "rc_init_host: TRX50 creating SCSI host for adapter %d\n", i);
+			// Force SCSI host creation for each adapter
+			if (rc_state.adapters[i].version) {
+				rc_printk(RC_DEBUG, "rc_init_host: TRX50 adapter %d has version %s\n", i, 
+					rc_state.adapters[i].version->model ? rc_state.adapters[i].version->model : "unknown");
+			}
+		}
+	}
+	
+	// TRX50-specific: Create additional SCSI hosts for each RAID adapter
+	rc_printk(RC_DEBUG, "rc_init_host: TRX50 creating additional SCSI hosts\n");
+	{
+		int i;
+		for (i = 1; i < rc_state.num_hba; i++) {
+			rc_printk(RC_DEBUG, "rc_init_host: TRX50 creating SCSI host %d for adapter %d\n", i, i);
+			
+			// Create additional SCSI host for each RAID adapter
+			struct Scsi_Host *raid_host = scsi_host_alloc(&driver_template, 32);
+			if (raid_host) {
+				rc_printk(RC_DEBUG, "rc_init_host: TRX50 SCSI host %d allocated\n", i);
+				
+				// Set host data
+				raid_host->hostdata[0] = (unsigned long)&rc_state.adapters[i];
+				
+				// Add the host
+				if (scsi_add_host(raid_host, &pdev->dev) == 0) {
+					rc_printk(RC_DEBUG, "rc_init_host: TRX50 SCSI host %d added successfully\n", i);
+					scsi_scan_host(raid_host);
+				} else {
+					rc_printk(RC_ERROR, "rc_init_host: TRX50 failed to add SCSI host %d\n", i);
+					scsi_host_put(raid_host);
+				}
+			} else {
+				rc_printk(RC_ERROR, "rc_init_host: TRX50 failed to allocate SCSI host %d\n", i);
+			}
+		}
+	}
+	
 	rc_printk(RC_DEBUG, "rc_init_host: completed\n");
 	return 0;
 }
