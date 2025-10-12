@@ -82,6 +82,29 @@ This error occurs when the build system can't find the rcblob binary files. This
    make
    ```
 
+### Error: "Conflicting types" or "overriding recipe"
+
+**Problem:**
+```
+src/rc_msg.c:222:1: error: conflicting types for 'rc_vprintf'
+Makefile:246: warning: overriding recipe for target 'rcblob.x86_64.o'
+```
+
+**Solution:**
+These errors occur due to function signature mismatches and duplicate Makefile rules. This has been fixed in the latest version.
+
+1. **Update to the latest version** of the driver
+2. **Clean and rebuild:**
+   ```bash
+   make clean
+   make
+   ```
+
+3. **If still failing, use the build script:**
+   ```bash
+   ./build.sh
+   ```
+
 ### Error: "No such file or directory" for src/Makefile
 
 **Problem:**
