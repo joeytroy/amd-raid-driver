@@ -43,8 +43,9 @@
 ```
 
 **Important:** 
-- **SATA drives**: Use `modprobe.blacklist=ahci` only
-- **NVMe drives**: Use `modprobe.blacklist=ahci modprobe.blacklist=nvme` (both)
+- **SATA drives only**: Use `modprobe.blacklist=ahci` only
+- **NVMe drives only**: Use `modprobe.blacklist=ahci modprobe.blacklist=nvme` (both)
+- **Mixed SATA + NVMe**: Use `modprobe.blacklist=ahci modprobe.blacklist=nvme` (both)
 - **"Append"** means add to the END of the line, not the beginning!
 
 ## 2. BIOS Configuration
@@ -53,6 +54,9 @@
 2. **Find SATA Configuration** (Advanced or Storage section)
 3. **Change SATA Mode** from "AHCI" to "RAID"
 4. **Configure RAID arrays** (RAID 0, RAID 1, etc.)
+   - **SATA drives only**: Create RAID with SATA drives
+   - **NVMe drives only**: Create RAID with NVMe drives  
+   - **Mixed configuration**: Create RAID with both SATA and NVMe drives
 5. **Save and exit BIOS**
 
 ## 3. Install Driver and Verify RAID

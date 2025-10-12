@@ -6,7 +6,8 @@ AMD RAID driver (rcraid) for modern Linux distributions supporting both SATA and
 
 This repository provides a modern AMD RAID driver that supports:
 - **SATA drives** in RAID configurations
-- **NVMe drives** in RAID configurations  
+- **NVMe drives** in RAID configurations
+- **Mixed SATA + NVMe** RAID arrays (same array)
 - **AMD RAIDXpert** and **AMD Software RAID** BIOS configurations
 - **Cross-distribution** support for Ubuntu, Debian, Arch, RHEL, and SUSE
 
@@ -15,6 +16,7 @@ This repository provides a modern AMD RAID driver that supports:
 **Drive Types:**
 - **SATA drives** (SATA 3.0/6.0 Gbps)
 - **NVMe drives** (PCIe 3.0/4.0/5.0)
+- **Mixed configurations** (SATA + NVMe in same RAID array)
 
 **AMD Chipsets:**
 
