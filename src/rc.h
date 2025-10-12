@@ -154,7 +154,6 @@ int rc_msg_init(rc_softstate_t *state);
 void rc_msg_free_dma_memory(rc_adapter_t *adapter, void *cpu_addr, dma_addr_t dmaHandle, rc_uint32_t bytes);
 size_t Min(size_t a, size_t b);
 int rc_mop_stats(char *buf, int buf_size);
-rc_sg_list_t *rc_mem_sg_list(rc_addr_list_t *ap, rc_uint32_t starting_elem, rc_uint32_t offset, rc_thread_buf_t *buf);
 
 extern rc_softstate_t       rc_state;
 extern rc_adapter_t       *rc_dev[];
@@ -225,6 +224,9 @@ typedef struct {
         rc_sg_list_t *sg;
         int          size;
 } rc_thread_buf_t;
+
+// Function prototype that uses rc_thread_buf_t
+rc_sg_list_t *rc_mem_sg_list(rc_addr_list_t *ap, rc_uint32_t starting_elem, rc_uint32_t offset, rc_thread_buf_t *buf);
 
 typedef struct rc_thread_s {
         struct task_struct *thread;
