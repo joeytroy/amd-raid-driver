@@ -20,12 +20,12 @@
 
 **For NVMe drives:**
 ```bash
-# Edit USB:/boot/grub/grub.cfg - append BOTH blacklist parameters to the END:
+# Edit USB:/boot/grub/grub.cfg - append ONLY ahci blacklist to the END:
 # FROM: linux /casper/vmlinuz --- quiet splash
-# TO:   linux /casper/vmlinuz --- quiet splash modprobe.blacklist=ahci modprobe.blacklist=nvme
+# TO:   linux /casper/vmlinuz --- quiet splash modprobe.blacklist=ahci
 
 # FROM: linux /casper/vmlinuz nomodeset --- quiet splash  
-# TO:   linux /casper/vmlinuz nomodeset --- quiet splash modprobe.blacklist=ahci modprobe.blacklist=nvme
+# TO:   linux /casper/vmlinuz nomodeset --- quiet splash modprobe.blacklist=ahci
 ```
 
 **Edit USB:/boot/grub/loopback.cfg:**
@@ -34,18 +34,18 @@
 # FROM: linux /casper/vmlinuz iso-scan/filename=${iso_path} --- quiet splash
 # TO:   linux /casper/vmlinuz iso-scan/filename=${iso_path} --- quiet splash modprobe.blacklist=ahci
 
-# For NVMe drives - append BOTH blacklist parameters to the END:
+# For NVMe drives - append ONLY ahci blacklist to the END:
 # FROM: linux /casper/vmlinuz iso-scan/filename=${iso_path} --- quiet splash
-# TO:   linux /casper/vmlinuz iso-scan/filename=${iso_path} --- quiet splash modprobe.blacklist=ahci modprobe.blacklist=nvme
+# TO:   linux /casper/vmlinuz iso-scan/filename=${iso_path} --- quiet splash modprobe.blacklist=ahci
 
 # FROM: linux /casper/vmlinuz nomodeset iso-scan/filename=${iso_path} --- quiet splash
-# TO:   linux /casper/vmlinuz nomodeset iso-scan/filename=${iso_path} --- quiet splash modprobe.blacklist=ahci modprobe.blacklist=nvme
+# TO:   linux /casper/vmlinuz nomodeset iso-scan/filename=${iso_path} --- quiet splash modprobe.blacklist=ahci
 ```
 
 **Important:** 
 - **SATA drives only**: Use `modprobe.blacklist=ahci` only
-- **NVMe drives only**: Use `modprobe.blacklist=ahci modprobe.blacklist=nvme` (both)
-- **Mixed SATA + NVMe**: Use `modprobe.blacklist=ahci modprobe.blacklist=nvme` (both)
+- **NVMe drives only**: Use `modprobe.blacklist=ahci` only (NVMe driver must load for RAID)
+- **Mixed SATA + NVMe**: Use `modprobe.blacklist=ahci` only (NVMe driver must load for RAID)
 - **"Append"** means add to the END of the line, not the beginning!
 
 ## 2. BIOS Configuration
@@ -224,7 +224,7 @@ sudo dmesg | tail -20
 - Verify RAID arrays are configured in BIOS
 - Check GRUB has correct blacklist parameters:
   - SATA: `modprobe.blacklist=ahci`
-  - NVMe: `modprobe.blacklist=ahci modprobe.blacklist=nvme`
+  - NVMe: `modprobe.blacklist=ahci` (NVMe driver must load for RAID)
 
 **System won't boot:**
 - Check BIOS is set to RAID mode
