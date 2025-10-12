@@ -26,7 +26,7 @@
 #include "linux/kmod.h"
 #include "linux/kthread.h"
 
-static void rc_cfg_change_detect(rc_uint32_t type, rc_uint32_t bus, int flags);
+void rc_cfg_change_detect(rc_uint32_t type, rc_uint32_t bus, int flags);
 static void rc_cfg_change_detect_tasklet( unsigned long arg);
 
 static void rc_cfg_change_response(struct rc_srb_s *srb);
