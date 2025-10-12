@@ -895,6 +895,26 @@ rc_init_host(struct pci_dev *pdev)
 		}
 	}
 	
+	// TRX50-specific: Force RAID array detection and presentation
+	rc_printk(RC_DEBUG, "rc_init_host: TRX50 forcing RAID array detection\n");
+	{
+		// Force SCSI rescan to detect RAID arrays
+		rc_printk(RC_DEBUG, "rc_init_host: TRX50 forcing SCSI rescan for RAID arrays\n");
+		scsi_scan_host(host_ptr);
+		
+		// Force detection of RAID arrays on all SCSI hosts
+		int i;
+		for (i = 0; i < 4; i++) {
+			rc_printk(RC_DEBUG, "rc_init_host: TRX50 scanning host %d for RAID arrays\n", i);
+			rc_cfg_change_detect(1, i, 1);  // Force update mode
+		}
+		
+		// Force block device creation for RAID arrays
+		rc_printk(RC_DEBUG, "rc_init_host: TRX50 forcing block device creation\n");
+		msleep(1000);  // Wait for detection
+		scsi_scan_host(host_ptr);
+	}
+	
 	rc_printk(RC_DEBUG, "rc_init_host: completed\n");
 	return 0;
 }
