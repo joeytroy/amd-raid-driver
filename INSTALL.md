@@ -7,9 +7,10 @@
 2. Burn ISO to USB using Rufus, Balena Etcher, or `dd`
 
 ### Modify GRUB Configuration
-**Edit USB:/boot/grub/grub.cfg:**
+
+**For SATA drives (AHCI):**
 ```bash
-# Find these lines and append modprobe.blacklist=ahci to the END:
+# Edit USB:/boot/grub/grub.cfg - append modprobe.blacklist=ahci to the END:
 # FROM: linux /casper/vmlinuz --- quiet splash
 # TO:   linux /casper/vmlinuz --- quiet splash modprobe.blacklist=ahci
 
@@ -17,17 +18,34 @@
 # TO:   linux /casper/vmlinuz nomodeset --- quiet splash modprobe.blacklist=ahci
 ```
 
+**For NVMe drives:**
+```bash
+# Edit USB:/boot/grub/grub.cfg - append BOTH blacklist parameters to the END:
+# FROM: linux /casper/vmlinuz --- quiet splash
+# TO:   linux /casper/vmlinuz --- quiet splash modprobe.blacklist=ahci modprobe.blacklist=nvme
+
+# FROM: linux /casper/vmlinuz nomodeset --- quiet splash  
+# TO:   linux /casper/vmlinuz nomodeset --- quiet splash modprobe.blacklist=ahci modprobe.blacklist=nvme
+```
+
 **Edit USB:/boot/grub/loopback.cfg:**
 ```bash
-# Find these lines and append modprobe.blacklist=ahci to the END:
+# For SATA drives - append modprobe.blacklist=ahci to the END:
 # FROM: linux /casper/vmlinuz iso-scan/filename=${iso_path} --- quiet splash
 # TO:   linux /casper/vmlinuz iso-scan/filename=${iso_path} --- quiet splash modprobe.blacklist=ahci
 
+# For NVMe drives - append BOTH blacklist parameters to the END:
+# FROM: linux /casper/vmlinuz iso-scan/filename=${iso_path} --- quiet splash
+# TO:   linux /casper/vmlinuz iso-scan/filename=${iso_path} --- quiet splash modprobe.blacklist=ahci modprobe.blacklist=nvme
+
 # FROM: linux /casper/vmlinuz nomodeset iso-scan/filename=${iso_path} --- quiet splash
-# TO:   linux /casper/vmlinuz nomodeset iso-scan/filename=${iso_path} --- quiet splash modprobe.blacklist=ahci
+# TO:   linux /casper/vmlinuz nomodeset iso-scan/filename=${iso_path} --- quiet splash modprobe.blacklist=ahci modprobe.blacklist=nvme
 ```
 
-**Important:** "Append" means add to the END of the line, not the beginning!
+**Important:** 
+- **SATA drives**: Use `modprobe.blacklist=ahci` only
+- **NVMe drives**: Use `modprobe.blacklist=ahci modprobe.blacklist=nvme` (both)
+- **"Append"** means add to the END of the line, not the beginning!
 
 ## 2. BIOS Configuration
 
@@ -119,20 +137,92 @@ sudo reboot
 
 ## Troubleshooting
 
-**If RAID arrays not detected:**
+### Verify Driver is Working
+
+**Check if driver is loaded:**
 ```bash
-# Check if driver loaded
 lsmod | grep rcraid
-
-# Check hardware detection
-sudo dmesg | grep -i rcraid
-lspci | grep -i raid
-
-# Rescan devices
-echo "- - -" | sudo tee /sys/class/scsi_host/host*/scan
+```
+**Expected output:**
+```
+rcraid               5025792  0
 ```
 
-**If system won't boot:**
+**Check hardware detection:**
+```bash
+sudo dmesg | grep -i rcraid
+```
+**Expected output:**
+```
+[  145.856658] <5>AMD, Inc. rcraid raid driver version 8.1.0 build_number 8.1.0-00039 built Oct 12 2025
+[  145.856758] <5>rcraid_probe_one: vendor = 0x1022 device 0x43bd
+[  145.856793] <5>rcraid_probe_one: Total adapters matched 1
+[  145.857350] <5>rcraid: card 0: AMD, Inc. AHCI
+[  146.899682] scsi host1: AMD, Inc. AMD-RAID
+[  146.900915] scsi 1:0:24:0: Processor         AMD-RAID Configuration    V1.2 PQ: 0 ANSI: 5
+```
+
+**Check RAID controller detection:**
+```bash
+lspci | grep -i raid
+```
+**Expected output:**
+```
+4a:00.0 RAID bus controller: Advanced Micro Devices, Inc. [AMD] Device 43bd (rev 01)
+```
+
+### Verify RAID Arrays are Detected
+
+**Check SCSI hosts:**
+```bash
+ls -la /sys/class/scsi_host/
+```
+**Expected output:**
+```
+host1 -> ../../devices/pci0000:40/0000:40:03.6/0000:46:00.0/0000:47:0d.0/0000:4a:00.0/host1/scsi_host/host1
+```
+
+**Check for RAID arrays:**
+```bash
+lsblk
+```
+**Expected output (with working RAID):**
+```
+sdb    8:16   0   3.6T  0 disk
+└─sdb1 8:17   0   3.6T  0 part
+```
+
+**If RAID arrays not showing:**
+```bash
+# Check SCSI devices
+ls -la /sys/class/scsi_device/
+
+# Try rescanning
+echo "- - -" | sudo tee /sys/class/scsi_host/host*/scan
+
+# Check again
+lsblk
+```
+
+### Common Issues
+
+**Driver not loading:**
+```bash
+# Load manually
+sudo modprobe rcraid
+
+# Check for errors
+sudo dmesg | tail -20
+```
+
+**RAID arrays not detected:**
+- Check BIOS is set to RAID mode (not AHCI)
+- Verify RAID arrays are configured in BIOS
+- Check GRUB has correct blacklist parameters:
+  - SATA: `modprobe.blacklist=ahci`
+  - NVMe: `modprobe.blacklist=ahci modprobe.blacklist=nvme`
+
+**System won't boot:**
 - Check BIOS is set to RAID mode
-- Verify GRUB has `modprobe.blacklist=ahci` parameter
+- Verify GRUB has correct blacklist parameters
 - Check that driver is in initramfs
