@@ -1,13 +1,22 @@
-# amd-raid-driver
-AMD RAIDXpert driver as DKMS package for modern Linux distributions
+# AMD RAID Driver
+
+AMD RAID driver (rcraid) for modern Linux distributions supporting both SATA and NVMe drives.
 
 ## Overview
 
-This repository provides a modern, cross-distribution AMD RAID driver (rcraid) packaged as a DKMS module. It supports AMD mainboards with RAID capabilities on various Linux distributions.
+This repository provides a modern AMD RAID driver that supports:
+- **SATA drives** in RAID configurations
+- **NVMe drives** in RAID configurations  
+- **AMD RAIDXpert** and **AMD Software RAID** BIOS configurations
+- **Cross-distribution** support for Ubuntu, Debian, Arch, RHEL, and SUSE
 
 ### Supported Hardware
 
-AMD mainboards with RAID capabilities based on the following chipsets:
+**Drive Types:**
+- **SATA drives** (SATA 3.0/6.0 Gbps)
+- **NVMe drives** (PCIe 3.0/4.0/5.0)
+
+**AMD Chipsets:**
 
 **AM4 Socket:**
 - X370 / B350
