@@ -20,12 +20,12 @@
 
 **For NVMe drives:**
 ```bash
-# Edit USB:/boot/grub/grub.cfg - append ONLY ahci blacklist to the END:
+# Edit USB:/boot/grub/grub.cfg - append BOTH blacklist parameters to the END:
 # FROM: linux /casper/vmlinuz --- quiet splash
-# TO:   linux /casper/vmlinuz --- quiet splash modprobe.blacklist=ahci
+# TO:   linux /casper/vmlinuz --- quiet splash modprobe.blacklist=ahci modprobe.blacklist=nvme
 
 # FROM: linux /casper/vmlinuz nomodeset --- quiet splash  
-# TO:   linux /casper/vmlinuz nomodeset --- quiet splash modprobe.blacklist=ahci
+# TO:   linux /casper/vmlinuz nomodeset --- quiet splash modprobe.blacklist=ahci modprobe.blacklist=nvme
 ```
 
 **Edit USB:/boot/grub/loopback.cfg:**
@@ -34,18 +34,18 @@
 # FROM: linux /casper/vmlinuz iso-scan/filename=${iso_path} --- quiet splash
 # TO:   linux /casper/vmlinuz iso-scan/filename=${iso_path} --- quiet splash modprobe.blacklist=ahci
 
-# For NVMe drives - append ONLY ahci blacklist to the END:
+# For NVMe drives - append BOTH blacklist parameters to the END:
 # FROM: linux /casper/vmlinuz iso-scan/filename=${iso_path} --- quiet splash
-# TO:   linux /casper/vmlinuz iso-scan/filename=${iso_path} --- quiet splash modprobe.blacklist=ahci
+# TO:   linux /casper/vmlinuz iso-scan/filename=${iso_path} --- quiet splash modprobe.blacklist=ahci modprobe.blacklist=nvme
 
 # FROM: linux /casper/vmlinuz nomodeset iso-scan/filename=${iso_path} --- quiet splash
-# TO:   linux /casper/vmlinuz nomodeset iso-scan/filename=${iso_path} --- quiet splash modprobe.blacklist=ahci
+# TO:   linux /casper/vmlinuz nomodeset iso-scan/filename=${iso_path} --- quiet splash modprobe.blacklist=ahci modprobe.blacklist=nvme
 ```
 
 **Important:** 
 - **SATA drives only**: Use `modprobe.blacklist=ahci` only
-- **NVMe drives only**: Use `modprobe.blacklist=ahci` only (NVMe driver must load for RAID)
-- **Mixed SATA + NVMe**: Use `modprobe.blacklist=ahci` only (NVMe driver must load for RAID)
+- **NVMe drives only**: Use `modprobe.blacklist=ahci modprobe.blacklist=nvme` (both)
+- **Mixed SATA + NVMe**: Use `modprobe.blacklist=ahci modprobe.blacklist=nvme` (both)
 - **"Append"** means add to the END of the line, not the beginning!
 
 ## 2. BIOS Configuration
