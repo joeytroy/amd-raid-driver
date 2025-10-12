@@ -859,9 +859,9 @@ rc_init_host(struct pci_dev *pdev)
 		for (i = 0; i < rc_state.num_hba; i++) {
 			rc_printk(RC_DEBUG, "rc_init_host: TRX50 creating SCSI host for adapter %d\n", i);
 			// Force SCSI host creation for each adapter
-			if (rc_state.adapters[i].version) {
+			if (rc_dev[i] && rc_dev[i]->version) {
 				rc_printk(RC_DEBUG, "rc_init_host: TRX50 adapter %d has version %s\n", i, 
-					rc_state.adapters[i].version->model ? rc_state.adapters[i].version->model : "unknown");
+					rc_dev[i]->version->model ? rc_dev[i]->version->model : "unknown");
 			}
 		}
 	}
@@ -879,7 +879,7 @@ rc_init_host(struct pci_dev *pdev)
 				rc_printk(RC_DEBUG, "rc_init_host: TRX50 SCSI host %d allocated\n", i);
 				
 				// Set host data
-				raid_host->hostdata[0] = (unsigned long)&rc_state.adapters[i];
+				raid_host->hostdata[0] = (unsigned long)rc_dev[i];
 				
 				// Add the host
 				if (scsi_add_host(raid_host, &pdev->dev) == 0) {
