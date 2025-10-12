@@ -371,6 +371,15 @@ static struct pci_device_id rcraid_id_tbl[] = {
 		.class_mask = 0,
 		.driver_data = (unsigned long)&rc_ahci_version
 	},
+	{
+		.vendor = RC_PD_VID_AMD,
+		.device = RC_PD_DID_NVME_RAID_BOTTOM,
+		.subvendor = PCI_ANY_ID,
+		.subdevice = PCI_ANY_ID,
+		.class = 0,
+		.class_mask = 0,
+		.driver_data = (unsigned long)&rc_ahci_version
+	},
 #endif // RC_AHCI_SUPPORT
 	{0,}
 };

@@ -100,6 +100,7 @@
 #define RC_PD_DID_WRX90             0x7910 // AMD WRX90 chipset RAID mode (Threadripper PRO)
 #define RC_PD_DID_X870E             0x7911 // AMD X870E chipset RAID mode
 #define RC_PD_DID_B850E             0x7912 // AMD B850E chipset RAID mode
+#define RC_PD_DID_NVME_RAID_BOTTOM  0xb000 // AMD NVMe RAID Bottom Device
 #define RC_PD_DID_LSI1068E          0x0058 // PCIe LSI1068 Adapater
 #define RC_PD_DID_LSI1068           0x0059 // Motherboard LSI1068
 #define RC_PD_DID_FALCON            0x0072 // MPT2 Falcon Adapter
