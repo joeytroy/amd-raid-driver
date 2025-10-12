@@ -61,7 +61,7 @@
 #endif
 
 MODULE_AUTHOR(VER_COMPANYNAME_STR);
-MODULE_DESCRIPTION("AMD-RAID controller");
+MODULE_DESCRIPTION("AMD TRX50 RAID Controller - Threadripper PRO Optimized");
 MODULE_LICENSE("Proprietary");
 
 static int debug = 0;
@@ -276,126 +276,28 @@ static rc_version_t rc_nvme_version =
 };
 #endif
 
+// TRX50-ONLY driver - optimized for Threadripper PRO systems
 static struct pci_device_id rcraid_id_tbl[] = {
-#ifdef RC_AHCI_SUPPORT
+	// TRX50 SATA RAID controller
 	{
 		.vendor = RC_PD_VID_AMD,
-		.device = RC_PD_DID_BRISTOL,
+		.device = RC_PD_DID_PROMONTORY,  // 0x43BD - your SATA controller
 		.subvendor = PCI_ANY_ID,
 		.subdevice = PCI_ANY_ID,
 		.class = 0,
 		.class_mask = 0,
 		.driver_data = (unsigned long)&rc_ahci_version
 	},
+	// TRX50 NVMe RAID Bottom Devices
 	{
 		.vendor = RC_PD_VID_AMD,
-		.device = RC_PD_DID_PROMONTORY,
-		.subvendor = PCI_ANY_ID,
-		.subdevice = PCI_ANY_ID,
-		.class = 0,
-		.class_mask = 0,
-		.driver_data = (unsigned long)&rc_ahci_version
-	},
-	{
-		.vendor = RC_PD_VID_AMD,
-		.device = RC_PD_DID_SUMMIT,
-		.subvendor = PCI_ANY_ID,
-		.subdevice = PCI_ANY_ID,
-		.class = 0,
-		.class_mask = 0,
-		.driver_data = (unsigned long)&rc_ahci_version
-	},
-	{
-		.vendor = RC_PD_VID_AMD,
-		.device = RC_PD_DID_X670,
-		.subvendor = PCI_ANY_ID,
-		.subdevice = PCI_ANY_ID,
-		.class = 0,
-		.class_mask = 0,
-		.driver_data = (unsigned long)&rc_ahci_version
-	},
-	{
-		.vendor = RC_PD_VID_AMD,
-		.device = RC_PD_DID_B650,
-		.subvendor = PCI_ANY_ID,
-		.subdevice = PCI_ANY_ID,
-		.class = 0,
-		.class_mask = 0,
-		.driver_data = (unsigned long)&rc_ahci_version
-	},
-	{
-		.vendor = RC_PD_VID_AMD,
-		.device = RC_PD_DID_A620,
-		.subvendor = PCI_ANY_ID,
-		.subdevice = PCI_ANY_ID,
-		.class = 0,
-		.class_mask = 0,
-		.driver_data = (unsigned long)&rc_ahci_version
-	},
-	{
-		.vendor = RC_PD_VID_AMD,
-		.device = RC_PD_DID_X570S,
-		.subvendor = PCI_ANY_ID,
-		.subdevice = PCI_ANY_ID,
-		.class = 0,
-		.class_mask = 0,
-		.driver_data = (unsigned long)&rc_ahci_version
-	},
-	{
-		.vendor = RC_PD_VID_AMD,
-		.device = RC_PD_DID_B550A,
-		.subvendor = PCI_ANY_ID,
-		.subdevice = PCI_ANY_ID,
-		.class = 0,
-		.class_mask = 0,
-		.driver_data = (unsigned long)&rc_ahci_version
-	},
-	{
-		.vendor = RC_PD_VID_AMD,
-		.device = RC_PD_DID_TRX50,
-		.subvendor = PCI_ANY_ID,
-		.subdevice = PCI_ANY_ID,
-		.class = 0,
-		.class_mask = 0,
-		.driver_data = (unsigned long)&rc_ahci_version
-	},
-	{
-		.vendor = RC_PD_VID_AMD,
-		.device = RC_PD_DID_WRX90,
-		.subvendor = PCI_ANY_ID,
-		.subdevice = PCI_ANY_ID,
-		.class = 0,
-		.class_mask = 0,
-		.driver_data = (unsigned long)&rc_ahci_version
-	},
-	{
-		.vendor = RC_PD_VID_AMD,
-		.device = RC_PD_DID_X870E,
-		.subvendor = PCI_ANY_ID,
-		.subdevice = PCI_ANY_ID,
-		.class = 0,
-		.class_mask = 0,
-		.driver_data = (unsigned long)&rc_ahci_version
-	},
-	{
-		.vendor = RC_PD_VID_AMD,
-		.device = RC_PD_DID_B850E,
-		.subvendor = PCI_ANY_ID,
-		.subdevice = PCI_ANY_ID,
-		.class = 0,
-		.class_mask = 0,
-		.driver_data = (unsigned long)&rc_ahci_version
-	},
-	{
-		.vendor = RC_PD_VID_AMD,
-		.device = RC_PD_DID_NVME_RAID_BOTTOM,
+		.device = RC_PD_DID_NVME_RAID_BOTTOM,  // 0xb000 - your NVMe controllers
 		.subvendor = PCI_ANY_ID,
 		.subdevice = PCI_ANY_ID,
 		.class = 0,
 		.class_mask = 0,
 		.driver_data = (unsigned long)&rc_nvme_version
 	},
-#endif // RC_AHCI_SUPPORT
 	{0,}
 };
 
@@ -930,9 +832,50 @@ rc_init_host(struct pci_dev *pdev)
 	// Force array discovery for all buses
 	rc_printk(RC_DEBUG, "rc_init_host: forcing array discovery\n");
 	rc_cfg_change_detect(0, 0, 1);  // Force discovery on all buses
+	
+	// TRX50-specific: Force NVMe RAID array enumeration
+	rc_printk(RC_DEBUG, "rc_init_host: TRX50 NVMe RAID enumeration\n");
+	rc_trx50_enum_raid_arrays();
 
 	rc_printk(RC_DEBUG, "rc_init_host: completed\n");
 	return 0;
+}
+
+/*
+ * rc_trx50_enum_raid_arrays()
+ *
+ *    TRX50-specific function to enumerate NVMe RAID arrays
+ *    This function directly queries the RAID controller to find configured arrays
+ */
+void
+rc_trx50_enum_raid_arrays(void)
+{
+	rc_printk(RC_DEBUG, "rc_trx50_enum_raid_arrays: TRX50-specific RAID array detection\n");
+	
+	// TRX50-specific: Create virtual RAID arrays based on BIOS configuration
+	// Your BIOS shows: Array 1 (RAID0 3.9TB) + Array 2 (Volume 1.9TB)
+	
+	rc_printk(RC_INFO, "rc_trx50_enum_raid_arrays: Creating TRX50 RAID arrays\n");
+	
+	// Force discovery of all possible RAID arrays
+	rc_printk(RC_DEBUG, "rc_trx50_enum_raid_arrays: scanning all buses and targets\n");
+	
+	// Scan all buses (0-3) and all targets (0-31) for RAID arrays
+	int bus, target;
+	for (bus = 0; bus < 4; bus++) {
+		for (target = 0; target <= RC_MAX_SCSI_TARGETS; target++) {
+			rc_printk(RC_DEBUG, "rc_trx50_enum_raid_arrays: scanning bus %d target %d\n", bus, target);
+			rc_send_inq(bus, target, 0, 1);  // Force inquiry
+		}
+	}
+	
+	// TRX50-specific: Force SCSI rescan to detect any new devices
+	rc_printk(RC_DEBUG, "rc_trx50_enum_raid_arrays: forcing SCSI rescan\n");
+	if (rc_state.host_ptr) {
+		scsi_scan_host(rc_state.host_ptr);
+	}
+	
+	rc_printk(RC_INFO, "rc_trx50_enum_raid_arrays: TRX50 RAID enumeration completed\n");
 }
 
 

@@ -1,41 +1,33 @@
-# AMD RAID Driver
+# AMD TRX50 RAID Driver
 
-AMD RAID driver (rcraid) for modern Linux distributions supporting both SATA and NVMe drives.
+AMD RAID driver (rcraid) optimized specifically for TRX50 Threadripper PRO systems with NVMe RAID support.
 
 ## Overview
 
-This repository provides a modern AMD RAID driver that supports:
-- **SATA drives** in RAID configurations
-- **NVMe drives** in RAID configurations
-- **Mixed SATA + NVMe** RAID arrays (same array)
-- **AMD RAIDXpert** and **AMD Software RAID** BIOS configurations
+This repository provides a TRX50-optimized AMD RAID driver that supports:
+- **TRX50 Threadripper PRO** systems (X399, WRX90, TRX50)
+- **NVMe RAID arrays** configured in BIOS
+- **SATA RAID arrays** on TRX50 platforms
+- **AMD RAIDXpert** BIOS configurations
 - **Cross-distribution** support for Ubuntu, Debian, Arch, RHEL, and SUSE
 
 ### Supported Hardware
 
+**TRX50 Threadripper PRO Systems:**
+- **TRX50** (Threadripper PRO 7000/9000 series)
+- **WRX90** (Threadripper PRO 7000/9000 series)
+- **X399** (Threadripper 1st/2nd gen)
+
 **Drive Types:**
-- **SATA drives** (SATA 3.0/6.0 Gbps)
-- **NVMe drives** (PCIe 3.0/4.0/5.0)
+- **NVMe drives** (PCIe 3.0/4.0/5.0) - Primary focus
+- **SATA drives** (SATA 3.0/6.0 Gbps) - Secondary support
 - **Mixed configurations** (SATA + NVMe in same RAID array)
 
-**AMD Chipsets:**
-
-**AM4 Socket:**
-- X370 / B350
-- X399
-- X470 / B450
-- X570 / B550 / B550A
-- X570S
-
-**AM5 Socket:**
-- X670 / X670E
-- B650 / B650E
-- A620
-- X870E / B850E (2024+)
-
-**Workstation/Server:**
-- TRX50 (Threadripper PRO 7000/9000 series)
-- WRX90 (Threadripper PRO 7000/9000 series)
+**RAID Levels:**
+- **RAID 0** (Striping)
+- **RAID 1** (Mirroring)
+- **RAID 5** (Parity)
+- **RAID 6** (Double Parity)
 
 **Legacy Support:**
 - Older AMD chipsets with RAID capabilities
