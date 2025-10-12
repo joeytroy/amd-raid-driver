@@ -105,6 +105,28 @@ These errors occur due to function signature mismatches and duplicate Makefile r
    ./build.sh
    ```
 
+### Error: "Unknown type name"
+
+**Problem:**
+```
+src/rc.h:157:97: error: unknown type name 'rc_thread_buf_t'
+```
+
+**Solution:**
+This error occurs when a function prototype references a type that hasn't been defined yet. This has been fixed in the latest version.
+
+1. **Update to the latest version** of the driver
+2. **Clean and rebuild:**
+   ```bash
+   make clean
+   make
+   ```
+
+3. **If still failing, use the build script:**
+   ```bash
+   ./build.sh
+   ```
+
 ### Error: "No such file or directory" for src/Makefile
 
 **Problem:**
