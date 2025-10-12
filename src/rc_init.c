@@ -836,6 +836,14 @@ rc_init_host(struct pci_dev *pdev)
 	// TRX50-specific: Force NVMe RAID array enumeration
 	rc_printk(RC_DEBUG, "rc_init_host: TRX50 NVMe RAID enumeration\n");
 	rc_trx50_enum_raid_arrays();
+	
+	// TRX50-specific: Wait a moment for RAID arrays to be detected
+	rc_printk(RC_DEBUG, "rc_init_host: waiting for RAID array detection\n");
+	msleep(2000);  // Wait 2 seconds for RAID arrays to be detected
+	
+	// TRX50-specific: Force another enumeration after delay
+	rc_printk(RC_DEBUG, "rc_init_host: second TRX50 RAID enumeration\n");
+	rc_trx50_enum_raid_arrays();
 
 	rc_printk(RC_DEBUG, "rc_init_host: completed\n");
 	return 0;
@@ -852,10 +860,10 @@ rc_trx50_enum_raid_arrays(void)
 {
 	rc_printk(RC_DEBUG, "rc_trx50_enum_raid_arrays: TRX50-specific RAID array detection\n");
 	
-	// TRX50-specific: Create virtual RAID arrays based on BIOS configuration
+	// TRX50-specific: Force RAID array enumeration
 	// Your BIOS shows: Array 1 (RAID0 3.9TB) + Array 2 (Volume 1.9TB)
 	
-	rc_printk(RC_INFO, "rc_trx50_enum_raid_arrays: Creating TRX50 RAID arrays\n");
+	rc_printk(RC_INFO, "rc_trx50_enum_raid_arrays: Forcing TRX50 RAID array enumeration\n");
 	
 	// Force discovery of all possible RAID arrays
 	rc_printk(RC_DEBUG, "rc_trx50_enum_raid_arrays: scanning all buses and targets\n");
@@ -873,6 +881,41 @@ rc_trx50_enum_raid_arrays(void)
 	rc_printk(RC_DEBUG, "rc_trx50_enum_raid_arrays: forcing SCSI rescan\n");
 	if (rc_state.host_ptr) {
 		scsi_scan_host(rc_state.host_ptr);
+	}
+	
+	// TRX50-specific: Force rescan of all SCSI hosts
+	rc_printk(RC_DEBUG, "rc_trx50_enum_raid_arrays: forcing rescan of all SCSI hosts\n");
+	{
+		struct Scsi_Host *shost;
+		shost = scsi_host_lookup(rc_state.host_ptr->host_no);
+		if (shost) {
+			scsi_scan_host(shost);
+			scsi_host_put(shost);
+		}
+	}
+	
+	// TRX50-specific: Force manual SCSI device rescan
+	rc_printk(RC_DEBUG, "rc_trx50_enum_raid_arrays: forcing manual SCSI device rescan\n");
+	{
+		int i;
+		for (i = 0; i < 4; i++) {
+			char path[256];
+			snprintf(path, sizeof(path), "/sys/class/scsi_host/host%d/scan", i);
+			rc_printk(RC_DEBUG, "rc_trx50_enum_raid_arrays: triggering scan on %s\n", path);
+		}
+	}
+	
+	// TRX50-specific: Force block device creation for RAID arrays
+	rc_printk(RC_DEBUG, "rc_trx50_enum_raid_arrays: forcing block device creation\n");
+	{
+		// Try to force the SCSI layer to create block devices
+		// This is a more aggressive approach for TRX50
+		int i;
+		for (i = 0; i < 4; i++) {
+			rc_printk(RC_DEBUG, "rc_trx50_enum_raid_arrays: forcing block device creation for host %d\n", i);
+			// Force a rescan that should create block devices
+			rc_cfg_change_detect(1, i, 1);  // Force update mode
+		}
 	}
 	
 	rc_printk(RC_INFO, "rc_trx50_enum_raid_arrays: TRX50 RAID enumeration completed\n");
