@@ -78,6 +78,10 @@ if [ -f "rcraid.ko" ]; then
     fi
 else
     log_error "Build failed - rcraid.ko not found"
+    log_error "Common issues:"
+    log_error "  - Missing kernel headers: sudo apt install linux-headers-\$(uname -r)"
+    log_error "  - Missing build tools: sudo apt install build-essential"
+    log_error "  - Check build output above for specific errors"
     exit 1
 fi
 

@@ -64,16 +64,43 @@ This is usually just a warning and won't prevent the build. However, to fix it:
 
 **Problem:**
 ```
-make[4]: *** No rule to make target '/path/to/src/Makefile'. Stop.
+make[4]: *** No rule to make target 'src/rcblob.x86_64.o', needed by 'rcraid.o'. Stop.
 ```
 
 **Solution:**
-This indicates the Makefile is incorrectly configured. The driver doesn't need a separate Makefile in the src/ directory.
+This error occurs when the build system can't find the rcblob binary files. This has been fixed in the latest version.
 
 1. **Update to the latest version** of the driver
 2. **Use the build script:**
    ```bash
    ./build.sh
+   ```
+
+3. **If still failing, clean and rebuild:**
+   ```bash
+   make clean
+   make
+   ```
+
+### Error: "No such file or directory" for src/Makefile
+
+**Problem:**
+```
+/usr/src/linux-headers-6.14.0-27-generic/scripts/Makefile.build:41: /home/kubuntu/amd-raid-driver/src/Makefile: No such file or directory
+```
+
+**Solution:**
+This error occurs when the kernel build system can't find the source files. The driver doesn't use a separate Makefile in the src/ directory.
+
+1. **Use the build script:**
+   ```bash
+   ./build.sh
+   ```
+
+2. **Or build manually:**
+   ```bash
+   make clean
+   make
    ```
 
 ### Error: "Kernel headers not found"
