@@ -165,6 +165,7 @@ clean:
 	$(RM) -f rcraid.mod.c Module.symvers Modules.symvers
 	$(RM) -rf .tmp_versions Module.markers modules.order
 	$(RM) -f src/*.o src/.*.cmd src/.*.d
+	$(RM) -f rcblob.*.o
 
 test:
 	@echo "Running rcraid driver tests..."
@@ -226,16 +227,20 @@ rcraid-objs := src/rc_init.o \
                src/rc_mem_ops.o \
                src/rc_event.o \
                src/rc_config.o \
-               src/rcblob.${PLATFORM}.o \
+               rcblob.${PLATFORM}.o \
 	       vers.o
 
 .PHONY:	$(obj)/vers.c
 $(obj)/vers.c:
 	@echo "char *rc_ident = \"built on $(RC_HOST) by $(RC_USER) on $(RC_DATE)\";" > $@
 
+# Special handling for rcblob files (binary blobs)
+rcblob.${PLATFORM}.o: src/rcblob.${PLATFORM}
+	@echo "Processing binary blob: src/rcblob.${PLATFORM}"
+	@cp src/rcblob.${PLATFORM} rcblob.${PLATFORM}.o
+
 # hack to avoid warning about missing .rcblob.cmd file when modpost tries to
 # find all the sources
 .PHONY: $(obj)/rcblob.${PLATFORM}.o
 $(obj)/rcblob.${PLATFORM}.o:
-	ln -sf `basename $@ .o` $@
 	@( echo "cmd_$@ := true"; echo "dep_$@ := \\"; echo "	$@ \\"; echo "" ) > $(obj)/.`basename $@`.cmd

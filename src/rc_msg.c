@@ -2073,7 +2073,7 @@ rc_msg_send_srb_function (rc_softstate_t *state, int function)
  * We've already checked that this is the case.
  */
 
-void __inline__
+static inline void
 rc_msg_build_sg_virt( rc_srb_t *srb)
 {
 
@@ -2098,7 +2098,7 @@ rc_msg_build_sg_virt( rc_srb_t *srb)
 /*
  * build a scatter/gater list of physical address to send to the OSIC.
  */
-void __inline__
+static inline void
 rc_msg_build_sg_phys( rc_srb_t *srb)
 {
 

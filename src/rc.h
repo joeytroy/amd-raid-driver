@@ -134,6 +134,28 @@ void rc_event(rc_uint32_t type, rc_uint8_t bus, int update_mode);
 int rc_event_init(void);
 void rc_event_shutdown(void);
 
+// Function prototypes to avoid compiler warnings
+void rc_shutdown_host(struct Scsi_Host *host_ptr);
+void rcraid_shutdown_one(struct pci_dev *pdev);
+void rc_init_proc(void);
+u32 rc_ahci_regread(void *context, u32 offset);
+void rc_ahci_regwrite(void *context, u32 offset, u32 value);
+void rc_vprintf(uint32_t severity, const char *format, va_list ar);
+void rc_check_interrupt(rc_adapter_t* adapter);
+void rc_msg_suspend(rc_softstate_t *state, rc_adapter_t* adapter);
+void rc_msg_resume(rc_softstate_t *state, rc_adapter_t* adapter);
+void rc_msg_pci_config(rc_pci_op_t *pci_op, rc_uint32_t call_type);
+int rc_wq_handler(void *work);
+void rc_msg_resume_work(void);
+void rc_msg_suspend_work(rc_adapter_t *adapter);
+void rc_msg_init_tasklets(rc_softstate_t *state);
+void rc_msg_kill_tasklets(rc_softstate_t *state);
+int rc_msg_init(rc_softstate_t *state);
+void rc_msg_free_dma_memory(rc_adapter_t *adapter, void *cpu_addr, dma_addr_t dmaHandle, rc_uint32_t bytes);
+size_t Min(size_t a, size_t b);
+int rc_mop_stats(char *buf, int buf_size);
+int rc_mem_sg_list(rc_addr_list_t *ap, struct scatterlist *sg, int sg_count, int direction);
+
 extern rc_softstate_t       rc_state;
 extern rc_adapter_t       *rc_dev[];
 extern int            rc_msg_level;
