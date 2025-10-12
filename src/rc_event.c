@@ -30,7 +30,6 @@ void rc_cfg_change_detect(rc_uint32_t type, rc_uint32_t bus, int flags);
 static void rc_cfg_change_detect_tasklet( unsigned long arg);
 
 static void rc_cfg_change_response(struct rc_srb_s *srb);
-void rc_send_inq(rc_uint32_t bus, rc_uint32_t target, rc_uint32_t lun, int update_mode);
 static void rc_inq_callback (rc_srb_t *srb);
 static int rc_notify_scsi_layer(int bus, int target, int lun, int present);
 static int rc_event_kthread(void *arg);

@@ -140,7 +140,6 @@ void rcraid_shutdown_one(struct pci_dev *pdev);
 void rc_init_proc(void);
 void rc_cfg_change_detect(rc_uint32_t type, rc_uint32_t bus, int flags);
 void rc_trx50_enum_raid_arrays(void);
-void rc_send_inq(rc_uint32_t bus, rc_uint32_t target, rc_uint32_t lun, int update_mode);
 u32 rc_ahci_regread(void *context, u32 offset);
 void rc_ahci_regwrite(void *context, u32 offset, u32 value);
 int32_t rc_vprintf(uint32_t severity, const char *format, va_list ar);

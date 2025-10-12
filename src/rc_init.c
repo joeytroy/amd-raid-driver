@@ -865,7 +865,7 @@ rc_trx50_enum_raid_arrays(void)
 	for (bus = 0; bus < 4; bus++) {
 		for (target = 0; target <= RC_MAX_SCSI_TARGETS; target++) {
 			rc_printk(RC_DEBUG, "rc_trx50_enum_raid_arrays: scanning bus %d target %d\n", bus, target);
-			rc_send_inq(bus, target, 0, 1);  // Force inquiry
+			rc_cfg_change_detect(0, bus, 1);  // Use existing function to scan this bus
 		}
 	}
 	
