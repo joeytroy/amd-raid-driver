@@ -259,6 +259,21 @@ static rc_version_t rc_ahci_version =
 	.which_bar = 5,
 	.swl_type = RC_SHWL_TYPE_AHCI
 };
+
+static rc_version_t rc_nvme_version =
+{
+	.init_func = rc_ahci_init,  // Use same init as AHCI for now
+	.start_func = rc_ahci_start,
+	.shutdown_func = rc_ahci_shutdown,
+	.isr_func = rc_ahci_isr,
+	.device_name = "rcraid",
+	.vendor = VER_COMPANYNAME_STR,
+	.model = "AMD-RAID NVMe",
+	.num_ports = 6,
+	.window_size = 0,
+	.which_bar = 0,  // NVMe devices might use different BAR
+	.swl_type = RC_SHWL_TYPE_AHCI
+};
 #endif
 
 static struct pci_device_id rcraid_id_tbl[] = {
@@ -378,7 +393,7 @@ static struct pci_device_id rcraid_id_tbl[] = {
 		.subdevice = PCI_ANY_ID,
 		.class = 0,
 		.class_mask = 0,
-		.driver_data = (unsigned long)&rc_ahci_version
+		.driver_data = (unsigned long)&rc_nvme_version
 	},
 #endif // RC_AHCI_SUPPORT
 	{0,}
