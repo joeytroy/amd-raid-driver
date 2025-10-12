@@ -88,3 +88,14 @@ fi
 log_info "Build completed successfully!"
 log_info "To install: sudo make install"
 log_info "To install with DKMS: sudo make install-dkms"
+
+# Check if DKMS is available
+if command -v dkms >/dev/null 2>&1; then
+    log_info "DKMS is available - you can use 'sudo make install-dkms' for automatic kernel rebuilds"
+else
+    log_warn "DKMS not found - install it for automatic kernel rebuilds:"
+    log_warn "  Ubuntu/Debian: sudo apt install dkms"
+    log_warn "  Arch Linux: sudo pacman -S dkms"
+    log_warn "  RHEL/CentOS: sudo yum install dkms"
+    log_warn "  SUSE: sudo zypper install dkms"
+fi

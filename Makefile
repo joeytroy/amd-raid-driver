@@ -204,7 +204,8 @@ install: module
 install-dkms: module
 	@echo "Installing via DKMS for $(DISTRO) $(DISTRO_VERSION)"
 	@if command -v dkms >/dev/null 2>&1; then                       \
-	    dkms add -m rcraid -v 8.1.0 --force;                       \
+	    echo "Adding rcraid-8.1.0 to DKMS from $(PWD)";            \
+	    dkms add -m rcraid -v 8.1.0 $(PWD) --force;                \
 	    dkms build -m rcraid -v 8.1.0;                             \
 	    dkms install -m rcraid -v 8.1.0 --force;                   \
 	else                                                            \

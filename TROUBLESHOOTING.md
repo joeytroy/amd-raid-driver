@@ -245,6 +245,35 @@ sudo yum install dkms
 sudo zypper install dkms
 ```
 
+### Error: "Could not find module source directory"
+
+**Problem:**
+```
+Error! Could not find module source directory.
+Directory: /usr/src/rcraid-8.1.0 does not exist.
+```
+
+**Solution:**
+This error occurs when DKMS can't find the source directory. This has been fixed in the latest version.
+
+1. **Update to the latest version** of the driver
+2. **Clean and reinstall:**
+   ```bash
+   make clean
+   sudo make install-dkms
+   ```
+
+3. **If still failing, try manual installation:**
+   ```bash
+   sudo make install
+   ```
+
+4. **Or use the build script:**
+   ```bash
+   ./build.sh
+   sudo make install-dkms
+   ```
+
 ## Runtime Issues
 
 ### Error: "Device not found" or "No RAID arrays detected"
