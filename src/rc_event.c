@@ -183,12 +183,16 @@ rc_cfg_change_detect_tasklet( unsigned long arg)
 static void
 rc_cfg_change_detect(rc_uint32_t type, rc_uint32_t bus, int update_mode)
 {
-	unsigned int i;
+	unsigned int i, j;
 
 	rc_printk(RC_DEBUG,"rc_cfg_change_detect type 0x%x bus %d\n", type, bus);
 
-	for (i = 0; i <= RC_MAX_SCSI_TARGETS; i++) {
-		rc_send_inq(bus, i, 0, update_mode);
+	// Scan all buses for RAID arrays (0-3 for multiple controllers)
+	for (j = 0; j < 4; j++) {
+		rc_printk(RC_DEBUG,"rc_cfg_change_detect: scanning bus %d\n", j);
+		for (i = 0; i <= RC_MAX_SCSI_TARGETS; i++) {
+			rc_send_inq(j, i, 0, update_mode);
+		}
 	}
 }
 

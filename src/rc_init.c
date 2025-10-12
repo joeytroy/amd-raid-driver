@@ -927,6 +927,10 @@ rc_init_host(struct pci_dev *pdev)
     rc_state.is_suspended = 0;
 	scsi_scan_host(host_ptr);
 
+	// Force array discovery for all buses
+	rc_printk(RC_DEBUG, "rc_init_host: forcing array discovery\n");
+	rc_cfg_change_detect(0, 0, 1);  // Force discovery on all buses
+
 	rc_printk(RC_DEBUG, "rc_init_host: completed\n");
 	return 0;
 }
