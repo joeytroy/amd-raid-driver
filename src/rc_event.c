@@ -199,7 +199,7 @@ rc_cfg_change_detect(rc_uint32_t type, rc_uint32_t bus, int update_mode)
  * Note: an inquiry could take 30 seconds or more when doing pass-through IO
  * and the scsi command has to time out for nonexistant devices.
  */
-static void
+void
 rc_send_inq(rc_uint32_t bus, rc_uint32_t target, rc_uint32_t lun,
 	    int update_mode)
 {
