@@ -9,17 +9,25 @@
 ### Modify GRUB Configuration
 **Edit USB:/boot/grub/grub.cfg:**
 ```bash
-# Find these lines and add modprobe.blacklist=ahci:
-linux /casper/vmlinuz file=/cdrom/preseed/ubuntu.seed boot=casper quiet splash modprobe.blacklist=ahci
-linux /casper/vmlinuz nomodeset file=/cdrom/preseed/ubuntu.seed boot=casper quiet splash modprobe.blacklist=ahci
+# Find these lines and append modprobe.blacklist=ahci to the END:
+# FROM: linux /casper/vmlinuz --- quiet splash
+# TO:   linux /casper/vmlinuz --- quiet splash modprobe.blacklist=ahci
+
+# FROM: linux /casper/vmlinuz nomodeset --- quiet splash  
+# TO:   linux /casper/vmlinuz nomodeset --- quiet splash modprobe.blacklist=ahci
 ```
 
 **Edit USB:/boot/grub/loopback.cfg:**
 ```bash
-# Find these lines and add modprobe.blacklist=ahci:
-linux /casper/vmlinuz iso-scan/filename=${iso_path} quiet splash modprobe.blacklist=ahci
-linux /casper/vmlinuz nomodeset iso-scan/filename=${iso_path} quiet splash modprobe.blacklist=ahci
+# Find these lines and append modprobe.blacklist=ahci to the END:
+# FROM: linux /casper/vmlinuz iso-scan/filename=${iso_path} --- quiet splash
+# TO:   linux /casper/vmlinuz iso-scan/filename=${iso_path} --- quiet splash modprobe.blacklist=ahci
+
+# FROM: linux /casper/vmlinuz nomodeset iso-scan/filename=${iso_path} --- quiet splash
+# TO:   linux /casper/vmlinuz nomodeset iso-scan/filename=${iso_path} --- quiet splash modprobe.blacklist=ahci
 ```
+
+**Important:** "Append" means add to the END of the line, not the beginning!
 
 ## 2. BIOS Configuration
 
