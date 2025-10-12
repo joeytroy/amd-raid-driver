@@ -1035,6 +1035,19 @@ rcraid_probe_one(struct pci_dev *dev, const struct pci_device_id *id)
 	rc_printk(RC_DEBUG, "rcraid_probe_one: checking init conditions - adapter_count=%u, rc_adapter_count=%d, rc_state.num_hba=%d\n", 
 		adapter_count, rc_adapter_count, rc_state.num_hba);
 	
+	// TRX50-specific: Force initialization after first adapter
+	if (rc_state.num_hba == 1) {
+		rc_printk(RC_DEBUG, "rcraid_probe_one: TRX50 forcing initialization after first adapter\n");
+		int err;
+		err = rc_init_host(dev);
+		if (!err) {
+			if (misc_register(&rccfg_api_dev))
+				rc_printk(RC_ERROR, "%s: failed to register rc_api\n",__FUNCTION__);
+			mutex_init(&ioctl_mutex);
+		} else
+			rc_printk(RC_ERROR, "%s: rc_init_host failed\n",__FUNCTION__);
+	}
+	
 	if ((adapter_count && rc_adapter_count == rc_state.num_hba) ||
         (rc_adapter_count == 999 && adapter_count == rc_state.num_hba)) {
 		int err;
