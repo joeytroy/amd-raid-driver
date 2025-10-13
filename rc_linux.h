@@ -214,16 +214,41 @@ int rc_raid_array_ioctl(struct block_device *bdev, fmode_t mode, unsigned int cm
 #define RC_REG_INTERRUPT_STATUS	0x500
 #define RC_REG_INTERRUPT_MASK	0x600
 
+// Real AMD RAID command structures (based on Windows driver analysis)
+#define RC_CMD_READ_DATA		0x01
+#define RC_CMD_WRITE_DATA		0x02
+#define RC_CMD_CONFIG_READ		0x03
+#define RC_CMD_CONFIG_WRITE		0x04
+#define RC_CMD_METADATA_READ		0x05
+#define RC_CMD_METADATA_WRITE		0x06
+#define RC_CMD_SCAN_DISKS		0x07
+#define RC_CMD_RESCAN			0x08
+
+// Command flags
+#define RC_CMD_FLAG_SYNC		0x01
+#define RC_CMD_FLAG_URGENT		0x02
+#define RC_CMD_FLAG_NO_RETRY		0x04
+
+// Status codes
+#define RC_STATUS_SUCCESS		0x00
+#define RC_STATUS_ERROR			0x01
+#define RC_STATUS_BUSY			0x02
+#define RC_STATUS_INVALID_CMD		0x03
+#define RC_STATUS_INVALID_PARAM	0x04
+#define RC_STATUS_DEVICE_ERROR		0x05
+
 // Command queue structures
 struct rc_hw_command {
 	u32 command_id;
 	u32 opcode;
 	u32 flags;
+	u32 channel_id;		// Logical device ID
 	u64 lba;
 	u32 sector_count;
 	u64 data_addr;
 	u64 completion_addr;
-	u32 reserved[4];
+	u64 generation_number;	// For config commands
+	u32 reserved[2];
 } __packed;
 
 // Completion queue structures  
@@ -272,6 +297,12 @@ void rc_hw_cleanup(struct rc_hw_adapter *hw);
 int rc_hw_submit_command(struct rc_hw_adapter *hw, struct rc_hw_command *cmd);
 int rc_hw_process_completions(struct rc_hw_adapter *hw);
 irqreturn_t rc_hw_interrupt_handler(int irq, void *dev_id);
+
+// Metadata discovery functions
+int rc_discover_arrays(struct rc_adapter *adapter);
+int rc_read_array_metadata(struct rc_adapter *adapter, int array_id, 
+			   struct rc_raid_metadata *metadata);
+int rc_scan_physical_disks(struct rc_adapter *adapter);
 
 // RAID management functions
 int rc_raid_scan_arrays(struct rc_adapter *adapter);

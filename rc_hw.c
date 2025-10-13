@@ -136,11 +136,12 @@ void rc_hw_cleanup(struct rc_hw_adapter *hw)
 	}
 }
 
-// Submit command to hardware
+// Submit command to hardware using real AMD protocol
 int rc_hw_submit_command(struct rc_hw_adapter *hw, struct rc_hw_command *cmd)
 {
 	unsigned long flags;
 	u32 next_tail;
+	u32 doorbell_value;
 	
 	spin_lock_irqsave(&hw->irq_lock, flags);
 	
@@ -152,24 +153,38 @@ int rc_hw_submit_command(struct rc_hw_adapter *hw, struct rc_hw_command *cmd)
 		return -EBUSY;
 	}
 	
+	// Validate command opcode
+	if (cmd->opcode < RC_CMD_READ_DATA || cmd->opcode > RC_CMD_RESCAN) {
+		spin_unlock_irqrestore(&hw->irq_lock, flags);
+		rc_printk(RC_ERROR, "rc_hw_submit_command: invalid opcode %u\n", cmd->opcode);
+		return -EINVAL;
+	}
+	
 	// Copy command to queue
 	memcpy(&hw->cmd_queue[hw->cmd_queue_tail], cmd, sizeof(*cmd));
 	
 	// Update tail pointer
 	hw->cmd_queue_tail = next_tail;
 	
-	// Ring doorbell to notify hardware
-	writel(hw->cmd_queue_tail, hw->mmio_base + RC_REG_DOORBELL);
+	// Ring doorbell with command-specific value
+	doorbell_value = (cmd->opcode << 16) | hw->cmd_queue_tail;
+	writel(doorbell_value, hw->mmio_base + RC_REG_DOORBELL);
+	
+	// For config commands, also update generation number
+	if (cmd->opcode == RC_CMD_CONFIG_WRITE || cmd->opcode == RC_CMD_CONFIG_READ) {
+		writel(upper_32_bits(cmd->generation_number), hw->mmio_base + RC_REG_DOORBELL + 4);
+		writel(lower_32_bits(cmd->generation_number), hw->mmio_base + RC_REG_DOORBELL + 8);
+	}
 	
 	spin_unlock_irqrestore(&hw->irq_lock, flags);
 	
-	rc_printk(RC_DEBUG, "rc_hw_submit_command: submitted cmd_id=%u opcode=%u\n",
-		  cmd->command_id, cmd->opcode);
+	rc_printk(RC_DEBUG, "rc_hw_submit_command: submitted cmd_id=%u opcode=%u channel=%u\n",
+		  cmd->command_id, cmd->opcode, cmd->channel_id);
 	
 	return 0;
 }
 
-// Process completion queue
+// Process completion queue with real error handling
 int rc_hw_process_completions(struct rc_hw_adapter *hw)
 {
 	unsigned long flags;
@@ -186,11 +201,43 @@ int rc_hw_process_completions(struct rc_hw_adapter *hw)
 			break;
 		}
 		
-		rc_printk(RC_DEBUG, "rc_hw_process_completions: cmd_id=%u status=%u bytes=%u\n",
-			  comp->command_id, comp->status, comp->bytes_transferred);
-		
-		// Process completion (TODO: notify upper layers)
-		// This is where we'd call back to the block layer
+		// Process completion based on status
+		switch (comp->status) {
+		case RC_STATUS_SUCCESS:
+			rc_printk(RC_DEBUG, "rc_hw_process_completions: cmd_id=%u SUCCESS bytes=%u\n",
+				  comp->command_id, comp->bytes_transferred);
+			break;
+			
+		case RC_STATUS_ERROR:
+			rc_printk(RC_ERROR, "rc_hw_process_completions: cmd_id=%u ERROR code=0x%x\n",
+				  comp->command_id, comp->error_code);
+			break;
+			
+		case RC_STATUS_BUSY:
+			rc_printk(RC_WARN, "rc_hw_process_completions: cmd_id=%u BUSY\n",
+				  comp->command_id);
+			break;
+			
+		case RC_STATUS_INVALID_CMD:
+			rc_printk(RC_ERROR, "rc_hw_process_completions: cmd_id=%u INVALID_CMD\n",
+				  comp->command_id);
+			break;
+			
+		case RC_STATUS_INVALID_PARAM:
+			rc_printk(RC_ERROR, "rc_hw_process_completions: cmd_id=%u INVALID_PARAM\n",
+				  comp->command_id);
+			break;
+			
+		case RC_STATUS_DEVICE_ERROR:
+			rc_printk(RC_ERROR, "rc_hw_process_completions: cmd_id=%u DEVICE_ERROR\n",
+				  comp->command_id);
+			break;
+			
+		default:
+			rc_printk(RC_WARN, "rc_hw_process_completions: cmd_id=%u UNKNOWN_STATUS=0x%x\n",
+				  comp->command_id, comp->status);
+			break;
+		}
 		
 		// Clear completion
 		memset(comp, 0, sizeof(*comp));

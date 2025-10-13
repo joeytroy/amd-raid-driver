@@ -166,7 +166,21 @@ int rc_raid_scan_arrays(struct rc_adapter *adapter)
 {
     int i, err;
     
-    rc_printk(RC_NOTE, "rc_raid_scan_arrays: scanning for RAID arrays\n");
+    rc_printk(RC_NOTE, "rc_raid_scan_arrays: scanning for RAID arrays using firmware\n");
+    
+    // Scan for physical disks first
+    err = rc_scan_physical_disks(adapter);
+    if (err < 0) {
+        rc_printk(RC_ERROR, "rc_raid_scan_arrays: failed to scan physical disks\n");
+        return err;
+    }
+    
+    // Discover RAID arrays from firmware metadata
+    err = rc_discover_arrays(adapter);
+    if (err < 0) {
+        rc_printk(RC_ERROR, "rc_raid_scan_arrays: failed to discover arrays\n");
+        return err;
+    }
     
     // For now, create a dummy RAID array to test block device functionality
     // In a real implementation, this would read from the RAID controller's configuration

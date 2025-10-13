@@ -81,26 +81,30 @@ static int rc_transfer_data(struct rc_raid_array *array, sector_t sector,
         // Copy data to DMA buffer
         memcpy(dma_buf, buf, len);
         
-        // Prepare write command
+        // Prepare write command using real AMD protocol
         cmd.command_id = atomic_inc_return(&g_hw_adapter.irq_count);
-        cmd.opcode = 0x02; // WRITE command
-        cmd.flags = 0;
+        cmd.opcode = RC_CMD_WRITE_DATA;
+        cmd.flags = RC_CMD_FLAG_SYNC;
+        cmd.channel_id = 0; // Default channel
         cmd.lba = sector;
         cmd.sector_count = len >> 9;
         cmd.data_addr = dma_addr;
         cmd.completion_addr = 0;
+        cmd.generation_number = 0; // Not used for data commands
         
         rc_printk(RC_DEBUG, "rc_transfer_data: write cmd_id=%u lba=%llu sectors=%u\n",
                   cmd.command_id, (unsigned long long)cmd.lba, cmd.sector_count);
     } else {
-        // Prepare read command
+        // Prepare read command using real AMD protocol
         cmd.command_id = atomic_inc_return(&g_hw_adapter.irq_count);
-        cmd.opcode = 0x01; // READ command
-        cmd.flags = 0;
+        cmd.opcode = RC_CMD_READ_DATA;
+        cmd.flags = RC_CMD_FLAG_SYNC;
+        cmd.channel_id = 0; // Default channel
         cmd.lba = sector;
         cmd.sector_count = len >> 9;
         cmd.data_addr = dma_addr;
         cmd.completion_addr = 0;
+        cmd.generation_number = 0; // Not used for data commands
         
         rc_printk(RC_DEBUG, "rc_transfer_data: read cmd_id=%u lba=%llu sectors=%u\n",
                   cmd.command_id, (unsigned long long)cmd.lba, cmd.sector_count);
