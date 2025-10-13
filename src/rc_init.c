@@ -43,6 +43,7 @@
 #include <linux/hdreg.h>
 #include <linux/reboot.h>
 #include <linux/pci.h>
+#include <linux/msi.h>
 #include <linux/interrupt.h>
 #include <asm/uaccess.h>
 #include <linux/miscdevice.h>
@@ -1315,10 +1316,10 @@ int rc_ahci_init(rc_adapter_t *adapter)
 
 	// Enhanced MSI support for TRX50 platforms
 	// Try MSI-X first (better for multi-function devices)
-	if (pci_enable_msix(adapter->pdev, NULL, 0) == 0) {
+	if (pci_alloc_irq_vectors(adapter->pdev, 1, 1, PCI_IRQ_MSIX) >= 0) {
 		adapter->hardware.ismsi = 2; // MSI-X
 		rc_printk(RC_NOTE, "rc_ahci_init: MSI-X enabled\n");
-	} else if (pci_enable_msi(adapter->pdev) == 0) {
+	} else if (pci_alloc_irq_vectors(adapter->pdev, 1, 1, PCI_IRQ_MSI) >= 0) {
 		adapter->hardware.ismsi = 1; // MSI
 		rc_printk(RC_NOTE, "rc_ahci_init: MSI enabled\n");
 	} else {
@@ -1366,10 +1367,10 @@ int rc_ahci_shutdown(rc_adapter_t *adapter)
 		free_irq(adapter->hardware.irq, adapter);
 		adapter->hardware.irq = 0;
 		if (adapter->hardware.ismsi == 2) {
-		  pci_disable_msix(adapter->pdev);
+		  pci_free_irq_vectors(adapter->pdev);
 		  adapter->hardware.ismsi = 0;
 		} else if (adapter->hardware.ismsi == 1) {
-		  pci_disable_msi(adapter->pdev);
+		  pci_free_irq_vectors(adapter->pdev);
 		  adapter->hardware.ismsi = 0;
 		}
 	}
@@ -1478,8 +1479,8 @@ int rc_mpt2_init(rc_adapter_t *adapter)
 {
 	rc_mpt2_disable_irq(adapter);
 
-	if (pci_enable_msi(adapter->pdev))
-		rc_printk(RC_WARN, "%s: pci_enable_msi failed\n",__FUNCTION__);
+	if (pci_alloc_irq_vectors(adapter->pdev, 1, 1, PCI_IRQ_MSI) < 0)
+		rc_printk(RC_WARN, "%s: pci_alloc_irq_vectors MSI failed\n",__FUNCTION__);
 	else
 		adapter->hardware.ismsi = 1;
 
