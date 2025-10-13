@@ -92,12 +92,10 @@ void rc_raid_request_handler(struct request_queue *q)
 {
     struct request *req;
     
-    while ((req = blk_peek_request(q)) != NULL) {
-        blk_start_request(req);
-        
+    while ((req = blk_fetch_request(q)) != NULL) {
         // Process the request - for now just complete it
         // In a real implementation, this would handle the actual RAID I/O
-        __blk_end_request_all(req, BLK_STS_OK);
+        blk_end_request_all(req, BLK_STS_OK);
     }
 }
 
@@ -143,7 +141,13 @@ int rc_raid_array_init(struct rc_raid_array *array)
     set_capacity(array->disk, array->total_sectors);
     
     // Add disk
-    add_disk(array->disk);
+    err = add_disk(array->disk);
+    if (err) {
+        rc_printk(RC_ERROR, "rc_raid_array_init: failed to add disk\n");
+        blk_cleanup_queue(array->queue);
+        put_disk(array->disk);
+        return err;
+    }
     
     array->initialized = 1;
     rc_printk(RC_NOTE, "rc_raid_array_init: RAID array %d initialized as %s\n", 
@@ -183,9 +187,8 @@ int rc_raid_array_ioctl(struct block_device *bdev, fmode_t mode, unsigned int cm
 // Interrupt handler
 irqreturn_t rc_interrupt_handler(int irq, void *dev_id)
 {
-    struct rc_adapter *adapter = dev_id;
-    
     // Interrupt processing would be implemented here
+    // struct rc_adapter *adapter = dev_id;
     return IRQ_HANDLED;
 }
 

@@ -26,8 +26,15 @@ struct scsi_cmnd;
 struct scsi_host_template;
 #define SCSI_SCAN_INITIAL 1
 #define DID_OK 0x00
+// Define missing SCSI functions as stubs
+static inline int scsi_remove_host(struct Scsi_Host *host) { return 0; }
+static inline void scsi_host_put(struct Scsi_Host *host) { }
+static inline struct Scsi_Host *scsi_host_alloc(struct scsi_host_template *sht, int privsize) { return NULL; }
+static inline int scsi_add_host(struct Scsi_Host *host, struct device *dev) { return 0; }
 #endif
 #include <linux/blkdev.h>
+#include <linux/blk-mq.h>
+#include <linux/blk_types.h>
 #include <linux/delay.h>
 #include <linux/dma-mapping.h>
 #include <linux/msi.h>
@@ -38,6 +45,7 @@ struct scsi_host_template;
 #include <linux/mutex.h>
 #include <linux/kthread.h>
 #include <linux/workqueue.h>
+#include <linux/genhd.h>
 
 #include "rc_pci_ids.h"
 

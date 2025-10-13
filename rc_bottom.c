@@ -82,8 +82,8 @@ static int rc_bottom_probe(struct pci_dev *pdev, const struct pci_device_id *id)
             adapter->mmio_base = pci_iomap(pdev, bar, 0);
             if (adapter->mmio_base) {
                 adapter->mmio_len = pci_resource_len(pdev, bar);
-                rc_printk(RC_NOTE, "rc_bottom_probe: mapped MMIO space BAR %d (len=%lu)\n", 
-                          bar, adapter->mmio_len);
+                rc_printk(RC_NOTE, "rc_bottom_probe: mapped MMIO space BAR %d (len=%llu)\n", 
+                          bar, (unsigned long long)adapter->mmio_len);
                 break;
             } else {
                 rc_printk(RC_NOTE, "rc_bottom_probe: failed to map BAR %d\n", bar);
