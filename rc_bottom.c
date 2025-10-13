@@ -62,10 +62,10 @@ static int rc_bottom_probe(struct pci_dev *pdev, const struct pci_device_id *id)
         rc_printk(RC_NOTE, "rc_bottom_probe: using 64-bit DMA\n");
     }
     
-    // Map MMIO space
-    adapter->mmio_base = pci_iomap(pdev, 0, 0);
+    // Map MMIO space - AMD RAID controllers use BAR 5
+    adapter->mmio_base = pci_iomap(pdev, 5, 0);
     if (!adapter->mmio_base) {
-        rc_printk(RC_ERROR, "rc_bottom_probe: failed to map MMIO space\n");
+        rc_printk(RC_ERROR, "rc_bottom_probe: failed to map MMIO space (BAR 5)\n");
         err = -ENODEV;
         goto err_disable_device;
     }
