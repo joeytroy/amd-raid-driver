@@ -45,7 +45,6 @@ static inline int scsi_add_host(struct Scsi_Host *host, struct device *dev) { re
 #include <linux/mutex.h>
 #include <linux/kthread.h>
 #include <linux/workqueue.h>
-#include <linux/genhd.h>
 
 #include "rc_pci_ids.h"
 
