@@ -792,13 +792,9 @@ rc_init_adapter(struct pci_dev *dev, const struct pci_device_id *id)
 	}
 
 	pci_set_drvdata(dev, adapter);
-	rc_dev[rc_state.num_hba++] = adapter;
 
-	rc_printk(RC_NOTE, RC_DRIVER_NAME ": card %d: %s %s\n", adapter->instance,
-		  adapter->version->vendor, adapter->version->model);
-
-	// Create SCSI host for each adapter (TRX50 fix)
-	if (rc_state.num_hba == 1) {
+	// Create SCSI host for first adapter (TRX50 fix)
+	if (rc_state.num_hba == 0) {
 		int err;
 		rc_printk(RC_DEBUG, "rcraid_probe_one: creating SCSI host for first adapter\n");
 		err = rc_init_host(dev);
@@ -810,6 +806,11 @@ rc_init_adapter(struct pci_dev *dev, const struct pci_device_id *id)
 			rc_printk(RC_ERROR, "rc_init_host failed: %d\n", err);
 		}
 	}
+
+	rc_dev[rc_state.num_hba++] = adapter;
+
+	rc_printk(RC_NOTE, RC_DRIVER_NAME ": card %d: %s %s\n", adapter->instance,
+		  adapter->version->vendor, adapter->version->model);
 
 	return 0;
 }
