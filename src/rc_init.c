@@ -144,12 +144,12 @@ static unsigned adapter_count = 0;     /* Number of adapters on the PCI bus,
 					  adapter has been initialized. */
 extern struct miscdevice rccfg_api_dev;
 
-unsigned int RC_EnableDIPM;
-unsigned int RC_EnableHIPM;
-unsigned int RC_EnableAN;
-unsigned int RC_EnableNCQ;
-unsigned int RC_EnableZPODD;
-unsigned int RC_HMBAllocationPolicy;
+extern unsigned int RC_EnableDIPM;
+extern unsigned int RC_EnableHIPM;
+extern unsigned int RC_EnableAN;
+extern unsigned int RC_EnableNCQ;
+extern unsigned int RC_EnableZPODD;
+extern unsigned int RC_HMBAllocationPolicy;
 
 #define RCRAID_DEFAULT_DIPM	0x00000000;  /* Turn OFF DIPM for all ports by default for Linux */
 #define RCRAID_DEFAULT_HIPM	0x00000000;  /* Turn OFF HIPM for all ports by default for Linux */
@@ -465,13 +465,7 @@ rc_init_module(void)
 	//rc_state.osic_lock = __SPIN_LOCK_UNLOCKED(rc_state.osic_lock);
 	sema_init(&rc_state.rc_timeout_sema, 0);
 
-	/* Initialize Power Management DIPM & HIPM settings */
-	RC_EnableDIPM = RCRAID_DEFAULT_DIPM;
-	RC_EnableHIPM = RCRAID_DEFAULT_HIPM;
-    RC_EnableAN = RCRAID_DEFAULT_AN;
-    RC_EnableNCQ = RCRAID_DEFAULT_NCQ;
-    RC_EnableZPODD = RCRAID_DEFAULT_ZPODD;
-    RC_HMBAllocationPolicy = RCRAID_DEFAULT_HMB;
+	/* Power Management DIPM & HIPM settings are initialized in binary blob */
 
     // Setup ACPI work handler
     {
