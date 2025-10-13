@@ -14,8 +14,6 @@ static blk_status_t rc_queue_rq(struct blk_mq_hw_ctx *hctx,
     struct bvec_iter iter;
     void *kaddr;
     
-    blk_mq_start_request(req);
-    
     /* Process each bio in the request */
     __rq_for_each_bio(bio, req) {
         bio_for_each_segment(bvec, bio, iter) {
@@ -29,9 +27,12 @@ static blk_status_t rc_queue_rq(struct blk_mq_hw_ctx *hctx,
             
             kunmap_atomic(kaddr);
         }
+        
+        /* Complete the bio */
+        bio->bi_status = BLK_STS_OK;
+        bio_endio(bio);
     }
     
-    blk_mq_end_request(req, BLK_STS_OK);
     return BLK_STS_OK;
 }
 
