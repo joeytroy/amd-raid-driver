@@ -17,6 +17,7 @@ alwaysApply: true
 - Test changes on actual TRX50 hardware when possible
 - Fix code issues immediately while explaining the problem
 - We are doing vibe coding so execute and code based on needs
+- RAID is already configured in BIOS - focus on driver functionality, not BIOS setup
 
 ## Communication
 - Keep responses concise and actionable
