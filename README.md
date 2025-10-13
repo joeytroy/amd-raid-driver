@@ -1,19 +1,56 @@
 # AMD RAID Driver for Linux
 
-A modern Linux kernel driver for AMD RAID controllers, built from scratch based on Windows driver specifications. This driver provides full support for AMD RAID arrays on TRX50 and other AMD platforms.
+> ⚠️ **WARNING: THIS IS NOT A COMPLETED DRIVER** ⚠️
+> 
+> This is a **development driver** currently in **early stages**. It provides:
+> - ✅ Basic kernel module structure and PCI device detection
+> - ✅ In-memory backing store for testing purposes
+> - ❌ **NO real hardware communication** (uses memory storage only)
+> - ❌ **NO actual RAID functionality** (no real firmware integration)
+> - ❌ **NO production use** (for development and testing only)
+> 
+> **Current Status:** Foundation driver ready for hardware implementation
+> **Next Phase:** Real hardware communication and firmware integration
 
-## Features
+A modern Linux kernel driver for AMD RAID controllers, built from scratch based on Windows driver specifications. This driver is designed to provide full support for AMD RAID arrays on TRX50 and other AMD platforms.
 
-- **Complete Windows Driver Compatibility**: Built using exact specifications from Windows `rcbottom.inf`, `rccfg.inf`, and `rcraid.inf` files
-- **TRX50 Platform Support**: Full support for AMD TRX50 Threadripper PRO platforms
+## Current Implementation Status
+
+### ✅ **Implemented (Working)**
+- **Basic Kernel Module**: Complete module structure with proper initialization
+- **PCI Device Detection**: Detects AMD RAID controllers (VID: 0x1022)
+- **Block Device Creation**: Creates `/dev/rcraid0` for testing
+- **In-Memory Storage**: Page-based backing store for I/O operations
 - **Three-Layer Architecture**: 
   - `rcbottom`: Hardware initialization and PCI device management
-  - `rccfg`: Configuration and management interface (`/dev/rcfg`)
-  - `rcraid`: RAID array detection and SCSI host management
-- **Power Management**: Full HIPM/DIPM and HMB allocation policy support
-- **MSI/MSI-X Support**: Advanced interrupt handling with up to 5 vectors
-- **SCSI Host Management**: Creates SCSI hosts for RAID array detection
-- **Modern Linux Support**: Compatible with Kubuntu 24.04 LTS and newer kernels
+  - `rccfg`: Configuration device interface (`/dev/rcfg`)
+  - `rcraid`: RAID array structure and block device management
+- **Modern Linux Support**: Compatible with recent kernels (tested on 6.14+)
+
+### ❌ **Not Yet Implemented (Planned)**
+- **Real Hardware Communication**: No actual controller communication
+- **Firmware Integration**: No OSIC protocol or metadata discovery
+- **RAID Functionality**: No real RAID operations (uses memory only)
+- **Power Management**: HIPM/DIPM support not implemented
+- **MSI/MSI-X Support**: Interrupt handling not implemented
+- **SCSI Host Management**: SCSI layer not fully functional
+
+## Development and Testing
+
+This driver is currently in **development phase** and is designed for:
+
+- **Testing and Development**: Validating kernel module structure
+- **Hardware Research**: Gathering information about AMD RAID controllers
+- **Foundation Building**: Creating a base for real hardware implementation
+
+### Testing Process
+See [TESTING.md](TESTING.md) for a comprehensive testing guide that will help gather the information needed for real hardware implementation.
+
+### Next Development Steps
+1. **Hardware Analysis**: Research specific AMD RAID controller specifications
+2. **Register Mapping**: Implement real PCI register access
+3. **Firmware Communication**: Add OSIC protocol implementation
+4. **Real I/O Path**: Replace memory storage with actual hardware communication
 
 ## System Requirements
 
