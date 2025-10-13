@@ -806,6 +806,7 @@ rc_init_adapter(struct pci_dev *dev, const struct pci_device_id *id)
 			if (misc_register(&rccfg_api_dev))
 				rc_printk(RC_ERROR, "%s: failed to register rc_api\n",__FUNCTION__);
 			mutex_init(&ioctl_mutex);
+			rc_printk(RC_NOTE, "rc_init_adapter: SCSI host created successfully\n");
 		} else {
 			rc_printk(RC_ERROR, "rc_init_host failed: %d\n", err);
 		}
