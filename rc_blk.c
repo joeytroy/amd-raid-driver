@@ -5,6 +5,7 @@
 #include <linux/bio.h>
 #include <linux/slab.h>
 #include <linux/highmem.h>
+#include <linux/version.h>
 
 #define RC_SECTORS_PER_PAGE (PAGE_SIZE >> 9)          /* sectors cached per page */
 #define RC_SECTOR_OFFSET_MASK (RC_SECTORS_PER_PAGE - 1)
@@ -228,11 +229,7 @@ int rc_blk_create_disk(struct rc_raid_array *a, int major)
     if (ret)
         return ret;
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 3, 0)
-    a->disk = blk_mq_alloc_disk(&a->tag_set, a);
-#else
     a->disk = blk_mq_alloc_disk(&a->tag_set, NULL, a);
-#endif
     if (IS_ERR(a->disk)) {
         ret = PTR_ERR(a->disk);
         a->disk = NULL;
