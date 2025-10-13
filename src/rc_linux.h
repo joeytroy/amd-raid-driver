@@ -31,11 +31,14 @@
 #define RC_DRIVER_NAME               "rcraid"
 #define RC_DRIVER_VERSION            "9.3.2.00255"
 #define RC_DRIVER_DESCRIPTION        "AMD RAID Controller for Linux"
+#define RC_DRIVER_BUILD              "9.3.2-00039"
 
-// Maximum adapters and targets
-#define RC_MAX_ADAPTERS              8
+// Maximum adapters and targets (AMD Official Specifications)
+#define RC_MAX_ADAPTERS              11  // Max Controller Count per AMD spec
 #define RC_MAX_SCSI_TARGETS          32
 #define RC_MAX_SCSI_LUNS             8
+#define RC_MAX_DEVICES               14  // Total devices (SATA + NVMe)
+#define RC_MAX_NVME_DEVICES          10  // Max NVMe devices per AMD spec
 
 // Debug levels
 #define RC_DEBUG                     0

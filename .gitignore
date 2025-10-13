@@ -1,0 +1,55 @@
+# Windows driver files (not needed in Linux repo)
+windows/
+
+# Build artifacts
+*.ko
+*.o
+*.mod
+*.mod.c
+*.mod.o
+*.order
+*.symvers
+*.markers
+Module.symvers
+modules.order
+.ko.cmd
+.mod.cmd
+.tmp_versions/
+
+# Kernel build directory
+/usr/
+
+# Backup files
+*.bak
+*.backup
+*~
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Log files
+*.log
+dmesg.log
+
+# Temporary files
+*.tmp
+*.temp
+
+# Compiled binaries
+rcraid
+rcraid_generic
+
+# Driver installation directory
+/dd/
