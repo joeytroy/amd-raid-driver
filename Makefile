@@ -23,6 +23,7 @@ all:
 clean:
 	@echo "Cleaning build files..."
 	@rm -f *.o *.ko *.mod.c *.mod *.symvers *.order .*.cmd
+	@rm -f src/*.o src/*.mod.c src/*.mod src/.*.cmd
 	@rm -rf .tmp_versions
 	@echo "Clean completed"
 

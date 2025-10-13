@@ -90,25 +90,6 @@ Recent fixes include:
 - **Build system robustness**: Handles kernel header issues gracefully
 - **Better error handling**: More informative build messages and fallback options
 
-### Build Options
-
-**Recommended (automatic):**
-```bash
-sudo ./build.sh
-```
-
-**Manual build:**
-```bash
-sudo make clean
-sudo make simple
-```
-
-**Debug build:**
-```bash
-sudo make clean
-sudo make simple 2>&1 | tee build.log
-```
-
 ### Boot from Live USB
 1. Boot from your modified USB
 2. Open terminal
