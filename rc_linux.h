@@ -184,7 +184,7 @@ int rc_scsi_queuecommand(void *host, void *scmd);
 // Block device functions
 int rc_raid_array_init(struct rc_raid_array *array);
 void rc_raid_array_cleanup(struct rc_raid_array *array);
-void rc_raid_request_handler(struct request_queue *q);
+blk_status_t rc_raid_request_handler(struct request *req);
 int rc_raid_array_ioctl(struct block_device *bdev, fmode_t mode, unsigned int cmd, unsigned long arg);
 
 // RAID management functions
