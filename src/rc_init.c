@@ -813,6 +813,7 @@ rc_init_adapter(struct pci_dev *dev, const struct pci_device_id *id)
 	rc_printk(RC_NOTE, RC_DRIVER_NAME ": card %d: %s %s\n", adapter->instance,
 		  adapter->version->vendor, adapter->version->model);
 	rc_printk(RC_NOTE, "rcraid_probe_one: AFTER adapter setup - num_hba=%d\n", rc_state.num_hba);
+	rc_printk(RC_NOTE, "rcraid_probe_one: DEBUG - This message should appear\n");
 
 	return 0;
 }
