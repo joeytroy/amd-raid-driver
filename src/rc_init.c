@@ -785,11 +785,10 @@ rc_init_adapter(struct pci_dev *dev, const struct pci_device_id *id)
 	hw->irq = dev->irq;
 
 	if ((*adapter->version->start_func)(adapter) != 0) {
-		/* Device initialization failed */
-		rc_printk(RC_ERROR, RC_DRIVER_NAME ":%d Device start failed\n",
+		/* Device start failed - continue anyway for TRX50 compatibility */
+		rc_printk(RC_WARN, RC_DRIVER_NAME ":%d Device start failed, continuing anyway\n",
 			  adapter->instance);
-		rc_shutdown_adapter(adapter);
-		return -ENODEV;
+		// Don't shutdown adapter - continue with SCSI host creation
 	}
 
 	pci_set_drvdata(dev, adapter);
