@@ -1,7 +1,6 @@
 #pragma once
 #include <linux/blkdev.h>
 #include <linux/blk-mq.h>
-#include <linux/genhd.h>
 #include <linux/version.h>
 
 struct rc_array; /* forward-declare your array struct */
