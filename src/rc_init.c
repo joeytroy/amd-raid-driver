@@ -761,11 +761,10 @@ rc_init_adapter(struct pci_dev *dev, const struct pci_device_id *id)
 	/* Call initialization routine */
 	rc_printk(RC_DEBUG, "%s: Initializing hardware...\n", __FUNCTION__);
 	if ((*adapter->version->init_func)(adapter) != 0) {
-		/* Device initialization failed */
-		rc_printk(RC_ERROR, RC_DRIVER_NAME ":%d Device initialization failed\n",
+		/* Device initialization failed - continue anyway for TRX50 compatibility */
+		rc_printk(RC_WARN, RC_DRIVER_NAME ":%d Device initialization failed, continuing anyway\n",
 			  adapter->instance);
-		rc_shutdown_adapter(adapter);
-		return -ENODEV;
+		// Don't shutdown adapter - continue with SCSI host creation
 	}
 
 	/* attach the interrupt */
