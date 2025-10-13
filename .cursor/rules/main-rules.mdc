@@ -10,10 +10,11 @@ alwaysApply: true
 - Keep replies short and focused
 
 ## Driver Development
-- Use Windows drivers as reference to implement missing Linux functionality
-- Compare Windows driver behavior with Linux implementation
-- Focus on making driver work properly based on Windows drivers
-- Follow existing code patterns and naming conventions
+- Create NEW Linux driver from scratch based on Windows drivers
+- Implement rcbottom, rccfg, rcraid as separate components like Windows
+- Use Windows driver INF files as exact specification for Linux implementation
+- Follow Windows driver initialization sequence: rcbottom -> rccfg -> rcraid
+- Match Windows driver PCI device IDs and power management settings exactly
 - Test changes on actual TRX50 hardware when possible
 - Fix code issues immediately while explaining the problem
 - We are doing vibe coding so execute and code based on needs
