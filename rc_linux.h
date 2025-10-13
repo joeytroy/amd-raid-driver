@@ -35,6 +35,7 @@ static inline int scsi_add_host(struct Scsi_Host *host, struct device *dev) { re
 #include <linux/blkdev.h>
 #include <linux/blk-mq.h>
 #include <linux/blk_types.h>
+#include <linux/genhd.h>
 #include <linux/delay.h>
 #include <linux/dma-mapping.h>
 #include <linux/msi.h>
@@ -132,6 +133,7 @@ struct rc_raid_array {
     char name[32];
     struct gendisk *disk;
     struct request_queue *queue;
+    struct blk_mq_tag_set tag_set;
     struct rc_adapter *adapter;
     int initialized;
 };

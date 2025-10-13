@@ -88,17 +88,22 @@ int rc_scsi_remove(void *sdev)
 #endif
 
 // Block device request handler (blk-mq style)
-blk_status_t rc_raid_request_handler(struct request *req)
+static blk_status_t rc_raid_request_handler(struct request *req)
 {
     // Process the request - for now just complete it
     // In a real implementation, this would handle the actual RAID I/O
     return BLK_STS_OK;
 }
 
-// RAID array block device operations
+// Block device operations
 static const struct block_device_operations rc_raid_fops = {
     .owner = THIS_MODULE,
     .ioctl = rc_raid_array_ioctl,
+};
+
+// blk-mq operations
+static const struct blk_mq_ops rc_raid_mq_ops = {
+    .queue_rq = rc_raid_request_handler,
 };
 
 // Initialize RAID array as block device
@@ -108,10 +113,30 @@ int rc_raid_array_init(struct rc_raid_array *array)
     
     rc_printk(RC_NOTE, "rc_raid_array_init: initializing RAID array %d\n", array->array_id);
     
-    // For now, skip queue allocation and use a simple approach
-    // This will be implemented properly once we have the correct API
-    array->queue = NULL;
-    rc_printk(RC_NOTE, "rc_raid_array_init: skipping queue allocation for now\n");
+    // Initialize blk-mq tag set
+    array->tag_set.ops = &rc_raid_mq_ops;
+    array->tag_set.nr_hw_queues = 1;
+    array->tag_set.queue_depth = 128;
+    array->tag_set.numa_node = NUMA_NO_NODE;
+    array->tag_set.cmd_size = 0;
+    array->tag_set.flags = BLK_MQ_F_SHOULD_MERGE;
+    
+    err = blk_mq_alloc_tag_set(&array->tag_set);
+    if (err) {
+        rc_printk(RC_ERROR, "rc_raid_array_init: failed to allocate tag set\n");
+        return err;
+    }
+    
+    // Allocate request queue
+    array->queue = blk_mq_alloc_queue(&array->tag_set);
+    if (!array->queue) {
+        rc_printk(RC_ERROR, "rc_raid_array_init: failed to allocate request queue\n");
+        blk_mq_free_tag_set(&array->tag_set);
+        return -ENOMEM;
+    }
+    
+    blk_queue_logical_block_size(array->queue, 512);
+    blk_queue_physical_block_size(array->queue, 512);
     
     // Allocate gendisk
     array->disk = alloc_disk(1);
@@ -159,6 +184,10 @@ void rc_raid_array_cleanup(struct rc_raid_array *array)
         if (array->queue) {
             blk_put_queue(array->queue);
             array->queue = NULL;
+        }
+        
+        if (array->tag_set.ops) {
+            blk_mq_free_tag_set(&array->tag_set);
         }
         
         array->initialized = 0;
