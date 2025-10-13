@@ -6,6 +6,7 @@ alwaysApply: true
 
 ## Command Execution
 - Don't run make commands - user handles all builds
+- Never attempt compilation on macOS - user develops on live Kubuntu system
 - Group remote commands into single code blocks
 - Keep replies short and focused
 
