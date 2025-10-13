@@ -109,6 +109,7 @@ MODULE_PARM_DESC (use_swl, "Specify SWL chipsets");
 // Set the number of adapters for spanning. Issues with "hot insert"
 // so force this to be passed every time...
 static int rc_adapter_count = 999;      // Bogus value
+static int rc_scsi_host_created = 0;
 #ifdef module_param_named
 module_param_named(rc_adapter_count, rc_adapter_count, int, 0444);
 #else
@@ -796,16 +797,17 @@ rc_init_adapter(struct pci_dev *dev, const struct pci_device_id *id)
 	// Add adapter to array first (rcbottom equivalent)
 	rc_dev[rc_state.num_hba++] = adapter;
 
-	// Create SCSI host for first adapter (rcraid equivalent - TRX50 fix)
-	if (rc_state.num_hba == 1) {
+	// Create SCSI host once globally (rcraid equivalent - TRX50 fix)
+	if (!rc_scsi_host_created && rc_state.num_hba >= 1) {
 		int err;
-		rc_printk(RC_NOTE, "rc_init_adapter: creating SCSI host for first adapter - num_hba=%d\n", rc_state.num_hba);
+		rc_printk(RC_NOTE, "rc_init_adapter: creating SCSI host - num_hba=%d, first_time=%d\n", rc_state.num_hba, !rc_scsi_host_created);
 		rc_printk(RC_NOTE, "rc_init_adapter: BEFORE SCSI host creation\n");
 		err = rc_init_host(dev);
 		if (!err) {
 			if (misc_register(&rccfg_api_dev))
 				rc_printk(RC_ERROR, "%s: failed to register rc_api\n",__FUNCTION__);
 			mutex_init(&ioctl_mutex);
+			rc_scsi_host_created = 1;
 			rc_printk(RC_NOTE, "rc_init_adapter: SCSI host created successfully\n");
 		} else {
 			rc_printk(RC_ERROR, "rc_init_host failed: %d\n", err);
