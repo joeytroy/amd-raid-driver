@@ -794,6 +794,20 @@ rc_init_adapter(struct pci_dev *dev, const struct pci_device_id *id)
 	rc_printk(RC_NOTE, RC_DRIVER_NAME ": card %d: %s %s\n", adapter->instance,
 		  adapter->version->vendor, adapter->version->model);
 
+	// Create SCSI host for each adapter (TRX50 fix)
+	if (rc_state.num_hba == 1) {
+		int err;
+		rc_printk(RC_DEBUG, "rcraid_probe_one: creating SCSI host for first adapter\n");
+		err = rc_init_host(dev);
+		if (!err) {
+			if (misc_register(&rccfg_api_dev))
+				rc_printk(RC_ERROR, "%s: failed to register rc_api\n",__FUNCTION__);
+			mutex_init(&ioctl_mutex);
+		} else {
+			rc_printk(RC_ERROR, "rc_init_host failed: %d\n", err);
+		}
+	}
+
 	return 0;
 }
 
@@ -920,20 +934,7 @@ rcraid_probe_one(struct pci_dev *dev, const struct pci_device_id *id)
 	rc_printk(RC_DEBUG, "rcraid_probe_one: checking init conditions - adapter_count=%u, rc_adapter_count=%d, rc_state.num_hba=%d\n", 
 		adapter_count, rc_adapter_count, rc_state.num_hba);
 	
-	// Create SCSI hosts when we have adapters detected
-	// Fixed condition to work with TRX50 platforms
-	if (rc_state.num_hba > 0) {
-		int err;
-
-		rc_printk(RC_DEBUG, "rcraid_probe_one: calling rc_init_host\n");
-		err = rc_init_host(dev);
-		if (!err) {
-			if (misc_register(&rccfg_api_dev))
-				rc_printk(RC_ERROR, "%s: failed to register rc_api\n",__FUNCTION__);
-			mutex_init(&ioctl_mutex);
-		} else
-			return err;
-	}
+	// SCSI host creation moved to individual adapter probe (TRX50 fix)
 	return ret;
 }
 
