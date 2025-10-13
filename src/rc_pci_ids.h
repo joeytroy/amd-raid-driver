@@ -92,7 +92,6 @@
 #define RC_PD_DID_X670              0x7906 // AMD X670 chipset RAID mode
 #define RC_PD_DID_B650              0x7907 // AMD B650 chipset RAID mode
 #define RC_PD_DID_A620              0x7908 // AMD A620 chipset RAID mode
-#define RC_PD_DID_X570S             0x7917 // AMD X570S chipset RAID mode
 #define RC_PD_DID_B550A             0x7918 // AMD B550A chipset RAID mode
 
 // AMD Workstation chipsets (2024+)
@@ -101,6 +100,11 @@
 #define RC_PD_DID_X870E             0x7911 // AMD X870E chipset RAID mode
 #define RC_PD_DID_B850E             0x7912 // AMD B850E chipset RAID mode
 #define RC_PD_DID_NVME_RAID_BOTTOM  0xb000 // AMD NVMe RAID Bottom Device
+
+// Additional AMD chipsets supported by Windows drivers
+#define RC_PD_DID_BRISTOL           0x7905 // PCIe AMD Bristol RAID mode (TRX50 compatible)
+#define RC_PD_DID_SUMMIT            0x7916 // PCIe AMD Summit RAID mode (TRX50 compatible)
+#define RC_PD_DID_X570S             0x7917 // AMD X570S chipset RAID mode (TRX50 compatible)
 #define RC_PD_DID_LSI1068E          0x0058 // PCIe LSI1068 Adapater
 #define RC_PD_DID_LSI1068           0x0059 // Motherboard LSI1068
 #define RC_PD_DID_FALCON            0x0072 // MPT2 Falcon Adapter

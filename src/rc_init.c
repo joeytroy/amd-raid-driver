@@ -61,7 +61,7 @@
 #endif
 
 MODULE_AUTHOR(VER_COMPANYNAME_STR);
-MODULE_DESCRIPTION("AMD TRX50 Hybrid RAID Controller - SCSI + NVMe Support");
+MODULE_DESCRIPTION("AMD TRX50 Hybrid RAID Controller - SCSI + NVMe Support (Bristol/Summit/X570S)");
 MODULE_LICENSE("Proprietary");
 
 static int debug = 0;
@@ -143,17 +143,19 @@ static unsigned adapter_count = 0;     /* Number of adapters on the PCI bus,
 					  adapter has been initialized. */
 extern struct miscdevice rccfg_api_dev;
 
-extern unsigned int RC_EnableDIPM;
-extern unsigned int RC_EnableHIPM;
-extern unsigned int RC_EnableAN;
-extern unsigned int RC_EnableNCQ;
-extern unsigned int RC_EnableZPODD;
+unsigned int RC_EnableDIPM;
+unsigned int RC_EnableHIPM;
+unsigned int RC_EnableAN;
+unsigned int RC_EnableNCQ;
+unsigned int RC_EnableZPODD;
+unsigned int RC_HMBAllocationPolicy;
 
 #define RCRAID_DEFAULT_DIPM	0x00000000;  /* Turn OFF DIPM for all ports by default for Linux */
 #define RCRAID_DEFAULT_HIPM	0x00000000;  /* Turn OFF HIPM for all ports by default for Linux */
 #define RCRAID_DEFAULT_AN	0x00000001;  /* Turn ON Asynchronous Notification by default for Linux */
 #define RCRAID_DEFAULT_NCQ	0x00000001;  /* Turn ON NCQ by default for Linux */
 #define RCRAID_DEFAULT_ZPODD    0x00000001; /* Turn ON Zero Power Optical Disk Device by default for Linux */
+#define RCRAID_DEFAULT_HMB	0x00000002;  /* HMB Allocation Policy - default to 2 (from Windows drivers) */
 
 struct task_struct      *rc_wq = NULL;
 rc_work_t               *acpi_work_item_head = NULL;
@@ -281,7 +283,37 @@ static struct pci_device_id rcraid_id_tbl[] = {
 	// TRX50 SATA RAID controller
 	{
 		.vendor = RC_PD_VID_AMD,
-		.device = RC_PD_DID_PROMONTORY,  // 0x43BD - your SATA controller
+		.device = RC_PD_DID_PROMONTORY,  // 0x43BD - Promontory SATA controller
+		.subvendor = PCI_ANY_ID,
+		.subdevice = PCI_ANY_ID,
+		.class = 0,
+		.class_mask = 0,
+		.driver_data = (unsigned long)&rc_ahci_version
+	},
+	// TRX50 Bristol RAID mode
+	{
+		.vendor = RC_PD_VID_AMD,
+		.device = RC_PD_DID_BRISTOL,  // 0x7905 - Bristol RAID mode
+		.subvendor = PCI_ANY_ID,
+		.subdevice = PCI_ANY_ID,
+		.class = 0,
+		.class_mask = 0,
+		.driver_data = (unsigned long)&rc_ahci_version
+	},
+	// TRX50 Summit RAID mode
+	{
+		.vendor = RC_PD_VID_AMD,
+		.device = RC_PD_DID_SUMMIT,  // 0x7916 - Summit RAID mode
+		.subvendor = PCI_ANY_ID,
+		.subdevice = PCI_ANY_ID,
+		.class = 0,
+		.class_mask = 0,
+		.driver_data = (unsigned long)&rc_ahci_version
+	},
+	// TRX50 X570S chipset RAID mode
+	{
+		.vendor = RC_PD_VID_AMD,
+		.device = RC_PD_DID_X570S,  // 0x7917 - X570S chipset RAID mode
 		.subvendor = PCI_ANY_ID,
 		.subdevice = PCI_ANY_ID,
 		.class = 0,
@@ -291,7 +323,7 @@ static struct pci_device_id rcraid_id_tbl[] = {
 	// TRX50 NVMe RAID Bottom Devices
 	{
 		.vendor = RC_PD_VID_AMD,
-		.device = RC_PD_DID_NVME_RAID_BOTTOM,  // 0xb000 - your NVMe controllers
+		.device = RC_PD_DID_NVME_RAID_BOTTOM,  // 0xb000 - NVMe RAID controllers
 		.subvendor = PCI_ANY_ID,
 		.subdevice = PCI_ANY_ID,
 		.class = 0,
@@ -438,6 +470,7 @@ rc_init_module(void)
     RC_EnableAN = RCRAID_DEFAULT_AN;
     RC_EnableNCQ = RCRAID_DEFAULT_NCQ;
     RC_EnableZPODD = RCRAID_DEFAULT_ZPODD;
+    RC_HMBAllocationPolicy = RCRAID_DEFAULT_HMB;
 
     // Setup ACPI work handler
     {
@@ -1280,12 +1313,18 @@ int rc_ahci_init(rc_adapter_t *adapter)
 {
 	rc_ahci_disable_irq(adapter);
 
-	// try using msi (0 return means success)
-	if (pci_enable_msi(adapter->pdev)) {
-		rc_printk(RC_WARN, "rc_ahci_init: pci_enable_msi failed\n");
+	// Enhanced MSI support for TRX50 platforms
+	// Try MSI-X first (better for multi-function devices)
+	if (pci_enable_msix(adapter->pdev, NULL, 0) == 0) {
+		adapter->hardware.ismsi = 2; // MSI-X
+		rc_printk(RC_NOTE, "rc_ahci_init: MSI-X enabled\n");
+	} else if (pci_enable_msi(adapter->pdev) == 0) {
+		adapter->hardware.ismsi = 1; // MSI
+		rc_printk(RC_NOTE, "rc_ahci_init: MSI enabled\n");
 	} else {
-		adapter->hardware.ismsi = 1;
-        }
+		rc_printk(RC_WARN, "rc_ahci_init: MSI/MSI-X failed, using legacy interrupts\n");
+		adapter->hardware.ismsi = 0;
+	}
 
 	return 0;
 }
@@ -1293,6 +1332,7 @@ int rc_ahci_init(rc_adapter_t *adapter)
 int rc_ahci_start(rc_adapter_t *adapter)
 {
 	u16 cmd;
+	u32 pci_cap;
 
 	// The RAIDCore BIOS (and INT13 driver) may turn off access to
 	// the chip by clearing PCI Bus Master, Memory, and IO bits.  These
@@ -1301,6 +1341,20 @@ int rc_ahci_start(rc_adapter_t *adapter)
 	pci_read_config_word(adapter->pdev, PCI_COMMAND, &cmd);
 	cmd |= (PCI_COMMAND_IO | PCI_COMMAND_MEMORY);
 	pci_write_config_word(adapter->pdev, PCI_COMMAND, cmd);
+
+	// Enhanced power management for TRX50 platforms
+	// Enable ASPM (Active State Power Management) if supported
+	if (pci_find_capability(adapter->pdev, PCI_CAP_ID_PM)) {
+		pci_read_config_dword(adapter->pdev, pci_find_capability(adapter->pdev, PCI_CAP_ID_PM) + PCI_PM_CTRL, &pci_cap);
+		pci_cap |= PCI_PM_CTRL_STATE_MASK; // Enable ASPM
+		pci_write_config_dword(adapter->pdev, pci_find_capability(adapter->pdev, PCI_CAP_ID_PM) + PCI_PM_CTRL, pci_cap);
+		rc_printk(RC_NOTE, "rc_ahci_start: ASPM enabled\n");
+	}
+
+	// Apply HMB allocation policy if supported
+	if (RC_HMBAllocationPolicy != 0) {
+		rc_printk(RC_NOTE, "rc_ahci_start: HMB allocation policy set to 0x%x\n", RC_HMBAllocationPolicy);
+	}
 
 	return 0;
 }
@@ -1311,7 +1365,10 @@ int rc_ahci_shutdown(rc_adapter_t *adapter)
 	if  (adapter->hardware.irq) {
 		free_irq(adapter->hardware.irq, adapter);
 		adapter->hardware.irq = 0;
-		if (adapter->hardware.ismsi) {
+		if (adapter->hardware.ismsi == 2) {
+		  pci_disable_msix(adapter->pdev);
+		  adapter->hardware.ismsi = 0;
+		} else if (adapter->hardware.ismsi == 1) {
 		  pci_disable_msi(adapter->pdev);
 		  adapter->hardware.ismsi = 0;
 		}
@@ -1883,6 +1940,29 @@ rc_proc_write_delay(struct file *file, const char __user *buffer,
     return count;
 }
 
+static ssize_t
+rc_proc_write_hmb(struct file *file, const char __user *buffer,
+                  size_t count, loff_t *off)
+{
+    int			    err;
+    unsigned long   num;
+
+    if (!capable(CAP_SYS_ADMIN) || !capable(CAP_SYS_RAWIO))
+        return -EACCES;
+    err = kstrtoul_from_user(buffer, count, 16, &num);
+    if (err)
+        return err;
+    if (num >= 0 && num <= 0xFFFFFFFF)
+        RC_HMBAllocationPolicy = num;
+    return count;
+}
+
+static int
+rc_proc_hmb_open(struct inode *inode, struct file *file)
+{
+    return single_open(file, rc_proc_show_hex, &RC_HMBAllocationPolicy);
+}
+
 static int
 rc_proc_delay_open(struct inode *inode, struct file *file)
 {
@@ -1904,6 +1984,25 @@ static const struct file_operations rc_proc_delay_fops = {
     .read       = seq_read,
     .llseek     = seq_lseek,
     .write	    = rc_proc_write_delay,
+    .release    = single_release,
+};
+#endif /* LINUX_VERSION_CODE >= KERNEL_VERSION(5,6,0) */
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5,6,0)
+static const struct proc_ops rc_proc_hmb_fops = {
+    .proc_open       = rc_proc_hmb_open,
+    .proc_read       = seq_read,
+    .proc_lseek     = seq_lseek,
+    .proc_write	    = rc_proc_write_hmb,
+    .proc_release    = single_release,
+};
+#else
+static const struct file_operations rc_proc_hmb_fops = {
+    .owner      = THIS_MODULE,
+    .open       = rc_proc_hmb_open,
+    .read       = seq_read,
+    .llseek     = seq_lseek,
+    .write	    = rc_proc_write_hmb,
     .release    = single_release,
 };
 #endif /* LINUX_VERSION_CODE >= KERNEL_VERSION(5,6,0) */
@@ -2000,6 +2099,7 @@ static const struct rc_proc_entry {
     { "an", &rc_proc_an_fops },
     { "zpodd", &rc_proc_zpodd_fops },
     { "suspend_delay", &rc_proc_delay_fops },
+    { "hmb_policy", &rc_proc_hmb_fops },
     { "stats", &rc_proc_stats_fops },
     { NULL, NULL }
 };
@@ -2820,6 +2920,13 @@ static struct ctl_table rcraid_table[] = {
     {
       .procname = "suspend_delay",
       .data     = &rc_suspend_delay,
+	  .maxlen	= sizeof(unsigned int),
+	  .mode		= 0644,
+	  .proc_handler	= &proc_dointvec
+	},
+    {
+      .procname = "hmb_policy",
+      .data     = &RC_HMBAllocationPolicy,
 	  .maxlen	= sizeof(unsigned int),
 	  .mode		= 0644,
 	  .proc_handler	= &proc_dointvec

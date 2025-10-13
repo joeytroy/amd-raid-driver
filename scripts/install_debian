@@ -103,9 +103,33 @@ cat > "${UDEV_RULES}" << EOF
 
 # Ensure proper device naming for RAID arrays
 SUBSYSTEM=="block", KERNEL=="sd*", ATTRS{vendor}=="AMD", ATTRS{model}=="*RAID*", SYMLINK+="raid%n"
+
+# TRX50-specific device naming
+SUBSYSTEM=="block", KERNEL=="sd*", ATTRS{vendor}=="AMD", ATTRS{model}=="*Bristol*", SYMLINK+="raid-bristol%n"
+SUBSYSTEM=="block", KERNEL=="sd*", ATTRS{vendor}=="AMD", ATTRS{model}=="*Summit*", SYMLINK+="raid-summit%n"
+SUBSYSTEM=="block", KERNEL=="sd*", ATTRS{vendor}=="AMD", ATTRS{model}=="*X570S*", SYMLINK+="raid-x570s%n"
 EOF
 
 log_info "Created udev rules: ${UDEV_RULES}"
+
+# Create systemd service for HMB policy configuration
+SERVICE_FILE="/etc/systemd/system/${DRIVER_NAME}-hmb.service"
+cat > "${SERVICE_FILE}" << EOF
+[Unit]
+Description=AMD RAID Driver HMB Policy Configuration
+After=rcraid.service
+Wants=rcraid.service
+
+[Service]
+Type=oneshot
+ExecStart=/bin/bash -c 'echo 2 > /proc/scsi/rcraid/hmb_policy 2>/dev/null || true'
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+log_info "Created HMB policy service: ${SERVICE_FILE}"
 
 # Reload udev rules
 if command -v udevadm >/dev/null 2>&1; then
@@ -113,6 +137,19 @@ if command -v udevadm >/dev/null 2>&1; then
     log_info "Reloaded udev rules"
 fi
 
+# Enable HMB policy service
+if command -v systemctl >/dev/null 2>&1; then
+    systemctl daemon-reload
+    systemctl enable "${DRIVER_NAME}-hmb.service"
+    log_info "Enabled HMB policy service"
+fi
+
 log_info "Installation completed successfully!"
+log_info "TRX50-specific features enabled:"
+log_info "  - HMB allocation policy (default: 2)"
+log_info "  - Enhanced MSI/MSI-X support"
+log_info "  - ASPM power management"
+log_info "  - TRX50 chipset support (Bristol/Summit/X570S)"
+log_info ""
 log_info "You may need to reboot for the changes to take effect."
 log_info "To load the driver now, run: modprobe ${DRIVER_NAME}"

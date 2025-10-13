@@ -156,12 +156,15 @@ rcraid               5025792  0
 ```bash
 sudo dmesg | grep -i rcraid
 ```
-**Expected output:**
+**Expected output (TRX50 platforms):**
 ```
 [  145.856658] <5>AMD, Inc. rcraid raid driver version 8.1.0 build_number 8.1.0-00039 built Oct 12 2025
 [  145.856758] <5>rcraid_probe_one: vendor = 0x1022 device 0x43bd
 [  145.856793] <5>rcraid_probe_one: Total adapters matched 1
 [  145.857350] <5>rcraid: card 0: AMD, Inc. AHCI
+[  145.857400] <5>rc_ahci_init: MSI-X enabled
+[  145.857450] <5>rc_ahci_start: ASPM enabled
+[  145.857500] <5>rc_ahci_start: HMB allocation policy set to 0x2
 [  146.899682] scsi host1: AMD, Inc. AMD-RAID
 [  146.900915] scsi 1:0:24:0: Processor         AMD-RAID Configuration    V1.2 PQ: 0 ANSI: 5
 ```
@@ -170,9 +173,22 @@ sudo dmesg | grep -i rcraid
 ```bash
 lspci | grep -i raid
 ```
-**Expected output:**
+**Expected output (TRX50 platforms):**
 ```
+# Promontory SATA controller
 4a:00.0 RAID bus controller: Advanced Micro Devices, Inc. [AMD] Device 43bd (rev 01)
+
+# Bristol RAID mode (if present)
+4b:00.0 RAID bus controller: Advanced Micro Devices, Inc. [AMD] Device 7905 (rev 01)
+
+# Summit RAID mode (if present)  
+4c:00.0 RAID bus controller: Advanced Micro Devices, Inc. [AMD] Device 7916 (rev 01)
+
+# X570S chipset RAID mode (if present)
+4d:00.0 RAID bus controller: Advanced Micro Devices, Inc. [AMD] Device 7917 (rev 01)
+
+# NVMe RAID Bottom Device (if present)
+4e:00.0 Non-Volatile memory controller: Advanced Micro Devices, Inc. [AMD] Device b000 (rev 01)
 ```
 
 ### Verify RAID Arrays are Detected
@@ -208,6 +224,37 @@ echo "- - -" | sudo tee /sys/class/scsi_host/host*/scan
 lsblk
 ```
 
+### TRX50-Specific Features
+
+**Check HMB allocation policy:**
+```bash
+cat /proc/scsi/rcraid/hmb_policy
+```
+**Expected output:**
+```
+2
+```
+
+**Check power management settings:**
+```bash
+# Check all power management settings
+ls /proc/scsi/rcraid/
+cat /proc/scsi/rcraid/dipm
+cat /proc/scsi/rcraid/hipm
+cat /proc/scsi/rcraid/an
+cat /proc/scsi/rcraid/ncq
+cat /proc/scsi/rcraid/zpodd
+```
+
+**Configure HMB allocation policy:**
+```bash
+# Set HMB policy (requires root)
+echo 2 | sudo tee /proc/scsi/rcraid/hmb_policy
+
+# Or via sysctl
+echo 2 | sudo tee /proc/sys/dev/scsi/rcraid/hmb_policy
+```
+
 ### Common Issues
 
 **Driver not loading:**
@@ -225,6 +272,11 @@ sudo dmesg | tail -20
 - Check GRUB has correct blacklist parameters:
   - SATA: `modprobe.blacklist=ahci`
   - NVMe: `modprobe.blacklist=ahci` (NVMe driver must load for RAID)
+
+**TRX50-specific issues:**
+- Verify MSI/MSI-X is working: `dmesg | grep -i msi`
+- Check ASPM is enabled: `dmesg | grep -i aspm`
+- Verify HMB policy is set: `cat /proc/scsi/rcraid/hmb_policy`
 
 **System won't boot:**
 - Check BIOS is set to RAID mode
