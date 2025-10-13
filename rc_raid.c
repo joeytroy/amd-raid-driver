@@ -127,43 +127,28 @@ int rc_raid_array_init(struct rc_raid_array *array)
         return err;
     }
     
-    // Allocate request queue
-    array->queue = blk_mq_alloc_queue(&array->tag_set, NULL, NULL);
-    if (!array->queue) {
-        rc_printk(RC_ERROR, "rc_raid_array_init: failed to allocate request queue\n");
-        blk_mq_free_tag_set(&array->tag_set);
-        return -ENOMEM;
-    }
+    // Queue is allocated by blk_mq_alloc_disk() - no need to allocate separately
     
-    // Skip queue setup for now
-    
-    // Try to allocate gendisk - this should work with proper includes
-    array->disk = alloc_disk(1);
-    if (!array->disk) {
+    // Use modern blk_mq_alloc_disk() instead of alloc_disk()
+    array->disk = blk_mq_alloc_disk(&array->tag_set, array);
+    if (IS_ERR(array->disk)) {
+        err = PTR_ERR(array->disk);
         rc_printk(RC_ERROR, "rc_raid_array_init: failed to allocate gendisk\n");
-        blk_put_queue(array->queue);
         blk_mq_free_tag_set(&array->tag_set);
-        return -ENOMEM;
+        return err;
     }
     
     // Setup gendisk
     array->disk->major = 0; // Let kernel assign major number
     array->disk->first_minor = 0;
+    array->disk->minors = 1;
     array->disk->fops = &rc_raid_fops;
-    array->disk->queue = array->queue;
     array->disk->private_data = array;
-    snprintf(array->disk->disk_name, sizeof(array->disk->disk_name), "rcraid%d", array->array_id);
+    strscpy(array->disk->disk_name, "rcraid0", DISK_NAME_LEN);
     set_capacity(array->disk, array->total_sectors);
     
     // Add disk
-    err = add_disk(array->disk);
-    if (err) {
-        rc_printk(RC_ERROR, "rc_raid_array_init: failed to add disk\n");
-        put_disk(array->disk);
-        blk_put_queue(array->queue);
-        blk_mq_free_tag_set(&array->tag_set);
-        return err;
-    }
+    add_disk(array->disk);
     
     array->initialized = 1;
     rc_printk(RC_NOTE, "rc_raid_array_init: RAID array %d initialized as %s\n", 
@@ -182,11 +167,6 @@ void rc_raid_array_cleanup(struct rc_raid_array *array)
             del_gendisk(array->disk);
             put_disk(array->disk);
             array->disk = NULL;
-        }
-        
-        if (array->queue) {
-            blk_put_queue(array->queue);
-            array->queue = NULL;
         }
         
         if (array->tag_set.ops) {
