@@ -12,6 +12,9 @@ struct rc_global_state rc_state = {
     .initialized = 0,
 };
 
+// Block major number
+static int rc_major = 0;
+
 // Module parameters
 static int debug_level = RC_NOTE;
 module_param(debug_level, int, 0644);
@@ -31,10 +34,19 @@ static int __init rc_init(void)
     rc_printk(RC_NOTE, "rc_init: AMD RAID Driver version %s\n", RC_DRIVER_VERSION);
     rc_printk(RC_NOTE, "rc_init: Based on Windows driver architecture\n");
     
+    // Register block major
+    rc_major = register_blkdev(0, "rcraid");
+    if (rc_major < 0) {
+        rc_printk(RC_ERROR, "rc_init: register_blkdev failed: %d\n", rc_major);
+        return rc_major;
+    }
+    rc_printk(RC_NOTE, "rc_init: registered block major %d\n", rc_major);
+    
     // Initialize rcbottom (hardware layer)
     err = rc_bottom_init();
     if (err) {
         rc_printk(RC_ERROR, "rc_init: failed to initialize rcbottom\n");
+        unregister_blkdev(rc_major, "rcraid");
         return err;
     }
     
@@ -43,6 +55,7 @@ static int __init rc_init(void)
     if (err) {
         rc_printk(RC_ERROR, "rc_init: failed to initialize rccfg\n");
         rc_bottom_cleanup();
+        unregister_blkdev(rc_major, "rcraid");
         return err;
     }
     
@@ -65,6 +78,12 @@ static void __exit rc_exit(void)
     rc_raid_cleanup();
     rc_config_cleanup();
     rc_bottom_cleanup();
+    
+    // Unregister block major
+    if (rc_major > 0) {
+        unregister_blkdev(rc_major, "rcraid");
+        rc_printk(RC_NOTE, "rc_exit: unregistered block major %d\n", rc_major);
+    }
     
     rc_state.initialized = 0;
     rc_printk(RC_NOTE, "rc_exit: AMD RAID Driver unloaded\n");

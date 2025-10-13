@@ -5,6 +5,7 @@
  ****************************************************************************/
 
 #include "rc_linux.h"
+#include "rc_blk.h"
 
 // SCSI host template
 #if RC_SCSI_AVAILABLE
@@ -113,55 +114,19 @@ int rc_raid_array_init(struct rc_raid_array *array)
     
     rc_printk(RC_NOTE, "rc_raid_array_init: initializing RAID array %d\n", array->array_id);
     
-    // Initialize blk-mq tag set
-    array->tag_set.ops = &rc_raid_mq_ops;
-    array->tag_set.nr_hw_queues = 1;
-    array->tag_set.queue_depth = 128;
-    array->tag_set.numa_node = NUMA_NO_NODE;
-    array->tag_set.cmd_size = 0;
-    array->tag_set.flags = 0;
+    // Set up array parameters for blk helper
+    array->size_bytes = array->total_sectors * 512;  // Convert sectors to bytes
+    array->index = array->array_id;  // Use array_id as index
     
-    err = blk_mq_alloc_tag_set(&array->tag_set);
+    // Use the blk-mq helper to create the disk
+    err = rc_blk_create_disk(array, rc_major);
     if (err) {
-        rc_printk(RC_ERROR, "rc_raid_array_init: failed to allocate tag set\n");
-        return err;
-    }
-    
-    // Queue is allocated by blk_mq_alloc_disk() - no need to allocate separately
-    
-    // Use modern blk_mq_alloc_disk() instead of alloc_disk()
-    array->disk = blk_mq_alloc_disk(&array->tag_set, NULL, array);
-    if (IS_ERR(array->disk)) {
-        err = PTR_ERR(array->disk);
-        rc_printk(RC_ERROR, "rc_raid_array_init: failed to allocate gendisk\n");
-        blk_mq_free_tag_set(&array->tag_set);
-        return err;
-    }
-    
-    // Setup gendisk
-    array->disk->major = 0; // Let kernel assign major number
-    array->disk->first_minor = 0;
-    array->disk->minors = 1;
-    array->disk->fops = &rc_raid_fops;
-    array->disk->private_data = array;
-    strscpy(array->disk->disk_name, "rcraid0", DISK_NAME_LEN);
-    
-    // Skip queue configuration for now - let kernel use defaults
-    
-    set_capacity(array->disk, array->total_sectors);
-    
-    // Add disk
-    err = add_disk(array->disk);
-    if (err) {
-        rc_printk(RC_ERROR, "rc_raid_array_init: failed to add disk\n");
-        put_disk(array->disk);
-        blk_mq_free_tag_set(&array->tag_set);
+        rc_printk(RC_ERROR, "rc_raid_array_init: failed to create disk (%d)\n", err);
         return err;
     }
     
     array->initialized = 1;
-    rc_printk(RC_NOTE, "rc_raid_array_init: RAID array %d initialized as %s\n", 
-              array->array_id, array->disk->disk_name);
+    rc_printk(RC_NOTE, "rc_raid_array_init: RAID array %d initialized successfully\n", array->array_id);
     
     return 0;
 }
@@ -172,15 +137,8 @@ void rc_raid_array_cleanup(struct rc_raid_array *array)
     if (array->initialized) {
         rc_printk(RC_NOTE, "rc_raid_array_cleanup: cleaning up RAID array %d\n", array->array_id);
         
-        if (array->disk) {
-            del_gendisk(array->disk);
-            put_disk(array->disk);
-            array->disk = NULL;
-        }
-        
-        if (array->tag_set.ops) {
-            blk_mq_free_tag_set(&array->tag_set);
-        }
+        // Use the blk-mq helper to destroy the disk
+        rc_blk_destroy_disk(array);
         
         array->initialized = 0;
     }

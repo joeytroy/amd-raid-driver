@@ -137,6 +137,10 @@ struct rc_raid_array {
     struct blk_mq_tag_set tag_set;
     struct rc_adapter *adapter;
     int initialized;
+    
+    // Additional fields for blk-mq helper
+    u64 size_bytes;          /* set this before calling rc_blk_create_disk */
+    int index;               /* 0,1,2… */
 };
 
 // RAID structure (rcraid equivalent)
@@ -189,6 +193,9 @@ int rc_raid_array_init(struct rc_raid_array *array);
 void rc_raid_array_cleanup(struct rc_raid_array *array);
 // Forward declaration removed - function is static
 int rc_raid_array_ioctl(struct block_device *bdev, fmode_t mode, unsigned int cmd, unsigned long arg);
+
+// Block major number (defined in rc_main.c)
+extern int rc_major;
 
 // RAID management functions
 int rc_raid_scan_arrays(struct rc_adapter *adapter);
