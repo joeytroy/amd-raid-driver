@@ -21,14 +21,17 @@ all:
 	 find /usr/src -name "linux-source-*" -type d | head -1 | xargs -I {} sh -c 'if [ -d "{}/build" ]; then echo "Using kernel: {}"; $(MAKE) -C {}/build M=$(PWD) modules; else echo "No suitable kernel found"; exit 1; fi')
 
 clean:
-	$(MAKE) -C $(KERNELDIR) M=$(PWD) clean
+	@echo "Cleaning build files..."
+	@rm -f *.o *.ko *.mod.c *.mod *.symvers *.order .*.cmd
+	@rm -rf .tmp_versions
+	@echo "Clean completed"
 
 # Simple build target that ignores missing files
 simple:
 	@echo "Building with minimal requirements..."
-	@$(MAKE) -C $(KERNELDIR) M=$(PWD) modules EXTRA_CFLAGS="$(EXTRA_CFLAGS) -Wno-error -Wno-unused-variable -Wno-unused-function" || \
+	@$(MAKE) -C $(KERNELDIR) M=$(PWD) modules EXTRA_CFLAGS="$(EXTRA_CFLAGS) -Wno-error -Wno-unused-variable -Wno-unused-function -Wno-missing-field-initializers" || \
 	(echo "Trying with older kernel..." && \
-	 find /usr/src -name "linux-source-*" -type d | head -1 | xargs -I {} sh -c 'if [ -d "{}/build" ]; then echo "Using: {}"; $(MAKE) -C {}/build M=$(PWD) modules EXTRA_CFLAGS="$(EXTRA_CFLAGS) -Wno-error"; else echo "No kernel found"; exit 1; fi')
+	 find /usr/src -name "linux-source-*" -type d | head -1 | xargs -I {} sh -c 'if [ -d "{}/build" ]; then echo "Using: {}"; $(MAKE) -C {}/build M=$(PWD) modules EXTRA_CFLAGS="$(EXTRA_CFLAGS) -Wno-error -Wno-unused-variable -Wno-unused-function -Wno-missing-field-initializers"; else echo "No kernel found"; exit 1; fi')
 
 install:
 	$(MAKE) -C $(KERNELDIR) M=$(PWD) modules_install

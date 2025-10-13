@@ -13,6 +13,7 @@
 #include <linux/interrupt.h>
 #include <linux/scsi/scsi.h>
 #include <linux/scsi/scsi_host.h>
+#include <linux/scsi/scsi_device.h>
 #include <linux/blkdev.h>
 #include <linux/delay.h>
 #include <linux/dma-mapping.h>
@@ -49,7 +50,7 @@
 
 // Debug macro
 #define rc_printk(level, fmt, ...) \
-    printk(KERN_##level RC_DRIVER_NAME ": " fmt, ##__VA_ARGS__)
+    printk(KERN_INFO RC_DRIVER_NAME ": " fmt, ##__VA_ARGS__)
 
 // Adapter structure (rcbottom equivalent)
 struct rc_adapter {

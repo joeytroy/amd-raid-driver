@@ -73,6 +73,42 @@
 
 ## 3. Install Driver and Verify RAID
 
+### Improved Build System
+
+The driver now includes an improved build system that automatically handles kernel header issues:
+
+- **`build.sh`**: Robust build script that finds working kernel directories and handles compilation errors
+- **Enhanced Makefile**: Better error handling and compiler flags
+- **Automatic fallbacks**: Tries multiple kernel versions if the primary build fails
+
+### Driver Improvements
+
+Recent fixes include:
+
+- **Fixed debug macros**: Proper printk level handling
+- **SCSI template cleanup**: Removed deprecated fields for better compatibility
+- **Build system robustness**: Handles kernel header issues gracefully
+- **Better error handling**: More informative build messages and fallback options
+
+### Build Options
+
+**Recommended (automatic):**
+```bash
+sudo ./build.sh
+```
+
+**Manual build:**
+```bash
+sudo make clean
+sudo make simple
+```
+
+**Debug build:**
+```bash
+sudo make clean
+sudo make simple 2>&1 | tee build.log
+```
+
 ### Boot from Live USB
 1. Boot from your modified USB
 2. Open terminal
@@ -88,9 +124,12 @@ git clone https://github.com/joeytroy/amd-raid-driver.git
 cd amd-raid-driver
 sudo cp /sys/kernel/btf/vmlinux /usr/lib/modules/`uname -r`/build/
 
-# Build driver
-sudo make clean
-sudo make simple
+# Build driver (use the improved build script)
+sudo ./build.sh
+
+# Alternative: manual build if script fails
+# sudo make clean
+# sudo make simple
 
 # Create AMD-compatible driver structure
 sudo mkdir -p /dd
@@ -146,8 +185,11 @@ sudo apt install -y build-essential linux-headers-{new-kernel-version} flex biso
 
 # Rebuild driver for new kernel
 cd ~/amd-raid-driver
-sudo make clean
-sudo make simple
+sudo ./build.sh
+
+# Alternative: manual build if script fails
+# sudo make clean
+# sudo make simple
 
 # Install driver
 sudo cp rcraid.ko /lib/modules/{new-kernel-version}/kernel/drivers/scsi/rcraid.ko
@@ -333,7 +375,10 @@ sudo dmesg | tail -20
 
 **Build fails:**
 ```bash
-# Try the simple build target:
+# First try the improved build script:
+sudo ./build.sh
+
+# If script fails, try manual build:
 sudo make clean
 sudo make simple
 
@@ -341,4 +386,15 @@ sudo make simple
 sudo apt install -y linux-source-6.8.0-* linux-headers-6.8.0-*
 sudo make clean
 sudo make KDIR=/usr/src/linux-source-6.8.0-*/build/
+
+# Check for specific build errors:
+sudo dmesg | tail -20
+sudo make clean && sudo make simple 2>&1 | tee build.log
 ```
+
+**Common build issues and solutions:**
+
+1. **Kernel header issues**: The build script automatically handles this
+2. **Missing dependencies**: Install with `sudo apt install -y build-essential linux-headers-$(uname -r) flex bison libssl-dev libelf-dev dwarves`
+3. **Permission issues**: Ensure you're running as root with `sudo`
+4. **Module compilation errors**: Check the build log for specific error messages

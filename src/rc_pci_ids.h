@@ -40,4 +40,7 @@
 #define RC_STORAGE_FEATURES          0x1
 #define RC_DRIVER_PARAMETER          "CSMI=Limited;"
 
+// SCSI Template Constants
+#define ENABLE_CLUSTERING            1
+
 #endif /* _RC_PCI_IDS_H_ */
