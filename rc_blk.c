@@ -70,16 +70,25 @@ static int rc_transfer_data(struct rc_raid_array *array, sector_t sector,
         unsigned int chunk = min_t(unsigned int, PAGE_SIZE - offset, len);
         struct rc_page_bucket *bucket;
 
-        bucket = rc_lookup_bucket(array, sector, write);
-        if (IS_ERR(bucket))
-            return PTR_ERR(bucket);
-
         if (write) {
-            memcpy(bucket->data + offset, buf, chunk);
-        } else if (bucket) {
-            memcpy(buf, bucket->data + offset, chunk);
+            bool all_zero = !memchr_inv(buf, 0, chunk);
+
+            if (all_zero) {
+                bucket = rc_lookup_bucket(array, sector, false);
+                if (bucket)
+                    memset(bucket->data + offset, 0, chunk);
+            } else {
+                bucket = rc_lookup_bucket(array, sector, true);
+                if (IS_ERR(bucket))
+                    return PTR_ERR(bucket);
+                memcpy(bucket->data + offset, buf, chunk);
+            }
         } else {
-            memset(buf, 0, chunk);
+            bucket = rc_lookup_bucket(array, sector, false);
+            if (bucket)
+                memcpy(buf, bucket->data + offset, chunk);
+            else
+                memset(buf, 0, chunk);
         }
 
         buf += chunk;
