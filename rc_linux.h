@@ -261,6 +261,20 @@ struct rc_hw_completion {
 	u32 reserved[3];
 } __packed;
 
+// RAID metadata structures (based on Windows driver analysis)
+struct rc_raid_metadata {
+	u32 signature;		// RAID signature
+	u32 version;		// Metadata version
+	u32 array_id;		// Array identifier
+	u32 raid_level;		// RAID level (0, 1, 5, 6, etc.)
+	u32 num_disks;		// Number of member disks
+	u64 array_size;		// Total array size in sectors
+	u64 stripe_size;	// Stripe size in sectors
+	u32 generation;		// Generation number
+	u32 checksum;		// Metadata checksum
+	u8 reserved[64];	// Reserved for future use
+} __packed;
+
 // Hardware adapter structure
 struct rc_hw_adapter {
 	void __iomem *mmio_base;
@@ -290,6 +304,9 @@ struct rc_hw_adapter {
 
 // Block major number (defined in rc_main.c)
 extern int rc_major;
+
+// Global hardware adapter (defined in rc_hw.c)
+extern struct rc_hw_adapter g_hw_adapter;
 
 // Hardware functions
 int rc_hw_init(struct pci_dev *pdev, struct rc_hw_adapter *hw);

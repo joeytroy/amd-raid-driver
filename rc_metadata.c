@@ -6,19 +6,7 @@
 
 #include "rc_linux.h"
 
-// RAID metadata structures (based on Windows driver analysis)
-struct rc_raid_metadata {
-	u32 signature;		// RAID signature
-	u32 version;		// Metadata version
-	u32 array_id;		// Array identifier
-	u32 raid_level;		// RAID level (0, 1, 5, 6, etc.)
-	u32 num_disks;		// Number of member disks
-	u64 array_size;		// Total array size in sectors
-	u64 stripe_size;	// Stripe size in sectors
-	u32 generation;		// Generation number
-	u32 checksum;		// Metadata checksum
-	u8 reserved[64];	// Reserved for future use
-} __packed;
+// RAID metadata structures are defined in rc_linux.h
 
 // Discover RAID arrays from firmware
 int rc_discover_arrays(struct rc_adapter *adapter)
