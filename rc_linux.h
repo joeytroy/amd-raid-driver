@@ -31,6 +31,14 @@ static inline int scsi_remove_host(struct Scsi_Host *host) { return 0; }
 static inline void scsi_host_put(struct Scsi_Host *host) { }
 static inline struct Scsi_Host *scsi_host_alloc(struct scsi_host_template *sht, int privsize) { return NULL; }
 static inline int scsi_add_host(struct Scsi_Host *host, struct device *dev) { return 0; }
+
+// Forward declarations for gendisk functions
+struct gendisk;
+extern struct gendisk *alloc_disk(int minors);
+extern void put_disk(struct gendisk *disk);
+extern int add_disk(struct gendisk *disk);
+extern void del_gendisk(struct gendisk *disk);
+extern void set_capacity(struct gendisk *disk, sector_t size);
 #endif
 #include <linux/blkdev.h>
 #include <linux/blk-mq.h>
