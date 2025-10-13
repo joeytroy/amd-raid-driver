@@ -11,11 +11,22 @@
 #include <linux/kernel.h>
 #include <linux/pci.h>
 #include <linux/interrupt.h>
-// Always try to include SCSI headers - they should be available
+// Try to include SCSI headers with fallback
+#if __has_include(<linux/scsi/scsi.h>)
 #include <linux/scsi/scsi.h>
 #include <linux/scsi/scsi_host.h>
 #include <linux/scsi/scsi_device.h>
 #define RC_SCSI_AVAILABLE 1
+#else
+// SCSI headers not available - define minimal fallbacks
+#define RC_SCSI_AVAILABLE 0
+struct Scsi_Host;
+struct scsi_device;
+struct scsi_cmnd;
+struct scsi_host_template;
+#define SCSI_SCAN_INITIAL 1
+#define DID_OK 0x00
+#endif
 #include <linux/blkdev.h>
 #include <linux/delay.h>
 #include <linux/dma-mapping.h>
@@ -153,9 +164,15 @@ int rc_pci_probe(struct pci_dev *pdev, const struct pci_device_id *id);
 void rc_pci_remove(struct pci_dev *pdev);
 
 // SCSI functions
+#if RC_SCSI_AVAILABLE
 int rc_scsi_probe(struct scsi_device *sdev);
 int rc_scsi_remove(struct scsi_device *sdev);
 int rc_scsi_queuecommand(struct Scsi_Host *host, struct scsi_cmnd *scmd);
+#else
+int rc_scsi_probe(void *sdev);
+int rc_scsi_remove(void *sdev);
+int rc_scsi_queuecommand(void *host, void *scmd);
+#endif
 
 // Block device functions
 int rc_raid_array_init(struct rc_raid_array *array);

@@ -7,6 +7,7 @@
 #include "rc_linux.h"
 
 // SCSI host template
+#if RC_SCSI_AVAILABLE
 static struct scsi_host_template rc_scsi_template = {
     .module = THIS_MODULE,
     .name = "AMD-RAID",
@@ -39,8 +40,10 @@ static struct scsi_host_template rc_scsi_template = {
     .sdev_attrs = NULL,
     .no_write_same = 1,
 };
+#endif
 
 // SCSI command processing
+#if RC_SCSI_AVAILABLE
 int rc_scsi_queuecommand(struct Scsi_Host *host, struct scsi_cmnd *scmd)
 {
     // RAID command processing would be implemented here
@@ -64,6 +67,25 @@ int rc_scsi_remove(struct scsi_device *sdev)
               sdev->host->host_no, sdev->id, sdev->lun);
     return 0;
 }
+#else
+int rc_scsi_queuecommand(void *host, void *scmd)
+{
+    // RAID command processing would be implemented here
+    return 0;
+}
+
+int rc_scsi_probe(void *sdev)
+{
+    rc_printk(RC_NOTE, "rc_scsi_probe: detected device (SCSI not available)\n");
+    return 0;
+}
+
+int rc_scsi_remove(void *sdev)
+{
+    rc_printk(RC_NOTE, "rc_scsi_remove: removing device (SCSI not available)\n");
+    return 0;
+}
+#endif
 
 // Block device request handler
 void rc_raid_request_handler(struct request_queue *q)
@@ -248,7 +270,8 @@ int rc_raid_init(void)
     rc_state.raid.num_arrays = 0;
     rc_state.raid.scsi_host_created = 0;
     
-    // Allocate SCSI host for RAID management
+    // Allocate SCSI host for RAID management (if SCSI is available)
+#if RC_SCSI_AVAILABLE
     struct Scsi_Host *host = scsi_host_alloc(&rc_scsi_template, sizeof(struct rc_raid));
     if (host) {
         // Set host parameters
@@ -271,6 +294,9 @@ int rc_raid_init(void)
     } else {
         rc_printk(RC_WARN, "rc_raid_init: failed to allocate SCSI host, continuing without SCSI\n");
     }
+#else
+    rc_printk(RC_NOTE, "rc_raid_init: SCSI not available, using block device only\n");
+#endif
     
     // Scan for RAID arrays and create block devices
     err = rc_raid_scan_arrays(&rc_state.adapters[0]);
@@ -302,12 +328,14 @@ void rc_raid_cleanup(void)
     rc_state.raid.num_arrays = 0;
     
     // Cleanup SCSI host
+#if RC_SCSI_AVAILABLE
     if (rc_state.raid.scsi_host_created && rc_state.raid.host) {
         scsi_remove_host(rc_state.raid.host);
         scsi_host_put(rc_state.raid.host);
         rc_state.raid.host = NULL;
         rc_state.raid.scsi_host_created = 0;
     }
+#endif
     
     rc_state.raid.initialized = 0;
 }
