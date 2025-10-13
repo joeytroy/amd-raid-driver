@@ -796,6 +796,7 @@ rc_init_adapter(struct pci_dev *dev, const struct pci_device_id *id)
 
 	// Add adapter to array first (rcbottom equivalent)
 	rc_dev[rc_state.num_hba++] = adapter;
+	rc_printk(RC_NOTE, "rc_init_adapter: adapter added to array - num_hba=%d\n", rc_state.num_hba);
 
 	rc_printk(RC_NOTE, RC_DRIVER_NAME ": card %d: %s %s\n", adapter->instance,
 		  adapter->version->vendor, adapter->version->model);
@@ -815,11 +816,13 @@ rc_init_adapter(struct pci_dev *dev, const struct pci_device_id *id)
 		} else {
 			rc_printk(RC_ERROR, "rc_init_host failed: %d\n", err);
 		}
+	} else {
+		rc_printk(RC_NOTE, "rc_init_adapter: skipping SCSI host creation - created=%d, num_hba=%d\n", rc_scsi_host_created, rc_state.num_hba);
 	}
 
-	rc_printk(RC_NOTE, "rcraid_probe_one: AFTER adapter setup - num_hba=%d\n", rc_state.num_hba);
-	rc_printk(RC_NOTE, "rcraid_probe_one: DEBUG - This message should appear\n");
-	rc_printk(RC_NOTE, "rcraid_probe_one: END OF FUNCTION\n");
+	rc_printk(RC_NOTE, "rc_init_adapter: AFTER adapter setup - num_hba=%d\n", rc_state.num_hba);
+	rc_printk(RC_NOTE, "rc_init_adapter: DEBUG - This message should appear\n");
+	rc_printk(RC_NOTE, "rc_init_adapter: END OF FUNCTION\n");
 
 	return 0;
 }
