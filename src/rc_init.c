@@ -149,7 +149,7 @@ extern unsigned int RC_EnableHIPM;
 extern unsigned int RC_EnableAN;
 extern unsigned int RC_EnableNCQ;
 extern unsigned int RC_EnableZPODD;
-extern unsigned int RC_HMBAllocationPolicy;
+unsigned int RC_HMBAllocationPolicy;
 
 #define RCRAID_DEFAULT_DIPM	0x00000000;  /* Turn OFF DIPM for all ports by default for Linux */
 #define RCRAID_DEFAULT_HIPM	0x00000000;  /* Turn OFF HIPM for all ports by default for Linux */
@@ -466,6 +466,8 @@ rc_init_module(void)
 	sema_init(&rc_state.rc_timeout_sema, 0);
 
 	/* Power Management DIPM & HIPM settings are initialized in binary blob */
+	/* Initialize HMB allocation policy (not in binary blob) */
+	RC_HMBAllocationPolicy = RCRAID_DEFAULT_HMB;
 
     // Setup ACPI work handler
     {
