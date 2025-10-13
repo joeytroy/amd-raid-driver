@@ -535,6 +535,7 @@ rc_init_adapter(struct pci_dev *dev, const struct pci_device_id *id)
 	int                   i;
 	struct rc_pci_bar     bar;
 
+	rc_printk(RC_NOTE, "rc_init_adapter: START - function called\n");
 	rc_printk(RC_DEBUG, "%s: Matched %.04x/%.04x/%.04x/%.04x\n", __FUNCTION__,
 		  id->vendor, id->device, id->subvendor, id->subdevice);
 
