@@ -185,7 +185,7 @@ int rc_scsi_queuecommand(void *host, void *scmd);
 // Block device functions
 int rc_raid_array_init(struct rc_raid_array *array);
 void rc_raid_array_cleanup(struct rc_raid_array *array);
-blk_status_t rc_raid_request_handler(struct blk_mq_hw_ctx *hctx, const struct blk_mq_queue_data *bd);
+// Forward declaration removed - function is static
 int rc_raid_array_ioctl(struct block_device *bdev, fmode_t mode, unsigned int cmd, unsigned long arg);
 
 // RAID management functions
