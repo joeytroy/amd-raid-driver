@@ -137,7 +137,7 @@ int rc_raid_array_init(struct rc_raid_array *array)
     
     // Skip queue setup for now
     
-    // Allocate gendisk
+    // Try to allocate gendisk - this should work with proper includes
     array->disk = alloc_disk(1);
     if (!array->disk) {
         rc_printk(RC_ERROR, "rc_raid_array_init: failed to allocate gendisk\n");

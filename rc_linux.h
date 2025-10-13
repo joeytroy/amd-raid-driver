@@ -37,6 +37,7 @@ static inline int scsi_add_host(struct Scsi_Host *host, struct device *dev) { re
 #include <linux/blkdev.h>
 #include <linux/blk-mq.h>
 #include <linux/blk_types.h>
+#include <linux/genhd.h>
 #include <linux/delay.h>
 #include <linux/dma-mapping.h>
 #include <linux/msi.h>
