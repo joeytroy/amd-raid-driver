@@ -161,12 +161,13 @@ static blk_status_t rc_queue_rq(struct blk_mq_hw_ctx *hctx,
                                 const struct blk_mq_queue_data *bd)
 {
     struct request *rq = bd->rq;
-    struct rc_raid_array *array = rq->q->queuedata;
+    struct rc_raid_array *array = rq->q ? rq->q->queuedata : NULL;
     blk_status_t status = BLK_STS_OK;
 
     blk_mq_start_request(rq);
 
     if (!array) {
+        rc_printk(RC_WARN, "rc_queue_rq: missing array context for op=%u\n", req_op(rq));
         blk_mq_end_request(rq, BLK_STS_IOERR);
         return BLK_STS_OK;
     }
@@ -191,6 +192,10 @@ static blk_status_t rc_queue_rq(struct blk_mq_hw_ctx *hctx,
     }
 
     blk_mq_end_request(rq, status);
+    if (status != BLK_STS_OK && status != BLK_STS_NOTSUPP)
+        rc_printk(RC_ERROR, "rc_queue_rq: op=%u status=%d sector=%llu len=%u\n",
+                  req_op(rq), status, (unsigned long long)blk_rq_pos(rq),
+                  blk_rq_bytes(rq));
     return BLK_STS_OK;
 }
 
@@ -223,7 +228,11 @@ int rc_blk_create_disk(struct rc_raid_array *a, int major)
     if (ret)
         return ret;
 
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 3, 0)
+    a->disk = blk_mq_alloc_disk(&a->tag_set, a);
+#else
     a->disk = blk_mq_alloc_disk(&a->tag_set, NULL, a);
+#endif
     if (IS_ERR(a->disk)) {
         ret = PTR_ERR(a->disk);
         a->disk = NULL;
