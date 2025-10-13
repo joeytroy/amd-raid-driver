@@ -1,0 +1,20 @@
+---
+alwaysApply: true
+---
+
+# AMD RAID Driver Development Rules
+
+## Command Execution
+- Don't run make commands - user handles all builds
+- Group remote commands into single code blocks
+- Keep replies short and focused
+
+## Driver Development
+- Focus on making driver work properly based on Windows drivers
+- Follow existing code patterns and naming conventions
+- Test changes on actual TRX50 hardware when possible
+
+## Communication
+- Keep responses concise and actionable
+- Group diagnostic commands together
+- Focus on driver functionality over documentation
