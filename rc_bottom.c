@@ -74,8 +74,8 @@ static int rc_bottom_probe(struct pci_dev *pdev, const struct pci_device_id *id)
     if (pci_alloc_irq_vectors(pdev, 1, RC_MSI_MESSAGE_LIMIT, PCI_IRQ_MSIX | PCI_IRQ_MSI) > 0) {
         adapter->msi_enabled = 1;
         adapter->msi_vectors = pci_irq_vector(pdev, 0);
-        rc_printk(RC_NOTE, "rc_bottom_probe: MSI enabled with %d vectors\n", 
-                  pci_irq_vector_count(pdev));
+        rc_printk(RC_NOTE, "rc_bottom_probe: MSI enabled with vector %d\n", 
+                  adapter->msi_vectors);
     } else {
         adapter->msi_enabled = 0;
         adapter->irq = pdev->irq;
