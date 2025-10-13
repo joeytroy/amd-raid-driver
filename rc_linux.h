@@ -11,14 +11,11 @@
 #include <linux/kernel.h>
 #include <linux/pci.h>
 #include <linux/interrupt.h>
-#if __has_include(<linux/scsi/scsi.h>)
+// Always try to include SCSI headers - they should be available
 #include <linux/scsi/scsi.h>
 #include <linux/scsi/scsi_host.h>
 #include <linux/scsi/scsi_device.h>
 #define RC_SCSI_AVAILABLE 1
-#else
-#define RC_SCSI_AVAILABLE 0
-#endif
 #include <linux/blkdev.h>
 #include <linux/delay.h>
 #include <linux/dma-mapping.h>
@@ -45,15 +42,22 @@
 #define RC_MAX_SCSI_LUNS             8
 #define RC_MAX_DEVICES               14  // Total devices (SATA + NVMe)
 #define RC_MAX_NVME_DEVICES          10  // Max NVMe devices per AMD spec
+#define RC_MAX_RAID_ARRAYS           8   // Maximum RAID arrays per controller
 
-// SCSI fallbacks if headers not available
-#if !RC_SCSI_AVAILABLE
-#define Scsi_Host                    void
-#define scsi_device                  void
-#define scsi_cmnd                    void
-#define scsi_host_template           void
-#define SCSI_SCAN_INITIAL            1
-#endif
+// RAID Array Types
+#define RC_RAID_TYPE_RAID0           0
+#define RC_RAID_TYPE_RAID1           1
+#define RC_RAID_TYPE_RAID5           5
+#define RC_RAID_TYPE_RAID6           6
+#define RC_RAID_TYPE_RAID10          10
+#define RC_RAID_TYPE_JBOD            15
+
+// RAID Array States
+#define RC_RAID_STATE_OFFLINE        0
+#define RC_RAID_STATE_ONLINE         1
+#define RC_RAID_STATE_DEGRADED       2
+#define RC_RAID_STATE_REBUILDING     3
+#define RC_RAID_STATE_FAILED         4
 
 // Debug levels
 #define RC_DEBUG                     0
@@ -98,12 +102,28 @@ struct rc_config {
     int initialized;
 };
 
+// RAID Array structure
+struct rc_raid_array {
+    int array_id;
+    int raid_type;
+    int state;
+    sector_t total_sectors;
+    sector_t used_sectors;
+    int num_disks;
+    int stripe_size;
+    char name[32];
+    struct gendisk *disk;
+    struct request_queue *queue;
+    struct rc_adapter *adapter;
+    int initialized;
+};
+
 // RAID structure (rcraid equivalent)
 struct rc_raid {
-#if RC_SCSI_AVAILABLE
     struct Scsi_Host *host;
-#endif
     struct rc_adapter *adapter;
+    struct rc_raid_array arrays[RC_MAX_RAID_ARRAYS];
+    int num_arrays;
     int initialized;
     int scsi_host_created;
 };
@@ -133,15 +153,21 @@ int rc_pci_probe(struct pci_dev *pdev, const struct pci_device_id *id);
 void rc_pci_remove(struct pci_dev *pdev);
 
 // SCSI functions
-#if RC_SCSI_AVAILABLE
 int rc_scsi_probe(struct scsi_device *sdev);
 int rc_scsi_remove(struct scsi_device *sdev);
 int rc_scsi_queuecommand(struct Scsi_Host *host, struct scsi_cmnd *scmd);
-#else
-int rc_scsi_probe(void *sdev);
-int rc_scsi_remove(void *sdev);
-int rc_scsi_queuecommand(void *host, void *scmd);
-#endif
+
+// Block device functions
+int rc_raid_array_init(struct rc_raid_array *array);
+void rc_raid_array_cleanup(struct rc_raid_array *array);
+void rc_raid_request_handler(struct request_queue *q);
+int rc_raid_array_ioctl(struct block_device *bdev, fmode_t mode, unsigned int cmd, unsigned long arg);
+
+// RAID management functions
+int rc_raid_scan_arrays(struct rc_adapter *adapter);
+int rc_raid_get_array_info(struct rc_raid_array *array);
+int rc_raid_create_array(struct rc_adapter *adapter, int raid_type, int num_disks);
+int rc_raid_delete_array(struct rc_raid_array *array);
 
 // Interrupt handlers
 irqreturn_t rc_interrupt_handler(int irq, void *dev_id);

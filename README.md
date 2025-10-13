@@ -76,7 +76,57 @@ The driver follows the Windows driver architecture with three main components:
 
 GPL v2 License
 
+## Troubleshooting
+
+### Driver Loaded But No RAID Arrays Detected
+
+If the driver loads successfully but doesn't show RAID arrays in `lsblk`:
+
+```bash
+# Check SCSI hosts
+ls -la /sys/class/scsi_host/
+
+# Check for any SCSI devices  
+ls -la /sys/class/scsi_device/
+
+# Check driver parameters
+cat /sys/module/rcraid/parameters/* 2>/dev/null || echo "No parameters found"
+
+# Check if RAID arrays are configured in BIOS
+sudo dmesg | grep -i raid
+
+# Check PCI device details
+sudo lspci -vvv -s 4a:00.0 | grep -A 10 -B 5 "Region"
+
+# Try rescanning for devices
+echo "- - -" | sudo tee /sys/class/scsi_host/host*/scan 2>/dev/null || echo "No SCSI hosts found"
+
+# Check again
+lsblk
+```
+
+### Common Issues
+
+1. **RAID arrays not configured in BIOS** - Ensure SATA mode is set to "RAID" and arrays are created
+2. **SCSI headers missing** - Driver runs in limited mode without full SCSI support
+3. **Wrong PCI BAR** - Driver automatically scans all BARs for MMIO space
+4. **BIOS RAID configuration** - RAID arrays must be created in BIOS before driver can detect them
+
+### Expected Output
+
+**Working driver:**
+```
+rcraid: rc_init: AMD RAID Driver initialized successfully
+rcraid: rc_init: Found 1 adapters
+```
+
+**RAID arrays should appear in:**
+```bash
+lsblk
+# Should show your RAID arrays as block devices
+```
+
 ## Support
 
 - Create an issue on GitHub
-- See [INSTALL.md](INSTALL.md) for troubleshooting
+- See [INSTALL.md](INSTALL.md) for detailed troubleshooting
