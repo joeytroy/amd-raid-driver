@@ -62,16 +62,29 @@ static int rc_bottom_probe(struct pci_dev *pdev, const struct pci_device_id *id)
         rc_printk(RC_NOTE, "rc_bottom_probe: using 64-bit DMA\n");
     }
     
+    // Debug: Check all BARs
+    rc_printk(RC_NOTE, "rc_bottom_probe: checking PCI resources:\n");
+    for (int bar = 0; bar < 6; bar++) {
+        unsigned long start = pci_resource_start(pdev, bar);
+        unsigned long len = pci_resource_len(pdev, bar);
+        unsigned long flags = pci_resource_flags(pdev, bar);
+        rc_printk(RC_NOTE, "  BAR %d: start=0x%lx len=0x%lx flags=0x%lx\n", 
+                  bar, start, len, flags);
+    }
+    
     // Map MMIO space - try different BARs for AMD RAID controllers
     adapter->mmio_base = NULL;
     for (int bar = 0; bar < 6; bar++) {
         if (pci_resource_len(pdev, bar) > 0) {
+            rc_printk(RC_NOTE, "rc_bottom_probe: trying to map BAR %d\n", bar);
             adapter->mmio_base = pci_iomap(pdev, bar, 0);
             if (adapter->mmio_base) {
                 adapter->mmio_len = pci_resource_len(pdev, bar);
                 rc_printk(RC_NOTE, "rc_bottom_probe: mapped MMIO space BAR %d (len=%lu)\n", 
                           bar, adapter->mmio_len);
                 break;
+            } else {
+                rc_printk(RC_NOTE, "rc_bottom_probe: failed to map BAR %d\n", bar);
             }
         }
     }
