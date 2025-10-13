@@ -81,14 +81,28 @@
 ```bash
 # Update and install dependencies
 sudo apt-get update
-sudo apt install -y build-essential linux-headers-$(uname -r) linux-source-$(uname -r) git flex bison libssl-dev libelf-dev dwarves
+sudo apt install -y build-essential linux-headers-$(uname -r) git flex bison libssl-dev libelf-dev dwarves
+
+# Try to install kernel source (may not be available for all kernel versions)
+sudo apt install -y linux-source-$(uname -r) || echo "Kernel source not available, using headers only"
 
 # Clone and build driver
 git clone https://github.com/joeytroy/amd-raid-driver.git
 cd amd-raid-driver
 sudo cp /sys/kernel/btf/vmlinux /usr/lib/modules/`uname -r`/build/
+
+# Build driver (if kernel source not available, this may fail)
 sudo make clean
 sudo make
+
+# If build fails due to missing kernel source, try alternative approach
+if [ $? -ne 0 ]; then
+    echo "Build failed - trying alternative approach..."
+    echo "Installing additional kernel development packages..."
+    sudo apt install -y linux-tools-$(uname -r) linux-tools-generic
+    sudo make clean
+    sudo make
+fi
 
 # Create AMD-compatible driver structure
 sudo mkdir -p /dd
@@ -328,3 +342,22 @@ sudo dmesg | tail -20
 - Check BIOS is set to RAID mode
 - Verify GRUB has correct blacklist parameters
 - Check that driver is in initramfs
+
+**Build fails with missing kernel source:**
+```bash
+# If linux-source package is not available, try:
+sudo apt install -y linux-tools-$(uname -r) linux-tools-generic
+
+# Or try building with a different kernel version:
+sudo apt install -y linux-source-6.8.0-* linux-headers-6.8.0-*
+make KDIR=/usr/src/linux-source-6.8.0-*/build/
+
+# Or use DKMS for automatic building:
+sudo apt install -y dkms
+sudo make dkms
+```
+
+**Kernel source not available for your kernel version:**
+- This is common with newer kernels (6.14+)
+- Try the alternative approaches above
+- Consider using DKMS for automatic module building
