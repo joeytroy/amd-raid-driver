@@ -212,6 +212,9 @@ int         rc_ahci_shutdown(rc_adapter_t *adapter);
 irqreturn_t rc_ahci_isr(int irq, void *arg, struct pt_regs *regs);
 #endif // RC_AHCI_SUPPORT
 
+// SCSI host initialization
+int         rc_init_host(struct pci_dev *pdev);
+
 #if defined(RC_LSI1068) || defined(RC_MPT2)
 // Additions for LSI MPT driver
 int         rc_mpt_init(rc_adapter_t *adapter);
