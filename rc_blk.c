@@ -2,7 +2,6 @@
 #include "rc_linux.h"
 #include <linux/printk.h>
 #include <linux/string.h>
-#include <linux/genhd.h>
 
 static blk_status_t rc_queue_rq(struct blk_mq_hw_ctx *hctx,
                                 const struct blk_mq_queue_data *bd)
