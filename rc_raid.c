@@ -147,9 +147,9 @@ int rc_raid_array_init(struct rc_raid_array *array)
     strscpy(array->disk->disk_name, "rcraid0", DISK_NAME_LEN);
     
     // Configure queue limits before adding disk
-    blk_queue_logical_block_size(array->disk->queue, 512);
-    blk_queue_physical_block_size(array->disk->queue, 512);
-    blk_queue_nonrot(array->disk->queue);
+    queue_logical_block_size(array->disk->queue, 512);
+    queue_physical_block_size(array->disk->queue, 512);
+    // Skip nonrot for now - it's just a macro
     
     set_capacity(array->disk, array->total_sectors);
     
