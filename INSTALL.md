@@ -3,7 +3,7 @@
 ## 1. Setup Live USB and GRUB Configuration
 
 ### Create Live USB
-1. Download Ubuntu 24.04 LTS ISO
+1. Download Kubuntu 24.04 LTS ISO
 2. Burn ISO to USB using Rufus on Windows only
 
 ### Modify GRUB Configuration
@@ -81,7 +81,7 @@
 ```bash
 # Update and install dependencies
 sudo apt-get update
-sudo apt install build-essential dwarves git
+sudo apt install -y build-essential linux-headers-$(uname -r) git flex bison libssl-dev libelf-dev dwarves
 
 # Clone and build driver
 git clone https://github.com/joeytroy/amd-raid-driver.git
@@ -104,9 +104,9 @@ sudo modprobe rcraid
 lsblk
 ```
 
-## 4. Install Ubuntu
+## 4. Install Kubuntu
 
-1. **Run Ubuntu installer** - it should now detect your RAID arrays
+1. **Run Kubuntu installer** - it should now detect your RAID arrays
 2. **Complete installation** normally
 3. **DO NOT RESTART YET**
 
@@ -138,6 +138,9 @@ When you update your kernel, reinstall the driver:
 ```bash
 # Install new kernel first
 sudo apt update && sudo apt upgrade
+
+# Install build dependencies for new kernel
+sudo apt install -y build-essential linux-headers-{new-kernel-version} flex bison libssl-dev libelf-dev dwarves
 
 # Rebuild driver for new kernel
 cd ~/amd-raid-driver
@@ -173,7 +176,7 @@ rcraid               5025792  0
 ```bash
 sudo dmesg | grep -i rcraid
 ```
-**Expected output (TRX50 platforms):**
+**Expected output (TRX50/WRX80 platforms on Kubuntu 24.04 LTS):**
 ```
 [  145.856658] rcraid: rc_init: AMD RAID Driver version 9.3.2.00255
 [  145.856758] rcraid: rc_init: Based on Windows driver architecture
@@ -196,7 +199,7 @@ sudo dmesg | grep -i rcraid
 ```bash
 lspci | grep -i raid
 ```
-**Expected output (TRX50/WRX80 platforms):**
+**Expected output (TRX50/WRX80 platforms on Kubuntu 24.04 LTS):**
 ```
 # Promontory SATA controller
 4a:00.0 RAID bus controller: Advanced Micro Devices, Inc. [AMD] Device 43bd (rev 01)

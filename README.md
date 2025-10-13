@@ -13,23 +13,43 @@ A modern Linux kernel driver for AMD RAID controllers, built from scratch based 
 - **Power Management**: Full HIPM/DIPM and HMB allocation policy support
 - **MSI/MSI-X Support**: Advanced interrupt handling with up to 5 vectors
 - **SCSI Host Management**: Creates SCSI hosts for RAID array detection
-- **Modern Linux Support**: Compatible with Ubuntu 24.04 LTS and newer kernels
+- **Modern Linux Support**: Compatible with Kubuntu 24.04 LTS and newer kernels
 
-## Supported Hardware
+## System Requirements
 
-### PCI Device IDs
+### Tested Configuration
+- **OS**: Kubuntu 24.04 LTS
+- **Kernel**: 6.14.0-27-generic
+- **Motherboard**: ASUS Pro WS TRX50-SAGE WIFI
+- **Memory**: 16GB+ RAM (32GB recommended)
+- **Storage**: Up to 14 devices (SATA + NVMe)
+- **Max NVMe**: 10 devices
+- **Max Controllers**: 11
+
+### Supported Hardware
+
+#### PCI Device IDs
 - `0x1022:0x7905` - AMD Bristol RAID mode
 - `0x1022:0x43BD` - AMD Promontory SATA controller
 - `0x1022:0x7916` - AMD Summit RAID mode
 - `0x1022:0x7917` - AMD X570S chipset RAID mode
 - `0x1022:0xB000` - AMD NVMe RAID Bottom Device
 
-### Supported Platforms
+#### Supported Platforms
 - AMD TRX50 Threadripper PRO
 - AMD WRX90 Threadripper PRO
 - AMD X570S chipset
 - AMD B550A chipset
 - Other AMD RAID-enabled platforms
+
+#### Build Dependencies
+- `build-essential` - GCC, make, and build tools
+- `linux-headers-$(uname -r)` - Kernel headers
+- `flex` - Lexical analyzer
+- `bison` - Parser generator
+- `libssl-dev` - SSL development libraries
+- `libelf-dev` - ELF library development files
+- `dwarves` - DWARF manipulation tools
 
 ## Installation
 
