@@ -797,6 +797,9 @@ rc_init_adapter(struct pci_dev *dev, const struct pci_device_id *id)
 	// Add adapter to array first (rcbottom equivalent)
 	rc_dev[rc_state.num_hba++] = adapter;
 
+	rc_printk(RC_NOTE, RC_DRIVER_NAME ": card %d: %s %s\n", adapter->instance,
+		  adapter->version->vendor, adapter->version->model);
+
 	// Create SCSI host once globally (rcraid equivalent - TRX50 fix)
 	if (!rc_scsi_host_created && rc_state.num_hba >= 1) {
 		int err;
@@ -814,8 +817,6 @@ rc_init_adapter(struct pci_dev *dev, const struct pci_device_id *id)
 		}
 	}
 
-	rc_printk(RC_NOTE, RC_DRIVER_NAME ": card %d: %s %s\n", adapter->instance,
-		  adapter->version->vendor, adapter->version->model);
 	rc_printk(RC_NOTE, "rcraid_probe_one: AFTER adapter setup - num_hba=%d\n", rc_state.num_hba);
 	rc_printk(RC_NOTE, "rcraid_probe_one: DEBUG - This message should appear\n");
 	rc_printk(RC_NOTE, "rcraid_probe_one: END OF FUNCTION\n");
