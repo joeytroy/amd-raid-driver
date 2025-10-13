@@ -130,7 +130,7 @@ int rc_raid_array_init(struct rc_raid_array *array)
     // Queue is allocated by blk_mq_alloc_disk() - no need to allocate separately
     
     // Use modern blk_mq_alloc_disk() instead of alloc_disk()
-    array->disk = blk_mq_alloc_disk(&array->tag_set, array);
+    array->disk = blk_mq_alloc_disk(&array->tag_set, NULL, array);
     if (IS_ERR(array->disk)) {
         err = PTR_ERR(array->disk);
         rc_printk(RC_ERROR, "rc_raid_array_init: failed to allocate gendisk\n");
@@ -148,7 +148,13 @@ int rc_raid_array_init(struct rc_raid_array *array)
     set_capacity(array->disk, array->total_sectors);
     
     // Add disk
-    add_disk(array->disk);
+    err = add_disk(array->disk);
+    if (err) {
+        rc_printk(RC_ERROR, "rc_raid_array_init: failed to add disk\n");
+        put_disk(array->disk);
+        blk_mq_free_tag_set(&array->tag_set);
+        return err;
+    }
     
     array->initialized = 1;
     rc_printk(RC_NOTE, "rc_raid_array_init: RAID array %d initialized as %s\n", 
