@@ -819,7 +819,7 @@ rc_init_adapter(struct pci_dev *dev, const struct pci_device_id *id)
  *    has been initialized. and the core started. finializes the host
  *    parameters.
  */
-static int
+int
 rc_init_host(struct pci_dev *pdev)
 {
 	int error;
