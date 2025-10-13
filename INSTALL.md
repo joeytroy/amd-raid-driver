@@ -4,49 +4,50 @@
 
 ### Create Live USB
 1. Download Ubuntu 24.04 LTS ISO
-2. Burn ISO to USB using Rufus, Balena Etcher, or `dd`
+2. Burn ISO to USB using Rufus on Windows only
 
 ### Modify GRUB Configuration
 
-**For SATA drives (AHCI):**
+**For SATA drives (RAID mode):**
 ```bash
-# Edit USB:/boot/grub/grub.cfg - append modprobe.blacklist=ahci to the END:
+# Edit USB:/boot/grub/grub.cfg - append AHCI blacklist to the END:
 # FROM: linux /casper/vmlinuz --- quiet splash
-# TO:   linux /casper/vmlinuz --- quiet splash modprobe.blacklist=ahci
+# TO:   linux /casper/vmlinuz --- quiet splash modprobe.blacklist=ahci,sata_ahci
 
 # FROM: linux /casper/vmlinuz nomodeset --- quiet splash  
-# TO:   linux /casper/vmlinuz nomodeset --- quiet splash modprobe.blacklist=ahci
+# TO:   linux /casper/vmlinuz nomodeset --- quiet splash modprobe.blacklist=ahci,sata_ahci
 ```
 
-**For NVMe drives:**
+**For NVMe drives (RAID mode):**
 ```bash
-# Edit USB:/boot/grub/grub.cfg - append BOTH blacklist parameters to the END:
+# Edit USB:/boot/grub/grub.cfg - append AHCI blacklist to the END:
 # FROM: linux /casper/vmlinuz --- quiet splash
-# TO:   linux /casper/vmlinuz --- quiet splash modprobe.blacklist=ahci modprobe.blacklist=nvme
+# TO:   linux /casper/vmlinuz --- quiet splash modprobe.blacklist=ahci,sata_ahci
 
 # FROM: linux /casper/vmlinuz nomodeset --- quiet splash  
-# TO:   linux /casper/vmlinuz nomodeset --- quiet splash modprobe.blacklist=ahci modprobe.blacklist=nvme
+# TO:   linux /casper/vmlinuz nomodeset --- quiet splash modprobe.blacklist=ahci,sata_ahci
 ```
 
 **Edit USB:/boot/grub/loopback.cfg:**
 ```bash
-# For SATA drives - append modprobe.blacklist=ahci to the END:
+# For SATA drives - append AHCI blacklist to the END:
 # FROM: linux /casper/vmlinuz iso-scan/filename=${iso_path} --- quiet splash
-# TO:   linux /casper/vmlinuz iso-scan/filename=${iso_path} --- quiet splash modprobe.blacklist=ahci
+# TO:   linux /casper/vmlinuz iso-scan/filename=${iso_path} --- quiet splash modprobe.blacklist=ahci,sata_ahci
 
-# For NVMe drives - append BOTH blacklist parameters to the END:
+# For NVMe drives - append AHCI blacklist to the END:
 # FROM: linux /casper/vmlinuz iso-scan/filename=${iso_path} --- quiet splash
-# TO:   linux /casper/vmlinuz iso-scan/filename=${iso_path} --- quiet splash modprobe.blacklist=ahci modprobe.blacklist=nvme
+# TO:   linux /casper/vmlinuz iso-scan/filename=${iso_path} --- quiet splash modprobe.blacklist=ahci,sata_ahci
 
 # FROM: linux /casper/vmlinuz nomodeset iso-scan/filename=${iso_path} --- quiet splash
-# TO:   linux /casper/vmlinuz nomodeset iso-scan/filename=${iso_path} --- quiet splash modprobe.blacklist=ahci modprobe.blacklist=nvme
+# TO:   linux /casper/vmlinuz nomodeset iso-scan/filename=${iso_path} --- quiet splash modprobe.blacklist=ahci,sata_ahci
 ```
 
 **Important:** 
-- **SATA drives only**: Use `modprobe.blacklist=ahci` only
-- **NVMe drives only**: Use `modprobe.blacklist=ahci modprobe.blacklist=nvme` (both)
-- **Mixed SATA + NVMe**: Use `modprobe.blacklist=ahci modprobe.blacklist=nvme` (both)
+- **SATA drives only**: Use `modprobe.blacklist=ahci,sata_ahci` (both AHCI drivers)
+- **NVMe drives only**: Use `modprobe.blacklist=ahci,sata_ahci` (both AHCI drivers, DO NOT blacklist nvme)
+- **Mixed SATA + NVMe**: Use `modprobe.blacklist=ahci,sata_ahci` (both AHCI drivers, DO NOT blacklist nvme)
 - **"Append"** means add to the END of the line, not the beginning!
+- **TRX50 Note**: The AMD RAID driver needs the NVMe driver loaded to work with NVMe drives
 
 ## 2. BIOS Configuration
 
@@ -270,8 +271,8 @@ sudo dmesg | tail -20
 - Check BIOS is set to RAID mode (not AHCI)
 - Verify RAID arrays are configured in BIOS
 - Check GRUB has correct blacklist parameters:
-  - SATA: `modprobe.blacklist=ahci`
-  - NVMe: `modprobe.blacklist=ahci` (NVMe driver must load for RAID)
+  - SATA: `modprobe.blacklist=ahci,sata_ahci`
+  - NVMe: `modprobe.blacklist=ahci,sata_ahci` (DO NOT blacklist nvme - driver needs it)
 
 **TRX50-specific issues:**
 - Verify MSI/MSI-X is working: `dmesg | grep -i msi`
