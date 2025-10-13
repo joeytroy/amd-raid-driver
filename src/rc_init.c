@@ -796,7 +796,7 @@ rc_init_adapter(struct pci_dev *dev, const struct pci_device_id *id)
 	// Create SCSI host for first adapter (TRX50 fix)
 	if (rc_state.num_hba == 0) {
 		int err;
-		rc_printk(RC_DEBUG, "rcraid_probe_one: creating SCSI host for first adapter\n");
+		rc_printk(RC_NOTE, "rcraid_probe_one: creating SCSI host for first adapter\n");
 		err = rc_init_host(dev);
 		if (!err) {
 			if (misc_register(&rccfg_api_dev))
