@@ -55,7 +55,7 @@ static const struct file_operations rc_config_fops = {
     .read = rc_config_read,
     .write = rc_config_write,
     .unlocked_ioctl = rc_config_ioctl,
-    .llseek = no_llseek,
+    .llseek = noop_llseek,
 };
 
 // rccfg initialization (configuration layer)
