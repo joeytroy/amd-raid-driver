@@ -47,6 +47,8 @@ static inline int scsi_add_host(struct Scsi_Host *host, struct device *dev) { re
 #include <linux/mutex.h>
 #include <linux/kthread.h>
 #include <linux/workqueue.h>
+#include <linux/list.h>
+#include <linux/spinlock.h>
 
 #include "rc_pci_ids.h"
 
@@ -141,6 +143,8 @@ struct rc_raid_array {
     // Additional fields for blk-mq helper
     u64 size_bytes;          /* set this before calling rc_blk_create_disk */
     int index;               /* 0,1,2… */
+    struct list_head page_list; /* in-memory backing store buckets */
+    spinlock_t page_lock;
 };
 
 // RAID structure (rcraid equivalent)

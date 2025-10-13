@@ -117,6 +117,8 @@ int rc_raid_array_init(struct rc_raid_array *array)
     // Set up array parameters for blk helper
     array->size_bytes = array->total_sectors * 512;  // Convert sectors to bytes
     array->index = array->array_id;  // Use array_id as index
+    INIT_LIST_HEAD(&array->page_list);
+    spin_lock_init(&array->page_lock);
     
     // Use the blk-mq helper to create the disk
     err = rc_blk_create_disk(array, rc_major);
