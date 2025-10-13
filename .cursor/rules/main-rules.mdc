@@ -21,9 +21,28 @@ alwaysApply: true
 - We are doing vibe coding so execute and code based on needs
 - RAID is already configured in BIOS - focus on driver functionality, not BIOS setup
 
+## Real Hardware Implementation Requirements
+- NO placeholder logic - implement real hardware communication
+- NO fake OSIC data - use actual firmware communication
+- NO unmapped DMA - implement proper DMA handling
+- NO fake completion handling - implement real interrupt/completion processing
+- Use actual PCI register addresses from hardware testing
+- Implement real command submission and completion queues
+- Handle real firmware responses and error conditions
+- Build working driver that actually communicates with AMD RAID hardware
+
+## Hardware-Specific Implementation
+- Use real MMIO base address: 0x81a80000 (from TRX50 testing)
+- Implement MSI interrupt handling for vector 244
+- Use actual BAR 5 mapping (1024 bytes) for hardware registers
+- Handle real PCI device ID 0x1022:0x43bd
+- Implement proper DMA operations for real data transfer
+- Use actual firmware command structures and protocols
+
 ## Communication
 - Keep responses concise and actionable
 - Group diagnostic commands together
 - Focus on driver functionality over documentation
 - Explain what's happening when debugging fails
 - Always identify the root cause of issues
+- Emphasize real hardware implementation over placeholder code

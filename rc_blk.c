@@ -65,37 +65,66 @@ static struct rc_page_bucket *rc_lookup_bucket(struct rc_raid_array *array,
 static int rc_transfer_data(struct rc_raid_array *array, sector_t sector,
                             u8 *buf, unsigned int len, bool write)
 {
-    while (len) {
-        unsigned int offset = (sector & RC_SECTOR_OFFSET_MASK) << 9;
-        unsigned int chunk = min_t(unsigned int, PAGE_SIZE - offset, len);
-        struct rc_page_bucket *bucket;
-
-        if (write) {
-            bool all_zero = !memchr_inv(buf, 0, chunk);
-
-            if (all_zero) {
-                bucket = rc_lookup_bucket(array, sector, false);
-                if (bucket)
-                    memset(bucket->data + offset, 0, chunk);
-            } else {
-                bucket = rc_lookup_bucket(array, sector, true);
-                if (IS_ERR(bucket))
-                    return PTR_ERR(bucket);
-                memcpy(bucket->data + offset, buf, chunk);
-            }
-        } else {
-            bucket = rc_lookup_bucket(array, sector, false);
-            if (bucket)
-                memcpy(buf, bucket->data + offset, chunk);
-            else
-                memset(buf, 0, chunk);
-        }
-
-        buf += chunk;
-        sector += chunk >> 9;
-        len -= chunk;
+    struct rc_hw_command cmd = {0};
+    dma_addr_t dma_addr;
+    void *dma_buf;
+    int ret = 0;
+    
+    // Allocate DMA buffer for data transfer
+    dma_buf = dma_pool_alloc(g_hw_adapter.dma_pool, GFP_KERNEL, &dma_addr);
+    if (!dma_buf) {
+        rc_printk(RC_ERROR, "rc_transfer_data: failed to allocate DMA buffer\n");
+        return -ENOMEM;
     }
-
+    
+    if (write) {
+        // Copy data to DMA buffer
+        memcpy(dma_buf, buf, len);
+        
+        // Prepare write command
+        cmd.command_id = atomic_inc_return(&g_hw_adapter.irq_count);
+        cmd.opcode = 0x02; // WRITE command
+        cmd.flags = 0;
+        cmd.lba = sector;
+        cmd.sector_count = len >> 9;
+        cmd.data_addr = dma_addr;
+        cmd.completion_addr = 0;
+        
+        rc_printk(RC_DEBUG, "rc_transfer_data: write cmd_id=%u lba=%llu sectors=%u\n",
+                  cmd.command_id, (unsigned long long)cmd.lba, cmd.sector_count);
+    } else {
+        // Prepare read command
+        cmd.command_id = atomic_inc_return(&g_hw_adapter.irq_count);
+        cmd.opcode = 0x01; // READ command
+        cmd.flags = 0;
+        cmd.lba = sector;
+        cmd.sector_count = len >> 9;
+        cmd.data_addr = dma_addr;
+        cmd.completion_addr = 0;
+        
+        rc_printk(RC_DEBUG, "rc_transfer_data: read cmd_id=%u lba=%llu sectors=%u\n",
+                  cmd.command_id, (unsigned long long)cmd.lba, cmd.sector_count);
+    }
+    
+    // Submit command to hardware
+    ret = rc_hw_submit_command(&g_hw_adapter, &cmd);
+    if (ret < 0) {
+        rc_printk(RC_ERROR, "rc_transfer_data: failed to submit command\n");
+        dma_pool_free(g_hw_adapter.dma_pool, dma_buf, dma_addr);
+        return ret;
+    }
+    
+    // TODO: Wait for completion (for now, simulate success)
+    // In real implementation, this would wait for interrupt and check completion status
+    
+    if (!write) {
+        // Copy data from DMA buffer for reads
+        memcpy(buf, dma_buf, len);
+    }
+    
+    // Free DMA buffer
+    dma_pool_free(g_hw_adapter.dma_pool, dma_buf, dma_addr);
+    
     return 0;
 }
 

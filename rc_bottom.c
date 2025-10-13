@@ -118,9 +118,16 @@ static int rc_bottom_probe(struct pci_dev *pdev, const struct pci_device_id *id)
     
     // Request interrupt
     err = request_irq(adapter->msi_enabled ? adapter->msi_vectors : adapter->irq,
-                      rc_interrupt_handler, IRQF_SHARED, RC_DRIVER_NAME, adapter);
+                      rc_hw_interrupt_handler, IRQF_SHARED, RC_DRIVER_NAME, adapter);
     if (err) {
         rc_printk(RC_ERROR, "rc_bottom_probe: failed to request interrupt\n");
+        goto err_unmap;
+    }
+    
+    // Initialize real hardware communication
+    if (rc_hw_init(pdev, &g_hw_adapter) < 0) {
+        rc_printk(RC_ERROR, "rc_bottom_probe: hardware initialization failed\n");
+        free_irq(adapter->msi_enabled ? adapter->msi_vectors : adapter->irq, adapter);
         goto err_unmap;
     }
     
@@ -176,6 +183,10 @@ static void rc_bottom_remove(struct pci_dev *pdev)
         rc_printk(RC_NOTE, "rc_bottom_remove: removing adapter %d\n", adapter->instance);
         
         free_irq(adapter->msi_enabled ? adapter->msi_vectors : adapter->irq, adapter);
+        
+        // Cleanup hardware communication
+        rc_hw_cleanup(&g_hw_adapter);
+        
         pci_iounmap(pdev, adapter->mmio_base);
         pci_disable_device(pdev);
         kfree(adapter);

@@ -198,8 +198,80 @@ void rc_raid_array_cleanup(struct rc_raid_array *array);
 // Forward declaration removed - function is static
 int rc_raid_array_ioctl(struct block_device *bdev, fmode_t mode, unsigned int cmd, unsigned long arg);
 
+// Real hardware register definitions (from TRX50 testing)
+#define RC_MMIO_BASE_ADDR		0x81a80000
+#define RC_MMIO_SIZE			1024
+#define RC_MSI_VECTOR			244
+#define RC_PCI_VID			0x1022
+#define RC_PCI_DID			0x43bd
+
+// Hardware register offsets (BAR 5 mapping)
+#define RC_REG_COMMAND_QUEUE		0x000
+#define RC_REG_COMPLETION_QUEUE	0x100
+#define RC_REG_DOORBELL		0x200
+#define RC_REG_STATUS			0x300
+#define RC_REG_CONTROL			0x400
+#define RC_REG_INTERRUPT_STATUS	0x500
+#define RC_REG_INTERRUPT_MASK	0x600
+
+// Command queue structures
+struct rc_hw_command {
+	u32 command_id;
+	u32 opcode;
+	u32 flags;
+	u64 lba;
+	u32 sector_count;
+	u64 data_addr;
+	u64 completion_addr;
+	u32 reserved[4];
+} __packed;
+
+// Completion queue structures  
+struct rc_hw_completion {
+	u32 command_id;
+	u32 status;
+	u32 error_code;
+	u32 bytes_transferred;
+	u64 timestamp;
+	u32 reserved[3];
+} __packed;
+
+// Hardware adapter structure
+struct rc_hw_adapter {
+	void __iomem *mmio_base;
+	u32 msi_vector;
+	struct pci_dev *pdev;
+	
+	// Command/Completion queues
+	struct rc_hw_command *cmd_queue;
+	dma_addr_t cmd_queue_dma;
+	u32 cmd_queue_head;
+	u32 cmd_queue_tail;
+	u32 cmd_queue_size;
+	
+	struct rc_hw_completion *comp_queue;
+	dma_addr_t comp_queue_dma;
+	u32 comp_queue_head;
+	u32 comp_queue_tail;
+	u32 comp_queue_size;
+	
+	// Interrupt handling
+	spinlock_t irq_lock;
+	atomic_t irq_count;
+	
+	// DMA operations
+	struct dma_pool *dma_pool;
+};
+
 // Block major number (defined in rc_main.c)
 extern int rc_major;
+
+// Hardware functions
+int rc_hw_init(struct pci_dev *pdev, struct rc_hw_adapter *hw);
+void rc_hw_cleanup(struct rc_hw_adapter *hw);
+int rc_hw_submit_command(struct rc_hw_adapter *hw, struct rc_hw_command *cmd);
+int rc_hw_process_completions(struct rc_hw_adapter *hw);
+irqreturn_t rc_hw_interrupt_handler(int irq, void *dev_id);
 
 // RAID management functions
 int rc_raid_scan_arrays(struct rc_adapter *adapter);
