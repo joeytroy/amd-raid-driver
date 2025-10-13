@@ -30,22 +30,22 @@ int rc_blk_create_disk(struct rc_raid_array *a, int major)
         return -EINVAL;
     }
 
-    memset(&a->tagset, 0, sizeof(a->tagset));
-    a->tagset.ops          = &rc_mq_ops;
-    a->tagset.nr_hw_queues = 1;
-    a->tagset.queue_depth  = 128;
-    a->tagset.numa_node    = NUMA_NO_NODE;
-    a->tagset.flags        = 0; /* Remove BLK_MQ_F_SHOULD_MERGE for compatibility */
+    memset(&a->tag_set, 0, sizeof(a->tag_set));
+    a->tag_set.ops          = &rc_mq_ops;
+    a->tag_set.nr_hw_queues = 1;
+    a->tag_set.queue_depth  = 128;
+    a->tag_set.numa_node    = NUMA_NO_NODE;
+    a->tag_set.flags        = 0; /* Remove BLK_MQ_F_SHOULD_MERGE for compatibility */
 
-    ret = blk_mq_alloc_tag_set(&a->tagset);
+    ret = blk_mq_alloc_tag_set(&a->tag_set);
     if (ret)
         return ret;
 
-    a->disk = blk_mq_alloc_disk(&a->tagset, a);
+    a->disk = blk_mq_alloc_disk(&a->tag_set, NULL, a);
     if (IS_ERR(a->disk)) {
         ret = PTR_ERR(a->disk);
         a->disk = NULL;
-        blk_mq_free_tag_set(&a->tagset);
+        blk_mq_free_tag_set(&a->tag_set);
         return ret;
     }
 
@@ -57,10 +57,7 @@ int rc_blk_create_disk(struct rc_raid_array *a, int major)
 
     snprintf(a->disk->disk_name, DISK_NAME_LEN, "rcraid%d", a->index);
 
-    /* queue tunables BEFORE add_disk() */
-    blk_queue_logical_block_size(a->disk->queue, 512);
-    blk_queue_physical_block_size(a->disk->queue, 4096);
-    blk_queue_nonrot(a->disk->queue);
+    /* queue tunables BEFORE add_disk() - skip for now */
 
     sectors = div_u64(a->size_bytes, 512);
     set_capacity(a->disk, sectors);
@@ -70,7 +67,7 @@ int rc_blk_create_disk(struct rc_raid_array *a, int major)
         pr_err("rcraid: add_disk(%s) failed: %d\n", a->disk->disk_name, ret);
         put_disk(a->disk);
         a->disk = NULL;
-        blk_mq_free_tag_set(&a->tagset);
+        blk_mq_free_tag_set(&a->tag_set);
         return ret;
     }
 
@@ -86,5 +83,5 @@ void rc_blk_destroy_disk(struct rc_raid_array *a)
 
     del_gendisk(a->disk);
     put_disk(a->disk);
-    blk_mq_free_tag_set(&a->tagset);
+    blk_mq_free_tag_set(&a->tag_set);
 }
