@@ -799,23 +799,17 @@ rc_init_adapter(struct pci_dev *dev, const struct pci_device_id *id)
 	rc_printk(RC_NOTE, RC_DRIVER_NAME ": card %d: %s %s\n", adapter->instance,
 		  adapter->version->vendor, adapter->version->model);
 
-	// Create SCSI host once globally (rcraid equivalent - TRX50 fix)
-	if (!rc_scsi_host_created && rc_state.num_hba >= 1) {
-		int err;
-		rc_printk(RC_NOTE, "rc_init_adapter: creating SCSI host - num_hba=%d, first_time=%d\n", rc_state.num_hba, !rc_scsi_host_created);
-		rc_printk(RC_NOTE, "rc_init_adapter: BEFORE SCSI host creation\n");
-		err = rc_init_host(dev);
-		if (!err) {
-			if (misc_register(&rccfg_api_dev))
-				rc_printk(RC_ERROR, "%s: failed to register rc_api\n",__FUNCTION__);
-			mutex_init(&ioctl_mutex);
-			rc_scsi_host_created = 1;
-			rc_printk(RC_NOTE, "rc_init_adapter: SCSI host created successfully\n");
-		} else {
-			rc_printk(RC_ERROR, "rc_init_host failed: %d\n", err);
+	// Force scan for RAID arrays immediately (TRX50 fix)
+	rc_printk(RC_NOTE, "rc_init_adapter: scanning for RAID arrays...\n");
+	if (rc_state.host_ptr) {
+		for (int target = 0; target < 32; target++) {
+			if (target != 24) { // Skip configuration processor
+				scsi_scan_target(&rc_state.host_ptr->shost_gendev, 0, target, SCAN_WILD_CARD, 1);
+			}
 		}
+		rc_printk(RC_NOTE, "rc_init_adapter: RAID array scan completed\n");
 	} else {
-		rc_printk(RC_NOTE, "rc_init_adapter: skipping SCSI host creation - created=%d, num_hba=%d\n", rc_scsi_host_created, rc_state.num_hba);
+		rc_printk(RC_WARN, "rc_init_adapter: no SCSI host available for scanning\n");
 	}
 
 	rc_printk(RC_NOTE, "rc_init_adapter: AFTER adapter setup - num_hba=%d\n", rc_state.num_hba);
