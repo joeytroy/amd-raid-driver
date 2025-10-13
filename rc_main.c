@@ -46,14 +46,8 @@ static int __init rc_init(void)
         return err;
     }
     
-    // Initialize rcraid (RAID layer)
-    err = rc_raid_init();
-    if (err) {
-        rc_printk(RC_ERROR, "rc_init: failed to initialize rcraid\n");
-        rc_config_cleanup();
-        rc_bottom_cleanup();
-        return err;
-    }
+    // Initialize rcraid (RAID layer) - will be called when adapters are found
+    // For now, just mark as ready for adapter registration
     
     rc_state.initialized = 1;
     rc_printk(RC_NOTE, "rc_init: AMD RAID Driver initialized successfully\n");

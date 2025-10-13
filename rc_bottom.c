@@ -132,6 +132,20 @@ static int rc_bottom_probe(struct pci_dev *pdev, const struct pci_device_id *id)
         rc_state.num_adapters++;
         rc_printk(RC_NOTE, "rc_bottom_probe: adapter %d initialized successfully\n", 
                   adapter->instance);
+        
+        // Initialize RAID layer when first adapter is found
+        if (rc_state.num_adapters == 1) {
+            mutex_unlock(&rc_state.lock);
+            err = rc_raid_init();
+            if (err) {
+                rc_printk(RC_ERROR, "rc_bottom_probe: failed to initialize RAID layer\n");
+                mutex_lock(&rc_state.lock);
+                rc_state.num_adapters--;
+                mutex_unlock(&rc_state.lock);
+                goto err_free_irq;
+            }
+            mutex_lock(&rc_state.lock);
+        }
     } else {
         rc_printk(RC_ERROR, "rc_bottom_probe: maximum adapters exceeded\n");
         err = -ENODEV;
