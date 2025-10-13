@@ -21,7 +21,7 @@ static const struct block_device_operations rc_bdev_ops = {
     .owner = THIS_MODULE,
 };
 
-int rc_blk_create_disk(struct rc_array *a, int major)
+int rc_blk_create_disk(struct rc_raid_array *a, int major)
 {
     int ret;
     sector_t sectors;
@@ -80,7 +80,7 @@ int rc_blk_create_disk(struct rc_array *a, int major)
     return 0;
 }
 
-void rc_blk_destroy_disk(struct rc_array *a)
+void rc_blk_destroy_disk(struct rc_raid_array *a)
 {
     if (!a || !a->disk)
         return;
