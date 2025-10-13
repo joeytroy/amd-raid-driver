@@ -11,9 +11,11 @@
 #include <linux/kernel.h>
 #include <linux/pci.h>
 #include <linux/interrupt.h>
+#ifdef CONFIG_SCSI
 #include <linux/scsi/scsi.h>
 #include <linux/scsi/scsi_host.h>
 #include <linux/scsi/scsi_device.h>
+#endif
 #include <linux/blkdev.h>
 #include <linux/delay.h>
 #include <linux/dma-mapping.h>
@@ -40,6 +42,15 @@
 #define RC_MAX_SCSI_LUNS             8
 #define RC_MAX_DEVICES               14  // Total devices (SATA + NVMe)
 #define RC_MAX_NVME_DEVICES          10  // Max NVMe devices per AMD spec
+
+// SCSI fallbacks if headers not available
+#ifndef CONFIG_SCSI
+#define Scsi_Host                    void
+#define scsi_device                  void
+#define scsi_cmnd                    void
+#define scsi_host_template           void
+#define SCSI_SCAN_INITIAL            1
+#endif
 
 // Debug levels
 #define RC_DEBUG                     0
@@ -86,7 +97,9 @@ struct rc_config {
 
 // RAID structure (rcraid equivalent)
 struct rc_raid {
+#ifdef CONFIG_SCSI
     struct Scsi_Host *host;
+#endif
     struct rc_adapter *adapter;
     int initialized;
     int scsi_host_created;
@@ -117,9 +130,15 @@ int rc_pci_probe(struct pci_dev *pdev, const struct pci_device_id *id);
 void rc_pci_remove(struct pci_dev *pdev);
 
 // SCSI functions
+#ifdef CONFIG_SCSI
 int rc_scsi_probe(struct scsi_device *sdev);
 int rc_scsi_remove(struct scsi_device *sdev);
 int rc_scsi_queuecommand(struct Scsi_Host *host, struct scsi_cmnd *scmd);
+#else
+int rc_scsi_probe(void *sdev);
+int rc_scsi_remove(void *sdev);
+int rc_scsi_queuecommand(void *host, void *scmd);
+#endif
 
 // Interrupt handlers
 irqreturn_t rc_interrupt_handler(int irq, void *dev_id);

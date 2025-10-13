@@ -7,6 +7,7 @@
 #include "rc_linux.h"
 
 // SCSI host template
+#ifdef CONFIG_SCSI
 static struct scsi_host_template rc_scsi_template = {
     .module = THIS_MODULE,
     .name = "AMD-RAID",
@@ -39,8 +40,10 @@ static struct scsi_host_template rc_scsi_template = {
     .sdev_attrs = NULL,
     .no_write_same = 1,
 };
+#endif
 
 // SCSI command processing
+#ifdef CONFIG_SCSI
 int rc_scsi_queuecommand(struct Scsi_Host *host, struct scsi_cmnd *scmd)
 {
     // RAID command processing would be implemented here
@@ -64,6 +67,25 @@ int rc_scsi_remove(struct scsi_device *sdev)
               sdev->host->host_no, sdev->id, sdev->lun);
     return 0;
 }
+#else
+int rc_scsi_queuecommand(void *host, void *scmd)
+{
+    // RAID command processing would be implemented here
+    return 0;
+}
+
+int rc_scsi_probe(void *sdev)
+{
+    rc_printk(RC_NOTE, "rc_scsi_probe: detected device (SCSI not available)\n");
+    return 0;
+}
+
+int rc_scsi_remove(void *sdev)
+{
+    rc_printk(RC_NOTE, "rc_scsi_remove: removing device (SCSI not available)\n");
+    return 0;
+}
+#endif
 
 // Interrupt handler
 irqreturn_t rc_interrupt_handler(int irq, void *dev_id)
@@ -75,6 +97,7 @@ irqreturn_t rc_interrupt_handler(int irq, void *dev_id)
 }
 
 // Force scan for RAID arrays
+#ifdef CONFIG_SCSI
 static void rc_scan_raid_arrays(struct Scsi_Host *host)
 {
     int target, lun;
@@ -92,11 +115,16 @@ static void rc_scan_raid_arrays(struct Scsi_Host *host)
     
     rc_printk(RC_NOTE, "rc_scan_raid_arrays: RAID array scan completed\n");
 }
+#else
+static void rc_scan_raid_arrays(void *host)
+{
+    rc_printk(RC_NOTE, "rc_scan_raid_arrays: scanning for RAID arrays (SCSI not available)\n");
+}
+#endif
 
 // rcraid initialization (RAID layer)
 int rc_raid_init(void)
 {
-    struct Scsi_Host *host;
     int err;
     
     rc_printk(RC_NOTE, "rc_raid_init: initializing RAID layer\n");
@@ -106,6 +134,9 @@ int rc_raid_init(void)
         rc_printk(RC_WARN, "rc_raid_init: no adapters available\n");
         return -ENODEV;
     }
+    
+#ifdef CONFIG_SCSI
+    struct Scsi_Host *host;
     
     // Allocate SCSI host
     host = scsi_host_alloc(&rc_scsi_template, sizeof(struct rc_raid));
@@ -136,6 +167,12 @@ int rc_raid_init(void)
     // Scan for RAID arrays
     scsi_scan_host(host);
     rc_scan_raid_arrays(host);
+#else
+    // SCSI not available, just initialize basic structure
+    rc_state.raid.adapter = &rc_state.adapters[0];
+    rc_state.raid.scsi_host_created = 0;
+    rc_printk(RC_WARN, "rc_raid_init: SCSI not available, limited functionality\n");
+#endif
     
     rc_printk(RC_NOTE, "rc_raid_init: RAID layer initialized successfully\n");
     return 0;
@@ -145,10 +182,14 @@ void rc_raid_cleanup(void)
 {
     rc_printk(RC_NOTE, "rc_raid_cleanup: cleaning up RAID layer\n");
     
+#ifdef CONFIG_SCSI
     if (rc_state.raid.scsi_host_created && rc_state.raid.host) {
         scsi_remove_host(rc_state.raid.host);
         scsi_host_put(rc_state.raid.host);
         rc_state.raid.host = NULL;
         rc_state.raid.scsi_host_created = 0;
     }
+#else
+    rc_state.raid.scsi_host_created = 0;
+#endif
 }
