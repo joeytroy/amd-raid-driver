@@ -7,7 +7,7 @@
 #include "rc_linux.h"
 
 // SCSI host template
-#ifdef CONFIG_SCSI
+#if RC_SCSI_AVAILABLE
 static struct scsi_host_template rc_scsi_template = {
     .module = THIS_MODULE,
     .name = "AMD-RAID",
@@ -43,7 +43,7 @@ static struct scsi_host_template rc_scsi_template = {
 #endif
 
 // SCSI command processing
-#ifdef CONFIG_SCSI
+#if RC_SCSI_AVAILABLE
 int rc_scsi_queuecommand(struct Scsi_Host *host, struct scsi_cmnd *scmd)
 {
     // RAID command processing would be implemented here
@@ -97,7 +97,7 @@ irqreturn_t rc_interrupt_handler(int irq, void *dev_id)
 }
 
 // Force scan for RAID arrays
-#ifdef CONFIG_SCSI
+#if RC_SCSI_AVAILABLE
 static void rc_scan_raid_arrays(struct Scsi_Host *host)
 {
     int target, lun;
@@ -135,7 +135,7 @@ int rc_raid_init(void)
         return -ENODEV;
     }
     
-#ifdef CONFIG_SCSI
+#if RC_SCSI_AVAILABLE
     struct Scsi_Host *host;
     
     // Allocate SCSI host
@@ -182,7 +182,7 @@ void rc_raid_cleanup(void)
 {
     rc_printk(RC_NOTE, "rc_raid_cleanup: cleaning up RAID layer\n");
     
-#ifdef CONFIG_SCSI
+#if RC_SCSI_AVAILABLE
     if (rc_state.raid.scsi_host_created && rc_state.raid.host) {
         scsi_remove_host(rc_state.raid.host);
         scsi_host_put(rc_state.raid.host);

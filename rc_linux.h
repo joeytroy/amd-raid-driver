@@ -11,10 +11,13 @@
 #include <linux/kernel.h>
 #include <linux/pci.h>
 #include <linux/interrupt.h>
-#ifdef CONFIG_SCSI
+#if __has_include(<linux/scsi/scsi.h>)
 #include <linux/scsi/scsi.h>
 #include <linux/scsi/scsi_host.h>
 #include <linux/scsi/scsi_device.h>
+#define RC_SCSI_AVAILABLE 1
+#else
+#define RC_SCSI_AVAILABLE 0
 #endif
 #include <linux/blkdev.h>
 #include <linux/delay.h>
@@ -44,7 +47,7 @@
 #define RC_MAX_NVME_DEVICES          10  // Max NVMe devices per AMD spec
 
 // SCSI fallbacks if headers not available
-#ifndef CONFIG_SCSI
+#if !RC_SCSI_AVAILABLE
 #define Scsi_Host                    void
 #define scsi_device                  void
 #define scsi_cmnd                    void
@@ -97,7 +100,7 @@ struct rc_config {
 
 // RAID structure (rcraid equivalent)
 struct rc_raid {
-#ifdef CONFIG_SCSI
+#if RC_SCSI_AVAILABLE
     struct Scsi_Host *host;
 #endif
     struct rc_adapter *adapter;
@@ -130,7 +133,7 @@ int rc_pci_probe(struct pci_dev *pdev, const struct pci_device_id *id);
 void rc_pci_remove(struct pci_dev *pdev);
 
 // SCSI functions
-#ifdef CONFIG_SCSI
+#if RC_SCSI_AVAILABLE
 int rc_scsi_probe(struct scsi_device *sdev);
 int rc_scsi_remove(struct scsi_device *sdev);
 int rc_scsi_queuecommand(struct Scsi_Host *host, struct scsi_cmnd *scmd);
