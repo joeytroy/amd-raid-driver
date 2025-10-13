@@ -9,33 +9,29 @@ static blk_status_t rc_queue_rq(struct blk_mq_hw_ctx *hctx,
                                 const struct blk_mq_queue_data *bd)
 {
     struct request *req = bd->rq;
-    struct rc_raid_array *array = req->q->queuedata;
-    blk_status_t status = BLK_STS_OK;
+    struct bio *bio;
+    struct bio_vec bvec;
+    struct bvec_iter iter;
+    void *kaddr;
     
     blk_mq_start_request(req);
     
-    /* For now, just complete all requests successfully */
-    /* This allows partition table operations to work */
-    if (req_op(req) == REQ_OP_READ || req_op(req) == REQ_OP_WRITE) {
-        /* Zero out read data, ignore write data */
-        if (req_op(req) == REQ_OP_READ) {
-            struct bio_vec bvec;
-            struct req_iterator iter;
-            void *kaddr;
+    /* Process each bio in the request */
+    __rq_for_each_bio(bio, req) {
+        bio_for_each_segment(bvec, bio, iter) {
+            kaddr = kmap_atomic(bvec.bv_page);
             
-            rq_for_each_segment(bvec, req, iter) {
-                kaddr = kmap_atomic(bvec.bv_page);
+            if (bio_data_dir(bio) == READ) {
+                /* For reads, return zeros */
                 memset(kaddr + bvec.bv_offset, 0, bvec.bv_len);
-                kunmap_atomic(kaddr);
             }
+            /* For writes, just ignore the data */
+            
+            kunmap_atomic(kaddr);
         }
-        status = BLK_STS_OK;
-    } else {
-        /* Handle other operations */
-        status = BLK_STS_OK;
     }
     
-    blk_mq_end_request(req, status);
+    blk_mq_end_request(req, BLK_STS_OK);
     return BLK_STS_OK;
 }
 
