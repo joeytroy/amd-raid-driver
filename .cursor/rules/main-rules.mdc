@@ -13,8 +13,7 @@ alwaysApply: true
 - Focus on making driver work properly based on Windows drivers
 - Follow existing code patterns and naming conventions
 - Test changes on actual TRX50 hardware when possible
-- Fix code issues immediately without explaining the problem
-- Make changes directly when you identify the solution
+- Fix code issues immediately while explaining the problem
 - We are doing vibe coding so execute and code based on needs
 
 ## Communication
