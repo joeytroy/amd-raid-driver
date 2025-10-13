@@ -1,6 +1,9 @@
 # Windows driver files (not needed in Linux repo)
 windows/
 
+# AMD reference drivers and documentation
+wrx80/
+
 # Build artifacts
 *.ko
 *.o
