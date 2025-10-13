@@ -836,7 +836,7 @@ rc_init_host(struct pci_dev *pdev)
 	if (0 != (error = rc_msg_init(&rc_state)))
 		return error;
 
-	rc_printk(RC_DEBUG, "rc_init_host: calling scsi_host_alloc\n");
+	rc_printk(RC_NOTE, "rc_init_host: calling scsi_host_alloc\n");
 	host_ptr = scsi_host_alloc (&driver_template, 32);
 	if (!host_ptr)
 		return -ENOMEM;
@@ -882,7 +882,7 @@ rc_init_host(struct pci_dev *pdev)
 	// Standard SCSI host initialization (removed all TRX50-specific code that caused crashes)
 	scsi_scan_host(host_ptr);
 	
-	rc_printk(RC_DEBUG, "rc_init_host: completed\n");
+	rc_printk(RC_NOTE, "rc_init_host: SCSI host created successfully\n");
 	return 0;
 }
 
