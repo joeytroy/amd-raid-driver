@@ -13,7 +13,7 @@ struct rc_global_state rc_state = {
 };
 
 // Block major number
-static int rc_major = 0;
+int rc_major = 0;
 
 // Module parameters
 static int debug_level = RC_NOTE;
