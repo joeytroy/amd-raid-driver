@@ -96,13 +96,13 @@ sudo insmod rcraid.ko
 # Check loading status
 echo "=== Module Loading Status ==="
 lsmod | grep rcraid
-dmesg | tail -20
+sudo dmesg | tail -20
 
 # Check for driver messages
 echo "=== Driver Messages ==="
-dmesg | grep -i rcraid
-dmesg | grep -i "adapter.*initialized"
-dmesg | grep -i "found.*raid.*array"
+sudo dmesg | grep -i rcraid
+sudo dmesg | grep -i "adapter.*initialized"
+sudo dmesg | grep -i "found.*raid.*array"
 ```
 
 **📝 Record this information:**
@@ -115,9 +115,9 @@ dmesg | grep -i "found.*raid.*array"
 ```bash
 # Check if driver detected hardware
 echo "=== Hardware Detection ==="
-dmesg | grep -i "rc_bottom_probe"
-dmesg | grep -i "initializing hardware"
-dmesg | grep -i "VID.*DID"
+sudo dmesg | grep -i "rc_bottom_probe"
+sudo dmesg | grep -i "initializing hardware"
+sudo dmesg | grep -i "VID.*DID"
 
 # Check for block device creation
 echo "=== Block Device Creation ==="
@@ -209,7 +209,7 @@ lspci -vvv -s $(lspci | grep -i amd | head -1 | cut -d' ' -f1)
 cat /proc/interrupts | grep -i rcraid
 
 # Kernel logs
-dmesg | grep -i rcraid > rcraid_dmesg.log
+sudo dmesg | grep -i rcraid > rcraid_dmesg.log
 echo "Driver logs saved to rcraid_dmesg.log"
 ```
 
@@ -221,7 +221,7 @@ sudo rmmod rcraid
 
 # Verify cleanup
 lsmod | grep rcraid
-dmesg | tail -10
+sudo dmesg | tail -10
 ```
 
 ## 📊 **Information to Report Back**
@@ -285,4 +285,4 @@ After testing, we'll use this information to:
 
 ---
 
-**Remember:** This is testing the in-memory version of the driver. It won't actually communicate with real RAID hardware yet, but it will help us understand your system and prepare for real hardware implementation.
+**Remember:** This driver now communicates with real AMD RAID hardware using the discovered firmware protocol. It will detect your RAID controller, submit real commands, and process actual hardware responses. The testing will validate both the driver functionality and the hardware communication.
