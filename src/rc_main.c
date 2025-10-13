@@ -1,0 +1,80 @@
+/****************************************************************************
+ * AMD RAID Driver for Linux - Main Module
+ * Based on Windows driver architecture (rcbottom, rccfg, rcraid)
+ * Copyright (c) 2024 Advanced Micro Devices, Inc.
+ ****************************************************************************/
+
+#include "rc_linux.h"
+
+// Global state
+struct rc_global_state rc_state = {
+    .num_adapters = 0,
+    .initialized = 0,
+};
+
+// Module parameters
+static int debug_level = RC_NOTE;
+module_param(debug_level, int, 0644);
+MODULE_PARM_DESC(debug_level, "Debug level (0=debug, 1=info, 2=note, 3=warn, 4=error)");
+
+// Module information
+MODULE_AUTHOR("Advanced Micro Devices, Inc.");
+MODULE_DESCRIPTION(RC_DRIVER_DESCRIPTION);
+MODULE_VERSION(RC_DRIVER_VERSION);
+MODULE_LICENSE("GPL");
+
+// Module initialization
+static int __init rc_init(void)
+{
+    int err;
+    
+    rc_printk(RC_NOTE, "rc_init: AMD RAID Driver version %s\n", RC_DRIVER_VERSION);
+    rc_printk(RC_NOTE, "rc_init: Based on Windows driver architecture\n");
+    
+    // Initialize rcbottom (hardware layer)
+    err = rc_bottom_init();
+    if (err) {
+        rc_printk(RC_ERROR, "rc_init: failed to initialize rcbottom\n");
+        return err;
+    }
+    
+    // Initialize rccfg (configuration layer)
+    err = rc_config_init();
+    if (err) {
+        rc_printk(RC_ERROR, "rc_init: failed to initialize rccfg\n");
+        rc_bottom_cleanup();
+        return err;
+    }
+    
+    // Initialize rcraid (RAID layer)
+    err = rc_raid_init();
+    if (err) {
+        rc_printk(RC_ERROR, "rc_init: failed to initialize rcraid\n");
+        rc_config_cleanup();
+        rc_bottom_cleanup();
+        return err;
+    }
+    
+    rc_state.initialized = 1;
+    rc_printk(RC_NOTE, "rc_init: AMD RAID Driver initialized successfully\n");
+    rc_printk(RC_NOTE, "rc_init: Found %d adapters\n", rc_state.num_adapters);
+    
+    return 0;
+}
+
+// Module cleanup
+static void __exit rc_exit(void)
+{
+    rc_printk(RC_NOTE, "rc_exit: AMD RAID Driver cleanup\n");
+    
+    // Cleanup in reverse order
+    rc_raid_cleanup();
+    rc_config_cleanup();
+    rc_bottom_cleanup();
+    
+    rc_state.initialized = 0;
+    rc_printk(RC_NOTE, "rc_exit: AMD RAID Driver unloaded\n");
+}
+
+module_init(rc_init);
+module_exit(rc_exit);
