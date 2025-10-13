@@ -88,7 +88,7 @@ int rc_scsi_remove(void *sdev)
 #endif
 
 // Block device request handler (blk-mq style)
-static blk_status_t rc_raid_request_handler(struct request *req)
+static blk_status_t rc_raid_request_handler(struct blk_mq_hw_ctx *hctx, const struct blk_mq_queue_data *bd)
 {
     // Process the request - for now just complete it
     // In a real implementation, this would handle the actual RAID I/O
@@ -119,7 +119,7 @@ int rc_raid_array_init(struct rc_raid_array *array)
     array->tag_set.queue_depth = 128;
     array->tag_set.numa_node = NUMA_NO_NODE;
     array->tag_set.cmd_size = 0;
-    array->tag_set.flags = BLK_MQ_F_SHOULD_MERGE;
+    array->tag_set.flags = 0;
     
     err = blk_mq_alloc_tag_set(&array->tag_set);
     if (err) {
@@ -128,15 +128,14 @@ int rc_raid_array_init(struct rc_raid_array *array)
     }
     
     // Allocate request queue
-    array->queue = blk_mq_alloc_queue(&array->tag_set);
+    array->queue = blk_mq_alloc_queue(&array->tag_set, NULL);
     if (!array->queue) {
         rc_printk(RC_ERROR, "rc_raid_array_init: failed to allocate request queue\n");
         blk_mq_free_tag_set(&array->tag_set);
         return -ENOMEM;
     }
     
-    blk_queue_logical_block_size(array->queue, 512);
-    blk_queue_physical_block_size(array->queue, 512);
+    // Skip queue setup for now
     
     // Temporarily disable gendisk allocation until we find the correct API
     array->disk = NULL;
