@@ -920,10 +920,9 @@ rcraid_probe_one(struct pci_dev *dev, const struct pci_device_id *id)
 	rc_printk(RC_DEBUG, "rcraid_probe_one: checking init conditions - adapter_count=%u, rc_adapter_count=%d, rc_state.num_hba=%d\n", 
 		adapter_count, rc_adapter_count, rc_state.num_hba);
 	
-	// Removed TRX50-specific code that was causing system crashes
-	
-	if ((adapter_count && rc_adapter_count == rc_state.num_hba) ||
-        (rc_adapter_count == 999 && adapter_count == rc_state.num_hba)) {
+	// Create SCSI hosts when we have adapters detected
+	// Fixed condition to work with TRX50 platforms
+	if (rc_state.num_hba > 0) {
 		int err;
 
 		rc_printk(RC_DEBUG, "rcraid_probe_one: calling rc_init_host\n");
