@@ -50,12 +50,11 @@ lspci -nn | grep -E "(1022:7905|1022:43BD|1022:7916|1022:7917|1022:B000)"
 
 # Check if any are already claimed by other drivers
 echo "=== Driver Binding Status ==="
-lspci -k | grep -A5 -B5 -i amd
-lspci -k | grep -A5 -B5 -i raid
+lspci -k | grep -A2 -B2 -E "(1022:43BD|1022:7905|1022:7916|1022:7917|1022:B000)"
 
-# Check PCI configuration
+# Check PCI configuration (concise)
 echo "=== PCI Configuration ==="
-lspci -vvv | grep -A20 -B5 -i amd
+lspci -nn | grep -E "(1022:43BD|1022:7905|1022:7916|1022:7917|1022:B000)"
 ```
 
 **📝 Record this information:**
@@ -202,8 +201,8 @@ modinfo rcraid.ko
 # Driver status
 cat /proc/modules | grep rcraid
 
-# PCI device details
-lspci -vvv -s $(lspci | grep -i amd | head -1 | cut -d' ' -f1)
+# PCI device details (concise)
+lspci -nn -s $(lspci | grep -E "1022:43BD" | head -1 | cut -d' ' -f1)
 
 # Interrupt information
 cat /proc/interrupts | grep -i rcraid
