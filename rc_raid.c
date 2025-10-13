@@ -137,16 +137,37 @@ int rc_raid_array_init(struct rc_raid_array *array)
     
     // Skip queue setup for now
     
-    // Temporarily disable gendisk allocation until we find the correct API
-    array->disk = NULL;
-    rc_printk(RC_NOTE, "rc_raid_array_init: skipping gendisk allocation for now\n");
+    // Allocate gendisk
+    array->disk = alloc_disk(1);
+    if (!array->disk) {
+        rc_printk(RC_ERROR, "rc_raid_array_init: failed to allocate gendisk\n");
+        blk_put_queue(array->queue);
+        blk_mq_free_tag_set(&array->tag_set);
+        return -ENOMEM;
+    }
     
-    // Skip gendisk setup for now
-    rc_printk(RC_NOTE, "rc_raid_array_init: skipping gendisk setup for now\n");
+    // Setup gendisk
+    array->disk->major = 0; // Let kernel assign major number
+    array->disk->first_minor = 0;
+    array->disk->fops = &rc_raid_fops;
+    array->disk->queue = array->queue;
+    array->disk->private_data = array;
+    snprintf(array->disk->disk_name, sizeof(array->disk->disk_name), "rcraid%d", array->array_id);
+    set_capacity(array->disk, array->total_sectors);
+    
+    // Add disk
+    err = add_disk(array->disk);
+    if (err) {
+        rc_printk(RC_ERROR, "rc_raid_array_init: failed to add disk\n");
+        put_disk(array->disk);
+        blk_put_queue(array->queue);
+        blk_mq_free_tag_set(&array->tag_set);
+        return err;
+    }
     
     array->initialized = 1;
-    rc_printk(RC_NOTE, "rc_raid_array_init: RAID array %d initialized (block device disabled for now)\n", 
-              array->array_id);
+    rc_printk(RC_NOTE, "rc_raid_array_init: RAID array %d initialized as %s\n", 
+              array->array_id, array->disk->disk_name);
     
     return 0;
 }
