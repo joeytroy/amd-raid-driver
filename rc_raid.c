@@ -128,7 +128,7 @@ int rc_raid_array_init(struct rc_raid_array *array)
     }
     
     // Allocate request queue
-    array->queue = blk_mq_alloc_queue(&array->tag_set);
+    array->queue = blk_mq_alloc_queue(&array->tag_set, NULL, NULL);
     if (!array->queue) {
         rc_printk(RC_ERROR, "rc_raid_array_init: failed to allocate request queue\n");
         blk_mq_free_tag_set(&array->tag_set);
