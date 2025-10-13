@@ -889,6 +889,14 @@ rc_init_host(struct pci_dev *pdev)
 	// Standard SCSI host initialization (removed all TRX50-specific code that caused crashes)
 	scsi_scan_host(host_ptr);
 	
+	// Force scan for RAID arrays on all targets (TRX50 fix)
+	rc_printk(RC_NOTE, "rc_init_host: scanning for RAID arrays...\n");
+	for (int target = 0; target < 32; target++) {
+		if (target != 24) { // Skip configuration processor
+			scsi_scan_target(&host_ptr->shost_gendev, 0, target, SCAN_WILD_CARD, 1);
+		}
+	}
+	
 	rc_printk(RC_NOTE, "rc_init_host: SCSI host created successfully\n");
 	return 0;
 }
