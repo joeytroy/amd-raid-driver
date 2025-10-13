@@ -81,7 +81,7 @@
 ```bash
 # Update and install dependencies
 sudo apt-get update
-sudo apt install -y build-essential linux-headers-$(uname -r) git flex bison libssl-dev libelf-dev dwarves
+sudo apt install -y build-essential linux-headers-$(uname -r) linux-source-$(uname -r) git flex bison libssl-dev libelf-dev dwarves
 
 # Clone and build driver
 git clone https://github.com/joeytroy/amd-raid-driver.git
@@ -140,7 +140,7 @@ When you update your kernel, reinstall the driver:
 sudo apt update && sudo apt upgrade
 
 # Install build dependencies for new kernel
-sudo apt install -y build-essential linux-headers-{new-kernel-version} flex bison libssl-dev libelf-dev dwarves
+sudo apt install -y build-essential linux-headers-{new-kernel-version} linux-source-{new-kernel-version} flex bison libssl-dev libelf-dev dwarves
 
 # Rebuild driver for new kernel
 cd ~/amd-raid-driver

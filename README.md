@@ -45,6 +45,7 @@ A modern Linux kernel driver for AMD RAID controllers, built from scratch based 
 #### Build Dependencies
 - `build-essential` - GCC, make, and build tools
 - `linux-headers-$(uname -r)` - Kernel headers
+- `linux-source-$(uname -r)` - Kernel source code (required for module building)
 - `flex` - Lexical analyzer
 - `bison` - Parser generator
 - `libssl-dev` - SSL development libraries
