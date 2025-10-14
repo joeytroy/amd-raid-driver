@@ -3,6 +3,7 @@ windows/
 
 # AMD reference drivers and documentation
 wrx80/
+ghidra/
 
 # Build artifacts
 *.ko
