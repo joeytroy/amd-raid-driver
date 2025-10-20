@@ -288,12 +288,24 @@ static int rc_bottom_probe(struct pci_dev *pdev, const struct pci_device_id *id)
     if (ret)
         goto err_free_irq;
 
+    ret = rc_queue_init(adapter);
+    if (ret)
+        goto err_hw_cleanup;
+
+    ret = rc_activate_doorbells(adapter);
+    if (ret)
+        goto err_queue_cleanup;
+
     rc_bottom_attach_adapter(adapter);
     pci_set_drvdata(pdev, adapter);
 
     rc_printk(RC_NOTE, "rc_bottom: adapter %d ready\n", adapter->instance);
     return 0;
 
+err_queue_cleanup:
+    rc_queue_cleanup(adapter);
+err_hw_cleanup:
+    rc_hw_cleanup(adapter);
 err_free_irq:
     rc_bottom_free_irq(adapter);
 err_release_vectors:
@@ -317,6 +329,7 @@ static void rc_bottom_remove(struct pci_dev *pdev)
     rc_printk(RC_NOTE, "rc_bottom: remove adapter %d\n", adapter->instance);
 
     rc_bottom_detach_adapter(adapter);
+    rc_queue_cleanup(adapter);
     rc_bottom_free_irq(adapter);
     rc_hw_cleanup(adapter);
     rc_bottom_release_interrupts(adapter);

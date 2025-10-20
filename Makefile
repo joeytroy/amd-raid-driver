@@ -3,7 +3,7 @@
 
 obj-m += rcraid.o
 
-rcraid-objs := rc_main.o rc_bottom.o rc_config.o rc_raid.o rc_blk.o rc_hw.o rc_metadata.o
+rcraid-objs := rc_main.o rc_bottom.o rc_config.o rc_raid.o rc_blk.o rc_hw.o rc_metadata.o rc_queue.o
 
 # Kernel build directory
 KERNELDIR ?= /lib/modules/$(shell uname -r)/build

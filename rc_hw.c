@@ -169,20 +169,79 @@ int rc_hw_process_completions(struct rc_hw_queue_context *hw)
     return processed;
 }
 
+/*----------------------------------------------------------------------
+ * StorPort slot +0x680: Completion pump logic (called by ISR)
+ *----------------------------------------------------------------------*/
+
+static void rc_completion_pump(struct rc_adapter *adapter, void *queue_handle)
+{
+    struct rc_hw_queue_context *hw = &adapter->hw;
+    u32 processed = 0;
+
+    // Process completions from this queue handle
+    while (hw->comp_queue_head != hw->comp_queue_tail) {
+        struct rc_hw_completion *comp = &hw->comp_queue[hw->comp_queue_head];
+
+        if (!comp->command_id)
+            break;
+
+        // TODO: Complete blk-mq requests here
+        rc_printk(RC_DEBUG, "rc_completion_pump: cmd_id=%u status=%u\n",
+                  comp->command_id, comp->status);
+
+        memset(comp, 0, sizeof(*comp));
+        hw->comp_queue_head = (hw->comp_queue_head + 1) % hw->cmd_queue_size;
+        processed++;
+    }
+
+    if (processed > 0) {
+        rc_printk(RC_DEBUG, "rc_completion_pump: processed %u completions\n",
+                  processed);
+    }
+}
+
+/*----------------------------------------------------------------------
+ * ISR sequence from FUN_14000d2b8
+ *----------------------------------------------------------------------*/
+
 irqreturn_t rc_hw_interrupt_handler(int irq, void *dev_id)
 {
     struct rc_adapter *adapter = dev_id;
     struct rc_hw_queue_context *hw = &adapter->hw;
+    struct rc_irq_state *irq_state = &adapter->ctx.irq;
     u32 status;
+    u32 i;
 
     status = readl(hw->mmio_base + RC_REG_INTERRUPT_STATUS);
     if (!status)
         return IRQ_NONE;
 
+    // Acknowledge interrupt
     writel(status, hw->mmio_base + RC_REG_INTERRUPT_STATUS);
     atomic_inc(&hw->irq_count);
 
-    rc_hw_process_completions(hw);
+    // FUN_14000d2b8 sequence:
+    // 1. Process primary queue handle (devExt+0x6B8)
+    if (irq_state->primary_queue) {
+        rc_completion_pump(adapter, irq_state->primary_queue);
+    }
+
+    // 2. Iterate queue table array (devExt+0x6C0) and process each
+    if (irq_state->queue_table) {
+        for (i = 0; i < RC_MAX_QUEUE_DESCRIPTORS; i++) {
+            void *queue_handle = irq_state->queue_table[i];
+            if (queue_handle && queue_handle != irq_state->primary_queue) {
+                rc_completion_pump(adapter, queue_handle);
+            }
+        }
+    }
+
+    // 3. Update pending count (devExt+0x678)
+    irq_state->pending = 0;
+
+    // 4. Clear scratch pointers (devExt+0x670, devExt+0x698)
+    irq_state->scratch_head = NULL;
+    irq_state->scratch_tail = NULL;
 
     return IRQ_HANDLED;
 }

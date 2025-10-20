@@ -399,6 +399,11 @@ int rc_hw_submit_command(struct rc_hw_queue_context *hw, struct rc_hw_command *c
 int rc_hw_process_completions(struct rc_hw_queue_context *hw);
 irqreturn_t rc_hw_interrupt_handler(int irq, void *dev_id);
 
+// Queue management functions (StorPort service slot equivalents)
+int rc_queue_init(struct rc_adapter *adapter);
+void rc_queue_cleanup(struct rc_adapter *adapter);
+int rc_activate_doorbells(struct rc_adapter *adapter);
+
 // Metadata discovery functions
 int rc_discover_arrays(struct rc_adapter *adapter);
 int rc_read_array_metadata(struct rc_adapter *adapter, int array_id, 
