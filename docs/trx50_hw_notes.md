@@ -34,6 +34,11 @@ programs doorbells:
 | `0x0018`     | Length passed to `MmMapIoSpace`.                                                  |
 | `0x00B0`     | Spinlock count used during adapter init.                                          |
 | `0x00B5`     | Flags describing the BAR (set according to BAR type).                             |
+| `0x0670`     | Scratch pointer cleared by ISR teardown (`FUN_14000d2b8`).                        |
+| `0x0678`     | Pending completion count consumed by the ISR loop.                               |
+| `0x0698`     | Additional scratch pointer zeroed after interrupt processing.                     |
+| `0x06B8`     | Primary queue handle pointer processed by `FUN_14000d2b8`.                        |
+| `0x06C0`     | Array of per-pending queue handles iterated by the ISR.                           |
 | `0x16010`    | Pointer passed to miniport service table when programming doorbells.              |
 | `0x16020`    | Another doorbell/context pointer (used with service table calls 1…4).             |
 | `0x16054`    | Adapter state flag (set/cleared during queue setup).                              |
@@ -58,6 +63,23 @@ programs doorbells:
 > **Todo:** confirm the purpose of each 0x160xx field by tracing the helper
 > routines (`FUN_140008a48`, `FUN_140008bc0`, `FUN_140008d88`,
 > `FUN_14000924c`) and rename them accordingly in our adapter struct.
+
+## StorPort Service Slots (confirmed)
+
+| Offset | Purpose (Windows behaviour) |
+|--------|-----------------------------|
+| `+0x188` | Rings firmware doorbells (indices 1…4) during queue activation. |
+| `+0x1B8` | Consumes the static descriptor block at `0x140012C20` while programming BAR/doorbell templates. |
+| `+0x1F8` | `FUN_14000d66c` – allocates a 0x78-byte queue descriptor (`FUN_14000c2fc`) and populates per-queue DMA tables. |
+| `+0x338` | Memset helper implemented by `FUN_140011400`. |
+| `+0x3F0` | Allocates per-queue DMA/control blocks (`FUN_14000655a`, arguments `(ctx, outPtr, queueIndex, 0x400)`). |
+| `+0x650` | Returns adapter context. |
+| `+0x680` | Completion pump invoked by the ISR to drain queue handles. |
+| `+0x838` | Manages completion handles (allocate/free paths in `FUN_14000c900`). |
+| `+0x980` | Returns iteration bound/count during resource enumeration. |
+| `+0x988` | Enumerates queue/doorbell descriptors after `+0x980`. |
+| `+0x9D8` | `FUN_1400023BB` – configures completion register blocks twice per queue during setup. |
+| `+0x1C2D0` | Descriptor accessor used when parsing firmware/static tables. |
 
 ## Callback Behaviour
 
@@ -190,11 +212,29 @@ programs doorbells:
   * Rings the firmware doorbells by loading `devExt+0x16020` into `RDX` four consecutive times and invoking service `+0x188` (indices 1..4 in the Windows driver). Each call is separated only by service latency; no explicit delay between them in this block.
   * Returns immediately afterward.
 
+## Interrupt & Completion Notes
+
+### `FUN_14000d2b8` – Interrupt service routine
+
+* Writes entry/exit breadcrumbs via ETW helpers (`call *0x4E61(%rip)` / `*0x4E01(%rip)`) with tag `0x72635041`.
+* Pulls the primary queue handle from `devExt+0x6B8` and iterates the array at `devExt+0x6C0`, invoking StorPort service `+0x680` for each entry (completion pump).
+* Uses `devExt+0x678` as the pending count then clears `devExt+0x698` / `+0x670` / `+0x678` before returning.
+
+### `FUN_14000c2fc` – Descriptor lookup
+
+* Walks the descriptor table at `devExt+0x1C2A0`, allocating 0x78-byte records and populating queue metadata when a free slot is found.
+* Relies on StorPort service `+0x338` (memset helper; implemented by `FUN_140011400`) before writing the descriptor pointer to `entry+0x28`.
+
+### `FUN_14000c900` – Completion fallback
+
+* Frees existing handles via service slots `+0x338` / `+0x680`, refreshes per-port fields `devExt+0x100`…`+0x112`, and when necessary calls service `+0x838` or `FUN_1400097ac` to recycle resources.
+
 ## Remaining Unknowns
 
-* Exact mapping between each service table call (`+0x650`, `+0x1B8`, `+0x1F8`,
-  `+0x188`, `+0x9D8`, etc.) and the hardware register/operation. Need to
-  translate to Linux equivalents (StorPortGetDeviceBase, BuildIoCaps, etc.).
+* Translate each confirmed StorPort slot to a Linux helper (e.g. `+0x1B8` → BAR
+  template programming, `+0x3F0` → queue DMA allocation). The table above captures
+  the observed Windows behaviour; we still need to map those to concrete kernel
+  APIs (`pci_resource`, DMA setup, completion queues, etc.).
 * Bit semantics of the global mask at `DAT_1400146B0` and how it interacts with
   the per-descriptor flag fields (`offsets 0x29/0x2C`) that gate the HMB path.
 * Which callback corresponds to `HwResetBus`, `HwAdapterControl`, etc.
@@ -243,7 +283,7 @@ driver and start issuing real hardware commands.
   * `FUN_140008bc0` – descriptor/WMI table registration, gated by feature bits.
   * `FUN_140008d88` – adapter object creation and StorPort registrations.
   * `FUN_14000924c` – doorbell activation once queues are ready.
-* Each StorPort service slot (`+0x1B8`, `+0x3F0`, `+0x980`, etc.) must be mapped to Linux equivalents (pci_resource, dma_alloc, etc.).
+* Each StorPort service slot (`+0x1B8`, `+0x3F0`, `+0x650`, `+0x680`, `+0x980`, `+0x988`, etc.) must be mapped to Linux equivalents (pci_resource, dma_alloc, queue discovery).
 
 ### `FUN_140008d88` – Adapter object creation
 
@@ -265,9 +305,11 @@ driver and start issuing real hardware commands.
 ## Queue Activation Path (FUN_140001ed8 / FUN_14000924c)
 
 * Legacy helper `FUN_140001ed8` installs `FUN_14000924c` into the `devExt+0x16100` queue dispatcher when `DAT_1400146B0` bit0 is set (legacy compatibility mode).
-* `FUN_14000924c` marks the adapter active (`devExt+0x16054 = 1`, sets `devExt+0x1607C` flags) and writes doorbells via StorPort service `+0x188`, calling it 4× with indices 1..4.
-* Between each doorbell write the driver calls `KeStallExecutionProcessor`; we need the literal stall values from the disassembly to replicate timing on Linux (likely small µs delays).
-* When `devExt+0x16068 == 1` the routine invokes `FUN_140001ED8` (legacy queue bring-up) before proceeding.
+* `FUN_14000924c` obtains the adapter context by calling the service-table entry at `+0x650`, then:
+  * sets `devExt+0x16054 = 1` and immediately calls `KeStallExecutionProcessor(5000)` (5 µs).
+  * if `devExt+0x16068 == 1` it invokes the legacy bring-up helper `FUN_140001ED8` and then issues a second stall `KeStallExecutionProcessor(25000)` (25 µs).
+  * marks `devExt+0x1C2DC = 1` and, when `devExt+0x1607C` is still clear, runs the WMI/descriptor binder `FUN_14000A564` before ringing doorbells.
+  * the firmware doorbells are issued by calling service-table slot `+0x188` four times with indices 1…4 while passing `devExt+0x16020` as the doorbell pointer (`RDx`); this is the same `StorPort` thunk used elsewhere for notification.
 * `FUN_140001ed8` walks 0x30 controller slots, stepping `devExt` substructures in 0x728-byte strides. For each slot with a non-null context at `slot+0x6e0`, it:
   * Optionally calls the StorPort thunk at service offset `+0x9e0` when the global latch `DAT_140014731` is clear (looks like an "acquire lock" wrapper).
   * Clears the per-port queue tables stored at `[slot + index*8 + 0x8]` and `[slot + index*8 + 0x108]` after calling `FUN_140001008` to flush outstanding work and release any heap (`[RAX+0x838]`).

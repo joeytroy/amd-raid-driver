@@ -20,14 +20,14 @@ int rc_discover_arrays(struct rc_adapter *adapter)
 	rc_printk(RC_INFO, "rc_discover_arrays: discovering RAID arrays from firmware\n");
 	
 	// Allocate DMA buffer for metadata
-	dma_buf = dma_pool_alloc(g_hw_adapter.dma_pool, GFP_KERNEL, &dma_addr);
+	dma_buf = dma_pool_alloc(adapter->hw.dma_pool, GFP_KERNEL, &dma_addr);
 	if (!dma_buf) {
 		rc_printk(RC_ERROR, "rc_discover_arrays: failed to allocate DMA buffer\n");
 		return -ENOMEM;
 	}
 	
 	// Prepare metadata read command
-	cmd.command_id = atomic_inc_return(&g_hw_adapter.irq_count);
+	cmd.command_id = atomic_inc_return(&adapter->hw.cmd_sequence);
 	cmd.opcode = RC_CMD_METADATA_READ;
 	cmd.flags = RC_CMD_FLAG_SYNC;
 	cmd.channel_id = 0;
@@ -40,10 +40,10 @@ int rc_discover_arrays(struct rc_adapter *adapter)
 	rc_printk(RC_DEBUG, "rc_discover_arrays: submitting metadata read command\n");
 	
 	// Submit command to hardware
-	ret = rc_hw_submit_command(&g_hw_adapter, &cmd);
+	ret = rc_hw_submit_command(&adapter->hw, &cmd);
 	if (ret < 0) {
 		rc_printk(RC_ERROR, "rc_discover_arrays: failed to submit command\n");
-		dma_pool_free(g_hw_adapter.dma_pool, dma_buf, dma_addr);
+		dma_pool_free(adapter->hw.dma_pool, dma_buf, dma_addr);
 		return ret;
 	}
 	
@@ -52,7 +52,7 @@ int rc_discover_arrays(struct rc_adapter *adapter)
 	rc_printk(RC_INFO, "rc_discover_arrays: found 1 RAID array (simulated)\n");
 	
 	// Free DMA buffer
-	dma_pool_free(g_hw_adapter.dma_pool, dma_buf, dma_addr);
+	dma_pool_free(adapter->hw.dma_pool, dma_buf, dma_addr);
 	
 	return 1; // Return number of arrays found
 }
@@ -69,14 +69,14 @@ int rc_read_array_metadata(struct rc_adapter *adapter, int array_id,
 	rc_printk(RC_DEBUG, "rc_read_array_metadata: reading metadata for array %d\n", array_id);
 	
 	// Allocate DMA buffer for metadata
-	dma_buf = dma_pool_alloc(g_hw_adapter.dma_pool, GFP_KERNEL, &dma_addr);
+	dma_buf = dma_pool_alloc(adapter->hw.dma_pool, GFP_KERNEL, &dma_addr);
 	if (!dma_buf) {
 		rc_printk(RC_ERROR, "rc_read_array_metadata: failed to allocate DMA buffer\n");
 		return -ENOMEM;
 	}
 	
 	// Prepare metadata read command
-	cmd.command_id = atomic_inc_return(&g_hw_adapter.irq_count);
+	cmd.command_id = atomic_inc_return(&adapter->hw.cmd_sequence);
 	cmd.opcode = RC_CMD_METADATA_READ;
 	cmd.flags = RC_CMD_FLAG_SYNC;
 	cmd.channel_id = array_id;
@@ -87,10 +87,10 @@ int rc_read_array_metadata(struct rc_adapter *adapter, int array_id,
 	cmd.generation_number = 0;
 	
 	// Submit command to hardware
-	ret = rc_hw_submit_command(&g_hw_adapter, &cmd);
+	ret = rc_hw_submit_command(&adapter->hw, &cmd);
 	if (ret < 0) {
 		rc_printk(RC_ERROR, "rc_read_array_metadata: failed to submit command\n");
-		dma_pool_free(g_hw_adapter.dma_pool, dma_buf, dma_addr);
+		dma_pool_free(adapter->hw.dma_pool, dma_buf, dma_addr);
 		return ret;
 	}
 	
@@ -109,7 +109,7 @@ int rc_read_array_metadata(struct rc_adapter *adapter, int array_id,
 	rc_printk(RC_DEBUG, "rc_read_array_metadata: array %d metadata read successfully\n", array_id);
 	
 	// Free DMA buffer
-	dma_pool_free(g_hw_adapter.dma_pool, dma_buf, dma_addr);
+	dma_pool_free(adapter->hw.dma_pool, dma_buf, dma_addr);
 	
 	return 0;
 }
@@ -123,7 +123,7 @@ int rc_scan_physical_disks(struct rc_adapter *adapter)
 	rc_printk(RC_INFO, "rc_scan_physical_disks: scanning for physical disks\n");
 	
 	// Prepare disk scan command
-	cmd.command_id = atomic_inc_return(&g_hw_adapter.irq_count);
+	cmd.command_id = atomic_inc_return(&adapter->hw.cmd_sequence);
 	cmd.opcode = RC_CMD_SCAN_DISKS;
 	cmd.flags = RC_CMD_FLAG_SYNC;
 	cmd.channel_id = 0;
@@ -134,7 +134,7 @@ int rc_scan_physical_disks(struct rc_adapter *adapter)
 	cmd.generation_number = 0;
 	
 	// Submit command to hardware
-	ret = rc_hw_submit_command(&g_hw_adapter, &cmd);
+	ret = rc_hw_submit_command(&adapter->hw, &cmd);
 	if (ret < 0) {
 		rc_printk(RC_ERROR, "rc_scan_physical_disks: failed to submit command\n");
 		return ret;

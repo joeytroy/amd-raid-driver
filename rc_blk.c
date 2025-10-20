@@ -71,7 +71,7 @@ static int rc_transfer_data(struct rc_raid_array *array, sector_t sector,
     int ret = 0;
     
     // Allocate DMA buffer for data transfer
-    dma_buf = dma_pool_alloc(g_hw_adapter.dma_pool, GFP_KERNEL, &dma_addr);
+    dma_buf = dma_pool_alloc(array->adapter->hw.dma_pool, GFP_KERNEL, &dma_addr);
     if (!dma_buf) {
         rc_printk(RC_ERROR, "rc_transfer_data: failed to allocate DMA buffer\n");
         return -ENOMEM;
@@ -82,7 +82,7 @@ static int rc_transfer_data(struct rc_raid_array *array, sector_t sector,
         memcpy(dma_buf, buf, len);
         
         // Prepare write command using real AMD protocol
-        cmd.command_id = atomic_inc_return(&g_hw_adapter.irq_count);
+        cmd.command_id = atomic_inc_return(&array->adapter->hw.cmd_sequence);
         cmd.opcode = RC_CMD_WRITE_DATA;
         cmd.flags = RC_CMD_FLAG_SYNC;
         cmd.channel_id = 0; // Default channel
@@ -96,7 +96,7 @@ static int rc_transfer_data(struct rc_raid_array *array, sector_t sector,
                   cmd.command_id, (unsigned long long)cmd.lba, cmd.sector_count);
     } else {
         // Prepare read command using real AMD protocol
-        cmd.command_id = atomic_inc_return(&g_hw_adapter.irq_count);
+        cmd.command_id = atomic_inc_return(&array->adapter->hw.cmd_sequence);
         cmd.opcode = RC_CMD_READ_DATA;
         cmd.flags = RC_CMD_FLAG_SYNC;
         cmd.channel_id = 0; // Default channel
@@ -111,10 +111,10 @@ static int rc_transfer_data(struct rc_raid_array *array, sector_t sector,
     }
     
     // Submit command to hardware
-    ret = rc_hw_submit_command(&g_hw_adapter, &cmd);
+    ret = rc_hw_submit_command(&array->adapter->hw, &cmd);
     if (ret < 0) {
         rc_printk(RC_ERROR, "rc_transfer_data: failed to submit command\n");
-        dma_pool_free(g_hw_adapter.dma_pool, dma_buf, dma_addr);
+        dma_pool_free(array->adapter->hw.dma_pool, dma_buf, dma_addr);
         return ret;
     }
     
@@ -127,7 +127,7 @@ static int rc_transfer_data(struct rc_raid_array *array, sector_t sector,
     }
     
     // Free DMA buffer
-    dma_pool_free(g_hw_adapter.dma_pool, dma_buf, dma_addr);
+    dma_pool_free(array->adapter->hw.dma_pool, dma_buf, dma_addr);
     
     return 0;
 }

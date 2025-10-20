@@ -252,7 +252,7 @@ int rc_raid_init(void)
     }
     
     // Initialize RAID structure
-    rc_state.raid.adapter = &rc_state.adapters[0];
+    rc_state.raid.adapter = rc_state.adapters[0];
     rc_state.raid.num_arrays = 0;
     rc_state.raid.scsi_host_created = 0;
     
@@ -267,7 +267,7 @@ int rc_raid_init(void)
         host->sg_tablesize = 32;
         
         // Add SCSI host
-        err = scsi_add_host(host, &rc_state.adapters[0].pdev->dev);
+        err = scsi_add_host(host, &rc_state.adapters[0]->pdev->dev);
         if (err) {
             rc_printk(RC_WARN, "rc_raid_init: failed to add SCSI host, continuing without SCSI\n");
             scsi_host_put(host);
@@ -285,7 +285,7 @@ int rc_raid_init(void)
 #endif
     
     // Scan for RAID arrays and create block devices
-    err = rc_raid_scan_arrays(&rc_state.adapters[0]);
+    err = rc_raid_scan_arrays(rc_state.adapters[0]);
     if (err) {
         rc_printk(RC_ERROR, "rc_raid_init: failed to scan RAID arrays\n");
         if (rc_state.raid.scsi_host_created && rc_state.raid.host) {

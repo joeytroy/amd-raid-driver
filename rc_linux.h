@@ -92,29 +92,115 @@ static inline int scsi_add_host(struct Scsi_Host *host, struct device *dev) { re
 #define rc_printk(level, fmt, ...) \
     printk(KERN_INFO RC_DRIVER_NAME ": " fmt, ##__VA_ARGS__)
 
+// Maximum number of PCI BARs we track
+#define RC_MAX_BARS            PCI_STD_NUM_BARS
+
+// Interrupt delivery mode
+enum rc_irq_mode {
+    RC_IRQ_MODE_NONE = 0,
+    RC_IRQ_MODE_MSI,
+    RC_IRQ_MODE_LEGACY,
+};
+
+// Per-BAR bookkeeping (mirrors StorPort resource descriptors)
+struct rc_bar {
+    resource_size_t phys;   // Physical base address
+    resource_size_t len;    // Length of the BAR window
+    u32 flags;              // IORESOURCE_* flags
+    void __iomem *virt;     // Remapped pointer when mapped
+};
+
+// Interrupt/queue state (device extension offsets 0x670–0x6C0)
+struct rc_irq_state {
+    void *primary_queue;        // devExt+0x6B8
+    void **queue_table;         // devExt+0x6C0
+    u32 pending;                // devExt+0x678
+    void *scratch_head;         // devExt+0x670
+    void *scratch_tail;         // devExt+0x698
+};
+
+// Doorbell/template context (device extension offsets 0x16010–0x1C2DC)
+struct rc_doorbell_state {
+    void __iomem *template_page;    // devExt+0x16010
+    void __iomem *doorbell_page;    // devExt+0x16020
+    bool adapter_active;            // devExt+0x16054
+    u8 queue_state;                 // devExt+0x16068
+    u8 queue_mode;                  // devExt+0x1606C
+    u16 variant[4];                 // devExt+0x16056/58/5A/5C
+    u8 fast_path_enabled;           // devExt+0x1607C
+    u32 capability_word;            // devExt+0x1C2D8
+};
+
+// Device context layout (clean-room mirror of the Windows device extension)
+struct rc_dev_context {
+    struct rc_bar bar[RC_MAX_BARS];
+    void __iomem *mmio_base;        // devExt+0x10 (primary BAR window)
+    resource_size_t mmio_len;       // devExt+0x18
+    resource_size_t mmio_phys;
+    u8 bar_type[RC_MAX_BARS];       // devExt+0xB5 (per BAR attributes)
+    void *descriptor_table;         // devExt+0x1C2A0
+    struct rc_irq_state irq;
+    struct rc_doorbell_state doorbell;
+};
+
+// Hardware adapter bookkeeping (queue/DMA resources)
+struct rc_hw_queue_context {
+    struct rc_adapter *owner;
+    struct pci_dev *pdev;
+    void __iomem *mmio_base;
+    resource_size_t mmio_len;
+    resource_size_t mmio_phys;
+    u32 msi_vector;
+
+    // Command / completion queues
+    struct rc_hw_command *cmd_queue;
+    dma_addr_t cmd_queue_dma;
+    u32 cmd_queue_head;
+    u32 cmd_queue_tail;
+    u32 cmd_queue_size;
+
+    struct rc_hw_completion *comp_queue;
+    dma_addr_t comp_queue_dma;
+    u32 comp_queue_head;
+    u32 comp_queue_tail;
+    u32 comp_queue_size;
+
+    spinlock_t irq_lock;
+    atomic_t irq_count;
+    atomic_t cmd_sequence;
+
+    struct dma_pool *dma_pool;
+};
+
 // Adapter structure (rcbottom equivalent)
 struct rc_adapter {
     struct pci_dev *pdev;
+    struct device *dev;
     int instance;
-    int irq;
-    void __iomem *mmio_base;
-    resource_size_t mmio_len;
-    
-    // MSI settings (from rcbottom.inf)
-    int msi_enabled;
-    int msi_vectors;
-    
-    // Power management (from rcbottom.inf)
+
+    // PCI identity
+    u16 vendor_id;
+    u16 device_id;
+    u16 subsystem_vendor;
+    u16 subsystem_device;
+    u8 revision;
+
+    // Power-management defaults (from rcbottom.inf)
     u32 enable_hipm;
     u32 enable_dipm;
     u32 hmb_policy;
-    
-    // Hardware info
-    u16 vendor_id;
-    u16 device_id;
-    u8 revision;
-    
-    struct list_head list;
+
+    // Interrupt wiring
+    enum rc_irq_mode irq_mode;
+    int irq_vector;
+
+    // Device-extension state mirrors
+    struct rc_dev_context ctx;
+
+    // Hardware queue/DMA resources
+    struct rc_hw_queue_context hw;
+
+    struct list_head list_node;
 };
 
 // Configuration structure (rccfg equivalent)
@@ -159,12 +245,13 @@ struct rc_raid {
 
 // Global state
 struct rc_global_state {
-    struct rc_adapter adapters[RC_MAX_ADAPTERS];
+    struct rc_adapter *adapters[RC_MAX_ADAPTERS];
     struct rc_config config;
     struct rc_raid raid;
     int num_adapters;
     int initialized;
     struct mutex lock;
+    struct list_head adapter_list;
 };
 
 extern struct rc_global_state rc_state;
@@ -305,14 +392,11 @@ struct rc_hw_adapter {
 // Block major number (defined in rc_main.c)
 extern int rc_major;
 
-// Global hardware adapter (defined in rc_hw.c)
-extern struct rc_hw_adapter g_hw_adapter;
-
 // Hardware functions
-int rc_hw_init(struct pci_dev *pdev, struct rc_hw_adapter *hw);
-void rc_hw_cleanup(struct rc_hw_adapter *hw);
-int rc_hw_submit_command(struct rc_hw_adapter *hw, struct rc_hw_command *cmd);
-int rc_hw_process_completions(struct rc_hw_adapter *hw);
+int rc_hw_init(struct rc_adapter *adapter);
+void rc_hw_cleanup(struct rc_adapter *adapter);
+int rc_hw_submit_command(struct rc_hw_queue_context *hw, struct rc_hw_command *cmd);
+int rc_hw_process_completions(struct rc_hw_queue_context *hw);
 irqreturn_t rc_hw_interrupt_handler(int irq, void *dev_id);
 
 // Metadata discovery functions
