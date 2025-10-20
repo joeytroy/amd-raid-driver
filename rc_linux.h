@@ -421,6 +421,10 @@ int rc_queue_init(struct rc_adapter *adapter);
 void rc_queue_cleanup(struct rc_adapter *adapter);
 int rc_activate_doorbells(struct rc_adapter *adapter);
 
+// Sysfs interface
+int rc_sysfs_create(struct rc_adapter *adapter);
+void rc_sysfs_remove(struct rc_adapter *adapter);
+
 // Metadata discovery functions
 int rc_discover_arrays(struct rc_adapter *adapter);
 int rc_read_array_metadata(struct rc_adapter *adapter, int array_id, 

@@ -1,5 +1,27 @@
 # AMD RAID Driver Installation Guide
 
+> **Alpha Status**: This driver now implements real hardware communication with the AMD RAID controller.
+> - ✅ Hardware register access via BAR5 MMIO
+> - ✅ Command/completion queues with DMA
+> - ✅ MSI interrupt handling
+> - ✅ Sysfs monitoring interface
+> - ✅ Automated test script (`test_driver.sh`)
+
+## Quick Start (For Testing)
+
+After building the driver, use the automated test script:
+
+```bash
+# Build driver
+./build.sh
+
+# Run comprehensive tests (includes load, sysfs checks, I/O test)
+sudo ./test_driver.sh
+
+# Monitor in real-time
+watch -n1 'cat /sys/bus/pci/drivers/rcbottom/*/rcraid/queue_stats'
+```
+
 ## 1. Setup Live USB and GRUB Configuration
 
 ### Create Live USB

@@ -1,56 +1,136 @@
 # AMD RAID Driver for Linux
 
-> ⚠️ **WARNING: THIS IS NOT A COMPLETED DRIVER** ⚠️
+> ⚠️ **WARNING: ALPHA DRIVER - TESTING PHASE** ⚠️
 > 
-> This is a **development driver** currently in **early stages**. It provides:
-> - ✅ Basic kernel module structure and PCI device detection
-> - ✅ In-memory backing store for testing purposes
-> - ❌ **NO real hardware communication** (uses memory storage only)
-> - ❌ **NO actual RAID functionality** (no real firmware integration)
-> - ❌ **NO production use** (for development and testing only)
+> This is an **alpha driver** implementing real hardware communication:
+> - ✅ Real PCI/BAR mapping and hardware register access
+> - ✅ Hardware command/completion queues with DMA
+> - ✅ MSI interrupt handling and async I/O completion
+> - ✅ Queue management following Windows driver flow
+> - ⚠️ **Early testing phase** - may have undiscovered bugs
+> - ❌ **NOT for production** - testing and validation only
 > 
-> **Current Status:** Foundation driver ready for hardware implementation
-> **Next Phase:** Real hardware communication and firmware integration
+> **Current Status:** Hardware communication implemented, alpha testing
+> **Next Phase:** Extended testing, performance tuning, bug fixes
 
 A modern Linux kernel driver for AMD RAID controllers, built from scratch based on Windows driver specifications. This driver is designed to provide full support for AMD RAID arrays on TRX50 and other AMD platforms.
 
 ## Current Implementation Status
 
-### ✅ **Implemented (Working)**
-- **Basic Kernel Module**: Complete module structure with proper initialization
-- **PCI Device Detection**: Detects AMD RAID controllers (VID: 0x1022)
-- **Block Device Creation**: Creates `/dev/rcraid0` for testing
-- **In-Memory Storage**: Page-based backing store for I/O operations
-- **Three-Layer Architecture**: 
-  - `rcbottom`: Hardware initialization and PCI device management
-  - `rccfg`: Configuration device interface (`/dev/rcfg`)
-  - `rcraid`: RAID array structure and block device management
-- **Modern Linux Support**: Compatible with recent kernels (tested on 6.14+)
+### ✅ **Implemented (Alpha)**
+- **Hardware Layer (rcbottom)**:
+  - ✅ PCI device probe with strict ID checking (1022:43bd)
+  - ✅ BAR mapping (all 6 BARs, focus on BAR5 for MMIO)
+  - ✅ MSI/MSI-X interrupt allocation with legacy fallback
+  - ✅ DMA mask setup (64-bit with 32-bit fallback)
+  - ✅ Power management defaults (HIPM/DIPM from rcbottom.inf)
 
-### ❌ **Not Yet Implemented (Planned)**
-- **Real Hardware Communication**: No actual controller communication
-- **Firmware Integration**: No OSIC protocol or metadata discovery
-- **RAID Functionality**: No real RAID operations (uses memory only)
-- **Power Management**: HIPM/DIPM support not implemented
-- **MSI/MSI-X Support**: Interrupt handling not implemented
-- **SCSI Host Management**: SCSI layer not fully functional
+- **Queue Management (rc_queue)**:
+  - ✅ Queue descriptor allocation (0x78-byte structures, FUN_14000d66c)
+  - ✅ DMA control blocks (0x400-byte per queue, FUN_14000655a)
+  - ✅ Completion register programming (FUN_1400023BB)
+  - ✅ Doorbell activation with proper timing (5µs + 25µs stalls)
+  - ✅ Descriptor table management (devExt+0x1C2A0)
+
+- **Hardware Communication (rc_hw)**:
+  - ✅ Command/completion queue setup (32 entries each)
+  - ✅ DMA pool allocation for data transfers
+  - ✅ Hardware register programming (queue addresses, sizes)
+  - ✅ Command submission via doorbells
+  - ✅ MSI interrupt handler (vector 244 on TRX50)
+  - ✅ ISR sequence matching FUN_14000d2b8 (drain 6B8/6C0, clear scratch)
+  - ✅ Completion pump with request tracking (256-slot hash table)
+
+- **Block I/O (rc_blk)**:
+  - ✅ blk-mq integration with async submission
+  - ✅ Request tracking for ISR completion
+  - ✅ DMA buffer allocation/management
+  - ✅ Hardware status → blk_status_t mapping
+  - ✅ Queue depth matching Windows (32 entries)
+
+- **Monitoring (rc_sysfs)**:
+  - ✅ Adapter info (PCI ID, IRQ mode, instance)
+  - ✅ Queue statistics (head/tail, DMA addresses, counters)
+  - ✅ Doorbell state (active, fast path, variants)
+  - ✅ BAR mapping info (physical, virtual, sizes)
+  - ✅ Pending request counts
+
+- **Testing**:
+  - ✅ Automated test script (test_driver.sh)
+  - ✅ Sysfs monitoring
+  - ✅ Basic I/O validation
+
+### ⚠️ **Partial / In Progress**
+- **Metadata Discovery**: Basic structure, needs real firmware protocol
+- **RAID Array Detection**: Simulated data, needs firmware queries
+- **Configuration Layer**: Basic interface, needs WMI equivalent
+- **Error Handling**: Basic paths, needs comprehensive coverage
+
+### ❌ **Not Yet Implemented**
+- **Advanced Features**:
+  - RAID rebuild/resync
+  - SMART monitoring
+  - Array creation/deletion from userspace
+  - Hot-plug support
+- **Performance Optimization**:
+  - Multi-queue support (currently single queue)
+  - Request batching/coalescing
+  - NUMA awareness
+- **Firmware Protocol**:
+  - OSIC data structures
+  - Firmware configuration commands
+  - Metadata format parsing
 
 ## Development and Testing
 
-This driver is currently in **development phase** and is designed for:
+This driver is currently in **alpha testing phase**:
 
-- **Testing and Development**: Validating kernel module structure
-- **Hardware Research**: Gathering information about AMD RAID controllers
-- **Foundation Building**: Creating a base for real hardware implementation
+- **Hardware Validation**: Testing real TRX50 RAID controller communication
+- **Queue Management**: Verifying command submission and completion paths
+- **Interrupt Handling**: Validating MSI and completion processing
+- **I/O Operations**: Testing async read/write with DMA
+
+### Quick Test
+
+Run the automated test script after building:
+
+```bash
+sudo ./test_driver.sh
+```
+
+The script will:
+1. Load the driver module
+2. Check for AMD RAID hardware
+3. Display sysfs statistics
+4. Test basic I/O (if arrays configured)
+5. Show queue status and adapter info
+
+### Monitor Driver Activity
+
+```bash
+# Watch queue statistics in real-time
+watch -n1 'cat /sys/bus/pci/drivers/rcbottom/*/rcraid/queue_stats'
+
+# Check adapter info
+cat /sys/bus/pci/drivers/rcbottom/*/rcraid/adapter_info
+
+# Monitor doorbell state
+cat /sys/bus/pci/drivers/rcbottom/*/rcraid/doorbell_state
+
+# View pending requests
+cat /sys/bus/pci/drivers/rcbottom/*/rcraid/pending_requests
+```
 
 ### Testing Process
-See [TESTING.md](TESTING.md) for a comprehensive testing guide that will help gather the information needed for real hardware implementation.
+See [TESTING.md](TESTING.md) for comprehensive testing procedures and hardware validation steps.
 
 ### Next Development Steps
-1. **Hardware Analysis**: Research specific AMD RAID controller specifications
-2. **Register Mapping**: Implement real PCI register access
-3. **Firmware Communication**: Add OSIC protocol implementation
-4. **Real I/O Path**: Replace memory storage with actual hardware communication
+1. **Alpha Testing**: Validate on real TRX50 hardware with configured RAID arrays
+2. **Firmware Protocol**: Decode and implement real OSIC metadata structures
+3. **Multi-Queue**: Add support for multiple hardware queues (devExt+0x16068)
+4. **Performance**: Request batching, completion coalescing, NUMA optimization
+5. **Error Recovery**: Timeout handling, retry logic, error reporting
+6. **Advanced RAID**: Rebuild, resync, array management operations
 
 ## System Requirements
 

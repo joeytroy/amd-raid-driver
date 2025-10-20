@@ -299,8 +299,15 @@ static int rc_bottom_probe(struct pci_dev *pdev, const struct pci_device_id *id)
     rc_bottom_attach_adapter(adapter);
     pci_set_drvdata(pdev, adapter);
 
+    ret = rc_sysfs_create(adapter);
+    if (ret)
+        goto err_detach;
+
     rc_printk(RC_NOTE, "rc_bottom: adapter %d ready\n", adapter->instance);
     return 0;
+
+err_detach:
+    rc_bottom_detach_adapter(adapter);
 
 err_queue_cleanup:
     rc_queue_cleanup(adapter);
@@ -328,6 +335,7 @@ static void rc_bottom_remove(struct pci_dev *pdev)
 
     rc_printk(RC_NOTE, "rc_bottom: remove adapter %d\n", adapter->instance);
 
+    rc_sysfs_remove(adapter);
     rc_bottom_detach_adapter(adapter);
     rc_queue_cleanup(adapter);
     rc_bottom_free_irq(adapter);
