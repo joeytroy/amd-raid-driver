@@ -12,7 +12,6 @@
 int rc_discover_arrays(struct rc_adapter *adapter)
 {
 	struct rc_hw_command cmd = {0};
-	struct rc_hw_completion comp = {0};
 	dma_addr_t dma_addr;
 	void *dma_buf;
 	int ret;

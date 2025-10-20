@@ -102,6 +102,7 @@ static inline int scsi_add_host(struct Scsi_Host *host, struct device *dev) { re
 enum rc_irq_mode {
     RC_IRQ_MODE_NONE = 0,
     RC_IRQ_MODE_MSI,
+    RC_IRQ_MODE_MSIX,
     RC_IRQ_MODE_LEGACY,
 };
 

@@ -84,9 +84,9 @@ static int rc_debugfs_comp_queue_show(struct seq_file *m, void *v)
 
     seq_printf(m, "Entries:\n");
     seq_printf(m, "%-4s %-10s %-8s %-10s %-12s\n",
-               "Idx", "CmdID", "Status", "DataXfer", "ErrorInfo");
+               "Idx", "CmdID", "Status", "BytesXfer", "ErrorCode");
     seq_printf(m, "%-4s %-10s %-8s %-10s %-12s\n",
-               "---", "-----", "------", "--------", "---------");
+               "---", "-----", "------", "---------", "---------");
 
     for (i = 0; i < hw->comp_queue_size; i++) {
         comp = &hw->comp_queue[i];
@@ -97,8 +97,8 @@ static int rc_debugfs_comp_queue_show(struct seq_file *m, void *v)
                    i,
                    comp->command_id,
                    comp->status,
-                   comp->data_transferred,
-                   comp->error_info);
+                   comp->bytes_transferred,
+                   comp->error_code);
     }
 
     return 0;

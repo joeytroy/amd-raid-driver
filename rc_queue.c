@@ -185,7 +185,6 @@ int rc_queue_init(struct rc_adapter *adapter)
     struct rc_queue_table *table;
     struct rc_queue_descriptor *desc;
     int ret;
-    u32 i;
 
     rc_printk(RC_INFO, "rc_queue_init: initializing queue subsystem\n");
 

@@ -142,7 +142,7 @@ static ssize_t bar_mapping_show(struct device *dev,
             continue;
 
         len += sprintf(buf + len,
-                       "  BAR%u: phys=0x%llx len=0x%llx flags=0x%lx virt=%p\n",
+                       "  BAR%u: phys=0x%llx len=0x%llx flags=0x%x virt=%p\n",
                        i,
                        (unsigned long long)ctx->bar[i].phys,
                        (unsigned long long)ctx->bar[i].len,
