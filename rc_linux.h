@@ -143,6 +143,16 @@ struct rc_dev_context {
     struct rc_doorbell_state doorbell;
 };
 
+// Request tracking for blk-mq completion
+#define RC_MAX_PENDING_REQUESTS 256
+
+struct rc_pending_request {
+    struct request *rq;
+    dma_addr_t dma_addr;
+    void *dma_buf;
+    u32 cmd_id;
+};
+
 // Hardware adapter bookkeeping (queue/DMA resources)
 struct rc_hw_queue_context {
     struct rc_adapter *owner;
@@ -170,6 +180,10 @@ struct rc_hw_queue_context {
     atomic_t cmd_sequence;
 
     struct dma_pool *dma_pool;
+
+    // Request tracking for blk-mq
+    struct rc_pending_request pending_reqs[RC_MAX_PENDING_REQUESTS];
+    spinlock_t pending_lock;
 };
 
 // Adapter structure (rcbottom equivalent)
@@ -398,6 +412,9 @@ void rc_hw_cleanup(struct rc_adapter *adapter);
 int rc_hw_submit_command(struct rc_hw_queue_context *hw, struct rc_hw_command *cmd);
 int rc_hw_process_completions(struct rc_hw_queue_context *hw);
 irqreturn_t rc_hw_interrupt_handler(int irq, void *dev_id);
+int rc_hw_submit_request(struct rc_adapter *adapter, struct request *rq,
+                         u32 opcode, sector_t lba, u32 sector_count,
+                         dma_addr_t dma_addr, void *dma_buf);
 
 // Queue management functions (StorPort service slot equivalents)
 int rc_queue_init(struct rc_adapter *adapter);

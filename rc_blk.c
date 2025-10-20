@@ -160,26 +160,47 @@ static blk_status_t rc_status_from_errno(int err)
     return BLK_STS_IOERR;
 }
 
-static blk_status_t rc_handle_rw(struct rc_raid_array *array, struct request *rq)
+static blk_status_t rc_handle_rw_async(struct rc_raid_array *array, struct request *rq)
 {
-    struct req_iterator iter;
-    struct bio_vec bvec;
+    struct rc_adapter *adapter = array->adapter;
+    dma_addr_t dma_addr;
+    void *dma_buf = NULL;
     sector_t sector = blk_rq_pos(rq);
-    bool write = op_is_write(req_op(rq));
+    u32 sector_count = blk_rq_sectors(rq);
+    u32 opcode = op_is_write(req_op(rq)) ? RC_CMD_WRITE_DATA : RC_CMD_READ_DATA;
     int ret;
 
-    rq_for_each_segment(bvec, rq, iter) {
-        void *kaddr = kmap_local_page(bvec.bv_page);
-        u8 *buf = (u8 *)kaddr + bvec.bv_offset;
-
-        ret = rc_transfer_data(array, sector, buf, bvec.bv_len, write);
-        kunmap_local(kaddr);
-        if (ret)
-            return rc_status_from_errno(ret);
-
-        sector += bvec.bv_len >> 9;
+    // Allocate DMA buffer for the entire request
+    dma_buf = dma_pool_alloc(adapter->hw.dma_pool, GFP_ATOMIC, &dma_addr);
+    if (!dma_buf) {
+        rc_printk(RC_ERROR, "rc_handle_rw_async: DMA alloc failed\n");
+        return BLK_STS_RESOURCE;
     }
 
+    // For writes, copy data to DMA buffer
+    if (opcode == RC_CMD_WRITE_DATA) {
+        struct req_iterator iter;
+        struct bio_vec bvec;
+        u8 *buf_ptr = dma_buf;
+
+        rq_for_each_segment(bvec, rq, iter) {
+            void *kaddr = kmap_local_page(bvec.bv_page);
+            memcpy(buf_ptr, (u8 *)kaddr + bvec.bv_offset, bvec.bv_len);
+            kunmap_local(kaddr);
+            buf_ptr += bvec.bv_len;
+        }
+    }
+
+    // Submit to hardware (async, will complete in ISR)
+    ret = rc_hw_submit_request(adapter, rq, opcode, sector, sector_count,
+                                dma_addr, dma_buf);
+    if (ret) {
+        rc_printk(RC_ERROR, "rc_handle_rw_async: submit failed\n");
+        dma_pool_free(adapter->hw.dma_pool, dma_buf, dma_addr);
+        return BLK_STS_IOERR;
+    }
+
+    // Request will be completed by ISR
     return BLK_STS_OK;
 }
 
@@ -206,6 +227,7 @@ static blk_status_t rc_queue_rq(struct blk_mq_hw_ctx *hctx,
     struct request *rq = bd->rq;
     struct rc_raid_array *array = rq->q ? rq->q->queuedata : NULL;
     blk_status_t status = BLK_STS_OK;
+    bool async = false;
 
     blk_mq_start_request(rq);
 
@@ -218,7 +240,9 @@ static blk_status_t rc_queue_rq(struct blk_mq_hw_ctx *hctx,
     switch (req_op(rq)) {
     case REQ_OP_READ:
     case REQ_OP_WRITE:
-        status = rc_handle_rw(array, rq);
+        // Async submission - ISR will complete
+        status = rc_handle_rw_async(array, rq);
+        async = (status == BLK_STS_OK);
         break;
     case REQ_OP_FLUSH:
         status = BLK_STS_OK;
@@ -234,11 +258,16 @@ static blk_status_t rc_queue_rq(struct blk_mq_hw_ctx *hctx,
         break;
     }
 
-    blk_mq_end_request(rq, status);
-    if (status != BLK_STS_OK && status != BLK_STS_NOTSUPP)
-        rc_printk(RC_ERROR, "rc_queue_rq: op=%u status=%d sector=%llu len=%u\n",
-                  req_op(rq), status, (unsigned long long)blk_rq_pos(rq),
-                  blk_rq_bytes(rq));
+    // Only complete synchronous operations here
+    // Async operations will be completed by ISR
+    if (!async) {
+        blk_mq_end_request(rq, status);
+        if (status != BLK_STS_OK && status != BLK_STS_NOTSUPP)
+            rc_printk(RC_ERROR, "rc_queue_rq: op=%u status=%d sector=%llu len=%u\n",
+                      req_op(rq), status, (unsigned long long)blk_rq_pos(rq),
+                      blk_rq_bytes(rq));
+    }
+
     return BLK_STS_OK;
 }
 
@@ -263,7 +292,7 @@ int rc_blk_create_disk(struct rc_raid_array *a, int major)
     memset(&a->tag_set, 0, sizeof(a->tag_set));
     a->tag_set.ops          = &rc_mq_ops;
     a->tag_set.nr_hw_queues = 1;
-    a->tag_set.queue_depth  = 128;
+    a->tag_set.queue_depth  = 32;  // Match Windows queue depth
     a->tag_set.numa_node    = NUMA_NO_NODE;
     a->tag_set.flags        = 0; /* Remove BLK_MQ_F_SHOULD_MERGE for compatibility */
 

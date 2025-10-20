@@ -37,8 +37,10 @@ int rc_hw_init(struct rc_adapter *adapter)
     hw->msi_vector = adapter->irq_vector;
 
     spin_lock_init(&hw->irq_lock);
+    spin_lock_init(&hw->pending_lock);
     atomic_set(&hw->irq_count, 0);
     atomic_set(&hw->cmd_sequence, 0);
+    memset(hw->pending_reqs, 0, sizeof(hw->pending_reqs));
 
     hw->dma_pool = dma_pool_create("rcraid_hw", &pdev->dev,
                                    sizeof(struct rc_hw_command), 64, 0);
@@ -170,6 +172,68 @@ int rc_hw_process_completions(struct rc_hw_queue_context *hw)
 }
 
 /*----------------------------------------------------------------------
+ * Request tracking helpers
+ *----------------------------------------------------------------------*/
+
+static int rc_track_request(struct rc_hw_queue_context *hw, u32 cmd_id,
+                             struct request *rq, dma_addr_t dma_addr,
+                             void *dma_buf)
+{
+    unsigned long flags;
+    u32 slot = cmd_id % RC_MAX_PENDING_REQUESTS;
+
+    spin_lock_irqsave(&hw->pending_lock, flags);
+
+    if (hw->pending_reqs[slot].rq) {
+        spin_unlock_irqrestore(&hw->pending_lock, flags);
+        rc_printk(RC_WARN, "rc_track_request: slot %u already occupied\n", slot);
+        return -EBUSY;
+    }
+
+    hw->pending_reqs[slot].rq = rq;
+    hw->pending_reqs[slot].dma_addr = dma_addr;
+    hw->pending_reqs[slot].dma_buf = dma_buf;
+    hw->pending_reqs[slot].cmd_id = cmd_id;
+
+    spin_unlock_irqrestore(&hw->pending_lock, flags);
+    return 0;
+}
+
+static struct rc_pending_request *
+rc_find_pending_request(struct rc_hw_queue_context *hw, u32 cmd_id)
+{
+    unsigned long flags;
+    u32 slot = cmd_id % RC_MAX_PENDING_REQUESTS;
+    struct rc_pending_request *pending = NULL;
+
+    spin_lock_irqsave(&hw->pending_lock, flags);
+
+    if (hw->pending_reqs[slot].cmd_id == cmd_id && hw->pending_reqs[slot].rq) {
+        pending = &hw->pending_reqs[slot];
+    }
+
+    spin_unlock_irqrestore(&hw->pending_lock, flags);
+    return pending;
+}
+
+static void rc_clear_pending_request(struct rc_hw_queue_context *hw, u32 cmd_id)
+{
+    unsigned long flags;
+    u32 slot = cmd_id % RC_MAX_PENDING_REQUESTS;
+
+    spin_lock_irqsave(&hw->pending_lock, flags);
+
+    if (hw->pending_reqs[slot].cmd_id == cmd_id) {
+        hw->pending_reqs[slot].rq = NULL;
+        hw->pending_reqs[slot].dma_addr = 0;
+        hw->pending_reqs[slot].dma_buf = NULL;
+        hw->pending_reqs[slot].cmd_id = 0;
+    }
+
+    spin_unlock_irqrestore(&hw->pending_lock, flags);
+}
+
+/*----------------------------------------------------------------------
  * StorPort slot +0x680: Completion pump logic (called by ISR)
  *----------------------------------------------------------------------*/
 
@@ -181,13 +245,45 @@ static void rc_completion_pump(struct rc_adapter *adapter, void *queue_handle)
     // Process completions from this queue handle
     while (hw->comp_queue_head != hw->comp_queue_tail) {
         struct rc_hw_completion *comp = &hw->comp_queue[hw->comp_queue_head];
+        struct rc_pending_request *pending;
+        blk_status_t blk_status;
 
         if (!comp->command_id)
             break;
 
-        // TODO: Complete blk-mq requests here
-        rc_printk(RC_DEBUG, "rc_completion_pump: cmd_id=%u status=%u\n",
-                  comp->command_id, comp->status);
+        // Find pending request for this completion
+        pending = rc_find_pending_request(hw, comp->command_id);
+        if (pending && pending->rq) {
+            // Map hardware status to blk-mq status
+            switch (comp->status) {
+            case RC_STATUS_SUCCESS:
+                blk_status = BLK_STS_OK;
+                break;
+            case RC_STATUS_BUSY:
+                blk_status = BLK_STS_AGAIN;
+                break;
+            default:
+                blk_status = BLK_STS_IOERR;
+                break;
+            }
+
+            // Free DMA buffer if allocated
+            if (pending->dma_buf) {
+                dma_pool_free(hw->dma_pool, pending->dma_buf, pending->dma_addr);
+            }
+
+            // Complete blk-mq request
+            blk_mq_end_request(pending->rq, blk_status);
+
+            // Clear pending tracking
+            rc_clear_pending_request(hw, comp->command_id);
+
+            rc_printk(RC_DEBUG, "rc_completion_pump: completed cmd_id=%u status=%u\n",
+                      comp->command_id, comp->status);
+        } else {
+            rc_printk(RC_DEBUG, "rc_completion_pump: cmd_id=%u (no request)\n",
+                      comp->command_id);
+        }
 
         memset(comp, 0, sizeof(*comp));
         hw->comp_queue_head = (hw->comp_queue_head + 1) % hw->cmd_queue_size;
@@ -198,6 +294,50 @@ static void rc_completion_pump(struct rc_adapter *adapter, void *queue_handle)
         rc_printk(RC_DEBUG, "rc_completion_pump: processed %u completions\n",
                   processed);
     }
+}
+
+/*----------------------------------------------------------------------
+ * High-level request submission (for blk-mq integration)
+ *----------------------------------------------------------------------*/
+
+int rc_hw_submit_request(struct rc_adapter *adapter, struct request *rq,
+                          u32 opcode, sector_t lba, u32 sector_count,
+                          dma_addr_t dma_addr, void *dma_buf)
+{
+    struct rc_hw_queue_context *hw = &adapter->hw;
+    struct rc_hw_command cmd = {0};
+    u32 cmd_id;
+    int ret;
+
+    cmd_id = atomic_inc_return(&hw->cmd_sequence);
+
+    // Track this request for completion
+    ret = rc_track_request(hw, cmd_id, rq, dma_addr, dma_buf);
+    if (ret) {
+        rc_printk(RC_ERROR, "rc_hw_submit_request: failed to track request\n");
+        return ret;
+    }
+
+    // Build command
+    cmd.command_id = cmd_id;
+    cmd.opcode = opcode;
+    cmd.flags = 0;  // Async
+    cmd.channel_id = 0;  // TODO: map from array
+    cmd.lba = lba;
+    cmd.sector_count = sector_count;
+    cmd.data_addr = dma_addr;
+    cmd.completion_addr = 0;
+    cmd.generation_number = 0;
+
+    // Submit to hardware
+    ret = rc_hw_submit_command(hw, &cmd);
+    if (ret) {
+        rc_printk(RC_ERROR, "rc_hw_submit_request: submit failed\n");
+        rc_clear_pending_request(hw, cmd_id);
+        return ret;
+    }
+
+    return 0;
 }
 
 /*----------------------------------------------------------------------
