@@ -95,6 +95,9 @@ static inline int scsi_add_host(struct Scsi_Host *host, struct device *dev) { re
 // Maximum number of PCI BARs we track
 #define RC_MAX_BARS            PCI_STD_NUM_BARS
 
+// Maximum number of queue descriptors
+#define RC_MAX_QUEUE_DESCRIPTORS 32
+
 // Interrupt delivery mode
 enum rc_irq_mode {
     RC_IRQ_MODE_NONE = 0,

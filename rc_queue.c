@@ -29,8 +29,6 @@ struct rc_queue_descriptor {
 } __packed;
 
 // Descriptor table state (devExt+0x1C2A0)
-#define RC_MAX_QUEUE_DESCRIPTORS 32
-
 struct rc_queue_table {
     struct rc_queue_descriptor *descriptors[RC_MAX_QUEUE_DESCRIPTORS];
     spinlock_t table_lock;
