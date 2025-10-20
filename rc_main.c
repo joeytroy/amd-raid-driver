@@ -42,10 +42,17 @@ static int __init rc_init(void)
     }
     rc_printk(RC_NOTE, "rc_init: registered block major %d\n", rc_major);
     
+    // Initialize debugfs
+    err = rc_debugfs_init();
+    if (err) {
+        rc_printk(RC_WARN, "rc_init: debugfs initialization failed (non-fatal)\n");
+    }
+    
     // Initialize rcbottom (hardware layer)
     err = rc_bottom_init();
     if (err) {
         rc_printk(RC_ERROR, "rc_init: failed to initialize rcbottom\n");
+        rc_debugfs_cleanup();
         unregister_blkdev(rc_major, "rcraid");
         return err;
     }
@@ -78,6 +85,7 @@ static void __exit rc_exit(void)
     rc_raid_cleanup();
     rc_config_cleanup();
     rc_bottom_cleanup();
+    rc_debugfs_cleanup();
     
     // Unregister block major
     if (rc_major > 0) {

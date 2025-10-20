@@ -191,6 +191,7 @@ struct rc_adapter {
     struct pci_dev *pdev;
     struct device *dev;
     int instance;
+    struct dentry *debugfs_dir;
 
     // PCI identity
     u16 vendor_id;
@@ -424,6 +425,12 @@ int rc_activate_doorbells(struct rc_adapter *adapter);
 // Sysfs interface
 int rc_sysfs_create(struct rc_adapter *adapter);
 void rc_sysfs_remove(struct rc_adapter *adapter);
+
+// Debugfs interface
+int rc_debugfs_init(void);
+void rc_debugfs_cleanup(void);
+int rc_debugfs_create_adapter(struct rc_adapter *adapter);
+void rc_debugfs_remove_adapter(struct rc_adapter *adapter);
 
 // Metadata discovery functions
 int rc_discover_arrays(struct rc_adapter *adapter);

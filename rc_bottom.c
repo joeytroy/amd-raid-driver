@@ -303,6 +303,10 @@ static int rc_bottom_probe(struct pci_dev *pdev, const struct pci_device_id *id)
     if (ret)
         goto err_detach;
 
+    ret = rc_debugfs_create_adapter(adapter);
+    if (ret)
+        rc_printk(RC_WARN, "rc_bottom: debugfs creation failed (non-fatal)\n");
+
     rc_printk(RC_NOTE, "rc_bottom: adapter %d ready\n", adapter->instance);
     return 0;
 
@@ -335,6 +339,7 @@ static void rc_bottom_remove(struct pci_dev *pdev)
 
     rc_printk(RC_NOTE, "rc_bottom: remove adapter %d\n", adapter->instance);
 
+    rc_debugfs_remove_adapter(adapter);
     rc_sysfs_remove(adapter);
     rc_bottom_detach_adapter(adapter);
     rc_queue_cleanup(adapter);

@@ -107,6 +107,7 @@ The script will:
 
 ### Monitor Driver Activity
 
+**Sysfs (Basic Monitoring):**
 ```bash
 # Watch queue statistics in real-time
 watch -n1 'cat /sys/bus/pci/drivers/rcbottom/*/rcraid/queue_stats'
@@ -119,6 +120,24 @@ cat /sys/bus/pci/drivers/rcbottom/*/rcraid/doorbell_state
 
 # View pending requests
 cat /sys/bus/pci/drivers/rcbottom/*/rcraid/pending_requests
+```
+
+**Debugfs (Detailed Inspection):**
+```bash
+# View command queue details
+cat /sys/kernel/debug/rcraid/adapter0/cmd_queue
+
+# View completion queue details
+cat /sys/kernel/debug/rcraid/adapter0/comp_queue
+
+# View pending request tracking
+cat /sys/kernel/debug/rcraid/adapter0/pending_requests
+
+# View IRQ state (queue handles, counters)
+cat /sys/kernel/debug/rcraid/adapter0/irq_state
+
+# View hardware registers and MMIO dump
+cat /sys/kernel/debug/rcraid/adapter0/registers
 ```
 
 ### Testing Process
