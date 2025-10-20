@@ -309,14 +309,15 @@ static int rc_bottom_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 
     rc_printk(RC_NOTE, "rc_bottom: adapter %d ready\n", adapter->instance);
 
-    // Initialize RAID layer on first adapter
-    if (adapter->instance == 0) {
-        ret = rc_raid_init();
-        if (ret) {
-            rc_printk(RC_ERROR, "rc_bottom: RAID layer initialization failed\n");
-            // Non-fatal - adapter still usable
-        }
-    }
+    // TODO: Initialize RAID layer on first adapter
+    // Temporarily disabled - RAID scanning needs firmware protocol implementation
+    // if (adapter->instance == 0) {
+    //     ret = rc_raid_init();
+    //     if (ret) {
+    //         rc_printk(RC_ERROR, "rc_bottom: RAID layer initialization failed\n");
+    //         // Non-fatal - adapter still usable
+    //     }
+    // }
 
     return 0;
 
