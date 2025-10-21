@@ -42,22 +42,28 @@ int rc_hw_init(struct rc_adapter *adapter)
     atomic_set(&hw->cmd_sequence, 0);
     memset(hw->pending_reqs, 0, sizeof(hw->pending_reqs));
 
-    hw->dma_pool = dma_pool_create("rcraid_hw", &pdev->dev,
-                                   sizeof(struct rc_hw_command), 64, 0);
+    // DMA pool for per-request data buffers (not for the queues themselves)
+    hw->dma_pool = dma_pool_create("rcraid_data", &pdev->dev, 4096, 64, 0);
     if (!hw->dma_pool)
         return -ENOMEM;
 
     hw->cmd_queue_size = 32;
     hw->comp_queue_size = 32;  // Match Windows queue depth
     
-    hw->cmd_queue = dma_pool_alloc(hw->dma_pool, GFP_KERNEL, &hw->cmd_queue_dma);
+    // Allocate command queue array (32 entries)
+    hw->cmd_queue = dma_alloc_coherent(&pdev->dev,
+                                       sizeof(struct rc_hw_command) * hw->cmd_queue_size,
+                                       &hw->cmd_queue_dma, GFP_KERNEL);
     if (!hw->cmd_queue) {
         ret = -ENOMEM;
         goto err_destroy_pool;
     }
     memset(hw->cmd_queue, 0, sizeof(struct rc_hw_command) * hw->cmd_queue_size);
 
-    hw->comp_queue = dma_pool_alloc(hw->dma_pool, GFP_KERNEL, &hw->comp_queue_dma);
+    // Allocate completion queue array (32 entries)
+    hw->comp_queue = dma_alloc_coherent(&pdev->dev,
+                                        sizeof(struct rc_hw_completion) * hw->comp_queue_size,
+                                        &hw->comp_queue_dma, GFP_KERNEL);
     if (!hw->comp_queue) {
         ret = -ENOMEM;
         goto err_free_cmd;
@@ -80,7 +86,9 @@ int rc_hw_init(struct rc_adapter *adapter)
     return 0;
 
 err_free_cmd:
-    dma_pool_free(hw->dma_pool, hw->cmd_queue, hw->cmd_queue_dma);
+    dma_free_coherent(&pdev->dev,
+                      sizeof(struct rc_hw_command) * hw->cmd_queue_size,
+                      hw->cmd_queue, hw->cmd_queue_dma);
 err_destroy_pool:
     dma_pool_destroy(hw->dma_pool);
     hw->dma_pool = NULL;
@@ -97,12 +105,16 @@ void rc_hw_cleanup(struct rc_adapter *adapter)
         writel(0x0, hw->mmio_base + RC_REG_INTERRUPT_MASK);
 
     if (hw->cmd_queue) {
-        dma_pool_free(hw->dma_pool, hw->cmd_queue, hw->cmd_queue_dma);
+        dma_free_coherent(&adapter->pdev->dev,
+                          sizeof(struct rc_hw_command) * hw->cmd_queue_size,
+                          hw->cmd_queue, hw->cmd_queue_dma);
         hw->cmd_queue = NULL;
     }
 
     if (hw->comp_queue) {
-        dma_pool_free(hw->dma_pool, hw->comp_queue, hw->comp_queue_dma);
+        dma_free_coherent(&adapter->pdev->dev,
+                          sizeof(struct rc_hw_completion) * hw->comp_queue_size,
+                          hw->comp_queue, hw->comp_queue_dma);
         hw->comp_queue = NULL;
     }
 
