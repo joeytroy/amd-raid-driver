@@ -198,15 +198,13 @@ int rc_raid_scan_arrays(struct rc_adapter *adapter)
         snprintf(array->name, sizeof(array->name), "RAID0_Array_%d", i);
         array->adapter = adapter;
         
-        // Initialize as block device
-        err = rc_raid_array_init(array);
-        if (err) {
-            rc_printk(RC_ERROR, "rc_raid_scan_arrays: failed to initialize array %d\n", i);
-            continue;
-        }
-        
+        // TODO: Block device creation hangs during module init
+        // Need to defer to workqueue or make it optional
+        // For now, just report the array without creating the device
         rc_state.raid.num_arrays++;
-        rc_printk(RC_NOTE, "rc_raid_scan_arrays: found RAID array %d (%s)\n", i, array->name);
+        rc_printk(RC_NOTE, "rc_raid_scan_arrays: found RAID array %d (%s) - %llu sectors\n", 
+                  i, array->name, array->total_sectors);
+        rc_printk(RC_NOTE, "rc_raid_scan_arrays: block device creation deferred (TODO)\n");
     }
     
     rc_printk(RC_NOTE, "rc_raid_scan_arrays: found %d RAID arrays\n", rc_state.raid.num_arrays);
