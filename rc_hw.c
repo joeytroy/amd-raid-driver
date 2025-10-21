@@ -48,6 +48,8 @@ int rc_hw_init(struct rc_adapter *adapter)
         return -ENOMEM;
 
     hw->cmd_queue_size = 32;
+    hw->comp_queue_size = 32;  // Match Windows queue depth
+    
     hw->cmd_queue = dma_pool_alloc(hw->dma_pool, GFP_KERNEL, &hw->cmd_queue_dma);
     if (!hw->cmd_queue) {
         ret = -ENOMEM;
@@ -60,7 +62,7 @@ int rc_hw_init(struct rc_adapter *adapter)
         ret = -ENOMEM;
         goto err_free_cmd;
     }
-    memset(hw->comp_queue, 0, sizeof(struct rc_hw_completion) * hw->cmd_queue_size);
+    memset(hw->comp_queue, 0, sizeof(struct rc_hw_completion) * hw->comp_queue_size);
 
     hw->cmd_queue_head = 0;
     hw->cmd_queue_tail = 0;
