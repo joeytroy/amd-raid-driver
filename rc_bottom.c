@@ -307,19 +307,18 @@ static int rc_bottom_probe(struct pci_dev *pdev, const struct pci_device_id *id)
     if (ret)
         rc_printk(RC_WARN, "rc_bottom: debugfs creation failed (non-fatal)\n");
 
-    rc_printk(RC_NOTE, "rc_bottom: adapter %d ready\n", adapter->instance);
+	rc_printk(RC_NOTE, "rc_bottom: adapter %d ready\n", adapter->instance);
 
-    // TODO: Initialize RAID layer on first adapter
-    // Temporarily disabled - RAID scanning needs firmware protocol implementation
-    // if (adapter->instance == 0) {
-    //     ret = rc_raid_init();
-    //     if (ret) {
-    //         rc_printk(RC_ERROR, "rc_bottom: RAID layer initialization failed\n");
-    //         // Non-fatal - adapter still usable
-    //     }
-    // }
+	// Initialize RAID layer on first adapter - DMA allocation is now fixed
+	if (adapter->instance == 0) {
+		ret = rc_raid_init();
+		if (ret) {
+			rc_printk(RC_ERROR, "rc_bottom: RAID layer initialization failed: %d\n", ret);
+			// Non-fatal - adapter still usable for diagnostics
+		}
+	}
 
-    return 0;
+	return 0;
 
 err_detach:
     rc_bottom_detach_adapter(adapter);
