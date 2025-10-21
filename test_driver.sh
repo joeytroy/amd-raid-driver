@@ -1,7 +1,7 @@
 #!/bin/bash
 #
 # AMD RAID Driver Test Script
-# Basic validation for TRX50 RAID driver
+# Comprehensive validation and diagnostics for TRX50 RAID driver
 #
 
 set -e
@@ -9,16 +9,43 @@ set -e
 DRIVER_NAME="rcraid"
 DRIVER_MODULE="${DRIVER_NAME}.ko"
 SYSFS_BASE="/sys/bus/pci/drivers/rcbottom"
+DEBUGFS_BASE="/sys/kernel/debug/rcraid"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 NC='\033[0m' # No Color
 
+# Diagnostic output file
+DIAG_FILE="driver_diagnostics_$(date +%Y%m%d_%H%M%S).txt"
+
+# Function to log to both console and file
+log_both() {
+    echo -e "$1" | tee -a "$DIAG_FILE"
+}
+
+# Function to run command and capture output
+run_and_capture() {
+    local cmd="$1"
+    local desc="$2"
+    
+    log_both "\n=== $desc ==="
+    log_both "Command: $cmd"
+    log_both "---"
+    eval "$cmd" 2>&1 | tee -a "$DIAG_FILE" || log_both "(command failed or returned no output)"
+}
+
 echo "=================================="
-echo "AMD RAID Driver Test Script"
+echo "AMD RAID Driver Test & Diagnostics"
 echo "=================================="
+echo "Diagnostic output: $DIAG_FILE"
 echo
+
+# Start diagnostic file
+log_both "AMD RAID Driver Diagnostic Report"
+log_both "Generated: $(date)"
+log_both "Hostname: $(hostname)"
+log_both "==================================\n"
 
 # Check if running as root
 if [ "$EUID" -ne 0 ]; then
@@ -165,6 +192,63 @@ else
 fi
 echo
 
+# Test 9: Comprehensive diagnostic collection
+echo -e "${YELLOW}[TEST 9]${NC} Collecting comprehensive diagnostics..."
+
+# System information
+run_and_capture "uname -a" "System Information"
+run_and_capture "cat /proc/version" "Kernel Version"
+run_and_capture "lsb_release -a" "Distribution Info"
+
+# Hardware detection
+run_and_capture "lspci -vvv -d 1022:43bd" "PCI Device Details (Full)"
+run_and_capture "lspci -nn | grep -i raid" "All RAID Controllers"
+
+# Complete dmesg log
+run_and_capture "dmesg | grep -i 'rcraid\|rcbottom\|rc_'" "Complete Driver Messages"
+
+# All sysfs files
+if [ -d "$SYSFS_BASE" ]; then
+    for device in "$SYSFS_BASE"/0000:*; do
+        if [ -d "$device/rcraid" ]; then
+            log_both "\n=== Sysfs Data for $(basename $device) ==="
+            for file in "$device/rcraid"/*; do
+                if [ -f "$file" ]; then
+                    log_both "\n--- $(basename $file) ---"
+                    cat "$file" 2>&1 | tee -a "$DIAG_FILE" || log_both "(read failed)"
+                fi
+            done
+        fi
+    done
+fi
+
+# All debugfs files  
+if [ -d "$DEBUGFS_BASE/adapter0" ]; then
+    log_both "\n=== Debugfs Data ==="
+    for file in "$DEBUGFS_BASE/adapter0"/*; do
+        if [ -f "$file" ]; then
+            log_both "\n--- $(basename $file) ---"
+            cat "$file" 2>&1 | tee -a "$DIAG_FILE" || log_both "(read failed)"
+        fi
+    done
+fi
+
+# Memory and resource usage
+run_and_capture "cat /proc/meminfo | head -20" "Memory Info"
+run_and_capture "cat /proc/interrupts | grep -E 'rcraid|244'" "Interrupt Info"
+run_and_capture "lsmod | grep rcraid" "Module Status"
+
+# Block device info
+run_and_capture "lsblk" "Block Devices"
+run_and_capture "ls -la /dev/rcraid* 2>&1" "RAID Device Nodes"
+
+log_both "\n==================================\n"
+log_both "Diagnostic collection complete!"
+log_both "Output saved to: $DIAG_FILE"
+echo
+echo -e "${GREEN}✓ Diagnostics saved to: $DIAG_FILE${NC}"
+echo
+
 # Summary
 echo "=================================="
 echo "Test Summary"
@@ -173,14 +257,17 @@ echo
 if lsmod | grep -q "^${DRIVER_NAME}"; then
     echo -e "${GREEN}✓ Driver loaded and operational${NC}"
     echo
-    echo "Next steps:"
-    echo "  1. Check dmesg for any errors: dmesg | grep -i rcraid"
-    echo "  2. Monitor sysfs: watch -n1 'cat $SYSFS_BASE/*/rcraid/queue_stats'"
-    echo "  3. Test I/O if arrays are configured"
-    echo "  4. Unload driver: rmmod $DRIVER_NAME"
+    echo -e "${GREEN}📊 Complete diagnostics saved to: $DIAG_FILE${NC}"
+    echo
+    echo "Share this file for analysis!"
+    echo
+    echo "Manual monitoring commands:"
+    echo "  • Watch queues: watch -n1 'cat $SYSFS_BASE/*/rcraid/queue_stats'"
+    echo "  • View registers: cat /sys/kernel/debug/rcraid/adapter0/registers"
+    echo "  • Check dmesg: dmesg | grep -i rcraid"
 else
     echo -e "${RED}✗ Driver not loaded${NC}"
-    echo "Check dmesg for errors"
+    echo "Check $DIAG_FILE for details"
 fi
 echo
 
