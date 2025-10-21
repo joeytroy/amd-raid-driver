@@ -90,20 +90,36 @@ This driver is currently in **alpha testing phase**:
 - **Interrupt Handling**: Validating MSI and completion processing
 - **I/O Operations**: Testing async read/write with DMA
 
-### Quick Test
+### Quick Test Workflow
 
-Run the automated test script after building:
-
+**First-time build and test:**
 ```bash
-sudo ./test_driver.sh
+sudo ./build.sh           # Clean build
+sudo ./test_driver.sh     # Load + comprehensive diagnostics
 ```
 
-The script will:
-1. Load the driver module
-2. Check for AMD RAID hardware
-3. Display sysfs statistics
-4. Test basic I/O (if arrays configured)
-5. Show queue status and adapter info
+**After making code changes:**
+```bash
+sudo ./unload.sh          # Safely unload old module
+sudo ./build.sh           # Rebuild with changes
+sudo ./test_driver.sh     # Test new module
+```
+
+**What test_driver.sh does:**
+1. Unloads any existing driver
+2. Loads the newly built module
+3. Validates hardware detection
+4. Collects comprehensive diagnostics
+5. Saves timestamped report: `driver_diagnostics_YYYYMMDD_HHMMSS.txt`
+6. Shows sysfs/debugfs monitoring info
+
+**The diagnostic file includes:**
+- System and kernel info
+- Complete PCI device details
+- All driver dmesg messages
+- Sysfs entries (adapter info, queue stats, doorbells, BARs)
+- Debugfs dumps (queues, IRQ state, registers)
+- Memory and interrupt info
 
 ### Monitor Driver Activity
 
