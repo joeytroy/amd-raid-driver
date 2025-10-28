@@ -20,6 +20,7 @@ alwaysApply: true
 - Fix code issues immediately while explaining the problem
 - We are doing vibe coding so execute and code based on needs
 - RAID is already configured in BIOS - focus on driver functionality, not BIOS setup
+- After each change to the code please commit with quality details so we know what has been done
 
 ## Real Hardware Implementation Requirements
 - NO placeholder logic - implement real hardware communication
