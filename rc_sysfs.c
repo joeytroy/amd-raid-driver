@@ -63,22 +63,24 @@ static ssize_t queue_stats_show(struct device *dev,
                    "Completion Queue:\n"
                    "  Size: %u\n"
                    "  Head: %u\n"
-                   "  Tail: %u\n"
                    "  DMA Address: 0x%llx\n"
                    "\n"
                    "Statistics:\n"
                    "  IRQ Count: %d\n"
-                   "  Command Sequence: %d\n",
+                   "  Command Sequence: %d\n"
+                   "  Completions: %d\n"
+                   "  Sync Completions: %d\n",
                    hw->cmd_queue_size,
                    hw->cmd_queue_head,
                    hw->cmd_queue_tail,
                    (unsigned long long)hw->cmd_queue_dma,
                    hw->comp_queue_size,
                    hw->comp_queue_head,
-                   hw->comp_queue_tail,
                    (unsigned long long)hw->comp_queue_dma,
                    atomic_read(&hw->irq_count),
-                   atomic_read(&hw->cmd_sequence));
+                   atomic_read(&hw->cmd_sequence),
+                   atomic_read(&hw->completion_count),
+                   atomic_read(&hw->sync_completion_count));
 
     return len;
 }

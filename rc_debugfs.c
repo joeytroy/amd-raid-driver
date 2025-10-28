@@ -79,7 +79,6 @@ static int rc_debugfs_comp_queue_show(struct seq_file *m, void *v)
     seq_printf(m, "=====================================\n\n");
     seq_printf(m, "Queue Size: %u\n", hw->comp_queue_size);
     seq_printf(m, "Head: %u\n", hw->comp_queue_head);
-    seq_printf(m, "Tail: %u\n", hw->comp_queue_tail);
     seq_printf(m, "DMA Address: 0x%llx\n\n", (unsigned long long)hw->comp_queue_dma);
 
     seq_printf(m, "Entries:\n");

@@ -11,10 +11,12 @@
 // Discover RAID arrays from firmware
 int rc_discover_arrays(struct rc_adapter *adapter)
 {
-	struct rc_hw_command cmd = {0};
-	dma_addr_t dma_addr;
-	void *dma_buf;
-	int ret;
+    struct rc_hw_command cmd = {0};
+    struct rc_hw_completion comp = {0};
+    dma_addr_t dma_addr;
+    void *dma_buf;
+    u32 bytes;
+    int ret;
 	
 	rc_printk(RC_INFO, "rc_discover_arrays: discovering RAID arrays from firmware\n");
 	
@@ -39,31 +41,42 @@ int rc_discover_arrays(struct rc_adapter *adapter)
 	rc_printk(RC_DEBUG, "rc_discover_arrays: submitting metadata read command\n");
 	
 	// Submit command to hardware
-	ret = rc_hw_submit_command(&adapter->hw, &cmd);
-	if (ret < 0) {
-		rc_printk(RC_ERROR, "rc_discover_arrays: failed to submit command\n");
-		dma_pool_free(adapter->hw.dma_pool, dma_buf, dma_addr);
-		return ret;
-	}
-	
-	// TODO: Wait for completion and process metadata
-	// For now, simulate finding one RAID array
-	rc_printk(RC_INFO, "rc_discover_arrays: found 1 RAID array (simulated)\n");
-	
-	// Free DMA buffer
-	dma_pool_free(adapter->hw.dma_pool, dma_buf, dma_addr);
-	
-	return 1; // Return number of arrays found
+    ret = rc_hw_submit_sync_command(&adapter->hw, &cmd, &comp, 5000);
+    if (ret < 0) {
+        rc_printk(RC_ERROR, "rc_discover_arrays: command timeout (%d)\n", ret);
+        dma_pool_free(adapter->hw.dma_pool, dma_buf, dma_addr);
+        return ret;
+    }
+
+    if (comp.status != RC_STATUS_SUCCESS) {
+        rc_printk(RC_WARN,
+                  "rc_discover_arrays: firmware status=%u error=0x%x\n",
+                  comp.status, comp.error_code);
+        dma_pool_free(adapter->hw.dma_pool, dma_buf, dma_addr);
+        return -EIO;
+    }
+
+    bytes = min(comp.bytes_transferred, (u32)0x1000);
+    rc_printk(RC_INFO,
+              "rc_discover_arrays: firmware metadata retrieved (%u bytes)\n",
+              bytes);
+
+    // TODO: Parse OSIC metadata layout and populate arrays.
+
+    dma_pool_free(adapter->hw.dma_pool, dma_buf, dma_addr);
+
+    return 0;
 }
 
 // Read specific array metadata
 int rc_read_array_metadata(struct rc_adapter *adapter, int array_id, 
 			   struct rc_raid_metadata *metadata)
 {
-	struct rc_hw_command cmd = {0};
-	dma_addr_t dma_addr;
-	void *dma_buf;
-	int ret;
+    struct rc_hw_command cmd = {0};
+    struct rc_hw_completion comp = {0};
+    dma_addr_t dma_addr;
+    void *dma_buf;
+    int ret;
 	
 	rc_printk(RC_DEBUG, "rc_read_array_metadata: reading metadata for array %d\n", array_id);
 	
@@ -86,38 +99,45 @@ int rc_read_array_metadata(struct rc_adapter *adapter, int array_id,
 	cmd.generation_number = 0;
 	
 	// Submit command to hardware
-	ret = rc_hw_submit_command(&adapter->hw, &cmd);
-	if (ret < 0) {
-		rc_printk(RC_ERROR, "rc_read_array_metadata: failed to submit command\n");
-		dma_pool_free(adapter->hw.dma_pool, dma_buf, dma_addr);
-		return ret;
-	}
-	
-	// TODO: Wait for completion and copy metadata
-	// For now, simulate metadata
-	memset(metadata, 0, sizeof(*metadata));
-	metadata->signature = 0x44414952; // "RAID"
-	metadata->version = 1;
-	metadata->array_id = array_id;
-	metadata->raid_level = 0; // RAID 0
-	metadata->num_disks = 2;
-	metadata->array_size = 4000787030016ULL >> 9; // 3.6TB in sectors
-	metadata->stripe_size = 64; // 64KB stripe
-	metadata->generation = 1;
-	
-	rc_printk(RC_DEBUG, "rc_read_array_metadata: array %d metadata read successfully\n", array_id);
-	
-	// Free DMA buffer
-	dma_pool_free(adapter->hw.dma_pool, dma_buf, dma_addr);
-	
-	return 0;
+    ret = rc_hw_submit_sync_command(&adapter->hw, &cmd, &comp, 5000);
+    if (ret < 0) {
+        rc_printk(RC_ERROR, "rc_read_array_metadata: command timeout (%d)\n", ret);
+        dma_pool_free(adapter->hw.dma_pool, dma_buf, dma_addr);
+        return ret;
+    }
+
+    if (comp.status != RC_STATUS_SUCCESS) {
+        rc_printk(RC_WARN,
+                  "rc_read_array_metadata: firmware status=%u error=0x%x\n",
+                  comp.status, comp.error_code);
+        dma_pool_free(adapter->hw.dma_pool, dma_buf, dma_addr);
+        return -EIO;
+    }
+
+    if (comp.bytes_transferred < sizeof(*metadata)) {
+        rc_printk(RC_WARN,
+                  "rc_read_array_metadata: insufficient data (%u bytes)\n",
+                  comp.bytes_transferred);
+        dma_pool_free(adapter->hw.dma_pool, dma_buf, dma_addr);
+        return -EMSGSIZE;
+    }
+
+    memcpy(metadata, dma_buf, sizeof(*metadata));
+    rc_printk(RC_DEBUG,
+              "rc_read_array_metadata: array %d metadata copied (%u bytes)\n",
+              array_id, comp.bytes_transferred);
+
+    dma_pool_free(adapter->hw.dma_pool, dma_buf, dma_addr);
+
+    return 0;
 }
 
 // Scan for physical disks
 int rc_scan_physical_disks(struct rc_adapter *adapter)
 {
 	struct rc_hw_command cmd = {0};
-	int ret;
+    struct rc_hw_completion comp = {0};
+    int ret;
 	
 	rc_printk(RC_INFO, "rc_scan_physical_disks: scanning for physical disks\n");
 	
@@ -133,13 +153,20 @@ int rc_scan_physical_disks(struct rc_adapter *adapter)
 	cmd.generation_number = 0;
 	
 	// Submit command to hardware
-	ret = rc_hw_submit_command(&adapter->hw, &cmd);
-	if (ret < 0) {
-		rc_printk(RC_ERROR, "rc_scan_physical_disks: failed to submit command\n");
-		return ret;
-	}
-	
-	rc_printk(RC_INFO, "rc_scan_physical_disks: disk scan command submitted\n");
-	
-	return 0;
+    ret = rc_hw_submit_sync_command(&adapter->hw, &cmd, &comp, 5000);
+    if (ret < 0) {
+        rc_printk(RC_ERROR, "rc_scan_physical_disks: command timeout (%d)\n", ret);
+        return ret;
+    }
+
+    if (comp.status != RC_STATUS_SUCCESS) {
+        rc_printk(RC_WARN,
+                  "rc_scan_physical_disks: firmware status=%u error=0x%x\n",
+                  comp.status, comp.error_code);
+        return -EIO;
+    }
+
+    rc_printk(RC_INFO, "rc_scan_physical_disks: disk scan completed\n");
+
+    return 0;
 }

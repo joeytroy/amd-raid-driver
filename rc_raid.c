@@ -164,9 +164,10 @@ irqreturn_t rc_interrupt_handler(int irq, void *dev_id)
 // Scan for RAID arrays configured in BIOS
 int rc_raid_scan_arrays(struct rc_adapter *adapter)
 {
-    int i, err;
+    int err;
     
     rc_printk(RC_NOTE, "rc_raid_scan_arrays: scanning for RAID arrays using firmware\n");
+    rc_state.raid.num_arrays = 0;
     
     // Scan for physical disks first
     err = rc_scan_physical_disks(adapter);
@@ -182,32 +183,8 @@ int rc_raid_scan_arrays(struct rc_adapter *adapter)
         return err;
     }
     
-    // For now, create a dummy RAID array to test block device functionality
-    // In a real implementation, this would read from the RAID controller's configuration
-    for (i = 0; i < 1; i++) { // Create one test array
-        struct rc_raid_array *array = &rc_state.raid.arrays[i];
-        
-        // Initialize array structure
-        array->array_id = i;
-        array->raid_type = RC_RAID_TYPE_RAID0;
-        array->state = RC_RAID_STATE_ONLINE;
-        array->total_sectors = 7814037168; // ~3.9TB in sectors (512 bytes each)
-        array->used_sectors = 0;
-        array->num_disks = 2;
-        array->stripe_size = 64; // 64KB stripe
-        snprintf(array->name, sizeof(array->name), "RAID0_Array_%d", i);
-        array->adapter = adapter;
-        
-        // TODO: Block device creation hangs during module init
-        // Need to defer to workqueue or make it optional
-        // For now, just report the array without creating the device
-        rc_state.raid.num_arrays++;
-        rc_printk(RC_NOTE, "rc_raid_scan_arrays: found RAID array %d (%s) - %llu sectors\n", 
-                  i, array->name, array->total_sectors);
-        rc_printk(RC_NOTE, "rc_raid_scan_arrays: block device creation deferred (TODO)\n");
-    }
-    
-    rc_printk(RC_NOTE, "rc_raid_scan_arrays: found %d RAID arrays\n", rc_state.raid.num_arrays);
+    rc_printk(RC_NOTE, "rc_raid_scan_arrays: firmware discovery completed (arrays pending parse)\n");
+    rc_state.raid.num_arrays = 0;
     return 0;
 }
 

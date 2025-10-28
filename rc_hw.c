@@ -10,13 +10,13 @@ static void rc_hw_program_queues(struct rc_hw_queue_context *hw)
 {
     void __iomem *base = hw->mmio_base;
 
-    writel(lower_32_bits(hw->cmd_queue_dma), base + RC_REG_COMMAND_QUEUE);
-    writel(upper_32_bits(hw->cmd_queue_dma), base + RC_REG_COMMAND_QUEUE + 4);
-    writel(hw->cmd_queue_size, base + RC_REG_COMMAND_QUEUE + 8);
+    writel(lower_32_bits(hw->cmd_queue_dma), base + RC_REG_CMD_Q_BASE_LO);
+    writel(upper_32_bits(hw->cmd_queue_dma), base + RC_REG_CMD_Q_BASE_HI);
+    writel(hw->cmd_queue_size, base + RC_REG_CMD_Q_SIZE);
 
-    writel(lower_32_bits(hw->comp_queue_dma), base + RC_REG_COMPLETION_QUEUE);
-    writel(upper_32_bits(hw->comp_queue_dma), base + RC_REG_COMPLETION_QUEUE + 4);
-    writel(hw->comp_queue_size, base + RC_REG_COMPLETION_QUEUE + 8);
+    writel(lower_32_bits(hw->comp_queue_dma), base + RC_REG_COMP_Q_BASE_LO);
+    writel(upper_32_bits(hw->comp_queue_dma), base + RC_REG_COMP_Q_BASE_HI);
+    writel(hw->comp_queue_size, base + RC_REG_COMP_Q_SIZE);
 }
 
 int rc_hw_init(struct rc_adapter *adapter)
@@ -40,7 +40,14 @@ int rc_hw_init(struct rc_adapter *adapter)
     spin_lock_init(&hw->pending_lock);
     atomic_set(&hw->irq_count, 0);
     atomic_set(&hw->cmd_sequence, 0);
+    atomic_set(&hw->completion_count, 0);
+    atomic_set(&hw->sync_completion_count, 0);
     memset(hw->pending_reqs, 0, sizeof(hw->pending_reqs));
+    spin_lock_init(&hw->sync_lock);
+    hw->sync.active = false;
+    hw->sync.completed = false;
+    hw->sync.cmd_id = 0;
+    memset(&hw->sync.completion, 0, sizeof(hw->sync.completion));
 
     // DMA pool for per-request data buffers (not for the queues themselves)
     hw->dma_pool = dma_pool_create("rcraid_data", &pdev->dev, 4096, 64, 0);
@@ -73,11 +80,12 @@ int rc_hw_init(struct rc_adapter *adapter)
     hw->cmd_queue_head = 0;
     hw->cmd_queue_tail = 0;
     hw->comp_queue_head = 0;
-    hw->comp_queue_tail = 0;
 
     rc_hw_program_queues(hw);
 
-    writel(0x1, hw->mmio_base + RC_REG_INTERRUPT_MASK);
+    /* Enable all interrupt sources we understand (vector 244). */
+    writel(0xffffffff, hw->mmio_base + RC_REG_INTERRUPT_STATUS);
+    writel(0x0000000f, hw->mmio_base + RC_REG_INTERRUPT_MASK);
 
     rc_printk(RC_INFO, "rc_hw_init: queues programmed (cmd=0x%llx comp=0x%llx)\n",
               (unsigned long long)hw->cmd_queue_dma,
@@ -143,7 +151,8 @@ int rc_hw_submit_command(struct rc_hw_queue_context *hw, struct rc_hw_command *c
         return -EINVAL;
     }
 
-    cmd->command_id = atomic_inc_return(&hw->cmd_sequence);
+    if (!cmd->command_id)
+        cmd->command_id = atomic_inc_return(&hw->cmd_sequence);
     memcpy(&hw->cmd_queue[hw->cmd_queue_tail], cmd, sizeof(*cmd));
     hw->cmd_queue_tail = next_tail;
 
@@ -164,25 +173,100 @@ int rc_hw_submit_command(struct rc_hw_queue_context *hw, struct rc_hw_command *c
 
 int rc_hw_process_completions(struct rc_hw_queue_context *hw)
 {
+    return rc_hw_poll_completions(hw);
+}
+
+int rc_hw_poll_completions(struct rc_hw_queue_context *hw)
+{
+    struct rc_adapter *adapter;
     unsigned long flags;
-    u32 processed = 0;
+    u32 processed;
+
+    if (!hw)
+        return 0;
+
+    adapter = hw->owner;
+    if (!adapter)
+        return 0;
 
     spin_lock_irqsave(&hw->irq_lock, flags);
-
-    while (hw->comp_queue_head != hw->comp_queue_tail) {
-        struct rc_hw_completion *comp = &hw->comp_queue[hw->comp_queue_head];
-
-        if (!comp->command_id)
-            break;
-
-        memset(comp, 0, sizeof(*comp));
-        hw->comp_queue_head = (hw->comp_queue_head + 1) % hw->cmd_queue_size;
-        processed++;
-    }
-
+    processed = rc_hw_complete_locked(adapter);
     spin_unlock_irqrestore(&hw->irq_lock, flags);
 
     return processed;
+}
+
+int rc_hw_submit_sync_command(struct rc_hw_queue_context *hw,
+                             struct rc_hw_command *cmd,
+                             struct rc_hw_completion *completion,
+                             unsigned int timeout_ms)
+{
+    unsigned long flags;
+    unsigned long timeout;
+    struct rc_adapter *adapter;
+    int ret;
+
+    if (!hw || !cmd)
+        return -EINVAL;
+
+    adapter = hw->owner;
+    if (!adapter)
+        return -ENODEV;
+
+    if (!timeout_ms)
+        timeout_ms = 5000;
+
+    spin_lock_irqsave(&hw->sync_lock, flags);
+    if (hw->sync.active) {
+        spin_unlock_irqrestore(&hw->sync_lock, flags);
+        rc_printk(RC_WARN, "rc_hw_submit_sync_command: sync slot busy\n");
+        return -EBUSY;
+    }
+
+    hw->sync.active = true;
+    hw->sync.completed = false;
+    hw->sync.cmd_id = 0;
+    memset(&hw->sync.completion, 0, sizeof(hw->sync.completion));
+    spin_unlock_irqrestore(&hw->sync_lock, flags);
+
+    ret = rc_hw_submit_command(hw, cmd);
+    if (ret)
+        goto out_clear;
+
+    spin_lock_irqsave(&hw->sync_lock, flags);
+    hw->sync.cmd_id = cmd->command_id;
+    spin_unlock_irqrestore(&hw->sync_lock, flags);
+
+    timeout = jiffies + msecs_to_jiffies(timeout_ms);
+    do {
+        rc_hw_poll_completions(hw);
+
+        spin_lock_irqsave(&hw->sync_lock, flags);
+        if (hw->sync.completed) {
+            if (completion)
+                *completion = hw->sync.completion;
+            hw->sync.active = false;
+            spin_unlock_irqrestore(&hw->sync_lock, flags);
+            return 0;
+        }
+        spin_unlock_irqrestore(&hw->sync_lock, flags);
+
+        usleep_range(500, 2000);
+    } while (time_before(jiffies, timeout));
+
+    ret = -ETIMEDOUT;
+    rc_printk(RC_WARN, "rc_hw_submit_sync_command: cmd_id=%u timed out\n",
+              cmd->command_id);
+
+out_clear:
+    spin_lock_irqsave(&hw->sync_lock, flags);
+    hw->sync.active = false;
+    hw->sync.completed = false;
+    hw->sync.cmd_id = 0;
+    memset(&hw->sync.completion, 0, sizeof(hw->sync.completion));
+    spin_unlock_irqrestore(&hw->sync_lock, flags);
+
+    return ret;
 }
 
 /*----------------------------------------------------------------------
@@ -247,67 +331,102 @@ static void rc_clear_pending_request(struct rc_hw_queue_context *hw, u32 cmd_id)
     spin_unlock_irqrestore(&hw->pending_lock, flags);
 }
 
-/*----------------------------------------------------------------------
- * StorPort slot +0x680: Completion pump logic (called by ISR)
- *----------------------------------------------------------------------*/
+static bool rc_hw_try_complete_sync(struct rc_hw_queue_context *hw,
+                                    struct rc_hw_completion *comp)
+{
+    unsigned long flags;
+    bool handled = false;
 
-static void rc_completion_pump(struct rc_adapter *adapter, void *queue_handle)
+    spin_lock_irqsave(&hw->sync_lock, flags);
+    if (hw->sync.active && hw->sync.cmd_id == comp->command_id) {
+        hw->sync.completion = *comp;
+        hw->sync.completed = true;
+        handled = true;
+    }
+    spin_unlock_irqrestore(&hw->sync_lock, flags);
+
+    if (handled)
+        atomic_inc(&hw->sync_completion_count);
+
+    return handled;
+}
+
+static void rc_hw_handle_async_completion(struct rc_adapter *adapter,
+                                          struct rc_hw_completion *comp)
+{
+    struct rc_hw_queue_context *hw = &adapter->hw;
+    struct rc_pending_request *pending;
+    blk_status_t blk_status;
+
+    pending = rc_find_pending_request(hw, comp->command_id);
+    if (pending && pending->rq) {
+        switch (comp->status) {
+        case RC_STATUS_SUCCESS:
+            blk_status = BLK_STS_OK;
+            break;
+        case RC_STATUS_BUSY:
+            blk_status = BLK_STS_AGAIN;
+            break;
+        default:
+            blk_status = BLK_STS_IOERR;
+            break;
+        }
+
+        if (pending->dma_buf)
+            dma_pool_free(hw->dma_pool, pending->dma_buf, pending->dma_addr);
+
+        blk_mq_end_request(pending->rq, blk_status);
+        rc_clear_pending_request(hw, comp->command_id);
+
+        rc_printk(RC_DEBUG, "rc_completion_pump: completed cmd_id=%u status=%u\n",
+                  comp->command_id, comp->status);
+    } else {
+        rc_printk(RC_DEBUG, "rc_completion_pump: cmd_id=%u (no request)\n",
+                  comp->command_id);
+    }
+}
+
+static u32 rc_hw_complete_locked(struct rc_adapter *adapter)
 {
     struct rc_hw_queue_context *hw = &adapter->hw;
     u32 processed = 0;
 
-    // Process completions from this queue handle
-    while (hw->comp_queue_head != hw->comp_queue_tail) {
+    while (true) {
         struct rc_hw_completion *comp = &hw->comp_queue[hw->comp_queue_head];
-        struct rc_pending_request *pending;
-        blk_status_t blk_status;
 
-        if (!comp->command_id)
+        if (!READ_ONCE(comp->command_id))
             break;
 
-        // Find pending request for this completion
-        pending = rc_find_pending_request(hw, comp->command_id);
-        if (pending && pending->rq) {
-            // Map hardware status to blk-mq status
-            switch (comp->status) {
-            case RC_STATUS_SUCCESS:
-                blk_status = BLK_STS_OK;
-                break;
-            case RC_STATUS_BUSY:
-                blk_status = BLK_STS_AGAIN;
-                break;
-            default:
-                blk_status = BLK_STS_IOERR;
-                break;
-            }
-
-            // Free DMA buffer if allocated
-            if (pending->dma_buf) {
-                dma_pool_free(hw->dma_pool, pending->dma_buf, pending->dma_addr);
-            }
-
-            // Complete blk-mq request
-            blk_mq_end_request(pending->rq, blk_status);
-
-            // Clear pending tracking
-            rc_clear_pending_request(hw, comp->command_id);
-
-            rc_printk(RC_DEBUG, "rc_completion_pump: completed cmd_id=%u status=%u\n",
-                      comp->command_id, comp->status);
-        } else {
-            rc_printk(RC_DEBUG, "rc_completion_pump: cmd_id=%u (no request)\n",
-                      comp->command_id);
-        }
+        if (!rc_hw_try_complete_sync(hw, comp))
+            rc_hw_handle_async_completion(adapter, comp);
 
         memset(comp, 0, sizeof(*comp));
-        hw->comp_queue_head = (hw->comp_queue_head + 1) % hw->cmd_queue_size;
+        hw->comp_queue_head = (hw->comp_queue_head + 1) % hw->comp_queue_size;
+        hw->cmd_queue_head = (hw->cmd_queue_head + 1) % hw->cmd_queue_size;
+        atomic_inc(&hw->completion_count);
         processed++;
     }
 
-    if (processed > 0) {
+    return processed;
+}
+
+/*----------------------------------------------------------------------
+ * StorPort slot +0x680: Completion pump logic (called by ISR)
+ *----------------------------------------------------------------------*/
+
+static void rc_completion_pump(struct rc_adapter *adapter)
+{
+    struct rc_hw_queue_context *hw = &adapter->hw;
+    unsigned long flags;
+    u32 processed;
+
+    spin_lock_irqsave(&hw->irq_lock, flags);
+    processed = rc_hw_complete_locked(adapter);
+    spin_unlock_irqrestore(&hw->irq_lock, flags);
+
+    if (processed)
         rc_printk(RC_DEBUG, "rc_completion_pump: processed %u completions\n",
                   processed);
-    }
 }
 
 /*----------------------------------------------------------------------
@@ -373,20 +492,19 @@ irqreturn_t rc_hw_interrupt_handler(int irq, void *dev_id)
     // Acknowledge interrupt
     writel(status, hw->mmio_base + RC_REG_INTERRUPT_STATUS);
     atomic_inc(&hw->irq_count);
+    rc_printk(RC_DEBUG, "rc_hw_interrupt_handler: status=0x%08x\n", status);
 
     // FUN_14000d2b8 sequence:
     // 1. Process primary queue handle (devExt+0x6B8)
-    if (irq_state->primary_queue) {
-        rc_completion_pump(adapter, irq_state->primary_queue);
-    }
+    if (irq_state->primary_queue)
+        rc_completion_pump(adapter);
 
     // 2. Iterate queue table array (devExt+0x6C0) and process each
     if (irq_state->queue_table) {
         for (i = 0; i < RC_MAX_QUEUE_DESCRIPTORS; i++) {
             void *queue_handle = irq_state->queue_table[i];
-            if (queue_handle && queue_handle != irq_state->primary_queue) {
-                rc_completion_pump(adapter, queue_handle);
-            }
+            if (queue_handle && queue_handle != irq_state->primary_queue)
+                rc_completion_pump(adapter);
         }
     }
 

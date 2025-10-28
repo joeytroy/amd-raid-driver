@@ -49,6 +49,7 @@ static inline int scsi_add_host(struct Scsi_Host *host, struct device *dev) { re
 #include <linux/workqueue.h>
 #include <linux/list.h>
 #include <linux/spinlock.h>
+#include <linux/wait.h>
 
 #include "rc_pci_ids.h"
 
@@ -176,18 +177,27 @@ struct rc_hw_queue_context {
     struct rc_hw_completion *comp_queue;
     dma_addr_t comp_queue_dma;
     u32 comp_queue_head;
-    u32 comp_queue_tail;
     u32 comp_queue_size;
 
     spinlock_t irq_lock;
     atomic_t irq_count;
     atomic_t cmd_sequence;
+    atomic_t completion_count;
+    atomic_t sync_completion_count;
 
     struct dma_pool *dma_pool;
 
     // Request tracking for blk-mq
     struct rc_pending_request pending_reqs[RC_MAX_PENDING_REQUESTS];
     spinlock_t pending_lock;
+
+    spinlock_t sync_lock;
+    struct {
+        u32 cmd_id;
+        struct rc_hw_completion completion;
+        bool active;
+        bool completed;
+    } sync;
 };
 
 // Adapter structure (rcbottom equivalent)
@@ -312,13 +322,17 @@ int rc_raid_array_ioctl(struct block_device *bdev, fmode_t mode, unsigned int cm
 #define RC_PCI_DID			0x43bd
 
 // Hardware register offsets (BAR 5 mapping)
-#define RC_REG_COMMAND_QUEUE		0x000
-#define RC_REG_COMPLETION_QUEUE	0x100
-#define RC_REG_DOORBELL		0x200
-#define RC_REG_STATUS			0x300
-#define RC_REG_CONTROL			0x400
-#define RC_REG_INTERRUPT_STATUS	0x500
-#define RC_REG_INTERRUPT_MASK	0x600
+#define RC_REG_STATUS			0x000
+#define RC_REG_CONTROL			0x004
+#define RC_REG_INTERRUPT_STATUS	0x008
+#define RC_REG_INTERRUPT_MASK	0x00C
+#define RC_REG_DOORBELL		0x010
+#define RC_REG_CMD_Q_BASE_LO		0x020
+#define RC_REG_CMD_Q_BASE_HI		0x024
+#define RC_REG_CMD_Q_SIZE		0x028
+#define RC_REG_COMP_Q_BASE_LO		0x030
+#define RC_REG_COMP_Q_BASE_HI		0x034
+#define RC_REG_COMP_Q_SIZE		0x038
 
 // Real AMD RAID command structures (based on Windows driver analysis)
 #define RC_CMD_READ_DATA		0x01
@@ -381,33 +395,6 @@ struct rc_raid_metadata {
 	u8 reserved[64];	// Reserved for future use
 } __packed;
 
-// Hardware adapter structure
-struct rc_hw_adapter {
-	void __iomem *mmio_base;
-	u32 msi_vector;
-	struct pci_dev *pdev;
-	
-	// Command/Completion queues
-	struct rc_hw_command *cmd_queue;
-	dma_addr_t cmd_queue_dma;
-	u32 cmd_queue_head;
-	u32 cmd_queue_tail;
-	u32 cmd_queue_size;
-	
-	struct rc_hw_completion *comp_queue;
-	dma_addr_t comp_queue_dma;
-	u32 comp_queue_head;
-	u32 comp_queue_tail;
-	u32 comp_queue_size;
-	
-	// Interrupt handling
-	spinlock_t irq_lock;
-	atomic_t irq_count;
-	
-	// DMA operations
-	struct dma_pool *dma_pool;
-};
-
 // Block major number (defined in rc_main.c)
 extern int rc_major;
 
@@ -416,6 +403,11 @@ int rc_hw_init(struct rc_adapter *adapter);
 void rc_hw_cleanup(struct rc_adapter *adapter);
 int rc_hw_submit_command(struct rc_hw_queue_context *hw, struct rc_hw_command *cmd);
 int rc_hw_process_completions(struct rc_hw_queue_context *hw);
+int rc_hw_submit_sync_command(struct rc_hw_queue_context *hw,
+                             struct rc_hw_command *cmd,
+                             struct rc_hw_completion *completion,
+                             unsigned int timeout_ms);
+int rc_hw_poll_completions(struct rc_hw_queue_context *hw);
 irqreturn_t rc_hw_interrupt_handler(int irq, void *dev_id);
 int rc_hw_submit_request(struct rc_adapter *adapter, struct request *rq,
                          u32 opcode, sector_t lba, u32 sector_count,
