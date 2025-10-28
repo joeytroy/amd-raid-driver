@@ -49,7 +49,6 @@ static inline int scsi_add_host(struct Scsi_Host *host, struct device *dev) { re
 #include <linux/workqueue.h>
 #include <linux/list.h>
 #include <linux/spinlock.h>
-#include <linux/wait.h>
 
 #include "rc_pci_ids.h"
 
@@ -157,6 +156,30 @@ struct rc_pending_request {
     void *dma_buf;
     u32 cmd_id;
 };
+
+// Hardware command/ completion structures must be defined before the queue
+// context because the context embeds completion instances for sync commands.
+struct rc_hw_command {
+    u32 command_id;
+    u32 opcode;
+    u32 flags;
+    u32 channel_id;        // Logical device ID
+    u64 lba;
+    u32 sector_count;
+    u64 data_addr;
+    u64 completion_addr;
+    u64 generation_number; // For config commands
+    u32 reserved[2];
+} __packed;
+
+struct rc_hw_completion {
+    u32 command_id;
+    u32 status;
+    u32 error_code;
+    u32 bytes_transferred;
+    u64 timestamp;
+    u32 reserved[3];
+} __packed;
 
 // Hardware adapter bookkeeping (queue/DMA resources)
 struct rc_hw_queue_context {
