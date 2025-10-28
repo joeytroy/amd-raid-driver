@@ -380,30 +380,6 @@ int rc_raid_array_ioctl(struct block_device *bdev, fmode_t mode, unsigned int cm
 #define RC_STATUS_INVALID_PARAM	0x04
 #define RC_STATUS_DEVICE_ERROR		0x05
 
-// Command queue structures
-struct rc_hw_command {
-	u32 command_id;
-	u32 opcode;
-	u32 flags;
-	u32 channel_id;		// Logical device ID
-	u64 lba;
-	u32 sector_count;
-	u64 data_addr;
-	u64 completion_addr;
-	u64 generation_number;	// For config commands
-	u32 reserved[2];
-} __packed;
-
-// Completion queue structures  
-struct rc_hw_completion {
-	u32 command_id;
-	u32 status;
-	u32 error_code;
-	u32 bytes_transferred;
-	u64 timestamp;
-	u32 reserved[3];
-} __packed;
-
 // RAID metadata structures (based on Windows driver analysis)
 struct rc_raid_metadata {
 	u32 signature;		// RAID signature
