@@ -9,14 +9,45 @@
 static void rc_hw_program_queues(struct rc_hw_queue_context *hw)
 {
     void __iomem *base = hw->mmio_base;
+    u32 offsets[] = {
+        RC_REG_CMD_Q_BASE_LO,
+        RC_REG_CMD_Q_BASE_HI,
+        RC_REG_CMD_Q_SIZE,
+        RC_REG_COMP_Q_BASE_LO,
+        RC_REG_COMP_Q_BASE_HI,
+        RC_REG_COMP_Q_SIZE,
+    };
+    const char *labels[] = {
+        "cmd_base_lo",
+        "cmd_base_hi",
+        "cmd_size",
+        "comp_base_lo",
+        "comp_base_hi",
+        "comp_size",
+    };
+    u32 values[] = {
+        lower_32_bits(hw->cmd_queue_dma),
+        upper_32_bits(hw->cmd_queue_dma),
+        hw->cmd_queue_size,
+        lower_32_bits(hw->comp_queue_dma),
+        upper_32_bits(hw->comp_queue_dma),
+        hw->comp_queue_size,
+    };
+    size_t i;
 
-    writel(lower_32_bits(hw->cmd_queue_dma), base + RC_REG_CMD_Q_BASE_LO);
-    writel(upper_32_bits(hw->cmd_queue_dma), base + RC_REG_CMD_Q_BASE_HI);
-    writel(hw->cmd_queue_size, base + RC_REG_CMD_Q_SIZE);
+    for (i = 0; i < ARRAY_SIZE(offsets); i++) {
+        u32 before = readl(base + offsets[i]);
+        writel(values[i], base + offsets[i]);
+        rc_printk(RC_INFO,
+                  "rc_hw_program_queues: %s offset=0x%03x before=0x%08x write=0x%08x after=0x%08x\n",
+                  labels[i], offsets[i], before, values[i], readl(base + offsets[i]));
+    }
 
-    writel(lower_32_bits(hw->comp_queue_dma), base + RC_REG_COMP_Q_BASE_LO);
-    writel(upper_32_bits(hw->comp_queue_dma), base + RC_REG_COMP_Q_BASE_HI);
-    writel(hw->comp_queue_size, base + RC_REG_COMP_Q_SIZE);
+    for (i = 0; i < ARRAY_SIZE(offsets); i++) {
+        rc_printk(RC_INFO,
+                  "rc_hw_program_queues: verify offset=0x%03x value=0x%08x\n",
+                  offsets[i], readl(base + offsets[i]));
+    }
 }
 
 int rc_hw_init(struct rc_adapter *adapter)

@@ -130,20 +130,38 @@ rc_program_completion_registers(struct rc_adapter *adapter,
 {
     void __iomem *base = adapter->ctx.mmio_base;
     u32 queue_idx = desc->queue_index;
+    u32 offsets[4];
+    const char *labels[] = {
+        "comp_base_lo",
+        "comp_base_hi",
+        "comp_size",
+        "comp_enable",
+    };
+    u32 values[4];
+    size_t i;
 
     if (!base) {
         rc_printk(RC_ERROR, "rc_program_completion_registers: no MMIO base\n");
         return -EINVAL;
     }
 
-    // Program completion queue base address (twice per queue as per notes)
-    // First pass: setup completion queue pointer
-    writel(lower_32_bits(desc->completion_dma), base + 0x100 + (queue_idx * 0x10));
-    writel(upper_32_bits(desc->completion_dma), base + 0x104 + (queue_idx * 0x10));
-    writel(desc->queue_depth, base + 0x108 + (queue_idx * 0x10));
+    offsets[0] = 0x100 + (queue_idx * 0x10);
+    offsets[1] = 0x104 + (queue_idx * 0x10);
+    offsets[2] = 0x108 + (queue_idx * 0x10);
+    offsets[3] = 0x10C + (queue_idx * 0x10);
 
-    // Second pass: enable completion interrupts
-    writel(0x1, base + 0x10C + (queue_idx * 0x10));
+    values[0] = lower_32_bits(desc->completion_dma);
+    values[1] = upper_32_bits(desc->completion_dma);
+    values[2] = desc->queue_depth;
+    values[3] = 0x1;
+
+    for (i = 0; i < ARRAY_SIZE(offsets); i++) {
+        u32 before = readl(base + offsets[i]);
+        writel(values[i], base + offsets[i]);
+        rc_printk(RC_INFO,
+                  "rc_program_completion_registers: q%u %s offset=0x%03x before=0x%08x write=0x%08x after=0x%08x\n",
+                  queue_idx, labels[i], offsets[i], before, values[i], readl(base + offsets[i]));
+    }
 
     rc_printk(RC_INFO, "rc_program_completion_registers: queue %u configured\n",
               queue_idx);
