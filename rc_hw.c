@@ -176,6 +176,8 @@ int rc_hw_process_completions(struct rc_hw_queue_context *hw)
     return rc_hw_poll_completions(hw);
 }
 
+static u32 rc_hw_complete_locked(struct rc_adapter *adapter);
+
 int rc_hw_poll_completions(struct rc_hw_queue_context *hw)
 {
     struct rc_adapter *adapter;
