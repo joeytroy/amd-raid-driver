@@ -11,21 +11,27 @@
 
 // StorPort slot +0x1F8: Queue descriptor (0x78 bytes, FUN_14000d66c)
 struct rc_queue_descriptor {
-    void *control_block;        // +0x00: pointer to 0x400-byte DMA block
-    dma_addr_t control_dma;     // +0x08: DMA address of control block
-    u32 queue_index;            // +0x10: queue index (0-based)
-    u32 queue_depth;            // +0x14: number of entries
-    u32 flags;                  // +0x18: queue flags
-    u32 state;                  // +0x1C: queue state
-    void *completion_ptr;       // +0x20: completion queue pointer
-    dma_addr_t completion_dma;  // +0x28: completion queue DMA
-    spinlock_t lock;            // +0x30: per-queue lock
-    u32 head;                   // +0x38: submission head
-    u32 tail;                   // +0x3C: submission tail
-    u32 comp_head;              // +0x40: completion head
-    u32 comp_tail;              // +0x44: completion tail
-    atomic_t pending;           // +0x48: pending command count
-    u8 reserved[44];            // +0x4C: padding to 0x78
+    void *control_block;        // Host command list buffer (0x400 bytes)
+    dma_addr_t control_dma;
+    u32 queue_index;
+    u32 queue_depth;
+    u32 flags;
+    u32 state;
+    void *completion_ptr;
+    dma_addr_t completion_dma;
+    void *cmd_list;             // alias of control_block for clarity
+    dma_addr_t cmd_list_dma;
+    u32 cmd_list_len;
+    void *fis;                  // received FIS buffer
+    dma_addr_t fis_dma;
+    u32 fis_len;
+    u32 completion_depth;
+    spinlock_t lock;
+    u32 head;
+    u32 tail;
+    u32 comp_head;
+    u32 comp_tail;
+    atomic_t pending;
 } __packed;
 
 // Descriptor table state (devExt+0x1C2A0)
@@ -65,6 +71,17 @@ rc_alloc_queue_descriptor(struct rc_adapter *adapter, u32 queue_index)
     desc->queue_depth = 32;  // Default depth from Windows
     desc->flags = 0;
     desc->state = 0;
+    desc->control_block = NULL;
+    desc->control_dma = 0;
+    desc->completion_ptr = NULL;
+    desc->completion_dma = 0;
+    desc->cmd_list = NULL;
+    desc->cmd_list_dma = 0;
+    desc->cmd_list_len = 0;
+    desc->fis = NULL;
+    desc->fis_dma = 0;
+    desc->fis_len = 0;
+    desc->completion_depth = 0;
     spin_lock_init(&desc->lock);
     atomic_set(&desc->pending, 0);
 
@@ -113,6 +130,26 @@ rc_alloc_queue_control_block(struct rc_adapter *adapter,
 
     desc->control_block = block;
     desc->control_dma = dma_addr;
+    desc->cmd_list = block;
+    desc->cmd_list_dma = dma_addr;
+    desc->cmd_list_len = 0x400;
+
+    desc->fis_len = 0x100;
+    desc->fis = dma_alloc_coherent(&pdev->dev, desc->fis_len,
+                                   &desc->fis_dma, GFP_KERNEL);
+    if (!desc->fis) {
+        rc_printk(RC_ERROR, "rc_alloc_queue_control_block: FIS alloc failed\n");
+        dma_free_coherent(&pdev->dev, 0x400, block, dma_addr);
+        desc->control_block = NULL;
+        desc->control_dma = 0;
+        desc->cmd_list = NULL;
+        desc->cmd_list_dma = 0;
+        desc->cmd_list_len = 0;
+        desc->fis_dma = 0;
+        desc->fis_len = 0;
+        return -ENOMEM;
+    }
+    memset(desc->fis, 0, desc->fis_len);
 
     rc_printk(RC_INFO, "rc_alloc_queue_control_block: queue %u block at 0x%llx\n",
               desc->queue_index, (unsigned long long)dma_addr);
@@ -167,6 +204,98 @@ rc_program_completion_registers(struct rc_adapter *adapter,
               queue_idx);
 
     return 0;
+}
+
+static int rc_program_port_registers(struct rc_adapter *adapter,
+                                     struct rc_queue_descriptor *desc)
+{
+    void __iomem *base = adapter->ctx.mmio_base;
+    void __iomem *port;
+    u32 cmd;
+    int timeout;
+
+    if (!base || !desc || !desc->cmd_list || !desc->fis)
+        return -EINVAL;
+
+    port = base + RC_PORT_REG_BASE(desc->queue_index);
+
+    /* Ensure the port is idle before reprogramming. */
+    cmd = readl(port + RC_PORT_CMD);
+    if (cmd & RC_PORT_CMD_ST) {
+        cmd &= ~RC_PORT_CMD_ST;
+        writel(cmd, port + RC_PORT_CMD);
+        wmb();
+    }
+
+    timeout = 1000;
+    while ((readl(port + RC_PORT_CMD) & RC_PORT_CMD_CR) && --timeout)
+        udelay(50);
+    if (timeout <= 0) {
+        rc_printk(RC_ERROR, "rc_program_port_registers: port %u busy (CR set)\n",
+                  desc->queue_index);
+        return -EBUSY;
+    }
+
+    cmd = readl(port + RC_PORT_CMD);
+    if (cmd & RC_PORT_CMD_FRE) {
+        cmd &= ~RC_PORT_CMD_FRE;
+        writel(cmd, port + RC_PORT_CMD);
+        wmb();
+    }
+
+    timeout = 1000;
+    while ((readl(port + RC_PORT_CMD) & RC_PORT_CMD_FR) && --timeout)
+        udelay(50);
+    if (timeout <= 0) {
+        rc_printk(RC_ERROR, "rc_program_port_registers: port %u busy (FR set)\n",
+                  desc->queue_index);
+        return -EBUSY;
+    }
+
+    writel(lower_32_bits(desc->cmd_list_dma), port + RC_PORT_CLB);
+    writel(upper_32_bits(desc->cmd_list_dma), port + RC_PORT_CLBU);
+    writel(lower_32_bits(desc->fis_dma), port + RC_PORT_FB);
+    writel(upper_32_bits(desc->fis_dma), port + RC_PORT_FBU);
+
+    wmb();
+
+    cmd = readl(port + RC_PORT_CMD);
+    cmd |= RC_PORT_CMD_FRE;
+    writel(cmd, port + RC_PORT_CMD);
+    wmb();
+
+    cmd |= RC_PORT_CMD_ST;
+    writel(cmd, port + RC_PORT_CMD);
+    wmb();
+
+    return 0;
+}
+
+static void rc_queue_stop_port(struct rc_adapter *adapter,
+                               struct rc_queue_descriptor *desc)
+{
+    void __iomem *base = adapter->ctx.mmio_base;
+    void __iomem *port;
+    u32 cmd;
+    int timeout;
+
+    if (!base || !desc)
+        return;
+
+    port = base + RC_PORT_REG_BASE(desc->queue_index);
+    cmd = readl(port + RC_PORT_CMD);
+    if (cmd & (RC_PORT_CMD_ST | RC_PORT_CMD_FRE)) {
+        cmd &= ~(RC_PORT_CMD_ST | RC_PORT_CMD_FRE);
+        writel(cmd, port + RC_PORT_CMD);
+        wmb();
+    }
+
+    timeout = 1000;
+    while ((readl(port + RC_PORT_CMD) & (RC_PORT_CMD_CR | RC_PORT_CMD_FR)) && --timeout)
+        udelay(50);
+    if (timeout <= 0)
+        rc_printk(RC_WARN, "rc_queue_stop_port: port %u did not quiesce\n",
+                  desc->queue_index);
 }
 
 /*----------------------------------------------------------------------
@@ -227,8 +356,17 @@ int rc_queue_init(struct rc_adapter *adapter)
     if (ret)
         goto err_free_desc;
 
+    desc->completion_ptr = adapter->hw.comp_queue;
+    desc->completion_dma = adapter->hw.comp_queue_dma;
+    desc->completion_depth = adapter->hw.comp_queue_size;
+    desc->queue_depth = adapter->hw.cmd_queue_size;
+
     // Program completion registers
     ret = rc_program_completion_registers(adapter, desc);
+    if (ret)
+        goto err_free_control;
+
+    ret = rc_program_port_registers(adapter, desc);
     if (ret)
         goto err_free_control;
 
@@ -250,6 +388,9 @@ int rc_queue_init(struct rc_adapter *adapter)
     return 0;
 
 err_free_control:
+    if (desc->fis)
+        dma_free_coherent(&adapter->pdev->dev, desc->fis_len,
+                          desc->fis, desc->fis_dma);
     if (desc->control_block)
         dma_free_coherent(&adapter->pdev->dev, 0x400,
                           desc->control_block, desc->control_dma);
@@ -276,6 +417,14 @@ void rc_queue_cleanup(struct rc_adapter *adapter)
         struct rc_queue_descriptor *desc = table->descriptors[i];
         if (!desc)
             continue;
+
+        rc_queue_stop_port(adapter, desc);
+
+        if (desc->fis) {
+            dma_free_coherent(&adapter->pdev->dev, desc->fis_len,
+                              desc->fis, desc->fis_dma);
+            desc->fis = NULL;
+        }
 
         if (desc->control_block)
             dma_free_coherent(&adapter->pdev->dev, 0x400,

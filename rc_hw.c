@@ -50,6 +50,52 @@ static void rc_hw_program_queues(struct rc_hw_queue_context *hw)
     }
 }
 
+static int rc_hw_start_controller(struct rc_hw_queue_context *hw)
+{
+    u32 status;
+    int timeout;
+
+    if (!hw || !hw->mmio_base)
+        return -EINVAL;
+
+    /* Wait for the controller to report idle. */
+    timeout = 1000;
+    do {
+        status = readl(hw->mmio_base + RC_REG_STATUS);
+        if (status == 0xffffffff) {
+            rc_printk(RC_ERROR, "rc_hw_start_controller: invalid status register value\n");
+            return -EIO;
+        }
+        if ((status & 0x1) == 0)
+            break;
+        udelay(100);
+    } while (--timeout);
+
+    if (timeout <= 0) {
+        rc_printk(RC_ERROR,
+                  "rc_hw_start_controller: controller busy (status=0x%08x)\n",
+                  status);
+        return -EBUSY;
+    }
+
+    /* Set the RUN bit. */
+    writel(RC_CONTROL_RUN, hw->mmio_base + RC_REG_CONTROL);
+    wmb();
+
+    timeout = 1000;
+    do {
+        status = readl(hw->mmio_base + RC_REG_STATUS);
+        if ((status & 0x1) == 0)
+            return 0;
+        udelay(100);
+    } while (--timeout);
+
+    rc_printk(RC_ERROR,
+              "rc_hw_start_controller: ready timeout (status=0x%08x)\n",
+              status);
+    return -ETIMEDOUT;
+}
+
 int rc_hw_init(struct rc_adapter *adapter)
 {
     struct rc_hw_queue_context *hw = &adapter->hw;
@@ -113,6 +159,10 @@ int rc_hw_init(struct rc_adapter *adapter)
     hw->comp_queue_head = 0;
 
     rc_hw_program_queues(hw);
+
+    ret = rc_hw_start_controller(hw);
+    if (ret)
+        goto err_free_cmd;
 
     /* Enable all interrupt sources we understand (vector 244). */
     writel(0xffffffff, hw->mmio_base + RC_REG_INTERRUPT_STATUS);

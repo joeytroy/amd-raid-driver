@@ -357,6 +357,20 @@ int rc_raid_array_ioctl(struct block_device *bdev, fmode_t mode, unsigned int cm
 #define RC_REG_COMP_Q_BASE_HI		0x034
 #define RC_REG_COMP_Q_SIZE		0x038
 
+/* Per-port register block (AHCI compatible) */
+#define RC_PORT_REG_BASE(idx)		(0x100 + ((idx) * 0x80))
+#define RC_PORT_CLB			0x00
+#define RC_PORT_CLBU			0x04
+#define RC_PORT_FB			0x08
+#define RC_PORT_FBU			0x0C
+#define RC_PORT_CMD			0x18
+#define RC_PORT_CMD_ST		BIT(0)
+#define RC_PORT_CMD_FRE	BIT(4)
+#define RC_PORT_CMD_FR		BIT(14)
+#define RC_PORT_CMD_CR		BIT(15)
+
+#define RC_CONTROL_RUN			0x80000000U
+
 // Real AMD RAID command structures (based on Windows driver analysis)
 #define RC_CMD_READ_DATA		0x01
 #define RC_CMD_WRITE_DATA		0x02
