@@ -14,8 +14,33 @@
 #define RC_AHCI_FIS_LEN_DWORDS	5
 #define RC_FIS_TYPE_REG_H2D		0x27
 
-struct rc_ahci_cmd_header;
-struct rc_ahci_prdt_entry;
+struct rc_ahci_cmd_header {
+	__le16 flags;
+	__le16 prdtl;
+	__le32 prdbc;
+	__le32 ctba;
+	__le32 ctbau;
+	__le32 reserved[4];
+} __packed;
+
+struct rc_ahci_prdt_entry {
+	__le32 dba;
+	__le32 dbau;
+	__le32 reserved;
+	__le32 dbc;
+} __packed;
+
+static inline struct rc_ahci_cmd_header *
+rc_ahci_get_cmd_header(struct rc_queue_descriptor *desc, u32 slot)
+{
+	return (struct rc_ahci_cmd_header *)((u8 *)desc->cmd_list +
+						  slot * RC_AHCI_CMD_HEADER_SIZE);
+}
+
+static inline u8 *rc_ahci_get_cmd_table(struct rc_queue_descriptor *desc, u32 slot)
+{
+	return (u8 *)desc->cmd_table + (slot * desc->cmd_table_stride);
+}
 
 static void rc_ahci_build_fis(const struct rc_hw_command *cmd, u8 *cfis)
 {
