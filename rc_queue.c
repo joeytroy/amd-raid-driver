@@ -74,23 +74,19 @@ static void rc_ahci_build_fis(const struct rc_hw_command *cmd, u8 *cfis)
 	cfis[0] = RC_FIS_TYPE_REG_H2D;
 	cfis[1] = BIT(7); /* Command bit */
 	cfis[2] = 0xB0;   /* Vendor/SMART command */
-	cfis[3] = cmd->opcode;
-	cfis[4] = cmd->command_id & 0xff;
-	cfis[5] = (cmd->command_id >> 8) & 0xff;
-	cfis[6] = (cmd->command_id >> 16) & 0xff;
-	cfis[7] = (cmd->command_id >> 24) & 0xff;
-	cfis[8] = cmd->flags & 0xff;
-	cfis[9] = (cmd->flags >> 8) & 0xff;
-	cfis[10] = cmd->sector_count & 0xff;
-	cfis[11] = (cmd->sector_count >> 8) & 0xff;
-	cfis[12] = cmd->channel_id & 0xff;
-	cfis[13] = (cmd->channel_id >> 8) & 0xff;
-	cfis[14] = cmd->lba & 0xff;
-	cfis[15] = (cmd->lba >> 8) & 0xff;
-	cfis[16] = (cmd->lba >> 16) & 0xff;
-	cfis[17] = (cmd->lba >> 24) & 0xff;
-	cfis[18] = cmd->generation_number & 0xff;
-	cfis[19] = (cmd->generation_number >> 8) & 0xff;
+	cfis[3] = cmd->opcode & 0xff; /* Features (7:0) */
+	cfis[4] = cmd->lba & 0xff;
+	cfis[5] = (cmd->lba >> 8) & 0xff;
+	cfis[6] = (cmd->lba >> 16) & 0xff;
+	cfis[7] = 0x40 | (cmd->channel_id & 0x0f); /* Device: LBA mode + target */
+	cfis[8] = (cmd->lba >> 24) & 0xff;
+	cfis[9] = (cmd->lba >> 32) & 0xff;
+	cfis[10] = (cmd->lba >> 40) & 0xff;
+	cfis[11] = (cmd->opcode >> 8) & 0xff; /* Features (15:8) */
+	cfis[12] = cmd->sector_count & 0xff;
+	cfis[13] = (cmd->sector_count >> 8) & 0xff;
+	cfis[14] = 0; /* ICC / control - unused */
+	cfis[15] = 0;
 }
 
 static void rc_ahci_prepare_slot(struct rc_queue_descriptor *desc,
@@ -655,7 +651,7 @@ int rc_queue_issue_sync(struct rc_adapter *adapter,
         u8 *fis_dbg = (u8 *)desc->cmd_table + (slot * desc->cmd_table_stride);
 
         rc_printk(RC_DEBUG,
-                  "rc_queue_issue_sync: slot=%u flags=0x%04x prdtl=%u ctba=%08x ctbau=%08x fis=%02x %02x %02x %02x %02x %02x %02x %02x %02x %02x\n",
+                  "rc_queue_issue_sync: slot=%u flags=0x%04x prdtl=%u ctba=%08x ctbau=%08x fis=%02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x\n",
                   slot,
                   le16_to_cpu(hdr_dbg->flags),
                   le16_to_cpu(hdr_dbg->prdtl),
@@ -663,7 +659,8 @@ int rc_queue_issue_sync(struct rc_adapter *adapter,
                   le32_to_cpu(hdr_dbg->ctbau),
                   fis_dbg[0], fis_dbg[1], fis_dbg[2], fis_dbg[3],
                   fis_dbg[4], fis_dbg[5], fis_dbg[6], fis_dbg[7],
-                  fis_dbg[8], fis_dbg[9]);
+                  fis_dbg[8], fis_dbg[9], fis_dbg[10], fis_dbg[11],
+                  fis_dbg[12], fis_dbg[13], fis_dbg[14], fis_dbg[15]);
         if (le16_to_cpu(hdr_dbg->prdtl)) {
             struct rc_ahci_prdt_entry *prdt_dbg =
                 (struct rc_ahci_prdt_entry *)(fis_dbg + 0x80);
