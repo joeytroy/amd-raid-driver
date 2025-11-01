@@ -29,7 +29,6 @@ struct rc_ahci_prdt_entry {
 	__le32 reserved;
 	__le32 dbc;
 } __packed;
-
 static void rc_ahci_build_fis(const struct rc_hw_command *cmd, u8 *cfis)
 {
 	memset(cfis, 0, 0x80);
