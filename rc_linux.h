@@ -363,7 +363,13 @@ int rc_raid_array_ioctl(struct block_device *bdev, fmode_t mode, unsigned int cm
 #define RC_PORT_CLBU			0x04
 #define RC_PORT_FB			0x08
 #define RC_PORT_FBU			0x0C
+#define RC_PORT_IS			0x10
 #define RC_PORT_CMD			0x18
+#define RC_PORT_TFD			0x20
+#define RC_PORT_SIG			0x24
+#define RC_PORT_SERR			0x30
+#define RC_PORT_SACT			0x34
+#define RC_PORT_CI			0x38
 #define RC_PORT_CMD_ST		BIT(0)
 #define RC_PORT_CMD_FRE	BIT(4)
 #define RC_PORT_CMD_FR		BIT(14)
@@ -385,6 +391,8 @@ int rc_raid_array_ioctl(struct block_device *bdev, fmode_t mode, unsigned int cm
 #define RC_CMD_FLAG_SYNC		0x01
 #define RC_CMD_FLAG_URGENT		0x02
 #define RC_CMD_FLAG_NO_RETRY		0x04
+#define RC_CMD_FLAG_DATA_IN		0x100
+#define RC_CMD_FLAG_DATA_OUT		0x200
 
 // Status codes
 #define RC_STATUS_SUCCESS		0x00
@@ -430,6 +438,11 @@ int rc_hw_submit_request(struct rc_adapter *adapter, struct request *rq,
 int rc_queue_init(struct rc_adapter *adapter);
 void rc_queue_cleanup(struct rc_adapter *adapter);
 int rc_activate_doorbells(struct rc_adapter *adapter);
+int rc_queue_issue_sync(struct rc_adapter *adapter,
+                       struct rc_hw_command *cmd,
+                       bool data_in, bool data_out,
+                       unsigned int timeout_ms,
+                       struct rc_hw_completion *completion);
 
 // Sysfs interface
 int rc_sysfs_create(struct rc_adapter *adapter);

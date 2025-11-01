@@ -30,7 +30,7 @@ int rc_discover_arrays(struct rc_adapter *adapter)
 	// Prepare metadata read command
 	cmd.command_id = atomic_inc_return(&adapter->hw.cmd_sequence);
 	cmd.opcode = RC_CMD_METADATA_READ;
-	cmd.flags = RC_CMD_FLAG_SYNC;
+	cmd.flags = RC_CMD_FLAG_SYNC | RC_CMD_FLAG_DATA_IN;
 	cmd.channel_id = 0;
 	cmd.lba = 0; // Read from beginning
 	cmd.sector_count = 1; // One sector of metadata
@@ -90,7 +90,7 @@ int rc_read_array_metadata(struct rc_adapter *adapter, int array_id,
 	// Prepare metadata read command
 	cmd.command_id = atomic_inc_return(&adapter->hw.cmd_sequence);
 	cmd.opcode = RC_CMD_METADATA_READ;
-	cmd.flags = RC_CMD_FLAG_SYNC;
+	cmd.flags = RC_CMD_FLAG_SYNC | RC_CMD_FLAG_DATA_IN;
 	cmd.channel_id = array_id;
 	cmd.lba = 0;
 	cmd.sector_count = 1;

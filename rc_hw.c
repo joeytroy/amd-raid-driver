@@ -205,41 +205,7 @@ void rc_hw_cleanup(struct rc_adapter *adapter)
 
 int rc_hw_submit_command(struct rc_hw_queue_context *hw, struct rc_hw_command *cmd)
 {
-    unsigned long flags;
-    u32 next_tail;
-    u32 doorbell_value;
-
-    spin_lock_irqsave(&hw->irq_lock, flags);
-
-    next_tail = (hw->cmd_queue_tail + 1) % hw->cmd_queue_size;
-    if (next_tail == hw->cmd_queue_head) {
-        spin_unlock_irqrestore(&hw->irq_lock, flags);
-        return -EBUSY;
-    }
-
-    if (cmd->opcode < RC_CMD_READ_DATA || cmd->opcode > RC_CMD_RESCAN) {
-        spin_unlock_irqrestore(&hw->irq_lock, flags);
-        return -EINVAL;
-    }
-
-    if (!cmd->command_id)
-        cmd->command_id = atomic_inc_return(&hw->cmd_sequence);
-    memcpy(&hw->cmd_queue[hw->cmd_queue_tail], cmd, sizeof(*cmd));
-    hw->cmd_queue_tail = next_tail;
-
-    doorbell_value = (cmd->opcode << 16) | hw->cmd_queue_tail;
-    writel(doorbell_value, hw->mmio_base + RC_REG_DOORBELL);
-
-    if (cmd->opcode == RC_CMD_CONFIG_WRITE || cmd->opcode == RC_CMD_CONFIG_READ) {
-        writel(upper_32_bits(cmd->generation_number),
-               hw->mmio_base + RC_REG_DOORBELL + 4);
-        writel(lower_32_bits(cmd->generation_number),
-               hw->mmio_base + RC_REG_DOORBELL + 8);
-    }
-
-    spin_unlock_irqrestore(&hw->irq_lock, flags);
-
-    return 0;
+    return -EOPNOTSUPP;
 }
 
 int rc_hw_process_completions(struct rc_hw_queue_context *hw)
@@ -274,10 +240,8 @@ int rc_hw_submit_sync_command(struct rc_hw_queue_context *hw,
                              struct rc_hw_completion *completion,
                              unsigned int timeout_ms)
 {
-    unsigned long flags;
-    unsigned long timeout;
+out_clear:
     struct rc_adapter *adapter;
-    int ret;
 
     if (!hw || !cmd)
         return -EINVAL;
@@ -286,60 +250,16 @@ int rc_hw_submit_sync_command(struct rc_hw_queue_context *hw,
     if (!adapter)
         return -ENODEV;
 
-    if (!timeout_ms)
-        timeout_ms = 5000;
+    if (!cmd->command_id)
+        cmd->command_id = atomic_inc_return(&hw->cmd_sequence);
 
-    spin_lock_irqsave(&hw->sync_lock, flags);
-    if (hw->sync.active) {
-        spin_unlock_irqrestore(&hw->sync_lock, flags);
-        rc_printk(RC_WARN, "rc_hw_submit_sync_command: sync slot busy\n");
-        return -EBUSY;
-    }
+    if (hw->cmd_queue_size)
+        memcpy(&hw->cmd_queue[0], cmd, sizeof(*cmd));
 
-    hw->sync.active = true;
-    hw->sync.completed = false;
-    hw->sync.cmd_id = 0;
-    memset(&hw->sync.completion, 0, sizeof(hw->sync.completion));
-    spin_unlock_irqrestore(&hw->sync_lock, flags);
-
-    ret = rc_hw_submit_command(hw, cmd);
-    if (ret)
-        goto out_clear;
-
-    spin_lock_irqsave(&hw->sync_lock, flags);
-    hw->sync.cmd_id = cmd->command_id;
-    spin_unlock_irqrestore(&hw->sync_lock, flags);
-
-    timeout = jiffies + msecs_to_jiffies(timeout_ms);
-    do {
-        rc_hw_poll_completions(hw);
-
-        spin_lock_irqsave(&hw->sync_lock, flags);
-        if (hw->sync.completed) {
-            if (completion)
-                *completion = hw->sync.completion;
-            hw->sync.active = false;
-            spin_unlock_irqrestore(&hw->sync_lock, flags);
-            return 0;
-        }
-        spin_unlock_irqrestore(&hw->sync_lock, flags);
-
-        usleep_range(500, 2000);
-    } while (time_before(jiffies, timeout));
-
-    ret = -ETIMEDOUT;
-    rc_printk(RC_WARN, "rc_hw_submit_sync_command: cmd_id=%u timed out\n",
-              cmd->command_id);
-
-out_clear:
-    spin_lock_irqsave(&hw->sync_lock, flags);
-    hw->sync.active = false;
-    hw->sync.completed = false;
-    hw->sync.cmd_id = 0;
-    memset(&hw->sync.completion, 0, sizeof(hw->sync.completion));
-    spin_unlock_irqrestore(&hw->sync_lock, flags);
-
-    return ret;
+    return rc_queue_issue_sync(adapter, cmd,
+                               !!(cmd->flags & RC_CMD_FLAG_DATA_IN),
+                               !!(cmd->flags & RC_CMD_FLAG_DATA_OUT),
+                               timeout_ms, completion);
 }
 
 /*----------------------------------------------------------------------
@@ -510,40 +430,7 @@ int rc_hw_submit_request(struct rc_adapter *adapter, struct request *rq,
                           u32 opcode, sector_t lba, u32 sector_count,
                           dma_addr_t dma_addr, void *dma_buf)
 {
-    struct rc_hw_queue_context *hw = &adapter->hw;
-    struct rc_hw_command cmd = {0};
-    u32 cmd_id;
-    int ret;
-
-    cmd_id = atomic_inc_return(&hw->cmd_sequence);
-
-    // Track this request for completion
-    ret = rc_track_request(hw, cmd_id, rq, dma_addr, dma_buf);
-    if (ret) {
-        rc_printk(RC_ERROR, "rc_hw_submit_request: failed to track request\n");
-        return ret;
-    }
-
-    // Build command
-    cmd.command_id = cmd_id;
-    cmd.opcode = opcode;
-    cmd.flags = 0;  // Async
-    cmd.channel_id = 0;  // TODO: map from array
-    cmd.lba = lba;
-    cmd.sector_count = sector_count;
-    cmd.data_addr = dma_addr;
-    cmd.completion_addr = 0;
-    cmd.generation_number = 0;
-
-    // Submit to hardware
-    ret = rc_hw_submit_command(hw, &cmd);
-    if (ret) {
-        rc_printk(RC_ERROR, "rc_hw_submit_request: submit failed\n");
-        rc_clear_pending_request(hw, cmd_id);
-        return ret;
-    }
-
-    return 0;
+    return -EOPNOTSUPP;
 }
 
 /*----------------------------------------------------------------------
