@@ -137,6 +137,8 @@ int rc_scan_physical_disks(struct rc_adapter *adapter)
 {
 	struct rc_hw_command cmd = {0};
     struct rc_hw_completion comp = {0};
+    void *dma_buf = NULL;
+    dma_addr_t dma_addr = 0;
     int ret;
 	
 	rc_printk(RC_INFO, "rc_scan_physical_disks: scanning for physical disks\n");
@@ -144,11 +146,19 @@ int rc_scan_physical_disks(struct rc_adapter *adapter)
 	// Prepare disk scan command
 	cmd.command_id = atomic_inc_return(&adapter->hw.cmd_sequence);
 	cmd.opcode = RC_CMD_SCAN_DISKS;
-	cmd.flags = RC_CMD_FLAG_SYNC;
+	cmd.flags = RC_CMD_FLAG_SYNC | RC_CMD_FLAG_DATA_IN;
 	cmd.channel_id = 0;
 	cmd.lba = 0;
-	cmd.sector_count = 0;
-	cmd.data_addr = 0;
+	cmd.sector_count = 1;
+
+    dma_buf = dma_pool_alloc(adapter->hw.dma_pool, GFP_KERNEL, &dma_addr);
+    if (!dma_buf) {
+        rc_printk(RC_ERROR, "rc_scan_physical_disks: failed to allocate DMA buffer\n");
+        return -ENOMEM;
+    }
+    memset(dma_buf, 0, 512);
+
+	cmd.data_addr = dma_addr;
 	cmd.completion_addr = 0;
 	cmd.generation_number = 0;
 	
@@ -156,17 +166,23 @@ int rc_scan_physical_disks(struct rc_adapter *adapter)
     ret = rc_hw_submit_sync_command(&adapter->hw, &cmd, &comp, 5000);
     if (ret < 0) {
         rc_printk(RC_ERROR, "rc_scan_physical_disks: command timeout (%d)\n", ret);
-        return ret;
+        goto out_free;
     }
 
     if (comp.status != RC_STATUS_SUCCESS) {
         rc_printk(RC_WARN,
                   "rc_scan_physical_disks: firmware status=%u error=0x%x\n",
                   comp.status, comp.error_code);
-        return -EIO;
+        ret = -EIO;
+        goto out_free;
     }
 
+    ret = 0;
     rc_printk(RC_INFO, "rc_scan_physical_disks: disk scan completed\n");
 
-    return 0;
+out_free:
+    if (dma_buf)
+        dma_pool_free(adapter->hw.dma_pool, dma_buf, dma_addr);
+
+    return ret;
 }
