@@ -7,6 +7,7 @@
 #include <linux/delay.h>
 #include <linux/jiffies.h>
 #include <linux/minmax.h>
+#include <linux/byteorder/generic.h>
 
 #define RC_AHCI_CMD_HEADER_SIZE	0x20
 #define RC_AHCI_CMD_LIST_BYTES	0x400
@@ -646,6 +647,33 @@ int rc_queue_issue_sync(struct rc_adapter *adapter,
     }
 
     rc_ahci_prepare_slot(desc, cmd, slot, data_in, data_out);
+
+    {
+        struct rc_ahci_cmd_header *hdr_dbg =
+            (struct rc_ahci_cmd_header *)((u8 *)desc->cmd_list +
+                                          slot * RC_AHCI_CMD_HEADER_SIZE);
+        u8 *fis_dbg = (u8 *)desc->cmd_table + (slot * desc->cmd_table_stride);
+
+        rc_printk(RC_DEBUG,
+                  "rc_queue_issue_sync: slot=%u flags=0x%04x prdtl=%u ctba=%08x ctbau=%08x fis=%02x %02x %02x %02x %02x %02x %02x %02x %02x %02x\n",
+                  slot,
+                  le16_to_cpu(hdr_dbg->flags),
+                  le16_to_cpu(hdr_dbg->prdtl),
+                  le32_to_cpu(hdr_dbg->ctba),
+                  le32_to_cpu(hdr_dbg->ctbau),
+                  fis_dbg[0], fis_dbg[1], fis_dbg[2], fis_dbg[3],
+                  fis_dbg[4], fis_dbg[5], fis_dbg[6], fis_dbg[7],
+                  fis_dbg[8], fis_dbg[9]);
+        if (le16_to_cpu(hdr_dbg->prdtl)) {
+            struct rc_ahci_prdt_entry *prdt_dbg =
+                (struct rc_ahci_prdt_entry *)(fis_dbg + 0x80);
+            rc_printk(RC_DEBUG,
+                      "  PRDT[0]: dba=%08x dbau=%08x dbc=%08x\n",
+                      le32_to_cpu(prdt_dbg->dba),
+                      le32_to_cpu(prdt_dbg->dbau),
+                      le32_to_cpu(prdt_dbg->dbc));
+        }
+    }
 
     desc->slot_in_use |= mask;
     writel(0xffffffff, port + RC_PORT_IS);
