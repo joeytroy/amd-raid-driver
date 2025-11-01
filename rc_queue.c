@@ -115,7 +115,6 @@ static void rc_ahci_prepare_slot(struct rc_queue_descriptor *desc,
     hdr->ctbau = cpu_to_le32(upper_32_bits(tbl_dma));
 
     rc_ahci_build_fis(cmd, table);
-    memcpy(table + 0x20, cmd, min_t(size_t, sizeof(*cmd), 0x100));
 
     if (cmd->sector_count && cmd->data_addr) {
         struct rc_ahci_prdt_entry *prdt;
