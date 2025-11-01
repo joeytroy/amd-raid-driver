@@ -4,6 +4,103 @@
  ****************************************************************************/
 
 #include "rc_linux.h"
+#include <linux/delay.h>
+#include <linux/jiffies.h>
+#include <linux/minmax.h>
+
+#define RC_AHCI_CMD_HEADER_SIZE	0x20
+#define RC_AHCI_CMD_LIST_BYTES	0x400
+#define RC_AHCI_CMD_TABLE_STRIDE	0x2080
+#define RC_AHCI_FIS_LEN_DWORDS	5
+#define RC_FIS_TYPE_REG_H2D		0x27
+
+struct rc_ahci_cmd_header {
+	__le16 flags;
+	__le16 prdtl;
+	__le32 prdbc;
+	__le32 ctba;
+	__le32 ctbau;
+	__le32 reserved[4];
+} __packed;
+
+struct rc_ahci_prdt_entry {
+	__le32 dba;
+	__le32 dbau;
+	__le32 reserved;
+	__le32 dbc;
+} __packed;
+
+static inline struct rc_ahci_cmd_header *
+rc_ahci_get_cmd_header(struct rc_queue_descriptor *desc, u32 slot)
+{
+	return (struct rc_ahci_cmd_header *)((u8 *)desc->cmd_list +
+						  slot * RC_AHCI_CMD_HEADER_SIZE);
+}
+
+static inline u8 *rc_ahci_get_cmd_table(struct rc_queue_descriptor *desc, u32 slot)
+{
+	return (u8 *)desc->cmd_table + (slot * desc->cmd_table_stride);
+}
+
+static void rc_ahci_build_fis(const struct rc_hw_command *cmd, u8 *cfis)
+{
+	memset(cfis, 0, 0x80);
+	cfis[0] = RC_FIS_TYPE_REG_H2D;
+	cfis[1] = BIT(7); /* Command bit */
+	cfis[2] = 0xB0;   /* Vendor/SMART command */
+	cfis[3] = cmd->opcode;
+	cfis[4] = cmd->command_id & 0xff;
+	cfis[5] = (cmd->command_id >> 8) & 0xff;
+	cfis[6] = (cmd->command_id >> 16) & 0xff;
+	cfis[7] = (cmd->command_id >> 24) & 0xff;
+	cfis[8] = cmd->flags & 0xff;
+	cfis[9] = (cmd->flags >> 8) & 0xff;
+	cfis[10] = cmd->sector_count & 0xff;
+	cfis[11] = (cmd->sector_count >> 8) & 0xff;
+	cfis[12] = cmd->channel_id & 0xff;
+	cfis[13] = (cmd->channel_id >> 8) & 0xff;
+	cfis[14] = cmd->lba & 0xff;
+	cfis[15] = (cmd->lba >> 8) & 0xff;
+	cfis[16] = (cmd->lba >> 16) & 0xff;
+	cfis[17] = (cmd->lba >> 24) & 0xff;
+	cfis[18] = cmd->generation_number & 0xff;
+	cfis[19] = (cmd->generation_number >> 8) & 0xff;
+}
+
+static void rc_ahci_prepare_slot(struct rc_queue_descriptor *desc,
+				      const struct rc_hw_command *cmd,
+				      u32 slot, bool data_in, bool data_out)
+{
+	struct rc_ahci_cmd_header *hdr = rc_ahci_get_cmd_header(desc, slot);
+	u8 *table = rc_ahci_get_cmd_table(desc, slot);
+	u64 tbl_dma = desc->cmd_table_dma + (slot * desc->cmd_table_stride);
+	u16 hdr_flags = RC_AHCI_FIS_LEN_DWORDS & 0x1f;
+
+	memset(hdr, 0, sizeof(*hdr));
+	memset(table, 0, desc->cmd_table_stride);
+
+	if (data_out)
+		hdr_flags |= BIT(6);
+	hdr->flags = cpu_to_le16(hdr_flags);
+	if (cmd->sector_count && cmd->data_addr)
+		hdr->prdtl = cpu_to_le16(1);
+	hdr->ctba = cpu_to_le32(lower_32_bits(tbl_dma));
+	hdr->ctbau = cpu_to_le32(upper_32_bits(tbl_dma));
+
+	rc_ahci_build_fis(cmd, table);
+	memcpy(table + 0x20, cmd, min_t(size_t, sizeof(*cmd), 0x100));
+
+	if (cmd->sector_count && cmd->data_addr) {
+		struct rc_ahci_prdt_entry *prdt;
+		u32 byte_count = cmd->sector_count * 512;
+
+		prdt = (struct rc_ahci_prdt_entry *)(table + 0x80);
+		prdt->dba = cpu_to_le32(lower_32_bits(cmd->data_addr));
+		prdt->dbau = cpu_to_le32(upper_32_bits(cmd->data_addr));
+		if (byte_count)
+			prdt->dbc = cpu_to_le32((byte_count - 1) | BIT(31));
+	}
+}
 
 /*----------------------------------------------------------------------
  * Queue descriptor structures (mirrors Windows devExt layouts)
@@ -26,6 +123,10 @@ struct rc_queue_descriptor {
     dma_addr_t fis_dma;
     u32 fis_len;
     u32 completion_depth;
+    void *cmd_table;            // command table/PRDT region
+    dma_addr_t cmd_table_dma;
+    u32 cmd_table_stride;
+    unsigned long slot_in_use;
     spinlock_t lock;
     u32 head;
     u32 tail;
@@ -82,6 +183,10 @@ rc_alloc_queue_descriptor(struct rc_adapter *adapter, u32 queue_index)
     desc->fis_dma = 0;
     desc->fis_len = 0;
     desc->completion_depth = 0;
+    desc->cmd_table = NULL;
+    desc->cmd_table_dma = 0;
+    desc->cmd_table_stride = 0;
+    desc->slot_in_use = 0;
     spin_lock_init(&desc->lock);
     atomic_set(&desc->pending, 0);
 
@@ -132,7 +237,7 @@ rc_alloc_queue_control_block(struct rc_adapter *adapter,
     desc->control_dma = dma_addr;
     desc->cmd_list = block;
     desc->cmd_list_dma = dma_addr;
-    desc->cmd_list_len = 0x400;
+    desc->cmd_list_len = RC_AHCI_CMD_LIST_BYTES;
 
     desc->fis_len = 0x100;
     desc->fis = dma_alloc_coherent(&pdev->dev, desc->fis_len,
@@ -150,6 +255,29 @@ rc_alloc_queue_control_block(struct rc_adapter *adapter,
         return -ENOMEM;
     }
     memset(desc->fis, 0, desc->fis_len);
+
+    desc->cmd_table_stride = RC_AHCI_CMD_TABLE_STRIDE;
+    {
+        size_t table_len = desc->queue_depth * desc->cmd_table_stride;
+
+        desc->cmd_table = dma_alloc_coherent(&pdev->dev, table_len,
+                                             &desc->cmd_table_dma, GFP_KERNEL);
+        if (!desc->cmd_table) {
+            rc_printk(RC_ERROR, "rc_alloc_queue_control_block: command table alloc failed\n");
+            dma_free_coherent(&pdev->dev, desc->fis_len, desc->fis, desc->fis_dma);
+            desc->fis = NULL;
+            desc->fis_dma = 0;
+            desc->fis_len = 0;
+            dma_free_coherent(&pdev->dev, 0x400, block, dma_addr);
+            desc->control_block = NULL;
+            desc->control_dma = 0;
+            desc->cmd_list = NULL;
+            desc->cmd_list_dma = 0;
+            desc->cmd_list_len = 0;
+            return -ENOMEM;
+        }
+        memset(desc->cmd_table, 0, table_len);
+    }
 
     rc_printk(RC_INFO, "rc_alloc_queue_control_block: queue %u block at 0x%llx\n",
               desc->queue_index, (unsigned long long)dma_addr);
@@ -257,6 +385,15 @@ static int rc_program_port_registers(struct rc_adapter *adapter,
     writel(lower_32_bits(desc->fis_dma), port + RC_PORT_FB);
     writel(upper_32_bits(desc->fis_dma), port + RC_PORT_FBU);
 
+    desc->slot_in_use = 0;
+    memset(desc->cmd_list, 0, desc->cmd_list_len);
+    if (desc->cmd_table)
+        memset(desc->cmd_table, 0, desc->queue_depth * desc->cmd_table_stride);
+
+    writel(0xffffffff, port + RC_PORT_IS);
+    writel(0, port + RC_PORT_SACT);
+    writel(0, port + RC_PORT_CI);
+
     wmb();
 
     cmd = readl(port + RC_PORT_CMD);
@@ -296,6 +433,8 @@ static void rc_queue_stop_port(struct rc_adapter *adapter,
     if (timeout <= 0)
         rc_printk(RC_WARN, "rc_queue_stop_port: port %u did not quiesce\n",
                   desc->queue_index);
+
+    desc->slot_in_use = 0;
 }
 
 /*----------------------------------------------------------------------
@@ -388,6 +527,10 @@ int rc_queue_init(struct rc_adapter *adapter)
     return 0;
 
 err_free_control:
+    if (desc->cmd_table)
+        dma_free_coherent(&adapter->pdev->dev,
+                          desc->queue_depth * desc->cmd_table_stride,
+                          desc->cmd_table, desc->cmd_table_dma);
     if (desc->fis)
         dma_free_coherent(&adapter->pdev->dev, desc->fis_len,
                           desc->fis, desc->fis_dma);
@@ -419,6 +562,11 @@ void rc_queue_cleanup(struct rc_adapter *adapter)
             continue;
 
         rc_queue_stop_port(adapter, desc);
+
+        if (desc->cmd_table)
+            dma_free_coherent(&adapter->pdev->dev,
+                              desc->queue_depth * desc->cmd_table_stride,
+                              desc->cmd_table, desc->cmd_table_dma);
 
         if (desc->fis) {
             dma_free_coherent(&adapter->pdev->dev, desc->fis_len,
@@ -473,5 +621,99 @@ int rc_activate_doorbells(struct rc_adapter *adapter)
     rc_printk(RC_INFO, "rc_activate_doorbells: doorbells activated\n");
 
     return 0;
+}
+
+int rc_queue_issue_sync(struct rc_adapter *adapter,
+                       struct rc_hw_command *cmd,
+                       bool data_in, bool data_out,
+                       unsigned int timeout_ms,
+                       struct rc_hw_completion *completion)
+{
+    struct rc_queue_descriptor *desc = adapter->ctx.irq.primary_queue;
+    void __iomem *port;
+    u32 slot = 0;
+    u32 mask = BIT(slot);
+    unsigned long deadline;
+    u32 bytes = cmd->sector_count ? cmd->sector_count * 512 : 0;
+    int ret = 0;
+
+    if (!desc || !adapter->ctx.mmio_base)
+        return -ENODEV;
+
+    if (!desc->cmd_list || !desc->cmd_table)
+        return -EINVAL;
+
+    port = adapter->ctx.mmio_base + RC_PORT_REG_BASE(desc->queue_index);
+
+    if (!timeout_ms)
+        timeout_ms = 5000;
+
+    deadline = jiffies + msecs_to_jiffies(timeout_ms);
+    while (readl(port + RC_PORT_CI) & mask) {
+        if (time_after(jiffies, deadline))
+            return -EBUSY;
+        usleep_range(200, 500);
+    }
+
+    rc_ahci_prepare_slot(desc, cmd, slot, data_in, data_out);
+
+    desc->slot_in_use |= mask;
+    writel(0xffffffff, port + RC_PORT_IS);
+    writel(0xffffffff, port + RC_PORT_SERR);
+    wmb();
+
+    writel(mask, port + RC_PORT_CI);
+
+    deadline = jiffies + msecs_to_jiffies(timeout_ms);
+    for (;;) {
+        u32 ci = readl(port + RC_PORT_CI);
+        if (!(ci & mask))
+            break;
+        if (time_after(jiffies, deadline)) {
+            if (completion) {
+                completion->command_id = cmd->command_id;
+                completion->status = RC_STATUS_ERROR;
+            }
+            ret = -ETIMEDOUT;
+            goto out_clear;
+        }
+        usleep_range(200, 500);
+    }
+
+    if (completion)
+        memset(completion, 0, sizeof(*completion));
+
+    if (completion) {
+        completion->command_id = cmd->command_id;
+        completion->bytes_transferred = data_in ? bytes : 0;
+    }
+
+    {
+        u32 is = readl(port + RC_PORT_IS);
+        u32 serr = readl(port + RC_PORT_SERR);
+        u32 tfd = readl(port + RC_PORT_TFD);
+
+        if (is)
+            writel(is, port + RC_PORT_IS);
+        if (serr)
+            writel(serr, port + RC_PORT_SERR);
+
+        if (tfd & BIT(0) || serr) {
+            if (completion) {
+                completion->status = RC_STATUS_ERROR;
+                completion->error_code = serr ? serr : is;
+                completion->bytes_transferred = 0;
+            }
+            ret = -EIO;
+        } else {
+            if (completion)
+                completion->status = RC_STATUS_SUCCESS;
+            ret = 0;
+        }
+    }
+
+out_clear:
+    desc->slot_in_use &= ~mask;
+    return ret;
 }
 
