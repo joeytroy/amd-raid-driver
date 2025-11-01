@@ -52,48 +52,38 @@ static void rc_hw_program_queues(struct rc_hw_queue_context *hw)
 
 static int rc_hw_start_controller(struct rc_hw_queue_context *hw)
 {
-    u32 status;
+    u32 ghc;
     int timeout;
 
     if (!hw || !hw->mmio_base)
         return -EINVAL;
 
-    /* Wait for the controller to report idle. */
+    /* Wait for any in-progress HBA reset to complete (GHC.HR clear). */
     timeout = 1000;
     do {
-        status = readl(hw->mmio_base + RC_REG_STATUS);
-        if (status == 0xffffffff) {
-            rc_printk(RC_ERROR, "rc_hw_start_controller: invalid status register value\n");
+        ghc = readl(hw->mmio_base + RC_REG_CONTROL);
+        if (ghc == 0xffffffff) {
+            rc_printk(RC_ERROR, "rc_hw_start_controller: invalid control register value\n");
             return -EIO;
         }
-        if ((status & 0x1) == 0)
+        if (!(ghc & BIT(1)))
             break;
         udelay(100);
     } while (--timeout);
 
     if (timeout <= 0) {
         rc_printk(RC_ERROR,
-                  "rc_hw_start_controller: controller busy (status=0x%08x)\n",
-                  status);
+                  "rc_hw_start_controller: HBA reset did not clear (GHC=0x%08x)\n",
+                  ghc);
         return -EBUSY;
     }
 
-    /* Set the RUN bit. */
-    writel(RC_CONTROL_RUN, hw->mmio_base + RC_REG_CONTROL);
+    /* Enable AHCI mode (AE) and interrupts (IE) without disturbing other bits. */
+    ghc |= RC_CONTROL_RUN | BIT(0);
+    writel(ghc, hw->mmio_base + RC_REG_CONTROL);
     wmb();
 
-    timeout = 1000;
-    do {
-        status = readl(hw->mmio_base + RC_REG_STATUS);
-        if ((status & 0x1) == 0)
-            return 0;
-        udelay(100);
-    } while (--timeout);
-
-    rc_printk(RC_ERROR,
-              "rc_hw_start_controller: ready timeout (status=0x%08x)\n",
-              status);
-    return -ETIMEDOUT;
+    return 0;
 }
 
 int rc_hw_init(struct rc_adapter *adapter)
