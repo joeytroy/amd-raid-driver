@@ -694,6 +694,10 @@ int rc_queue_issue_sync(struct rc_adapter *adapter,
                       readl(port + RC_PORT_IS),
                       readl(port + RC_PORT_SERR),
                       readl(port + RC_PORT_TFD));
+            if (desc->fis) {
+                u8 *rfis = desc->fis;
+                rc_printk(RC_WARN, "  rx FIS: %*ph\n", 32, rfis);
+            }
             ret = -ETIMEDOUT;
             goto out_clear;
         }
