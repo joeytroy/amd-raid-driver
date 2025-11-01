@@ -688,6 +688,12 @@ int rc_queue_issue_sync(struct rc_adapter *adapter,
                 completion->command_id = cmd->command_id;
                 completion->status = RC_STATUS_ERROR;
             }
+            rc_printk(RC_WARN,
+                      "rc_queue_issue_sync: timeout waiting for CI clear (ci=0x%08x, is=0x%08x, serr=0x%08x, tfd=0x%08x)\n",
+                      readl(port + RC_PORT_CI),
+                      readl(port + RC_PORT_IS),
+                      readl(port + RC_PORT_SERR),
+                      readl(port + RC_PORT_TFD));
             ret = -ETIMEDOUT;
             goto out_clear;
         }
