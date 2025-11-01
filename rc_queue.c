@@ -14,6 +14,44 @@
 #define RC_AHCI_FIS_LEN_DWORDS	5
 #define RC_FIS_TYPE_REG_H2D		0x27
 
+/*------------------------------------------------------------------
+ * Queue descriptor structures (mirrors Windows devExt layouts)
+ *------------------------------------------------------------------*/
+
+struct rc_queue_descriptor {
+    void *control_block;        // Host command list buffer (0x400 bytes)
+    dma_addr_t control_dma;
+    u32 queue_index;
+    u32 queue_depth;
+    u32 flags;
+    u32 state;
+    void *completion_ptr;
+    dma_addr_t completion_dma;
+    void *cmd_list;             // alias of control_block for clarity
+    dma_addr_t cmd_list_dma;
+    u32 cmd_list_len;
+    void *fis;                  // received FIS buffer
+    dma_addr_t fis_dma;
+    u32 fis_len;
+    u32 completion_depth;
+    void *cmd_table;            // command table/PRDT region
+    dma_addr_t cmd_table_dma;
+    u32 cmd_table_stride;
+    unsigned long slot_in_use;
+    spinlock_t lock;
+    u32 head;
+    u32 tail;
+    u32 comp_head;
+    u32 comp_tail;
+    atomic_t pending;
+} __packed;
+
+struct rc_queue_table {
+    struct rc_queue_descriptor *descriptors[RC_MAX_QUEUE_DESCRIPTORS];
+    spinlock_t table_lock;
+    u32 num_allocated;
+};
+
 struct rc_ahci_cmd_header {
 	__le16 flags;
 	__le16 prdtl;
@@ -93,46 +131,6 @@ static void rc_ahci_prepare_slot(struct rc_queue_descriptor *desc,
             prdt->dbc = cpu_to_le32((byte_count - 1) | BIT(31));
     }
 }
-
-/*----------------------------------------------------------------------
- * Queue descriptor structures (mirrors Windows devExt layouts)
- *----------------------------------------------------------------------*/
-
-// StorPort slot +0x1F8: Queue descriptor (0x78 bytes, FUN_14000d66c)
-struct rc_queue_descriptor {
-    void *control_block;        // Host command list buffer (0x400 bytes)
-    dma_addr_t control_dma;
-    u32 queue_index;
-    u32 queue_depth;
-    u32 flags;
-    u32 state;
-    void *completion_ptr;
-    dma_addr_t completion_dma;
-    void *cmd_list;             // alias of control_block for clarity
-    dma_addr_t cmd_list_dma;
-    u32 cmd_list_len;
-    void *fis;                  // received FIS buffer
-    dma_addr_t fis_dma;
-    u32 fis_len;
-    u32 completion_depth;
-    void *cmd_table;            // command table/PRDT region
-    dma_addr_t cmd_table_dma;
-    u32 cmd_table_stride;
-    unsigned long slot_in_use;
-    spinlock_t lock;
-    u32 head;
-    u32 tail;
-    u32 comp_head;
-    u32 comp_tail;
-    atomic_t pending;
-} __packed;
-
-// Descriptor table state (devExt+0x1C2A0)
-struct rc_queue_table {
-    struct rc_queue_descriptor *descriptors[RC_MAX_QUEUE_DESCRIPTORS];
-    spinlock_t table_lock;
-    u32 num_allocated;
-};
 
 /*----------------------------------------------------------------------
  * StorPort slot +0x1F8: Allocate queue descriptor (FUN_14000d66c)
