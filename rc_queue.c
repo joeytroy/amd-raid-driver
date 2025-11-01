@@ -14,8 +14,21 @@
 #define RC_AHCI_FIS_LEN_DWORDS	5
 #define RC_FIS_TYPE_REG_H2D		0x27
 
-struct rc_ahci_cmd_header;
-struct rc_ahci_prdt_entry;
+struct rc_ahci_cmd_header {
+	__le16 flags;
+	__le16 prdtl;
+	__le32 prdbc;
+	__le32 ctba;
+	__le32 ctbau;
+	__le32 reserved[4];
+} __packed;
+
+struct rc_ahci_prdt_entry {
+	__le32 dba;
+	__le32 dbau;
+	__le32 reserved;
+	__le32 dbc;
+} __packed;
 
 static void rc_ahci_build_fis(const struct rc_hw_command *cmd, u8 *cfis)
 {
@@ -43,38 +56,43 @@ static void rc_ahci_build_fis(const struct rc_hw_command *cmd, u8 *cfis)
 }
 
 static void rc_ahci_prepare_slot(struct rc_queue_descriptor *desc,
-				      const struct rc_hw_command *cmd,
-				      u32 slot, bool data_in, bool data_out)
+                                 const struct rc_hw_command *cmd,
+                                 u32 slot, bool data_in, bool data_out)
 {
-	struct rc_ahci_cmd_header *hdr = rc_ahci_get_cmd_header(desc, slot);
-	u8 *table = rc_ahci_get_cmd_table(desc, slot);
-	u64 tbl_dma = desc->cmd_table_dma + (slot * desc->cmd_table_stride);
-	u16 hdr_flags = RC_AHCI_FIS_LEN_DWORDS & 0x1f;
+    struct rc_ahci_cmd_header *hdr;
+    u8 *table;
+    u64 tbl_dma;
+    u16 hdr_flags = RC_AHCI_FIS_LEN_DWORDS & 0x1f;
 
-	memset(hdr, 0, sizeof(*hdr));
-	memset(table, 0, desc->cmd_table_stride);
+    hdr = (struct rc_ahci_cmd_header *)((u8 *)desc->cmd_list +
+                                        slot * RC_AHCI_CMD_HEADER_SIZE);
+    table = (u8 *)desc->cmd_table + (slot * desc->cmd_table_stride);
+    tbl_dma = desc->cmd_table_dma + (slot * desc->cmd_table_stride);
 
-	if (data_out)
-		hdr_flags |= BIT(6);
-	hdr->flags = cpu_to_le16(hdr_flags);
-	if (cmd->sector_count && cmd->data_addr)
-		hdr->prdtl = cpu_to_le16(1);
-	hdr->ctba = cpu_to_le32(lower_32_bits(tbl_dma));
-	hdr->ctbau = cpu_to_le32(upper_32_bits(tbl_dma));
+    memset(hdr, 0, sizeof(*hdr));
+    memset(table, 0, desc->cmd_table_stride);
 
-	rc_ahci_build_fis(cmd, table);
-	memcpy(table + 0x20, cmd, min_t(size_t, sizeof(*cmd), 0x100));
+    if (data_out)
+        hdr_flags |= BIT(6);
+    hdr->flags = cpu_to_le16(hdr_flags);
+    if (cmd->sector_count && cmd->data_addr)
+        hdr->prdtl = cpu_to_le16(1);
+    hdr->ctba = cpu_to_le32(lower_32_bits(tbl_dma));
+    hdr->ctbau = cpu_to_le32(upper_32_bits(tbl_dma));
 
-	if (cmd->sector_count && cmd->data_addr) {
-		struct rc_ahci_prdt_entry *prdt;
-		u32 byte_count = cmd->sector_count * 512;
+    rc_ahci_build_fis(cmd, table);
+    memcpy(table + 0x20, cmd, min_t(size_t, sizeof(*cmd), 0x100));
 
-		prdt = (struct rc_ahci_prdt_entry *)(table + 0x80);
-		prdt->dba = cpu_to_le32(lower_32_bits(cmd->data_addr));
-		prdt->dbau = cpu_to_le32(upper_32_bits(cmd->data_addr));
-		if (byte_count)
-			prdt->dbc = cpu_to_le32((byte_count - 1) | BIT(31));
-	}
+    if (cmd->sector_count && cmd->data_addr) {
+        struct rc_ahci_prdt_entry *prdt;
+        u32 byte_count = cmd->sector_count * 512;
+
+        prdt = (struct rc_ahci_prdt_entry *)(table + 0x80);
+        prdt->dba = cpu_to_le32(lower_32_bits(cmd->data_addr));
+        prdt->dbau = cpu_to_le32(upper_32_bits(cmd->data_addr));
+        if (byte_count)
+            prdt->dbc = cpu_to_le32((byte_count - 1) | BIT(31));
+    }
 }
 
 /*----------------------------------------------------------------------
