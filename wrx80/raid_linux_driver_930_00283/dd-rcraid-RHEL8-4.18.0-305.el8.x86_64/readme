@@ -1,0 +1,184 @@
+AMD RAID Driver for RHEL 7.5/8.2/8.3/8.4 x64
+
+
+1.Install the AMD-RAID drivers during a RHEL UEFI Linux Installation
+	NOTE: Prior to starting this procedure, obtain the AMD-RAID drivers from your system supplier or motherboard vendor. Copy the AMD-RAID drivers to a USB flash drive. See Copy AMD-RAID drivers: Linux.
+	NOTE: When installing Red Hat Linux, use the Linux dd installation mode instead of the Linux expert mode.
+	NOTE: It is AMD's recommendation that a reset/reboot of the system is performed whenever the user is adding or removing a SATA M.2 SSD or NVMe device(s).
+	      In the OS, issue a reset/reboot
+	      Wait for the AMD BIOS screen to display, press ESC to enter BIOS.
+	      Power off the system.
+	      Install or remove the necessary device(s).
+  	      Power on the system and allow the OS to boot properly.
+	NOTE: Not all of the windows indicated in this procedure will appear during the installation.
+	1.	Power-on the system.
+	2.	Insert the Red Hat operating system CD-ROM or DVD into the system’s CD or DVD drive.
+	3.	Create a bootable array, see Section 3.
+	4.	At the Red Hat Enterprise Linux Welcome window
+		•	Press the Up Arrow
+		•	Select Install Red Hat Enterprise Linux 7.5/8.2/8.3  (should be high-lighted in White)
+		•	Press E
+		•	Press the down arrow to the linuxefi /images string
+		•	Press the END key 
+			•	Add “inst.dd modprobe.blacklist=ahci modprobe.blacklist=nvme”  to the end of the existing string
+			Example – linuxefi /images……..quiet inst.dd modprobe.blacklist=ahci modprobe.blacklist=nvme 
+		•	Press CTRL X
+		Note: if you no longer get anything on the display after a couple minutes, reset and try again with these settings.
+			•	Add “inst.dd modprobe.blacklist=ahci modprobe.blacklist=nvme nomodeset”  to the end of the existing string
+			Example – linuxefi /images……..quiet inst.dd modprobe.blacklist=ahci modprobe.blacklist=nvme nomodeset
+		•	Press CTRL X
+	5.	At the Driver Disk Device Selection
+		•	Insert the USB drive (which contains the AMD-RAID drivers) into the USB port
+		•	Press 1 – number of the flash drive
+		•	Press Enter
+	6.	At the Choose Driver Disk ISO file
+		•	Press 1 – number of the dd-rcraid-RHEL….el7.x86_64.iso entry
+		•	Press Enter
+	7.	At the Select Drivers to Install
+		•	Press 1 – number of the /media/DD/…..x86_64.rpm entry
+		•	Press Enter
+		The /media/DD/… is now selected and should look like [X] /media/DD/……x86_64.rpm
+		•	Press C
+		•	Press Enter
+	8.	At the Driver Disk Device Selection 
+		•	Press C
+		•	Press Enter
+		•	Remove the USB drive (which contains the AMD-RAID drivers)
+	NOTE: For RHEL 7.5 and RHEL 8.2, perform steps 9 - 12
+	9.	At the Welcome to Red Hat Enterprise Linux Screen
+		•	Choose the desired Language
+		•	Choose the desired Country
+		•	In the bottom right corner, Click Continue
+	10.	At the Installation Summary Screen
+		•	Configure the following:
+		•	Under Localization
+		•		Date and Time
+		•		Keyboard
+		•		Language Support
+		•	Under Software
+		•		Installation Source
+		•		Software Selection
+		•			Under Base Environments
+		•				Select Server with GUI
+		•			Under Add-Ons for Selected Environments
+		•				Select Compatibility Library
+		•		In the upper left corner, Click Done
+		•	Under System
+		•		Installation Destination 
+		•			Under Local Standard Disks
+		•				Select AMD-RAID Array
+						Select I will configure partitioning
+						Click Done
+		•	Click the Click here to create them automatically link
+				Under Installation
+					Select Data /home
+					Change file system to ext4
+					Select system /boot
+					Change file system to ext4
+					Select system /rhel-root
+					Change file system to ext4
+				In the upper left corner, Click Done
+				In the Summary of Changes window, Click Accept Changes
+		•	Network and Hostname
+		•		In the bottom left corner, enter a valid Hostname
+		•			Select an Ethernet Port
+		•			In the bottom right corner,  Click Configure
+		•			Enter valid entries
+		•			Click Save
+		•		In the upper left corner, Click Done
+	11.	In the bottom right corner, Click  Beginning Installation
+	NOTE: system may appear to be locked up, please wait patiently, the system is busy writing out files and will respond shortly.
+	12.	At the Configuration Window
+		•	Click Root Password
+		•		Enter an applicable root password
+		•		Re-enter the root password
+		•	Click User Creation
+		•		Enter a Full Name
+		•		Enter a Username
+		•		Enter an applicable password
+		•		Re-enter the user password
+		•	In the upper right corner, Click Done
+	NOTE: For RHEL 8.3 Peform steps 13 - 17	
+	13.	At the Welcome to Red Hat Enterprise Linux Screen
+		•	Choose the desired Language
+		•	Choose the desired Country
+		•	In the bottom right corner, Click Continue
+	14.	At the Installation Summary screen, configure the following
+		•	Under Localization
+		•		Keyboard
+		•		Language Support
+		•		Time and Date
+ 		•	Under System
+		•		Installation Destination 
+		•		Under Local Standard Disks
+		•		Select AMD-RAID Array
+		•	Under Storage Configuration
+		•		Select Custom			
+		•	In the upper-left corner, click Done
+		•	Click the Click here to create them automatically link
+			Note: AMD-RAID only supports a file system type of ext4, using the XFS file system will cause an unrecoverable installation error.	
+		•	Under Installation
+				Select Data /home
+				Change file system to ext4
+				Select system /boot
+				Change file system to ext4
+				Select system /rhel-root
+				Change file system to ext4
+			In the upper left corner, Click Done
+			In the Summary of Changes window, Click Accept Changes
+		•	Network and Hostname
+		•		In the bottom left corner, enter a valid Hostname
+		•		Select an Ethernet Port
+		•		In the bottom right corner,  Click Configure
+		•		Enter valid entries
+		•		Click Save
+		•		Under Ethernet, click th ON button
+		•		In the upper left corner, Click Done
+	15. 	Under Software
+		•	Connect to Red Hat
+		•	Enter a valid User name
+		•	Enter a valid Password
+		•	Click Register
+		•	In the upper-left corner, click Done
+		Installation Source
+		•	Software Selection
+		•		Select Server with GUI
+		•	In the upper left corner, Click Done
+	16.	Under User Settings:
+		•	Click Root Password
+		•		Enter an applicable root password
+		•		Re-enter the root password
+		•	Click User Creation
+		•		Enter a Full Name
+		•		Enter a Username
+		•		Enter an applicable password
+		•		Re-enter the user password
+		•	In the upper right corner, Click Done
+	17.	In the bottom right corner, Click  Beginning Installation
+	NOTE: system may appear to be locked up, please wait patiently, the system is busy writing out files and will respond shortly.
+
+	18.	At the Installation Complete
+		•	In the bottom right corner, Click Reboot
+		•	Once the installation media has been ejected, remove it
+	19.	At the Initial Setup Window
+		•	Click License Information
+		•	Review and Select (Check Mark) I accept the License Agreement
+		•	In the upper left corner, Click Done
+		•	If not already done, configure Network and Host name
+		•	In the bottom right corner, Click Finish Configuration 
+	20.	Login to the system
+		•	Select a user
+		•	Enter a password
+	21.	At the Welcome window
+		•	Select the desired Language
+		•	Click Next
+	22.	At the Typing Window
+		•	Select the desired keyboard layout
+		•	Click Next
+	23.	If desired, Configure Privacy
+		•	Click Next
+		•	Click Deny Access or Grant Access to give Color access to your location?
+		•	If desired, Configure Connect your Online Accounts
+		•	Click Next  or Skip
+	24.	Click Start using Red Hat Enterprise Linux Server
+
