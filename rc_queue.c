@@ -93,45 +93,52 @@ static void rc_ahci_build_fis(const struct rc_hw_command *cmd, u8 *cfis)
  * rc_ahci_build_mailbox - Build vendor mailbox for TRX50 firmware
  * 
  * Mirrors Windows rcbottom.sys FUN_140001008 logic.
- * The mailbox is embedded in the AHCI command table starting at offset 0x10e.
+ * The mailbox is embedded in the AHCI command table starting at offset 0x40.
  * 
  * @table: Pointer to AHCI command table base
  * @cmd: Command structure
  * 
- * This is a minimal implementation to get the firmware to accept vendor commands.
- * We start with the simplest path: zero control flags, 20-byte payload, and
- * extended flags set. The exact payload values will be refined through testing.
+ * CORRECTED: The mailbox actually starts at offset 0x40 (after the 64-byte FIS).
+ * The offsets 0x10e-0x157 in FUN_140001008 are relative to a DIFFERENT base
+ * (likely a larger command structure). For AHCI, vendor data goes at 0x40.
  */
 static void rc_ahci_build_mailbox(u8 *table, const struct rc_hw_command *cmd)
 {
-	struct rc_vendor_mailbox *mb;
+	u8 *vendor_area;
 	
-	/* Mailbox starts at offset 0x10e in the command table */
-	mb = (struct rc_vendor_mailbox *)(table + 0x10e);
+	/* 
+	 * Vendor command area starts at offset 0x40 in AHCI command table
+	 * (immediately after the 64-byte FIS region at 0x00-0x3F)
+	 * 
+	 * Try placing a simple command descriptor here:
+	 * Byte 0: Magic/opcode marker (0xA1 or 0x34 from Windows code)
+	 * Byte 1: Reserved
+	 * Byte 2: Control flags
+	 * Byte 3: Command-specific flags
+	 * Bytes 4-7: Command opcode
+	 * Bytes 8+: Additional data
+	 */
+	vendor_area = table + 0x40;
+	memset(vendor_area, 0, 0x40);  /* Clear 64 bytes of vendor area */
 	
-	/* Zero the entire mailbox region */
-	memset(mb, 0, sizeof(*mb));
+	/* Try the "0x34" path from Windows (command payload format) */
+	vendor_area[0] = 0x34;  /* Magic byte from FUN_140001008 */
+	vendor_area[1] = 0x00;
+	vendor_area[2] = 0x00;  /* control_flags */
+	vendor_area[3] = 0x00;  /* secondary_control */
 	
-	/* Minimal implementation - start with simplest path */
-	mb->completion_flags = cpu_to_le16(0x0000);  /* Simplest completion path */
-	mb->cmd_type = 0x02;                          /* Command type = 0x02 when active */
-	mb->control_flags = 0x00;                     /* Start with no control flags */
-	mb->payload_length = 0x14;                    /* 20-byte payload (5 DWORDs) */
-	mb->secondary_control = 0x00;                 /* Start with no secondary flags */
+	/* Put command opcode in the payload */
+	*(u32 *)(vendor_area + 4) = cpu_to_le32(cmd->opcode);
+	*(u32 *)(vendor_area + 8) = 0;
+	*(u32 *)(vendor_area + 12) = 0;
+	*(u32 *)(vendor_area + 16) = 0;
+	*(u32 *)(vendor_area + 20) = 0;
 	
-	/* Zero payload for now - will refine based on testing */
-	mb->payload[0] = 0;
-	mb->payload[1] = 0;
-	mb->payload[2] = 0;
-	mb->payload[3] = 0;
-	mb->payload[4] = 0;
-	
-	/* Set extended flags - Windows always sets bit 17 (0x20000) */
-	mb->extended_flags = cpu_to_le32(0x20000);
-	
-	rc_printk(RC_DEBUG, "Mailbox: flags=0x%04x type=0x%02x ctrl=0x%02x len=0x%02x ext=0x%08x\n",
-	          le16_to_cpu(mb->completion_flags), mb->cmd_type, mb->control_flags,
-	          mb->payload_length, le32_to_cpu(mb->extended_flags));
+	rc_printk(RC_DEBUG, "Mailbox @0x40: magic=0x%02x opcode=0x%08x\n",
+	          vendor_area[0], cmd->opcode);
+	rc_printk(RC_DEBUG, "  Vendor area: %02x %02x %02x %02x %02x %02x %02x %02x\n",
+	          vendor_area[0], vendor_area[1], vendor_area[2], vendor_area[3],
+	          vendor_area[4], vendor_area[5], vendor_area[6], vendor_area[7]);
 }
 
 static void rc_ahci_prepare_slot(struct rc_queue_descriptor *desc,
