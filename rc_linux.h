@@ -181,6 +181,20 @@ struct rc_hw_completion {
     u32 reserved[3];
 } __packed;
 
+// Vendor mailbox structure (TRX50 firmware requirement)
+// Embedded in AHCI command table at offset 0x10e
+// Decoded from rcbottom.sys FUN_140001008
+struct rc_vendor_mailbox {
+    u16 completion_flags;  /* +0x10e: 0x4400/0x1100/0x1400/0x4703/0x0000 */
+    u8  cmd_type;          /* +0x110: 0x02 or 0x00 */
+    u8  control_flags;     /* +0x111: command-specific control */
+    u8  payload_length;    /* +0x112: 0x08, 0x14, or 0x00 */
+    u8  secondary_control; /* +0x113: command-specific flags */
+    u32 payload[5];        /* +0x114–0x124: command data */
+    u8  reserved[0x2c];    /* +0x128–0x153: unused */
+    u32 extended_flags;    /* +0x154: bit 17 = 0x20000 */
+} __packed;
+
 // Hardware adapter bookkeeping (queue/DMA resources)
 struct rc_hw_queue_context {
     struct rc_adapter *owner;

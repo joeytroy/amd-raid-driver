@@ -229,6 +229,98 @@ programs doorbells:
 
 * Frees existing handles via service slots `+0x338` / `+0x680`, refreshes per-port fields `devExt+0x100`…`+0x112`, and when necessary calls service `+0x838` or `FUN_1400097ac` to recycle resources.
 
+## Vendor Mailbox Layout (rcbottom.sys)
+
+The TRX50 firmware requires a vendor-specific "mailbox" structure embedded in the AHCI command table for vendor commands like `RC_CMD_SCAN_DISKS`. This mailbox is built dynamically by `FUN_140001008` with **no static template** - all fields are computed at runtime.
+
+### Mailbox Construction (`FUN_140001008`)
+
+* **Entry**: `(RCX=param_1, RDX=param_2, R8=param_3, R9=param_4, stack[0x28]=param_5, stack[0x30]=param_6)`
+  * `param_1`: adapter context
+  * `param_2`: **base of command table** (NOT the mailbox offset)
+  * `param_3`: pointer to 8-byte command descriptor (opcode + flags)
+  * `param_4`: pointer to 20-byte command payload (5 DWORDs)
+  * `param_5`: boolean - enables extended mode (0x14-byte payload vs 0x8-byte)
+  * `param_6`: boolean - controls flag bit 0x20000 at `+0x154`
+
+* **Field writes** (all relative to `param_2`, the command table base):
+  * `+0x10e`: 16-bit completion flags (values: `0x4400`, `0x1100`, `0x1400`, `0x4703`, or `0x0000`)
+  * `+0x110`: Command type byte (always `0x02` when flags are set, else `0x00`)
+  * `+0x111`: Control flags byte (copied from `param_3[2]` or `param_4[2]`)
+  * `+0x112`: Length field (`0x08`, `0x14`, or `0x00`)
+  * `+0x113`: Secondary control byte (copied from `param_3[3]` or `param_4[3]`)
+  * `+0x114`–`+0x124`: Five DWORDs (copied from `param_4[0..16]` when `param_4[0] == 0x34`, else from `param_3[0..7]`)
+  * `+0x154`: Extended flags DWORD (`|= 0x20000` when `param_5 == true && param_6 == false`)
+
+### Conditional Logic (decoded from assembly)
+
+1. **Command descriptor path** (`param_3 != NULL && param_3[0] == 0xA1`):
+   * Sets `param_2[0x112] = 0x8` (8-byte payload)
+   * Copies 8 bytes: `*(u64 *)(param_2 + 0x114) = *(u64 *)param_3`
+   * Copies control bytes: `param_2[0x111] = param_3[2]`, `param_2[0x113] = param_3[3]`
+
+2. **Command payload path** (`param_4 != NULL && param_4[0] == 0x34`):
+   * Sets `param_2[0x112] = 0x14` (20-byte payload)
+   * Copies 20 bytes: `memcpy(param_2 + 0x114, param_4, 20)`
+   * Copies control bytes: `param_2[0x111] = param_4[2]`, `param_2[0x113] = param_4[3]`
+   * **ACPI/GTF path**: If `param_4[2] & 0x1` and several other conditions pass, calls `FUN_140001df0(param_1, *(u32 *)(context + 0x8))` to inject ACPI data
+
+3. **Fallback path** (neither condition met):
+   * Zeroes the mailbox: `*(u16 *)(param_2 + 0x111) = 0`, `param_2[0x113] = 0`
+
+4. **Extended flags** (`param_5 == true && param_6 == false`):
+   * Sets bit 17: `*(u32 *)(param_2 + 0x154) |= 0x20000`
+
+5. **Completion flags** (based on `param_2[0x111] & 0x20` and `param_2[0x113]` bits):
+   * If `param_2[0x111] & 0x20`: writes `0x4400` to `param_2[0x10e]`
+   * Else if `param_2[0x111] & 0x01`:
+     * If `param_2[0x113] & 0x40`: writes `0x1100`
+     * Else if `param_2[0x113] & 0x10`: writes `0x1400`
+     * Else if `param_2[0x113] & 0x04` or `param_2[0x113] < 0`: writes `0x4703`
+     * Else: writes `0x0000`
+   * Else if `param_5 == false`: writes `0x0000`
+   * Else: writes `0x0002` to `param_2[0x110]` only
+
+### Struct Layout (confirmed from disassembly)
+
+The mailbox spans `param_2 + 0x10e` through `param_2 + 0x154` (70 bytes):
+
+```c
+/* Offsets relative to AHCI command table base */
+struct rc_vendor_mailbox {
+    u16 completion_flags;  /* +0x10e: 0x4400/0x1100/0x1400/0x4703/0x0000 */
+    u8  cmd_type;          /* +0x110: 0x02 or 0x00 */
+    u8  control_flags;     /* +0x111: from param_3[2] or param_4[2] */
+    u8  payload_length;    /* +0x112: 0x08, 0x14, or 0x00 */
+    u8  secondary_control; /* +0x113: from param_3[3] or param_4[3] */
+    u32 payload[5];        /* +0x114–0x124: command-specific data */
+    u8  reserved[0x2c];    /* +0x128–0x153: not written by FUN_140001008 */
+    u32 extended_flags;    /* +0x154: bit 17 = 0x20000 */
+} __packed;
+```
+
+### Caller Context (`FUN_140001180`)
+
+* Calls `FUN_140001008(param_1, lVar2, lVar1 + 0x58, lVar1 + 0x40, 1, 0)`
+  * `lVar2`: command table base
+  * `lVar1 + 0x58`: command descriptor pointer (8 bytes)
+  * `lVar1 + 0x40`: command payload pointer (20 bytes)
+  * `1`: param_5 = true (enable extended mode)
+  * `0`: param_6 = false (set bit 0x20000)
+
+### Linux Port Action Items
+
+1. **Define struct**: Add `struct rc_vendor_mailbox` to `rc_linux.h` at the correct offset in the command table.
+2. **Implement builder**: Add `rc_ahci_build_mailbox()` in `rc_queue.c` that mirrors `FUN_140001008` logic:
+   * Zero the mailbox region (`cmd_table + 0x10e` through `cmd_table + 0x157`)
+   * Set `payload_length = 0x14` for scan commands
+   * Set `control_flags` and `secondary_control` based on command type
+   * Copy command-specific payload (5 DWORDs) to `payload[0..4]`
+   * Compute `completion_flags` using the bit-testing logic above
+   * Set `extended_flags |= 0x20000` for normal commands
+3. **Wire into command path**: Call `rc_ahci_build_mailbox()` from `rc_ahci_prepare_slot()` after building the FIS.
+4. **Test with real hardware**: The exact values for `control_flags` and payload content must be determined by observing Windows driver behavior or firmware documentation.
+
 ## Remaining Unknowns
 
 * Translate each confirmed StorPort slot to a Linux helper (e.g. `+0x1B8` → BAR

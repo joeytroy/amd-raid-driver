@@ -89,6 +89,51 @@ static void rc_ahci_build_fis(const struct rc_hw_command *cmd, u8 *cfis)
 	cfis[15] = 0;
 }
 
+/*
+ * rc_ahci_build_mailbox - Build vendor mailbox for TRX50 firmware
+ * 
+ * Mirrors Windows rcbottom.sys FUN_140001008 logic.
+ * The mailbox is embedded in the AHCI command table starting at offset 0x10e.
+ * 
+ * @table: Pointer to AHCI command table base
+ * @cmd: Command structure
+ * 
+ * This is a minimal implementation to get the firmware to accept vendor commands.
+ * We start with the simplest path: zero control flags, 20-byte payload, and
+ * extended flags set. The exact payload values will be refined through testing.
+ */
+static void rc_ahci_build_mailbox(u8 *table, const struct rc_hw_command *cmd)
+{
+	struct rc_vendor_mailbox *mb;
+	
+	/* Mailbox starts at offset 0x10e in the command table */
+	mb = (struct rc_vendor_mailbox *)(table + 0x10e);
+	
+	/* Zero the entire mailbox region */
+	memset(mb, 0, sizeof(*mb));
+	
+	/* Minimal implementation - start with simplest path */
+	mb->completion_flags = cpu_to_le16(0x0000);  /* Simplest completion path */
+	mb->cmd_type = 0x02;                          /* Command type = 0x02 when active */
+	mb->control_flags = 0x00;                     /* Start with no control flags */
+	mb->payload_length = 0x14;                    /* 20-byte payload (5 DWORDs) */
+	mb->secondary_control = 0x00;                 /* Start with no secondary flags */
+	
+	/* Zero payload for now - will refine based on testing */
+	mb->payload[0] = 0;
+	mb->payload[1] = 0;
+	mb->payload[2] = 0;
+	mb->payload[3] = 0;
+	mb->payload[4] = 0;
+	
+	/* Set extended flags - Windows always sets bit 17 (0x20000) */
+	mb->extended_flags = cpu_to_le32(0x20000);
+	
+	rc_printk(RC_DEBUG, "Mailbox: flags=0x%04x type=0x%02x ctrl=0x%02x len=0x%02x ext=0x%08x\n",
+	          le16_to_cpu(mb->completion_flags), mb->cmd_type, mb->control_flags,
+	          mb->payload_length, le32_to_cpu(mb->extended_flags));
+}
+
 static void rc_ahci_prepare_slot(struct rc_queue_descriptor *desc,
                                  const struct rc_hw_command *cmd,
                                  u32 slot, bool data_in, bool data_out)
@@ -115,6 +160,9 @@ static void rc_ahci_prepare_slot(struct rc_queue_descriptor *desc,
     hdr->ctbau = cpu_to_le32(upper_32_bits(tbl_dma));
 
     rc_ahci_build_fis(cmd, table);
+
+    /* Build vendor mailbox for TRX50 firmware */
+    rc_ahci_build_mailbox(table, cmd);
 
     if (cmd->sector_count && cmd->data_addr) {
         struct rc_ahci_prdt_entry *prdt;
