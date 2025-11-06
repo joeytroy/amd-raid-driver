@@ -9,7 +9,8 @@
  * PCI identity table (from Windows rcbottom.inf)
  *----------------------------------------------------------------------*/
 static const struct pci_device_id rc_bottom_pci_tbl[] = {
-    { PCI_DEVICE(0x1022, 0x43bd) }, /* Solo TRX50 RAID bottom device */
+    { PCI_DEVICE(0x1022, 0x43bd) }, /* AMD Promontory SATA RAID bottom device */
+    { PCI_DEVICE(0x1022, 0xb000) }, /* AMD NVMe RAID Bottom Device (TRX50) */
     { 0, }
 };
 
@@ -23,19 +24,8 @@ static void rc_bottom_init_bar_templates(struct rc_adapter *adapter)
 {
     /* Windows service slot +0x1B8 writes static doorbell templates.
      * Our port just caches BAR metadata for rcbottom -> rccfg -> rcraid.
+     * This is now handled in rc_bottom_map_bars() based on device ID.
      */
-    struct rc_dev_context *ctx = &adapter->ctx;
-
-    /* Primary mapping is BAR5 (MMIO window, 1024 bytes). */
-    ctx->mmio_base = ctx->bar[5].virt;
-    ctx->mmio_len = ctx->bar[5].len;
-    ctx->mmio_phys = ctx->bar[5].phys;
-
-    rc_printk(RC_INFO,
-              "rc_bottom: BAR5 mapped phys=0x%pap len=0x%llx virt=%p\n",
-              &ctx->mmio_phys,
-              (unsigned long long)ctx->mmio_len,
-              ctx->mmio_base);
 }
 
 /*----------------------------------------------------------------------
@@ -87,8 +77,30 @@ static int rc_bottom_map_bars(struct rc_adapter *adapter)
                   bar->virt);
     }
 
+    /* For device ID 0xb000 (NVMe RAID Bottom), MMIO is in BAR0 */
+    /* For device ID 0x43bd (Promontory), MMIO is in BAR5 */
+    if (adapter->device_id == 0xb000) {
+        if (!ctx->bar[0].virt) {
+            rc_printk(RC_ERROR, "rc_bottom: BAR0 missing for NVMe RAID Bottom device\n");
+            return -ENODEV;
+        }
+        ctx->mmio_base = ctx->bar[0].virt;
+        ctx->mmio_len = ctx->bar[0].len;
+        ctx->mmio_phys = ctx->bar[0].phys;
+        rc_printk(RC_INFO, "rc_bottom: Using BAR0 for NVMe RAID Bottom (phys=0x%llx len=0x%llx)\n",
+                  (unsigned long long)ctx->mmio_phys, (unsigned long long)ctx->mmio_len);
+    } else if (adapter->device_id == 0x43bd) {
     if (!ctx->bar[5].virt) {
-        rc_printk(RC_ERROR, "rc_bottom: BAR5 missing, controller unsupported\n");
+            rc_printk(RC_ERROR, "rc_bottom: BAR5 missing for Promontory device\n");
+            return -ENODEV;
+        }
+        ctx->mmio_base = ctx->bar[5].virt;
+        ctx->mmio_len = ctx->bar[5].len;
+        ctx->mmio_phys = ctx->bar[5].phys;
+        rc_printk(RC_INFO, "rc_bottom: Using BAR5 for Promontory device (phys=0x%llx len=0x%llx)\n",
+                  (unsigned long long)ctx->mmio_phys, (unsigned long long)ctx->mmio_len);
+    } else {
+        rc_printk(RC_ERROR, "rc_bottom: Unknown device ID 0x%04x\n", adapter->device_id);
         return -ENODEV;
     }
 
@@ -257,8 +269,13 @@ static int rc_bottom_probe(struct pci_dev *pdev, const struct pci_device_id *id)
               pdev->subsystem_vendor,
               pdev->subsystem_device);
 
-    if (pdev->vendor != RC_PCI_VID || pdev->device != RC_PCI_DID) {
-        rc_printk(RC_ERROR, "rc_bottom: unexpected PCI ID, rejecting\n");
+    if (pdev->vendor != RC_PCI_VID) {
+        rc_printk(RC_ERROR, "rc_bottom: unexpected vendor ID 0x%04x\n", pdev->vendor);
+        return -ENODEV;
+    }
+    
+    if (pdev->device != RC_PCI_DID && pdev->device != 0xb000) {
+        rc_printk(RC_ERROR, "rc_bottom: unexpected device ID 0x%04x\n", pdev->device);
         return -ENODEV;
     }
 
@@ -287,6 +304,13 @@ static int rc_bottom_probe(struct pci_dev *pdev, const struct pci_device_id *id)
     ret = rc_hw_init(adapter);
     if (ret)
         goto err_free_irq;
+
+    /* Parse firmware capabilities to detect controller variant */
+    ret = rc_parse_firmware_capabilities(adapter);
+    if (ret) {
+        rc_printk(RC_WARN, "rc_bottom: firmware capability parsing failed (non-fatal)\n");
+        /* Continue anyway - will use safe dispatcher defaults */
+    }
 
     ret = rc_queue_init(adapter);
     if (ret)

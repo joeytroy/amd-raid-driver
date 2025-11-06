@@ -24,6 +24,219 @@ log_both() {
     echo -e "$1" | tee -a "$DIAG_FILE"
 }
 
+# Ensure debugfs is mounted so we can read rcraid diagnostics
+ensure_debugfs_mounted() {
+    if ! mount | grep -q ' on /sys/kernel/debug '; then
+        echo "Mounting debugfs..."
+        if mount -t debugfs debugfs /sys/kernel/debug 2>/dev/null; then
+            echo -e "${GREEN}  ✓ debugfs mounted${NC}"
+        else
+            echo -e "${YELLOW}  ⚠ Failed to mount debugfs (continuing without debugfs)${NC}"
+        fi
+    fi
+}
+
+# Check dmesg for rcraid-related error keywords
+check_driver_logs_for_errors() {
+    echo -e "${YELLOW}[TEST 4.5]${NC} Checking driver logs for errors..."
+    local errors
+    errors=$(dmesg | grep -iE "rcraid|rcbottom|rc_hw|rc_queue" | grep -iE "error|fail|timeout|reset" 2>/dev/null || true)
+    if [ -n "$errors" ]; then
+        echo -e "${YELLOW}⚠ Potential issues detected in kernel log:${NC}"
+        echo "$errors" | tail -10
+    else
+        echo -e "${GREEN}✓ No rcraid error keywords found in recent kernel log${NC}"
+    fi
+    echo
+}
+
+# Sanitize numeric metrics parsed from sysfs/debugfs
+sanitize_metric() {
+    local value="$1"
+    if [[ $value =~ ^[0-9]+$ ]]; then
+        echo "$value"
+    else
+        echo "0"
+    fi
+}
+
+# Verify metadata discovery messages appear in dmesg
+validate_metadata_flow() {
+    echo -e "${YELLOW}[TEST 5.5]${NC} Checking metadata discovery flow..."
+    local scan discover
+    scan=$(dmesg | grep "rc_scan_physical_disks" | tail -1 || true)
+    discover=$(dmesg | grep "rc_discover_arrays" | tail -1 || true)
+
+    if [ -n "$scan" ] && [ -n "$discover" ]; then
+        echo -e "${GREEN}✓ Firmware scan and array discovery messages detected${NC}"
+        echo "  $scan"
+        echo "  $discover"
+    else
+        echo -e "${YELLOW}⚠ Metadata discovery messages not observed; firmware handshake may be incomplete${NC}"
+    fi
+    echo
+}
+
+# Confirm pending request lists are empty for each adapter
+verify_pending_requests() {
+    echo -e "${YELLOW}[TEST 5.6]${NC} Checking pending request queues..."
+
+    local found=0
+    for file in "$SYSFS_BASE"/0000:*/rcraid/pending_requests; do
+        [ -f "$file" ] || continue
+        found=1
+        local adapter
+        adapter=$(basename "$(dirname "$file")")
+        local count
+        count=$(awk '/Pending Requests:/ {print $3}' "$file" 2>/dev/null)
+        if [ -z "$count" ]; then
+            echo -e "${YELLOW}  ⚠ Could not parse pending requests for $adapter${NC}"
+            continue
+        fi
+        if [ "$count" -gt 0 ]; then
+            echo -e "${YELLOW}  ⚠ $adapter reports $count pending request(s)${NC}"
+        else
+            echo -e "${GREEN}  ✓ $adapter pending queue empty${NC}"
+        fi
+    done
+
+    if [ $found -eq 0 ]; then
+        echo -e "${YELLOW}⚠ No rcraid pending request files available${NC}"
+    fi
+
+    echo
+}
+
+# Sample queue stats to detect activity/interrupt progress
+monitor_queue_activity() {
+    echo -e "${YELLOW}[TEST 5.7]${NC} Monitoring queue activity (5s sample)..."
+
+    local found=0
+    for file in "$SYSFS_BASE"/0000:*/rcraid/queue_stats; do
+        [ -f "$file" ] || continue
+        found=1
+        local adapter
+        adapter=$(basename "$(dirname "$file")")
+
+        local seq_start comp_start irq_start
+        seq_start=$(awk -F': ' '/Command Sequence/ {gsub(/^[ \t]+/, "", $2); print $2; exit}' "$file")
+        comp_start=$(awk -F': ' '/Completions/ {gsub(/^[ \t]+/, "", $2); print $2; exit}' "$file")
+        irq_start=$(awk -F': ' '/IRQ Count/ {gsub(/^[ \t]+/, "", $2); print $2; exit}' "$file")
+
+        seq_start=$(sanitize_metric "$seq_start")
+        comp_start=$(sanitize_metric "$comp_start")
+        irq_start=$(sanitize_metric "$irq_start")
+
+        sleep 5
+
+        local seq_end comp_end irq_end
+        seq_end=$(awk -F': ' '/Command Sequence/ {gsub(/^[ \t]+/, "", $2); print $2; exit}' "$file")
+        comp_end=$(awk -F': ' '/Completions/ {gsub(/^[ \t]+/, "", $2); print $2; exit}' "$file")
+        irq_end=$(awk -F': ' '/IRQ Count/ {gsub(/^[ \t]+/, "", $2); print $2; exit}' "$file")
+
+        seq_end=$(sanitize_metric "$seq_end")
+        comp_end=$(sanitize_metric "$comp_end")
+        irq_end=$(sanitize_metric "$irq_end")
+
+        local delta_seq=$((seq_end - seq_start))
+        local delta_comp=$((comp_end - comp_start))
+        local delta_irq=$((irq_end - irq_start))
+
+        echo "  $adapter:"
+        echo "    Command Sequence: $seq_start -> $seq_end (Δ $delta_seq)"
+        echo "    Completions:      $comp_start -> $comp_end (Δ $delta_comp)"
+        echo "    IRQ Count:        $irq_start -> $irq_end (Δ $delta_irq)"
+
+        if [ "$delta_seq" -gt 0 ] || [ "$delta_comp" -gt 0 ] || [ "$delta_irq" -gt 0 ]; then
+            echo -e "    ${GREEN}✓ Activity detected during sample window${NC}"
+        else
+            echo -e "    ${YELLOW}⚠ No queue or IRQ activity observed (idle path)${NC}"
+        fi
+    done
+
+    if [ $found -eq 0 ]; then
+        echo -e "${YELLOW}⚠ No queue_stats files available${NC}"
+    fi
+
+    echo
+}
+
+# Validate debugfs entries are present and readable
+verify_debugfs_access() {
+    echo -e "${YELLOW}[TEST 7.5]${NC} Validating debugfs access..."
+
+    if [ ! -d "$DEBUGFS_BASE" ]; then
+        echo -e "${YELLOW}⚠ rcraid debugfs root not available${NC}"
+        echo
+        return
+    fi
+
+    local any=0
+    for adapter_dir in "$DEBUGFS_BASE"/adapter*; do
+        [ -d "$adapter_dir" ] || continue
+        any=1
+        local name
+        name=$(basename "$adapter_dir")
+        for file in cmd_queue comp_queue pending_requests irq_state registers; do
+            local path="$adapter_dir/$file"
+            if [ -f "$path" ]; then
+                if head -n 5 "$path" >/dev/null 2>&1; then
+                    echo -e "${GREEN}  ✓ $name/$file readable${NC}"
+                else
+                    echo -e "${YELLOW}  ⚠ $name/$file not readable${NC}"
+                fi
+            else
+                echo -e "${YELLOW}  ⚠ $name/$file missing${NC}"
+            fi
+        done
+    done
+
+    if [ $any -eq 0 ]; then
+        echo -e "${YELLOW}⚠ No rcraid adapters exposed via debugfs${NC}"
+    fi
+
+    echo
+}
+
+# Check IRQ configuration reported in debugfs
+verify_irq_setup() {
+    echo -e "${YELLOW}[TEST 7.6]${NC} Verifying IRQ setup..."
+
+    if [ ! -d "$DEBUGFS_BASE" ]; then
+        echo -e "${YELLOW}⚠ Debugfs not available; skipping IRQ validation${NC}"
+        echo
+        return
+    fi
+
+    local any=0
+    for path in "$DEBUGFS_BASE"/adapter*/irq_state; do
+        [ -f "$path" ] || continue
+        any=1
+        local adapter mode vector count
+        adapter=$(basename "$(dirname "$path")")
+        mode=$(grep -m1 "IRQ Mode" "$path" | awk -F': ' '{print $2}')
+        vector=$(grep -m1 "IRQ Vector" "$path" | awk -F': ' '{print $2}')
+        count=$(grep -m1 "IRQ Count" "$path" | awk -F': ' '{print $2}')
+
+        if [ -z "$mode" ]; then
+            echo -e "${YELLOW}  ⚠ Unable to read IRQ state for $adapter${NC}"
+            continue
+        fi
+
+        if [ "$mode" = "MSI" ]; then
+            echo -e "${GREEN}  ✓ $adapter using MSI (vector $vector, count $count)${NC}"
+        else
+            echo -e "${YELLOW}  ⚠ $adapter not using MSI (mode reported: $mode)${NC}"
+        fi
+    done
+
+    if [ $any -eq 0 ]; then
+        echo -e "${YELLOW}⚠ No irq_state debugfs files found${NC}"
+    fi
+
+    echo
+}
+
 # Function to run command and capture output
 run_and_capture() {
     local cmd="$1"
@@ -65,14 +278,80 @@ fi
 echo
 
 # Test 2: Check for AMD RAID device
-echo -e "${YELLOW}[TEST 2]${NC} Checking for AMD RAID hardware (1022:43bd)..."
+echo -e "${YELLOW}[TEST 2]${NC} Checking for AMD RAID hardware..."
 if lspci -d 1022:43bd | grep -q "AMD"; then
-    echo -e "${GREEN}✓ AMD RAID device found:${NC}"
+    echo -e "${GREEN}✓ AMD RAID device (1022:43bd) found:${NC}"
     lspci -d 1022:43bd -vv | head -20
+fi
+if lspci -d 1022:b000 | grep -q "AMD"; then
+    echo -e "${GREEN}✓ AMD RAID Bottom device (1022:b000) found:${NC}"
+    lspci -d 1022:b000 -nn | head -10
+    echo
+    echo "Checking device bindings..."
+    for dev in $(lspci -d 1022:b000 | awk '{print $1}'); do
+        driver=$(readlink -f /sys/bus/pci/devices/0000:$dev/driver 2>/dev/null | xargs basename 2>/dev/null || echo "none")
+        subsystem=$(lspci -s $dev -v 2>/dev/null | grep -i "subsystem" | head -1)
+        echo "  Device $dev: driver=$driver $subsystem"
+    done
 else
-    echo -e "${YELLOW}⚠ AMD RAID device (1022:43bd) not found${NC}"
+    echo -e "${YELLOW}⚠ AMD RAID device (1022:43bd or 1022:b000) not found${NC}"
     echo "  This is OK if testing on non-TRX50 hardware"
 fi
+echo
+
+# Test 2.5: Ensure nvme driver is loaded, then unbind devices (except Samsung OS drive)
+echo -e "${YELLOW}[TEST 2.5]${NC} Managing NVMe driver bindings..."
+echo "Ensuring nvme driver is loaded (needed for OS drive)..."
+if ! lsmod | grep -q "^nvme "; then
+    echo "  Loading nvme driver..."
+    modprobe nvme 2>/dev/null || echo -e "${YELLOW}  ⚠ Could not load nvme driver (may already be loaded)${NC}"
+else
+    echo -e "${GREEN}  ✓ NVMe driver already loaded${NC}"
+fi
+
+echo
+echo "Unbinding AMD RAID devices from nvme driver (except Samsung OS drive)..."
+UNBOUND_COUNT=0
+SKIPPED_COUNT=0
+for dev in $(lspci -d 1022:b000 | awk '{print $1}'); do
+    driver=$(readlink -f /sys/bus/pci/devices/0000:$dev/driver 2>/dev/null | xargs basename 2>/dev/null || echo "none")
+    subsystem=$(lspci -s $dev -v 2>/dev/null | grep -i "subsystem" | head -1)
+    
+    # Identify Samsung devices (likely OS drive) - keep bound to nvme
+    if echo "$subsystem" | grep -qi "samsung"; then
+        echo -e "${YELLOW}  ⚠ Skipping Samsung device $dev (OS drive - keeping bound to nvme)${NC}"
+        SKIPPED_COUNT=$((SKIPPED_COUNT + 1))
+        continue
+    fi
+    
+    # For non-Samsung devices, unbind from nvme if bound
+    if [ "$driver" = "nvme" ]; then
+        echo "  Unbinding device $dev from nvme driver..."
+        if echo "0000:$dev" > /sys/bus/pci/drivers/nvme/unbind 2>/dev/null; then
+            echo -e "${GREEN}  ✓ Unbound device $dev from nvme${NC}"
+            UNBOUND_COUNT=$((UNBOUND_COUNT + 1))
+            sleep 0.5  # Give kernel time to process unbind
+        else
+            echo -e "${YELLOW}  ⚠ Failed to unbind device $dev (may be in use)${NC}"
+        fi
+    elif [ "$driver" = "rcbottom" ]; then
+        echo -e "${GREEN}  ✓ Device $dev already bound to rcbottom driver${NC}"
+    else
+        echo "  Device $dev status: driver=$driver (ready for binding)"
+    fi
+done
+
+echo
+if [ $UNBOUND_COUNT -gt 0 ]; then
+    echo -e "${GREEN}✓ Unbound $UNBOUND_COUNT device(s) from nvme driver${NC}"
+fi
+if [ $SKIPPED_COUNT -gt 0 ]; then
+    echo -e "${GREEN}✓ Skipped $SKIPPED_COUNT Samsung device(s) (OS drive protected)${NC}"
+fi
+if [ $UNBOUND_COUNT -eq 0 ] && [ $SKIPPED_COUNT -eq 0 ]; then
+    echo -e "${YELLOW}⚠ No devices processed (may already be configured)${NC}"
+fi
+sleep 1
 echo
 
 # Test 3: Load driver
@@ -98,6 +377,8 @@ echo -e "${YELLOW}[TEST 4]${NC} Checking kernel messages..."
 echo "Recent driver messages:"
 dmesg | grep -i "rcraid\|rcbottom\|rc_bottom\|rc_hw\|rc_queue" | tail -20 || echo "(no messages found)"
 echo
+
+check_driver_logs_for_errors
 
 # Test 5: Check sysfs entries
 echo -e "${YELLOW}[TEST 5]${NC} Checking sysfs entries..."
@@ -145,6 +426,10 @@ else
 fi
 echo
 
+validate_metadata_flow
+verify_pending_requests
+monitor_queue_activity
+
 # Test 6: Check for block devices
 echo -e "${YELLOW}[TEST 6]${NC} Checking for RAID block devices..."
 if ls /dev/rcraid* 2>/dev/null; then
@@ -176,6 +461,10 @@ else
     echo -e "${RED}✗ Module not loaded${NC}"
 fi
 echo
+
+ensure_debugfs_mounted
+verify_debugfs_access
+verify_irq_setup
 
 # Test 8: Basic I/O test (if devices exist)
 echo -e "${YELLOW}[TEST 8]${NC} Basic I/O test..."
@@ -281,4 +570,3 @@ if [[ $REPLY =~ ^[Yy]$ ]]; then
 else
     echo "Driver remains loaded"
 fi
-

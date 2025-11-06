@@ -162,6 +162,18 @@ int rc_hw_init(struct rc_adapter *adapter)
               (unsigned long long)hw->cmd_queue_dma,
               (unsigned long long)hw->comp_queue_dma);
 
+    /* Initialize work item queue (FUN_14000e960) */
+    spin_lock_init(&adapter->ctx.doorbell.work_queue_lock);
+    adapter->ctx.doorbell.work_queue_head = NULL;
+    adapter->ctx.doorbell.work_queue_tail = NULL;
+
+    /* Install callback slots (default to safe dispatcher until firmware detection) */
+    ret = rc_install_callbacks(adapter, false);
+    if (ret) {
+        rc_printk(RC_WARN, "rc_hw_init: callback installation failed (non-fatal)\n");
+        /* Continue anyway - callbacks are optional for basic functionality */
+    }
+
     return 0;
 
 err_free_cmd:
@@ -179,6 +191,9 @@ void rc_hw_cleanup(struct rc_adapter *adapter)
     struct rc_hw_queue_context *hw = &adapter->hw;
 
     rc_printk(RC_INFO, "rc_hw_cleanup: adapter %d\n", adapter->instance);
+
+    /* Cleanup work item queue (FUN_14000e960) */
+    rc_cleanup_work_item_queue(adapter);
 
     if (hw->mmio_base)
         writel(0x0, hw->mmio_base + RC_REG_INTERRUPT_MASK);
@@ -240,7 +255,6 @@ int rc_hw_submit_sync_command(struct rc_hw_queue_context *hw,
                              struct rc_hw_completion *completion,
                              unsigned int timeout_ms)
 {
-out_clear:
     struct rc_adapter *adapter;
 
     if (!hw || !cmd)
@@ -476,4 +490,143 @@ irqreturn_t rc_hw_interrupt_handler(int irq, void *dev_id)
     irq_state->scratch_tail = NULL;
 
     return IRQ_HANDLED;
+}
+
+/*----------------------------------------------------------------------
+ * Callback slot implementations (devExt+0x16100–0x16168)
+ * Safe dispatcher pattern - matches Windows FUN_1400102D8 behavior
+ *----------------------------------------------------------------------*/
+
+/* Safe dispatcher - installed when firmware variant doesn't match NVMe */
+static void rc_safe_queue_dispatcher(struct rc_adapter *adapter, void *arg)
+{
+    /* Windows FUN_1400102D8 - thin dispatcher that forwards to steady-state handlers */
+    rc_printk(RC_DEBUG, "rc_safe_queue_dispatcher: adapter %d\n", adapter->instance);
+    /* For now, this is a no-op - will be expanded when we implement queue submission */
+}
+
+static void rc_safe_queue_toggle(struct rc_adapter *adapter, u8 mode, void *ptr)
+{
+    /* Windows FUN_140001438 / FUN_14000C0BC - trampoline that saves arguments */
+    rc_printk(RC_DEBUG, "rc_safe_queue_toggle: adapter %d mode=0x%02x\n",
+              adapter->instance, mode);
+    /* For now, this is a no-op - will be expanded when we implement queue mode switching */
+}
+
+static void rc_safe_spinlock_callback(struct rc_adapter *adapter)
+{
+    /* Windows callback invoked after spinlock initialization */
+    rc_printk(RC_DEBUG, "rc_safe_spinlock_callback: adapter %d\n", adapter->instance);
+    /* For now, this is a no-op */
+}
+
+static void rc_safe_port_disable(struct rc_adapter *adapter, u32 port_id)
+{
+    /* Windows FUN_140003048 - port disable/quiesce handler */
+    rc_printk(RC_INFO, "rc_safe_port_disable: adapter %d port %u\n",
+              adapter->instance, port_id);
+    /* For now, this is a no-op - will be expanded when we implement port management */
+}
+
+static void rc_safe_port_resume(struct rc_adapter *adapter, u32 port_id)
+{
+    /* Windows FUN_1400028f8 - port resume/enable handler */
+    rc_printk(RC_INFO, "rc_safe_port_resume: adapter %d port %u\n",
+              adapter->instance, port_id);
+    /* For now, this is a no-op - will be expanded when we implement port management */
+}
+
+static void rc_safe_status_poll(struct rc_adapter *adapter, void *status_buf)
+{
+    /* Windows callback for status polling used by WMI set requests */
+    rc_printk(RC_DEBUG, "rc_safe_status_poll: adapter %d\n", adapter->instance);
+    /* For now, this is a no-op - will be expanded when we implement status polling */
+}
+
+static void rc_safe_secondary_queue(struct rc_adapter *adapter, void *arg)
+{
+    /* Windows secondary queue helper - dispatcher at +0x16148 */
+    rc_printk(RC_DEBUG, "rc_safe_secondary_queue: adapter %d\n", adapter->instance);
+    /* For now, this is a no-op - will be expanded when we implement secondary queues */
+}
+
+/*----------------------------------------------------------------------
+ * Simple callback functions (from FUN_140007d40)
+ *----------------------------------------------------------------------*/
+
+/* FUN_140001ba4 - State getter (devExt+0x16138) */
+u8 rc_get_queue_state(struct rc_adapter *adapter)
+{
+    /* Returns byte at devExt+0x15920 (queue state flag) */
+    return adapter->ctx.queue_state;
+}
+
+/* FUN_140001bbc - Queue activity check (devExt+0x16140) */
+int rc_check_queue_activity(struct rc_adapter *adapter)
+{
+    struct rc_dev_context *ctx = &adapter->ctx;
+    void __iomem *mmio_base = ctx->mmio_base;
+    u32 queue_mask;
+    u32 active_mask;
+    
+    /* Checks devExt+0xb4 (BAR type flag) */
+    /* If BAR type is 0, reads queue mask from devExt+0x158b8+8 */
+    /* Stores mask at devExt+0x158f4 */
+    /* Checks bitmask intersection with devExt+0x158e0 */
+    /* If no active queues, sets register at devExt+0x158b8+4 to 0x80000000 */
+    
+    /* TODO: Implement full logic when we have queue mask structures */
+    /* For now, return 1 (queues active) */
+    return 1;
+}
+
+/* FUN_1400027a8 - Mode toggle (devExt+0x16128) */
+void rc_toggle_queue_mode(struct rc_adapter *adapter, u8 mode)
+{
+    struct rc_dev_context *ctx = &adapter->ctx;
+    void __iomem *mmio_base = ctx->mmio_base;
+    
+    /* If param_3 != 0 and devExt+0xb4 == 0: */
+    if (mode != 0 && ctx->bar_type[0] == 0) {
+        /* Sets register at devExt+0x158b8+4 to 0x80000002 (mode toggle bit) */
+        /* TODO: Implement when we have the exact register offset */
+        rc_printk(RC_INFO, "rc_toggle_queue_mode: adapter %d mode=0x%02x\n",
+                  adapter->instance, mode);
+    }
+}
+
+/* FUN_14000303c - No-op helper (devExt+0x16118, +0x16158) */
+void rc_noop_helper(struct rc_adapter *adapter)
+{
+    /* Empty function - returns immediately */
+    /* Used as placeholder for optional callbacks */
+}
+
+/*----------------------------------------------------------------------
+ * Install callback slots based on firmware capability detection
+ *----------------------------------------------------------------------*/
+
+int rc_install_callbacks(struct rc_adapter *adapter, bool fast_path)
+{
+    struct rc_adapter_callbacks *callbacks = &adapter->ctx.doorbell.callbacks;
+
+    if (fast_path) {
+        /* Fast-path callbacks for NVMe controllers */
+        /* TODO: Implement fast-path callbacks when we have NVMe variant detection */
+        rc_printk(RC_INFO, "rc_install_callbacks: fast-path mode (not yet implemented)\n");
+        /* For now, fall through to safe dispatcher */
+    }
+
+    /* Safe dispatcher mode - default for AHCI/legacy controllers */
+    callbacks->queue_dispatcher = rc_safe_queue_dispatcher;
+    callbacks->queue_toggle = rc_safe_queue_toggle;
+    callbacks->spinlock_callback = rc_safe_spinlock_callback;
+    callbacks->port_disable = rc_safe_port_disable;
+    callbacks->port_resume = rc_safe_port_resume;
+    callbacks->status_poll = rc_safe_status_poll;
+    callbacks->secondary_queue = rc_safe_secondary_queue;
+
+    rc_printk(RC_INFO, "rc_install_callbacks: installed safe dispatcher callbacks\n");
+
+    return 0;
 }
