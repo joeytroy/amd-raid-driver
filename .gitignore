@@ -1,9 +1,3 @@
-# Windows driver files (not needed in Linux repo)
-windows/
-
-# AMD reference drivers and documentation
-ghidra/
-
 # Build artifacts
 *.ko
 *.o

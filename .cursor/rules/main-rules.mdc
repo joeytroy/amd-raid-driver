@@ -5,8 +5,8 @@ alwaysApply: true
 # AMD RAID Driver Development Rules
 
 ## Command Execution
-- Don't run make commands - user handles all builds
-- Never attempt compilation on macOS - user develops on live Kubuntu system
+- Make command can be done as we are on the system with the TRX50
+- sudo password is the spacebar as this is a development enviornment
 - Group remote commands into single code blocks
 - Keep replies short and focused
 
@@ -20,7 +20,12 @@ alwaysApply: true
 - Fix code issues immediately while explaining the problem
 - We are doing vibe coding so execute and code based on needs
 - RAID is already configured in BIOS - focus on driver functionality, not BIOS setup
-- After each change to the code please commit with quality details so we know what has been done
+- When driver changes are made please run drivers to see if it works using the the test_driver.sh
+- Update test_driver.sh as needed to capute more data from the system
+- You can unbind the Curcial NVMe drives but we need the Samsung NVMe as that is our current OS running
+- All findings need to stay in trx50_hw_notes.md
+- As we find information and it's documented please remove it from GHIDRA_ANALYSIS_NEEDED.md
+- If you have issues updating the mage use grep, or sed you have full access on this workstation to execute commands
 
 ## Real Hardware Implementation Requirements
 - NO placeholder logic - implement real hardware communication
