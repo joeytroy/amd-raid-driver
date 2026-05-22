@@ -476,54 +476,91 @@ have_cqe:
 	return 0;
 }
 
-/* Read LBA 0 of namespace 1 into a DMA buffer and hex-dump the first 64 B.
- * Proves the I/O path (SQE build → doorbell → poll → CQE) end-to-end. */
-static int rc_nvme_test_read_lba0(struct rc_adapter *adapter)
+/* Read 8 LBAs starting at slba into the given buffer (must be DMA-coherent
+ * and at least 8 * lba_bytes large; PAGE_SIZE is plenty for 512 B LBAs). */
+static int rc_nvme_read_lba(struct rc_adapter *adapter, u64 slba, u16 nlb_zbased,
+			    dma_addr_t buf_dma)
 {
-	struct device *dev = &adapter->pdev->dev;
-	struct rc_nvme_state *nvme = &adapter->ctx.nvme;
 	struct rc_nvme_sqe cmd;
-	void *buf;
-	dma_addr_t buf_dma;
-	size_t buf_bytes;
-	int ret;
-
-	if (!nvme->ns1_lba_bytes) {
-		rc_printk(RC_WARN,
-			  "rc_nvme_test_read_lba0: namespace LBA size unknown, skipping\n");
-		return -EINVAL;
-	}
-
-	/* Single-LBA read; PAGE_SIZE buffer guarantees no PRP boundary issue. */
-	buf_bytes = PAGE_SIZE;
-	buf = dma_alloc_coherent(dev, buf_bytes, &buf_dma, GFP_KERNEL);
-	if (!buf)
-		return -ENOMEM;
-	memset(buf, 0, buf_bytes);
 
 	memset(&cmd, 0, sizeof(cmd));
 	cmd.opc   = RC_NVME_NVM_OP_READ;
 	cmd.nsid  = cpu_to_le32(1);
 	cmd.prp1  = cpu_to_le64(buf_dma);
-	/* CDW10/11 = SLBA (start LBA, little-endian u64).  LBA 0. */
-	cmd.cdw10 = cpu_to_le32(0);
-	cmd.cdw11 = cpu_to_le32(0);
-	/* CDW12[15:0] = NLB (0's based; 0 = 1 LBA).  Other bits 0. */
-	cmd.cdw12 = cpu_to_le32(0);
+	cmd.cdw10 = cpu_to_le32((u32)(slba & 0xffffffff));
+	cmd.cdw11 = cpu_to_le32((u32)(slba >> 32));
+	cmd.cdw12 = cpu_to_le32(nlb_zbased);
+	return rc_nvme_io_cmd(adapter, &cmd);
+}
 
-	ret = rc_nvme_io_cmd(adapter, &cmd);
-	if (ret)
-		goto out;
+/* Scan a handful of "interesting" LBAs and dump the first 64 bytes of each.
+ * Goal is to spot where AMD's fakeRAID metadata is laid out so the next
+ * (Ghidra-assisted) pass knows where to look. */
+static int rc_nvme_test_read_scan(struct rc_adapter *adapter)
+{
+	struct device *dev = &adapter->pdev->dev;
+	struct rc_nvme_state *nvme = &adapter->ctx.nvme;
+	void *buf;
+	dma_addr_t buf_dma;
+	size_t buf_bytes;
+	u64 nsze;
+	int ret = 0;
+	size_t i;
 
-	rc_printk(RC_NOTE,
-		  "rc_nvme_test_read_lba0: LBA 0 (%u B) — first 64 bytes:\n",
-		  nvme->ns1_lba_bytes);
-	print_hex_dump(KERN_INFO, "rcraid: ", DUMP_PREFIX_OFFSET,
-		       16, 1, buf, 64, true);
+	if (!nvme->ns1_lba_bytes || !nvme->ns1_nsze) {
+		rc_printk(RC_WARN,
+			  "rc_nvme_test_read_scan: namespace not characterized, skipping\n");
+		return -EINVAL;
+	}
+	nsze = nvme->ns1_nsze;
 
-out:
+	buf_bytes = PAGE_SIZE;
+	buf = dma_alloc_coherent(dev, buf_bytes, &buf_dma, GFP_KERNEL);
+	if (!buf)
+		return -ENOMEM;
+
+	{
+		/* Pick a small set of LBAs likely to expose either generic
+		 * filesystem/GPT structure or vendor-reserved AMD blocks. */
+		const struct {
+			const char *label;
+			u64 slba;
+		} probes[] = {
+			{ "LBA 0 (MBR)",                  0 },
+			{ "LBA 1 (post-MBR / GPT hdr)",   1 },
+			{ "LBA 2 (GPT partition entries)", 2 },
+			{ "LBA NSZE-1 (last)",            nsze - 1 },
+			{ "LBA NSZE-33 (GPT secondary)",  nsze - 33 },
+			{ "LBA NSZE-2048 (1MiB tail)",    nsze - 2048 },
+		};
+
+		for (i = 0; i < ARRAY_SIZE(probes); i++) {
+			size_t dump_bytes = 64;
+			memset(buf, 0, PAGE_SIZE);
+			ret = rc_nvme_read_lba(adapter, probes[i].slba, 0, buf_dma);
+			if (ret) {
+				rc_printk(RC_WARN,
+					  "rc_nvme_test_read_scan: %s read failed (%d)\n",
+					  probes[i].label, ret);
+				continue;
+			}
+			/* For the last LBA — the one that reads as "EFI PART" —
+			 * dump the entire 512 bytes; the GPT-shaped header is
+			 * only the first 92 bytes and we want to see what AMD
+			 * stuffs after it. */
+			if (probes[i].slba == nsze - 1)
+				dump_bytes = nvme->ns1_lba_bytes;
+			rc_printk(RC_NOTE,
+				  "rc_nvme_test_read_scan: %s @ slba=%llu — first %zu bytes:\n",
+				  probes[i].label, (unsigned long long)probes[i].slba,
+				  dump_bytes);
+			print_hex_dump(KERN_INFO, "rcraid: ", DUMP_PREFIX_OFFSET,
+				       16, 1, buf, dump_bytes, true);
+		}
+	}
+
 	dma_free_coherent(dev, buf_bytes, buf, buf_dma);
-	return ret;
+	return 0;
 }
 
 /* Counterpart to create_io_queues; called from cleanup_controller. Sends
@@ -682,11 +719,11 @@ int rc_nvme_init_controller(struct rc_adapter *adapter)
 		return 0;
 	}
 
-	/* First real NVM I/O — read LBA 0 of nsid 1 and dump it. */
-	ret = rc_nvme_test_read_lba0(adapter);
+	/* First real NVM I/O — scan a few well-chosen LBAs to find metadata. */
+	ret = rc_nvme_test_read_scan(adapter);
 	if (ret)
 		rc_printk(RC_WARN,
-			  "rc_nvme_init_controller: test read of LBA 0 failed (%d)\n",
+			  "rc_nvme_init_controller: read scan failed (%d)\n",
 			  ret);
 
 	return 0;
