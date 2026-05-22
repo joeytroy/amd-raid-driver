@@ -18,6 +18,9 @@
 
 #include "rc_linux.h"
 #include <linux/unaligned.h>
+#include <linux/blkdev.h>
+#include <linux/blk-mq.h>
+#include <linux/highmem.h>
 
 /* Trivial global volume registry — assumes a single RAID0 volume.  Members
  * are inserted as their metadata validates.  Ordered by PCI BDF so the
@@ -34,6 +37,15 @@ static DEFINE_MUTEX(rc_volume_lock);
  * A real driver would read this from the metadata; we haven't decoded
  * which field encodes it yet. */
 #define RC_VOLUME_EXPECTED_MEMBERS	2
+
+/* gendisk state — at most one volume right now. */
+static struct gendisk *rc_volume_disk;
+static struct blk_mq_tag_set rc_volume_tagset;
+/* Per-member persistent DMA buffer (LBA-sized, allocated once at volume
+ * create).  With queue depth = 1 there's only one outstanding read per
+ * member, so a single buffer is safe. */
+static void       *rc_volume_dma_va[RC_VOLUME_MAX_MEMBERS];
+static dma_addr_t  rc_volume_dma_pa[RC_VOLUME_MAX_MEMBERS];
 
 #define RC_NVME_CC_DEFAULT	\
 	(RC_NVME_CC_IOSQES_64 | RC_NVME_CC_IOCQES_16 | \
@@ -493,9 +505,10 @@ have_cqe:
 	return 0;
 }
 
-/* Forward decl — defined below; read_validate_metadata calls it. */
+/* Forward decls — defined below. */
 static int rc_nvme_read_lba(struct rc_adapter *adapter, u64 slba,
 			    u16 nlb_zbased, dma_addr_t buf_dma);
+static int rc_volume_create_disk(void);
 
 /* AMD RAIDCore metadata checksum (ported from rcraid.sys FUN_1400014ec).
  *
@@ -784,10 +797,170 @@ static void rc_volume_register_member(struct rc_adapter *adapter)
 		  pci_name(adapter->pdev), pos,
 		  rc_volume_member_count, RC_VOLUME_EXPECTED_MEMBERS);
 
-	if (rc_volume_member_count == RC_VOLUME_EXPECTED_MEMBERS)
+	if (rc_volume_member_count == RC_VOLUME_EXPECTED_MEMBERS) {
 		rc_volume_demo_reads();
+		{
+			int rc = rc_volume_create_disk();
+			if (rc)
+				rc_printk(RC_WARN,
+					  "rc_volume_register_member: create_disk failed (%d)\n",
+					  rc);
+		}
+	}
 out:
 	mutex_unlock(&rc_volume_lock);
+}
+
+/* blk-mq request handler.  Walks each bvec, processes one sector at a time
+ * through rc_volume_map_lba + rc_nvme_read_lba.  Read-only for now.
+ * Runs in kworker context (can sleep). */
+static blk_status_t rc_volume_queue_rq(struct blk_mq_hw_ctx *hctx,
+				       const struct blk_mq_queue_data *bd)
+{
+	struct request *req = bd->rq;
+	struct bio_vec bvec;
+	struct req_iterator iter;
+	blk_status_t status = BLK_STS_OK;
+	sector_t pos = blk_rq_pos(req);
+
+	blk_mq_start_request(req);
+
+	if (req_op(req) != REQ_OP_READ) {
+		blk_mq_end_request(req, BLK_STS_IOERR);
+		return BLK_STS_OK;
+	}
+
+	rq_for_each_segment(bvec, req, iter) {
+		size_t off;
+		u8 *kaddr = kmap_local_page(bvec.bv_page);
+
+		for (off = 0; off < bvec.bv_len; off += 512) {
+			int member_idx;
+			u64 phys_lba;
+			int ret;
+
+			if (pos >= rc_volume_members[0]->ctx.nvme.ns1_nsze *
+				   rc_volume_member_count) {
+				status = BLK_STS_IOERR;
+				goto unmap;
+			}
+			rc_volume_map_lba(pos, &member_idx, &phys_lba);
+			ret = rc_nvme_read_lba(rc_volume_members[member_idx],
+					       phys_lba, 0,
+					       rc_volume_dma_pa[member_idx]);
+			if (ret) {
+				status = BLK_STS_IOERR;
+				goto unmap;
+			}
+			memcpy(kaddr + bvec.bv_offset + off,
+			       rc_volume_dma_va[member_idx], 512);
+			pos++;
+		}
+unmap:
+		kunmap_local(kaddr);
+		if (status != BLK_STS_OK)
+			break;
+	}
+
+	blk_mq_end_request(req, status);
+	return BLK_STS_OK;
+}
+
+static const struct blk_mq_ops rc_volume_mq_ops = {
+	.queue_rq = rc_volume_queue_rq,
+};
+
+static const struct block_device_operations rc_volume_bops = {
+	.owner = THIS_MODULE,
+};
+
+/* Allocate the gendisk + tagset, set up sizes, expose /dev/rcraid0. */
+static int rc_volume_create_disk(void)
+{
+	struct rc_adapter *m0 = rc_volume_members[0];
+	u64 total_sectors;
+	int i, ret;
+
+	/* One persistent DMA buffer per member. */
+	for (i = 0; i < rc_volume_member_count; i++) {
+		struct device *dev = &rc_volume_members[i]->pdev->dev;
+		rc_volume_dma_va[i] =
+			dma_alloc_coherent(dev, PAGE_SIZE,
+					   &rc_volume_dma_pa[i], GFP_KERNEL);
+		if (!rc_volume_dma_va[i]) {
+			ret = -ENOMEM;
+			goto err_free_dma;
+		}
+	}
+
+	memset(&rc_volume_tagset, 0, sizeof(rc_volume_tagset));
+	rc_volume_tagset.ops          = &rc_volume_mq_ops;
+	rc_volume_tagset.nr_hw_queues = 1;
+	rc_volume_tagset.queue_depth  = 1;
+	rc_volume_tagset.numa_node    = NUMA_NO_NODE;
+	rc_volume_tagset.cmd_size     = 0;
+	rc_volume_tagset.flags        = 0;
+
+	ret = blk_mq_alloc_tag_set(&rc_volume_tagset);
+	if (ret)
+		goto err_free_dma;
+
+	{
+		struct queue_limits lim = {
+			.logical_block_size  = 512,
+			.physical_block_size = 512,
+			.max_hw_sectors      = 8,
+			.max_segments        = 1,
+			.max_segment_size    = PAGE_SIZE,
+		};
+
+		rc_volume_disk = blk_mq_alloc_disk(&rc_volume_tagset, &lim, NULL);
+	}
+	if (IS_ERR(rc_volume_disk)) {
+		ret = PTR_ERR(rc_volume_disk);
+		rc_volume_disk = NULL;
+		goto err_free_tagset;
+	}
+
+	total_sectors = m0->ctx.nvme.ns1_nsze *
+			(u64)rc_volume_member_count;
+	set_capacity(rc_volume_disk, total_sectors);
+	snprintf(rc_volume_disk->disk_name, DISK_NAME_LEN, "rcraid0");
+	rc_volume_disk->fops        = &rc_volume_bops;
+	rc_volume_disk->major       = rc_major;
+	rc_volume_disk->minors      = 1;
+	rc_volume_disk->first_minor = 0;
+	rc_volume_disk->flags       = GENHD_FL_NO_PART;
+	/* Read-only — writes would corrupt the array. */
+	set_disk_ro(rc_volume_disk, 1);
+
+	ret = add_disk(rc_volume_disk);
+	if (ret)
+		goto err_put_disk;
+
+	rc_printk(RC_NOTE,
+		  "rc_volume_create_disk: /dev/%s up, %llu sectors (%llu MiB, read-only)\n",
+		  rc_volume_disk->disk_name,
+		  (unsigned long long)total_sectors,
+		  (unsigned long long)(total_sectors >> 11));
+	return 0;
+
+err_put_disk:
+	put_disk(rc_volume_disk);
+	rc_volume_disk = NULL;
+err_free_tagset:
+	blk_mq_free_tag_set(&rc_volume_tagset);
+err_free_dma:
+	for (i = 0; i < rc_volume_member_count; i++) {
+		if (rc_volume_dma_va[i]) {
+			struct device *dev = &rc_volume_members[i]->pdev->dev;
+			dma_free_coherent(dev, PAGE_SIZE,
+					  rc_volume_dma_va[i],
+					  rc_volume_dma_pa[i]);
+			rc_volume_dma_va[i] = NULL;
+		}
+	}
+	return ret;
 }
 
 /* Counterpart to create_io_queues; called from cleanup_controller. Sends
