@@ -526,12 +526,9 @@ static int rc_nvme_test_read_scan(struct rc_adapter *adapter)
 			const char *label;
 			u64 slba;
 		} probes[] = {
-			{ "LBA 0 (MBR)",                  0 },
-			{ "LBA 1 (post-MBR / GPT hdr)",   1 },
-			{ "LBA 2 (GPT partition entries)", 2 },
-			{ "LBA NSZE-1 (last)",            nsze - 1 },
-			{ "LBA NSZE-33 (GPT secondary)",  nsze - 33 },
-			{ "LBA NSZE-2048 (1MiB tail)",    nsze - 2048 },
+			{ "LBA 0 (MBR)",                       0 },
+			{ "LBA 0x5000 (AMD RAIDCore metadata)", 0x5000 },
+			{ "LBA NSZE-1 (last / GPT residue)",   nsze - 1 },
 		};
 
 		for (i = 0; i < ARRAY_SIZE(probes); i++) {
@@ -544,11 +541,10 @@ static int rc_nvme_test_read_scan(struct rc_adapter *adapter)
 					  probes[i].label, ret);
 				continue;
 			}
-			/* For the last LBA — the one that reads as "EFI PART" —
-			 * dump the entire 512 bytes; the GPT-shaped header is
-			 * only the first 92 bytes and we want to see what AMD
-			 * stuffs after it. */
-			if (probes[i].slba == nsze - 1)
+			/* Full 512 B for the metadata candidates so we can see
+			 * the AMD RAIDCore header + payload, not just first 64. */
+			if (probes[i].slba == nsze - 1 ||
+			    probes[i].slba == 0x5000)
 				dump_bytes = nvme->ns1_lba_bytes;
 			rc_printk(RC_NOTE,
 				  "rc_nvme_test_read_scan: %s @ slba=%llu — first %zu bytes:\n",

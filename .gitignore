@@ -53,3 +53,4 @@ rcraid_generic
 
 # Driver installation directory
 /dd/
+.ghidra_workspace/
