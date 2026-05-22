@@ -19,6 +19,22 @@
 #include "rc_linux.h"
 #include <linux/unaligned.h>
 
+/* Trivial global volume registry — assumes a single RAID0 volume.  Members
+ * are inserted as their metadata validates.  Ordered by PCI BDF so the
+ * stripe mapping is deterministic; this is a guess at member position
+ * until the metadata field that encodes the explicit position is decoded
+ * via further RE.  Tracked under rc_volume_lock. */
+#define RC_VOLUME_MAX_MEMBERS	8
+static struct rc_adapter *rc_volume_members[RC_VOLUME_MAX_MEMBERS];
+static int rc_volume_member_count;
+static u32 rc_volume_stripe_sectors;
+static DEFINE_MUTEX(rc_volume_lock);
+
+/* Conservatively hard-code expected member count = 2 (the user's RAID0).
+ * A real driver would read this from the metadata; we haven't decoded
+ * which field encodes it yet. */
+#define RC_VOLUME_EXPECTED_MEMBERS	2
+
 #define RC_NVME_CC_DEFAULT	\
 	(RC_NVME_CC_IOSQES_64 | RC_NVME_CC_IOCQES_16 | \
 	 RC_NVME_CC_AMS_RR | RC_NVME_CC_MPS_4K | RC_NVME_CC_CSS_NVM)
@@ -629,6 +645,151 @@ static int rc_nvme_read_lba(struct rc_adapter *adapter, u64 slba, u16 nlb_zbased
 	return rc_nvme_io_cmd(adapter, &cmd);
 }
 
+/* Compare two adapters by PCI BDF for deterministic member ordering. */
+static int rc_volume_bdf_cmp(struct rc_adapter *a, struct rc_adapter *b)
+{
+	unsigned int abdf = (a->pdev->bus->number << 8) | a->pdev->devfn;
+	unsigned int bbdf = (b->pdev->bus->number << 8) | b->pdev->devfn;
+	return (int)abdf - (int)bbdf;
+}
+
+/* Map a logical RAID0 LBA to (member_index, physical LBA on that member).
+ * Caller must hold rc_volume_lock (or be in a single-threaded init path). */
+static void rc_volume_map_lba(u64 logical_lba, int *out_member, u64 *out_phys)
+{
+	u32 stripe = rc_volume_stripe_sectors;
+	int nmembers = rc_volume_member_count;
+	u64 stripe_num = div_u64(logical_lba, stripe);
+	u32 stripe_off = (u32)(logical_lba - stripe_num * stripe);
+	u32 member_idx = (u32)(stripe_num % (u32)nmembers);
+	u64 phys_stripe = div_u64(stripe_num, (u32)nmembers);
+
+	*out_member = (int)member_idx;
+	*out_phys   = phys_stripe * stripe + stripe_off;
+}
+
+/* Read one LBA from the assembled RAID0 volume. */
+static int rc_volume_read_lba(u64 logical_lba, dma_addr_t buf_dma)
+{
+	int member_idx;
+	u64 phys_lba;
+	struct rc_adapter *adapter;
+
+	if (rc_volume_member_count != RC_VOLUME_EXPECTED_MEMBERS ||
+	    !rc_volume_stripe_sectors)
+		return -ENODEV;
+
+	rc_volume_map_lba(logical_lba, &member_idx, &phys_lba);
+	adapter = rc_volume_members[member_idx];
+	return rc_nvme_read_lba(adapter, phys_lba, 0, buf_dma);
+}
+
+/* Demonstrate volume assembly: walk a few logical LBAs that straddle a
+ * stripe boundary and dump the first 16 bytes of each.  Shows the mapping
+ * is wiring up physical reads to the expected member. */
+static void rc_volume_demo_reads(void)
+{
+	/* Use member 0's device for the DMA buffer; either works. */
+	struct rc_adapter *adapter = rc_volume_members[0];
+	struct device *dev = &adapter->pdev->dev;
+	void *buf;
+	dma_addr_t buf_dma;
+	int i;
+
+	u32 stripe = rc_volume_stripe_sectors;
+	u64 probes[] = {
+		0,			/* stripe 0 → member 0 LBA 0 */
+		stripe - 1,		/* end of first stripe → member 0 */
+		stripe,			/* stripe 1 → member 1 LBA 0 */
+		stripe + 1,		/* member 1 LBA 1 */
+		(u64)stripe * 2,	/* stripe 2 → member 0 LBA stripe */
+		(u64)stripe * 3,	/* stripe 3 → member 1 LBA stripe */
+		RC_RAIDCORE_LBA,	/* RAIDCore meta LBA on the volume — note: on phys
+					 * member it's still at LBA 0x5000 of that member */
+	};
+
+	buf = dma_alloc_coherent(dev, PAGE_SIZE, &buf_dma, GFP_KERNEL);
+	if (!buf)
+		return;
+
+	rc_printk(RC_NOTE,
+		  "rc_volume_demo_reads: volume up — %d members, stripe=%u sectors\n",
+		  rc_volume_member_count, stripe);
+
+	for (i = 0; i < (int)ARRAY_SIZE(probes); i++) {
+		int member_idx;
+		u64 phys_lba;
+		int ret;
+
+		rc_volume_map_lba(probes[i], &member_idx, &phys_lba);
+		memset(buf, 0, 16);
+		ret = rc_volume_read_lba(probes[i], buf_dma);
+		if (ret) {
+			rc_printk(RC_WARN,
+				  "rc_volume_demo_reads: logical %llu read failed (%d)\n",
+				  (unsigned long long)probes[i], ret);
+			continue;
+		}
+		rc_printk(RC_NOTE,
+			  "rc_volume_demo_reads: logical=%llu -> member %d phys=%llu, first 16 bytes:\n",
+			  (unsigned long long)probes[i], member_idx,
+			  (unsigned long long)phys_lba);
+		print_hex_dump(KERN_INFO, "rcraid: ", DUMP_PREFIX_OFFSET,
+			       16, 1, buf, 16, true);
+	}
+
+	dma_free_coherent(dev, PAGE_SIZE, buf, buf_dma);
+}
+
+/* Called once per adapter after its metadata block validates.  Inserts the
+ * adapter into the global volume registry (sorted by PCI BDF) and, on
+ * reaching RC_VOLUME_EXPECTED_MEMBERS, declares the volume up and runs
+ * the demo reads. */
+static void rc_volume_register_member(struct rc_adapter *adapter)
+{
+	int pos;
+
+	mutex_lock(&rc_volume_lock);
+	if (rc_volume_member_count >= RC_VOLUME_MAX_MEMBERS) {
+		rc_printk(RC_WARN,
+			  "rc_volume_register_member: too many members, ignoring\n");
+		goto out;
+	}
+
+	/* Stash stripe size on first member; verify identical on subsequent. */
+	if (rc_volume_member_count == 0) {
+		rc_volume_stripe_sectors = adapter->ctx.nvme.md_stripe_sectors;
+	} else if (rc_volume_stripe_sectors !=
+		   adapter->ctx.nvme.md_stripe_sectors) {
+		rc_printk(RC_WARN,
+			  "rc_volume_register_member: stripe-size mismatch %u vs %u — ignoring this member\n",
+			  rc_volume_stripe_sectors,
+			  adapter->ctx.nvme.md_stripe_sectors);
+		goto out;
+	}
+
+	/* Insert sorted by PCI BDF. */
+	for (pos = 0; pos < rc_volume_member_count; pos++) {
+		if (rc_volume_bdf_cmp(adapter, rc_volume_members[pos]) < 0)
+			break;
+	}
+	memmove(&rc_volume_members[pos + 1], &rc_volume_members[pos],
+		(rc_volume_member_count - pos) *
+		sizeof(rc_volume_members[0]));
+	rc_volume_members[pos] = adapter;
+	rc_volume_member_count++;
+
+	rc_printk(RC_INFO,
+		  "rc_volume_register_member: %s registered at pos %d (%d/%d)\n",
+		  pci_name(adapter->pdev), pos,
+		  rc_volume_member_count, RC_VOLUME_EXPECTED_MEMBERS);
+
+	if (rc_volume_member_count == RC_VOLUME_EXPECTED_MEMBERS)
+		rc_volume_demo_reads();
+out:
+	mutex_unlock(&rc_volume_lock);
+}
+
 /* Counterpart to create_io_queues; called from cleanup_controller. Sends
  * Delete SQ then Delete CQ (order matters per spec) before freeing DMA. */
 static void rc_nvme_destroy_io_queues(struct rc_adapter *adapter)
@@ -787,10 +948,13 @@ int rc_nvme_init_controller(struct rc_adapter *adapter)
 
 	/* Read + validate the AMD RAIDCore metadata block at LBA 0x5000. */
 	ret = rc_nvme_read_validate_metadata(adapter);
-	if (ret)
+	if (ret) {
 		rc_printk(RC_WARN,
 			  "rc_nvme_init_controller: metadata validation failed (%d) — member treated as orphan\n",
 			  ret);
+		return 0;
+	}
+	rc_volume_register_member(adapter);
 
 	return 0;
 }
