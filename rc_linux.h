@@ -774,6 +774,10 @@ struct rc_raid_metadata {
 // Block major number (defined in rc_main.c)
 extern int rc_major;
 
+/* Called from rc_exit to tear down the assembled-RAID gendisk and free
+ * its per-member DMA buffers (defined in rc_nvme.c). */
+void rc_volume_teardown(void);
+
 // Hardware functions
 int rc_hw_init(struct rc_adapter *adapter);
 void rc_hw_cleanup(struct rc_adapter *adapter);

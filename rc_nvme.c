@@ -38,6 +38,14 @@ static DEFINE_MUTEX(rc_volume_lock);
  * which field encodes it yet. */
 #define RC_VOLUME_EXPECTED_MEMBERS	2
 
+/* Member-ordering override: 0 = PCI BDF ascending (default), 1 = reverse.
+ * Until we decode the explicit position field in the metadata, this is the
+ * escape hatch if reads come back wrong on a populated array. */
+static int rc_volume_reverse_order;
+module_param_named(reverse_member_order, rc_volume_reverse_order, int, 0644);
+MODULE_PARM_DESC(reverse_member_order,
+		 "If non-zero, sort members by descending PCI BDF instead of ascending");
+
 /* gendisk state — at most one volume right now. */
 static struct gendisk *rc_volume_disk;
 static struct blk_mq_tag_set rc_volume_tagset;
@@ -509,6 +517,7 @@ have_cqe:
 static int rc_nvme_read_lba(struct rc_adapter *adapter, u64 slba,
 			    u16 nlb_zbased, dma_addr_t buf_dma);
 static int rc_volume_create_disk(void);
+void rc_volume_teardown(void);
 
 /* AMD RAIDCore metadata checksum (ported from rcraid.sys FUN_1400014ec).
  *
@@ -663,7 +672,8 @@ static int rc_volume_bdf_cmp(struct rc_adapter *a, struct rc_adapter *b)
 {
 	unsigned int abdf = (a->pdev->bus->number << 8) | a->pdev->devfn;
 	unsigned int bbdf = (b->pdev->bus->number << 8) | b->pdev->devfn;
-	return (int)abdf - (int)bbdf;
+	int cmp = (int)abdf - (int)bbdf;
+	return rc_volume_reverse_order ? -cmp : cmp;
 }
 
 /* Map a logical RAID0 LBA to (member_index, physical LBA on that member).
@@ -811,17 +821,23 @@ out:
 	mutex_unlock(&rc_volume_lock);
 }
 
-/* blk-mq request handler.  Walks each bvec, processes one sector at a time
- * through rc_volume_map_lba + rc_nvme_read_lba.  Read-only for now.
- * Runs in kworker context (can sleep). */
+/* blk-mq request handler.  With chunk_sectors == stripe_sectors set in the
+ * queue limits, every request is guaranteed to stay within a single stripe
+ * and therefore maps to one member.  So we issue exactly one NVMe READ per
+ * request (NLB = nr_sectors-1) into the per-member persistent DMA buffer,
+ * then copy out to the bvecs.  Read-only for now.  Sleep is OK here. */
 static blk_status_t rc_volume_queue_rq(struct blk_mq_hw_ctx *hctx,
 				       const struct blk_mq_queue_data *bd)
 {
 	struct request *req = bd->rq;
 	struct bio_vec bvec;
 	struct req_iterator iter;
-	blk_status_t status = BLK_STS_OK;
 	sector_t pos = blk_rq_pos(req);
+	unsigned int nr_sectors = blk_rq_sectors(req);
+	int member_idx;
+	u64 phys_lba;
+	int ret;
+	size_t off;
 
 	blk_mq_start_request(req);
 
@@ -830,39 +846,33 @@ static blk_status_t rc_volume_queue_rq(struct blk_mq_hw_ctx *hctx,
 		return BLK_STS_OK;
 	}
 
-	rq_for_each_segment(bvec, req, iter) {
-		size_t off;
-		u8 *kaddr = kmap_local_page(bvec.bv_page);
-
-		for (off = 0; off < bvec.bv_len; off += 512) {
-			int member_idx;
-			u64 phys_lba;
-			int ret;
-
-			if (pos >= rc_volume_members[0]->ctx.nvme.ns1_nsze *
-				   rc_volume_member_count) {
-				status = BLK_STS_IOERR;
-				goto unmap;
-			}
-			rc_volume_map_lba(pos, &member_idx, &phys_lba);
-			ret = rc_nvme_read_lba(rc_volume_members[member_idx],
-					       phys_lba, 0,
-					       rc_volume_dma_pa[member_idx]);
-			if (ret) {
-				status = BLK_STS_IOERR;
-				goto unmap;
-			}
-			memcpy(kaddr + bvec.bv_offset + off,
-			       rc_volume_dma_va[member_idx], 512);
-			pos++;
-		}
-unmap:
-		kunmap_local(kaddr);
-		if (status != BLK_STS_OK)
-			break;
+	if (nr_sectors == 0 || nr_sectors > (PAGE_SIZE / 512) ||
+	    pos + nr_sectors >
+	    rc_volume_members[0]->ctx.nvme.ns1_nsze * rc_volume_member_count) {
+		blk_mq_end_request(req, BLK_STS_IOERR);
+		return BLK_STS_OK;
 	}
 
-	blk_mq_end_request(req, status);
+	rc_volume_map_lba(pos, &member_idx, &phys_lba);
+	ret = rc_nvme_read_lba(rc_volume_members[member_idx], phys_lba,
+			       (u16)(nr_sectors - 1),
+			       rc_volume_dma_pa[member_idx]);
+	if (ret) {
+		blk_mq_end_request(req, BLK_STS_IOERR);
+		return BLK_STS_OK;
+	}
+
+	off = 0;
+	rq_for_each_segment(bvec, req, iter) {
+		u8 *kaddr = kmap_local_page(bvec.bv_page);
+		memcpy(kaddr + bvec.bv_offset,
+		       (u8 *)rc_volume_dma_va[member_idx] + off,
+		       bvec.bv_len);
+		kunmap_local(kaddr);
+		off += bvec.bv_len;
+	}
+
+	blk_mq_end_request(req, BLK_STS_OK);
 	return BLK_STS_OK;
 }
 
@@ -909,9 +919,19 @@ static int rc_volume_create_disk(void)
 		struct queue_limits lim = {
 			.logical_block_size  = 512,
 			.physical_block_size = 512,
-			.max_hw_sectors      = 8,
-			.max_segments        = 1,
+			/* max one PAGE_SIZE per request — PRP1 alone can address
+			 * up to PAGE_SIZE; multi-page reads would need a PRP
+			 * list, not yet implemented. */
+			.max_hw_sectors      = PAGE_SIZE / 512,
+			/* Allow several bvecs per request so the kernel can
+			 * coalesce contiguous user buffers — they all share the
+			 * single NVMe READ we issue. */
+			.max_segments        = 16,
 			.max_segment_size    = PAGE_SIZE,
+			/* Critical: requests never cross a RAID0 stripe boundary,
+			 * so every request maps to a single member and we can
+			 * service it with one NVMe READ. */
+			.chunk_sectors       = rc_volume_stripe_sectors,
 		};
 
 		rc_volume_disk = blk_mq_alloc_disk(&rc_volume_tagset, &lim, NULL);
@@ -961,6 +981,36 @@ err_free_dma:
 		}
 	}
 	return ret;
+}
+
+/* Tear down everything rc_volume_create_disk allocated.  Called from
+ * rc_exit().  Safe to call when the disk was never created (state is
+ * initialised to NULL/0). */
+void rc_volume_teardown(void)
+{
+	int i;
+
+	mutex_lock(&rc_volume_lock);
+	if (rc_volume_disk) {
+		del_gendisk(rc_volume_disk);
+		put_disk(rc_volume_disk);
+		rc_volume_disk = NULL;
+		blk_mq_free_tag_set(&rc_volume_tagset);
+	}
+	for (i = 0; i < RC_VOLUME_MAX_MEMBERS; i++) {
+		if (rc_volume_dma_va[i] && rc_volume_members[i]) {
+			struct device *dev = &rc_volume_members[i]->pdev->dev;
+			dma_free_coherent(dev, PAGE_SIZE,
+					  rc_volume_dma_va[i],
+					  rc_volume_dma_pa[i]);
+			rc_volume_dma_va[i] = NULL;
+			rc_volume_dma_pa[i] = 0;
+		}
+		rc_volume_members[i] = NULL;
+	}
+	rc_volume_member_count = 0;
+	rc_volume_stripe_sectors = 0;
+	mutex_unlock(&rc_volume_lock);
 }
 
 /* Counterpart to create_io_queues; called from cleanup_controller. Sends

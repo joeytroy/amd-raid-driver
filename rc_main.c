@@ -80,7 +80,10 @@ static int __init rc_init(void)
 static void __exit rc_exit(void)
 {
     rc_printk(RC_NOTE, "rc_exit: AMD RAID Driver cleanup\n");
-    
+
+    // Tear down the assembled RAID volume + gendisk before unbinding members.
+    rc_volume_teardown();
+
     // Cleanup in reverse order
     rc_raid_cleanup();
     rc_config_cleanup();
