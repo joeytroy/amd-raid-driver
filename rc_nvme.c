@@ -650,17 +650,26 @@ out:
 	return ret;
 }
 
-/* Read 8 LBAs starting at slba into the given buffer (must be DMA-coherent
- * and at least 8 * lba_bytes large; PAGE_SIZE is plenty for 512 B LBAs). */
+/* Read (nlb_zbased + 1) LBAs starting at slba into the given DMA-coherent
+ * buffer.  The buffer must be PAGE_SIZE-aligned (dma_alloc_coherent gives us
+ * that) and large enough for the transfer.  PRP2 is set when the transfer
+ * spills past the first page.  Transfers longer than 2 * PAGE_SIZE require a
+ * PRP list (not yet implemented); caller must keep within that range. */
 static int rc_nvme_read_lba(struct rc_adapter *adapter, u64 slba, u16 nlb_zbased,
 			    dma_addr_t buf_dma)
 {
 	struct rc_nvme_sqe cmd;
+	u32 bytes = ((u32)nlb_zbased + 1) * 512u;
 
 	memset(&cmd, 0, sizeof(cmd));
 	cmd.opc   = RC_NVME_NVM_OP_READ;
 	cmd.nsid  = cpu_to_le32(1);
 	cmd.prp1  = cpu_to_le64(buf_dma);
+	if (bytes > PAGE_SIZE) {
+		if (WARN_ON_ONCE(bytes > 2 * PAGE_SIZE))
+			return -EINVAL;
+		cmd.prp2 = cpu_to_le64(buf_dma + PAGE_SIZE);
+	}
 	cmd.cdw10 = cpu_to_le32((u32)(slba & 0xffffffff));
 	cmd.cdw11 = cpu_to_le32((u32)(slba >> 32));
 	cmd.cdw12 = cpu_to_le32(nlb_zbased);
@@ -846,7 +855,7 @@ static blk_status_t rc_volume_queue_rq(struct blk_mq_hw_ctx *hctx,
 		return BLK_STS_OK;
 	}
 
-	if (nr_sectors == 0 || nr_sectors > (PAGE_SIZE / 512) ||
+	if (nr_sectors == 0 || nr_sectors > ((2 * PAGE_SIZE) / 512) ||
 	    pos + nr_sectors >
 	    rc_volume_members[0]->ctx.nvme.ns1_nsze * rc_volume_member_count) {
 		blk_mq_end_request(req, BLK_STS_IOERR);
@@ -891,11 +900,12 @@ static int rc_volume_create_disk(void)
 	u64 total_sectors;
 	int i, ret;
 
-	/* One persistent DMA buffer per member. */
+	/* Two-page persistent DMA buffer per member (8 KiB), allowing up to a
+	 * PRP1+PRP2-style transfer = 16 sectors per request. */
 	for (i = 0; i < rc_volume_member_count; i++) {
 		struct device *dev = &rc_volume_members[i]->pdev->dev;
 		rc_volume_dma_va[i] =
-			dma_alloc_coherent(dev, PAGE_SIZE,
+			dma_alloc_coherent(dev, 2 * PAGE_SIZE,
 					   &rc_volume_dma_pa[i], GFP_KERNEL);
 		if (!rc_volume_dma_va[i]) {
 			ret = -ENOMEM;
@@ -919,18 +929,13 @@ static int rc_volume_create_disk(void)
 		struct queue_limits lim = {
 			.logical_block_size  = 512,
 			.physical_block_size = 512,
-			/* max one PAGE_SIZE per request — PRP1 alone can address
-			 * up to PAGE_SIZE; multi-page reads would need a PRP
-			 * list, not yet implemented. */
-			.max_hw_sectors      = PAGE_SIZE / 512,
-			/* Allow several bvecs per request so the kernel can
-			 * coalesce contiguous user buffers — they all share the
-			 * single NVMe READ we issue. */
+			/* PRP1+PRP2 spans up to 2*PAGE_SIZE.  PRP list support
+			 * for larger transfers is a follow-up. */
+			.max_hw_sectors      = (2 * PAGE_SIZE) / 512,
 			.max_segments        = 16,
 			.max_segment_size    = PAGE_SIZE,
-			/* Critical: requests never cross a RAID0 stripe boundary,
-			 * so every request maps to a single member and we can
-			 * service it with one NVMe READ. */
+			/* Requests never cross a RAID0 stripe boundary, so every
+			 * request maps to one member and one NVMe READ. */
 			.chunk_sectors       = rc_volume_stripe_sectors,
 		};
 
@@ -974,7 +979,7 @@ err_free_dma:
 	for (i = 0; i < rc_volume_member_count; i++) {
 		if (rc_volume_dma_va[i]) {
 			struct device *dev = &rc_volume_members[i]->pdev->dev;
-			dma_free_coherent(dev, PAGE_SIZE,
+			dma_free_coherent(dev, 2 * PAGE_SIZE,
 					  rc_volume_dma_va[i],
 					  rc_volume_dma_pa[i]);
 			rc_volume_dma_va[i] = NULL;
@@ -1000,7 +1005,7 @@ void rc_volume_teardown(void)
 	for (i = 0; i < RC_VOLUME_MAX_MEMBERS; i++) {
 		if (rc_volume_dma_va[i] && rc_volume_members[i]) {
 			struct device *dev = &rc_volume_members[i]->pdev->dev;
-			dma_free_coherent(dev, PAGE_SIZE,
+			dma_free_coherent(dev, 2 * PAGE_SIZE,
 					  rc_volume_dma_va[i],
 					  rc_volume_dma_pa[i]);
 			rc_volume_dma_va[i] = NULL;
