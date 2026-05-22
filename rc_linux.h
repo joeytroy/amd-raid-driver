@@ -208,7 +208,7 @@ struct rc_nvme_state {
 
     // Capability snapshot (CAP at BAR0 + 0x00)
     u64            cap;
-    u16            mqes;              // CAP.MQES + 1 = max queue depth
+    u32            mqes;              // CAP.MQES + 1 = max queue depth (must be wider than u16: spec max is 65536)
     u8             dstrd;             // CAP.DSTRD doorbell stride
     u8             timeout_500ms;     // CAP.TO * 500 ms = boot timeout
 
@@ -565,7 +565,7 @@ int rc_raid_array_ioctl(struct block_device *bdev, fmode_t mode, unsigned int cm
 #define RC_NVME_REG_DBL_BASE		0x1000	/* Doorbell registers begin here */
 
 /* CAP field accessors (64-bit register) */
-#define RC_NVME_CAP_MQES(cap)		((u16)((cap) & 0xffff))		/* Max queue entries supported - 1 */
+#define RC_NVME_CAP_MQES(cap)		((u32)((cap) & 0xffff))		/* Max queue entries supported - 1 (0's based, so +1 needs u32) */
 #define RC_NVME_CAP_TO(cap)		((u8)(((cap) >> 24) & 0xff))	/* Timeout (500 ms units) */
 #define RC_NVME_CAP_DSTRD(cap)		((u8)(((cap) >> 32) & 0xf))	/* Doorbell stride */
 #define RC_NVME_CAP_CSS(cap)		((u8)(((cap) >> 37) & 0xff))	/* Command sets supported */
