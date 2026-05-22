@@ -425,6 +425,107 @@ err_free_sq:
 	return ret;
 }
 
+/* Same shape as rc_nvme_admin_cmd, but for I/O queue 1 (polled). */
+static int rc_nvme_io_cmd(struct rc_adapter *adapter, struct rc_nvme_sqe *cmd)
+{
+	struct rc_nvme_state *nvme = &adapter->ctx.nvme;
+	struct rc_nvme_sqe *slot;
+	struct rc_nvme_cqe *cqe;
+	unsigned long deadline;
+	u8 expected_phase;
+	u32 tail;
+	u16 status, sc_sct;
+
+	slot = (struct rc_nvme_sqe *)nvme->io_sq + nvme->io_sq_tail;
+	cmd->cid = cpu_to_le16(0);
+	memcpy(slot, cmd, sizeof(*cmd));
+
+	tail = (nvme->io_sq_tail + 1) % nvme->io_sq_depth;
+	nvme->io_sq_tail = tail;
+	wmb();
+	rc_nvme_ring_sq_doorbell(adapter, RC_NVME_IO_QID, tail);
+
+	cqe = (struct rc_nvme_cqe *)nvme->io_cq + nvme->io_cq_head;
+	expected_phase = nvme->io_cq_phase;
+	deadline = jiffies + msecs_to_jiffies(RC_NVME_ADMIN_TIMEOUT_MS);
+	while (time_before(jiffies, deadline)) {
+		status = le16_to_cpu(READ_ONCE(cqe->status));
+		if ((status & 1) == expected_phase)
+			goto have_cqe;
+		usleep_range(10, 50);
+	}
+	rc_printk(RC_ERROR,
+		  "rc_nvme_io_cmd: timeout waiting for CQE (opc=0x%02x)\n",
+		  cmd->opc);
+	return -ETIMEDOUT;
+
+have_cqe:
+	sc_sct = (status >> 1) & 0x7fff;
+
+	nvme->io_cq_head = (nvme->io_cq_head + 1) % nvme->io_cq_depth;
+	if (nvme->io_cq_head == 0)
+		nvme->io_cq_phase ^= 1;
+	rc_nvme_ring_cq_doorbell(adapter, RC_NVME_IO_QID, nvme->io_cq_head);
+
+	if (sc_sct) {
+		rc_printk(RC_ERROR,
+			  "rc_nvme_io_cmd: opc=0x%02x SC/SCT=0x%04x (status=0x%04x)\n",
+			  cmd->opc, sc_sct, status);
+		return -EIO;
+	}
+	return 0;
+}
+
+/* Read LBA 0 of namespace 1 into a DMA buffer and hex-dump the first 64 B.
+ * Proves the I/O path (SQE build → doorbell → poll → CQE) end-to-end. */
+static int rc_nvme_test_read_lba0(struct rc_adapter *adapter)
+{
+	struct device *dev = &adapter->pdev->dev;
+	struct rc_nvme_state *nvme = &adapter->ctx.nvme;
+	struct rc_nvme_sqe cmd;
+	void *buf;
+	dma_addr_t buf_dma;
+	size_t buf_bytes;
+	int ret;
+
+	if (!nvme->ns1_lba_bytes) {
+		rc_printk(RC_WARN,
+			  "rc_nvme_test_read_lba0: namespace LBA size unknown, skipping\n");
+		return -EINVAL;
+	}
+
+	/* Single-LBA read; PAGE_SIZE buffer guarantees no PRP boundary issue. */
+	buf_bytes = PAGE_SIZE;
+	buf = dma_alloc_coherent(dev, buf_bytes, &buf_dma, GFP_KERNEL);
+	if (!buf)
+		return -ENOMEM;
+	memset(buf, 0, buf_bytes);
+
+	memset(&cmd, 0, sizeof(cmd));
+	cmd.opc   = RC_NVME_NVM_OP_READ;
+	cmd.nsid  = cpu_to_le32(1);
+	cmd.prp1  = cpu_to_le64(buf_dma);
+	/* CDW10/11 = SLBA (start LBA, little-endian u64).  LBA 0. */
+	cmd.cdw10 = cpu_to_le32(0);
+	cmd.cdw11 = cpu_to_le32(0);
+	/* CDW12[15:0] = NLB (0's based; 0 = 1 LBA).  Other bits 0. */
+	cmd.cdw12 = cpu_to_le32(0);
+
+	ret = rc_nvme_io_cmd(adapter, &cmd);
+	if (ret)
+		goto out;
+
+	rc_printk(RC_NOTE,
+		  "rc_nvme_test_read_lba0: LBA 0 (%u B) — first 64 bytes:\n",
+		  nvme->ns1_lba_bytes);
+	print_hex_dump(KERN_INFO, "rcraid: ", DUMP_PREFIX_OFFSET,
+		       16, 1, buf, 64, true);
+
+out:
+	dma_free_coherent(dev, buf_bytes, buf, buf_dma);
+	return ret;
+}
+
 /* Counterpart to create_io_queues; called from cleanup_controller. Sends
  * Delete SQ then Delete CQ (order matters per spec) before freeing DMA. */
 static void rc_nvme_destroy_io_queues(struct rc_adapter *adapter)
@@ -574,9 +675,18 @@ int rc_nvme_init_controller(struct rc_adapter *adapter)
 
 	/* One I/O queue pair so the upper layer can submit NVM commands. */
 	ret = rc_nvme_create_io_queues(adapter);
-	if (ret)
+	if (ret) {
 		rc_printk(RC_WARN,
 			  "rc_nvme_init_controller: I/O queue creation failed (%d) — admin still works\n",
+			  ret);
+		return 0;
+	}
+
+	/* First real NVM I/O — read LBA 0 of nsid 1 and dump it. */
+	ret = rc_nvme_test_read_lba0(adapter);
+	if (ret)
+		rc_printk(RC_WARN,
+			  "rc_nvme_init_controller: test read of LBA 0 failed (%d)\n",
 			  ret);
 
 	return 0;
