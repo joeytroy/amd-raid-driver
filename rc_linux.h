@@ -227,6 +227,16 @@ struct rc_nvme_state {
     u16            io_cq_head;
     u8             io_cq_phase;
 
+    // RAIDCore metadata (LBA 0x5000), populated after validation.
+    bool           md_valid;
+    u64            md_member_uuid;    // offset 0x10 — per-member identity
+    u64            md_fld_18;         // offset 0x18 (purpose TBD)
+    u64            md_fld_20;         // offset 0x20 (purpose TBD)
+    u32            md_stripe_sectors; // offset 0x28 — likely stripe size in sectors
+    u32            md_version;        // offset 0x2C — must equal 0x00030000
+    u64            md_fld_30;         // offset 0x30 — count? (0x1C observed)
+    u64            md_fld_38;         // offset 0x38 — per-member info
+
     // Per-doorbell pointers (computed once after CAP read)
     void __iomem  *sq_doorbell_base;  // BAR0 + 0x1000
 };
@@ -622,6 +632,28 @@ int rc_raid_array_ioctl(struct block_device *bdev, fmode_t mode, unsigned int cm
  * currently submit (one READ at a time) and well under MQES (=65536). */
 #define RC_NVME_IO_QUEUE_DEPTH		64
 #define RC_NVME_IO_QID			1u
+
+/* AMD RAIDCore metadata block (one LBA per member at LBA 0x5000). The
+ * layout was recovered from rcraid.sys (RC_CheckMetaData / RC_ReadMetaData).
+ * Bytes [0x08..0x1FF] are covered by a 64-bit checksum stored at [0x00]. */
+#define RC_RAIDCORE_LBA			0x5000ULL
+#define RC_RAIDCORE_BYTES		512u
+#define RC_RAIDCORE_PAYLOAD_BYTES	0x1F8u	/* 504 = 0x200 - 8 */
+#define RC_RAIDCORE_MAGIC		0x65726F4344494152ULL	/* "RAIDCore" LE */
+#define RC_RAIDCORE_VERSION		0x00030000u
+
+struct rc_raidcore_md {
+	__le64	checksum;	/* 0x00 — XOR-with-shuffle over [0x08..0x1FF] */
+	__le64	magic;		/* 0x08 = "RAIDCore" */
+	__le64	member_uuid;	/* 0x10 — per-member identifier */
+	__le64	fld_18;		/* 0x18 (purpose TBD) */
+	__le64	fld_20;		/* 0x20 (purpose TBD) */
+	__le32	stripe_sectors;	/* 0x28 — likely stripe size in sectors */
+	__le32	version;	/* 0x2C — must be 0x00030000 */
+	__le64	fld_30;		/* 0x30 — count? (0x1C observed) */
+	__le64	fld_38;		/* 0x38 — per-member info */
+	u8	reserved[RC_RAIDCORE_BYTES - 0x40];
+} __packed;
 
 /* Identify CNS values (NVMe 1.4 §5.15.1) */
 #define RC_NVME_IDENTIFY_CNS_NS		0x00	/* Identify Namespace (requires NSID) */

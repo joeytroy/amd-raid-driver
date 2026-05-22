@@ -17,6 +17,7 @@
  ****************************************************************************/
 
 #include "rc_linux.h"
+#include <linux/unaligned.h>
 
 #define RC_NVME_CC_DEFAULT	\
 	(RC_NVME_CC_IOSQES_64 | RC_NVME_CC_IOCQES_16 | \
@@ -476,6 +477,141 @@ have_cqe:
 	return 0;
 }
 
+/* Forward decl — defined below; read_validate_metadata calls it. */
+static int rc_nvme_read_lba(struct rc_adapter *adapter, u64 slba,
+			    u16 nlb_zbased, dma_addr_t buf_dma);
+
+/* AMD RAIDCore metadata checksum (ported from rcraid.sys FUN_1400014ec).
+ *
+ * Treats the input as a sequence of 64-bit little-endian words.  For each
+ * word it picks two 16-bit "lanes":
+ *
+ *   - lane_a = current accumulator & 3
+ *   - lane_b = current word        & 3
+ *
+ * If both choose the same lane, fall back to (iter & 3, (iter+1) & 3).
+ * Swap the two 16-bit lanes inside the word, then XOR the modified word
+ * into the accumulator.  Final accumulator is the checksum.
+ */
+static u64 rc_raidcore_checksum(const void *data, size_t bytes)
+{
+	const u8 *bp = data;
+	size_t words = bytes >> 3;
+	u64 acc = 0;
+	size_t i;
+
+	for (i = 0; i < words; i++) {
+		u64 w = get_unaligned_le64(bp + i * 8);
+		unsigned int lane_a = (unsigned int)(acc & 3);
+		unsigned int lane_b = (unsigned int)(w & 3);
+		u16 lanes[4];
+		u16 tmp;
+		int k;
+
+		if (lane_a == lane_b) {
+			lane_a = (unsigned int)(i & 3);
+			lane_b = (unsigned int)((i + 1) & 3);
+		}
+
+		for (k = 0; k < 4; k++)
+			lanes[k] = (u16)(w >> (k * 16));
+
+		tmp = lanes[lane_a];
+		lanes[lane_a] = lanes[lane_b];
+		lanes[lane_b] = tmp;
+
+		w = 0;
+		for (k = 0; k < 4; k++)
+			w |= (u64)lanes[k] << (k * 16);
+
+		acc ^= w;
+	}
+	return acc;
+}
+
+/* Read LBA 0x5000 (the RAIDCore metadata block), verify magic / version /
+ * checksum, and stash the shared and per-member fields in adapter state.
+ * Returns 0 on success, negative errno on failure. */
+static int rc_nvme_read_validate_metadata(struct rc_adapter *adapter)
+{
+	struct device *dev = &adapter->pdev->dev;
+	struct rc_nvme_state *nvme = &adapter->ctx.nvme;
+	struct rc_raidcore_md *md;
+	void *buf;
+	dma_addr_t buf_dma;
+	u64 stored_csum, calc_csum, magic;
+	u32 version;
+	int ret;
+
+	buf = dma_alloc_coherent(dev, PAGE_SIZE, &buf_dma, GFP_KERNEL);
+	if (!buf)
+		return -ENOMEM;
+
+	ret = rc_nvme_read_lba(adapter, RC_RAIDCORE_LBA, 0, buf_dma);
+	if (ret) {
+		rc_printk(RC_ERROR,
+			  "rc_nvme_read_validate_metadata: read LBA 0x%llx failed (%d)\n",
+			  (unsigned long long)RC_RAIDCORE_LBA, ret);
+		goto out;
+	}
+
+	md = buf;
+	magic = le64_to_cpu(md->magic);
+	if (magic != RC_RAIDCORE_MAGIC) {
+		rc_printk(RC_ERROR,
+			  "rc_nvme_read_validate_metadata: bad magic 0x%016llx (expected 0x%016llx)\n",
+			  (unsigned long long)magic,
+			  (unsigned long long)RC_RAIDCORE_MAGIC);
+		ret = -ENOENT;
+		goto out;
+	}
+
+	version = le32_to_cpu(md->version);
+	if (version != RC_RAIDCORE_VERSION) {
+		rc_printk(RC_ERROR,
+			  "rc_nvme_read_validate_metadata: unsupported version 0x%08x (expected 0x%08x)\n",
+			  version, RC_RAIDCORE_VERSION);
+		ret = -ENOTSUPP;
+		goto out;
+	}
+
+	stored_csum = le64_to_cpu(md->checksum);
+	calc_csum = rc_raidcore_checksum((const u8 *)md + 8,
+					 RC_RAIDCORE_PAYLOAD_BYTES);
+	if (stored_csum != calc_csum) {
+		rc_printk(RC_ERROR,
+			  "rc_nvme_read_validate_metadata: checksum mismatch (stored 0x%016llx, computed 0x%016llx)\n",
+			  (unsigned long long)stored_csum,
+			  (unsigned long long)calc_csum);
+		ret = -EBADMSG;
+		goto out;
+	}
+
+	nvme->md_member_uuid     = le64_to_cpu(md->member_uuid);
+	nvme->md_fld_18          = le64_to_cpu(md->fld_18);
+	nvme->md_fld_20          = le64_to_cpu(md->fld_20);
+	nvme->md_stripe_sectors  = le32_to_cpu(md->stripe_sectors);
+	nvme->md_version         = version;
+	nvme->md_fld_30          = le64_to_cpu(md->fld_30);
+	nvme->md_fld_38          = le64_to_cpu(md->fld_38);
+	nvme->md_valid           = true;
+
+	rc_printk(RC_NOTE,
+		  "rc_nvme_read_validate_metadata: RAIDCore v0x%08x stripe=%u sectors (%u KiB) member=0x%016llx fld18=0x%016llx fld20=0x%016llx fld30=0x%016llx fld38=0x%016llx\n",
+		  version, nvme->md_stripe_sectors,
+		  (nvme->md_stripe_sectors * nvme->ns1_lba_bytes) >> 10,
+		  (unsigned long long)nvme->md_member_uuid,
+		  (unsigned long long)nvme->md_fld_18,
+		  (unsigned long long)nvme->md_fld_20,
+		  (unsigned long long)nvme->md_fld_30,
+		  (unsigned long long)nvme->md_fld_38);
+	ret = 0;
+
+out:
+	dma_free_coherent(dev, PAGE_SIZE, buf, buf_dma);
+	return ret;
+}
+
 /* Read 8 LBAs starting at slba into the given buffer (must be DMA-coherent
  * and at least 8 * lba_bytes large; PAGE_SIZE is plenty for 512 B LBAs). */
 static int rc_nvme_read_lba(struct rc_adapter *adapter, u64 slba, u16 nlb_zbased,
@@ -491,72 +627,6 @@ static int rc_nvme_read_lba(struct rc_adapter *adapter, u64 slba, u16 nlb_zbased
 	cmd.cdw11 = cpu_to_le32((u32)(slba >> 32));
 	cmd.cdw12 = cpu_to_le32(nlb_zbased);
 	return rc_nvme_io_cmd(adapter, &cmd);
-}
-
-/* Scan a handful of "interesting" LBAs and dump the first 64 bytes of each.
- * Goal is to spot where AMD's fakeRAID metadata is laid out so the next
- * (Ghidra-assisted) pass knows where to look. */
-static int rc_nvme_test_read_scan(struct rc_adapter *adapter)
-{
-	struct device *dev = &adapter->pdev->dev;
-	struct rc_nvme_state *nvme = &adapter->ctx.nvme;
-	void *buf;
-	dma_addr_t buf_dma;
-	size_t buf_bytes;
-	u64 nsze;
-	int ret = 0;
-	size_t i;
-
-	if (!nvme->ns1_lba_bytes || !nvme->ns1_nsze) {
-		rc_printk(RC_WARN,
-			  "rc_nvme_test_read_scan: namespace not characterized, skipping\n");
-		return -EINVAL;
-	}
-	nsze = nvme->ns1_nsze;
-
-	buf_bytes = PAGE_SIZE;
-	buf = dma_alloc_coherent(dev, buf_bytes, &buf_dma, GFP_KERNEL);
-	if (!buf)
-		return -ENOMEM;
-
-	{
-		/* Pick a small set of LBAs likely to expose either generic
-		 * filesystem/GPT structure or vendor-reserved AMD blocks. */
-		const struct {
-			const char *label;
-			u64 slba;
-		} probes[] = {
-			{ "LBA 0 (MBR)",                       0 },
-			{ "LBA 0x5000 (AMD RAIDCore metadata)", 0x5000 },
-			{ "LBA NSZE-1 (last / GPT residue)",   nsze - 1 },
-		};
-
-		for (i = 0; i < ARRAY_SIZE(probes); i++) {
-			size_t dump_bytes = 64;
-			memset(buf, 0, PAGE_SIZE);
-			ret = rc_nvme_read_lba(adapter, probes[i].slba, 0, buf_dma);
-			if (ret) {
-				rc_printk(RC_WARN,
-					  "rc_nvme_test_read_scan: %s read failed (%d)\n",
-					  probes[i].label, ret);
-				continue;
-			}
-			/* Full 512 B for the metadata candidates so we can see
-			 * the AMD RAIDCore header + payload, not just first 64. */
-			if (probes[i].slba == nsze - 1 ||
-			    probes[i].slba == 0x5000)
-				dump_bytes = nvme->ns1_lba_bytes;
-			rc_printk(RC_NOTE,
-				  "rc_nvme_test_read_scan: %s @ slba=%llu — first %zu bytes:\n",
-				  probes[i].label, (unsigned long long)probes[i].slba,
-				  dump_bytes);
-			print_hex_dump(KERN_INFO, "rcraid: ", DUMP_PREFIX_OFFSET,
-				       16, 1, buf, dump_bytes, true);
-		}
-	}
-
-	dma_free_coherent(dev, buf_bytes, buf, buf_dma);
-	return 0;
 }
 
 /* Counterpart to create_io_queues; called from cleanup_controller. Sends
@@ -715,11 +785,11 @@ int rc_nvme_init_controller(struct rc_adapter *adapter)
 		return 0;
 	}
 
-	/* First real NVM I/O — scan a few well-chosen LBAs to find metadata. */
-	ret = rc_nvme_test_read_scan(adapter);
+	/* Read + validate the AMD RAIDCore metadata block at LBA 0x5000. */
+	ret = rc_nvme_read_validate_metadata(adapter);
 	if (ret)
 		rc_printk(RC_WARN,
-			  "rc_nvme_init_controller: read scan failed (%d)\n",
+			  "rc_nvme_init_controller: metadata validation failed (%d) — member treated as orphan\n",
 			  ret);
 
 	return 0;
