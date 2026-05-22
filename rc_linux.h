@@ -216,6 +216,17 @@ struct rc_nvme_state {
     u32            ns1_lba_bytes;     // LBA size in bytes (e.g. 512 or 4096)
     u64            ns1_nsze;          // total LBAs in the namespace
 
+    // I/O queue 1 (single pair, polled). Allocated after admin Identify.
+    void          *io_sq;             // 64-byte SQE array
+    dma_addr_t     io_sq_dma;
+    u16            io_sq_depth;
+    u16            io_sq_tail;
+    void          *io_cq;             // 16-byte CQE array
+    dma_addr_t     io_cq_dma;
+    u16            io_cq_depth;
+    u16            io_cq_head;
+    u8             io_cq_phase;
+
     // Per-doorbell pointers (computed once after CAP read)
     void __iomem  *sq_doorbell_base;  // BAR0 + 0x1000
 };
@@ -598,7 +609,19 @@ int rc_raid_array_ioctl(struct block_device *bdev, fmode_t mode, unsigned int cm
 #define RC_NVME_CQ_ENTRY_SIZE		16
 
 /* Admin command opcodes (NVMe 1.4 §5) — only what we currently submit. */
+#define RC_NVME_ADMIN_OP_DELETE_IO_SQ	0x00
+#define RC_NVME_ADMIN_OP_CREATE_IO_SQ	0x01
+#define RC_NVME_ADMIN_OP_DELETE_IO_CQ	0x04
+#define RC_NVME_ADMIN_OP_CREATE_IO_CQ	0x05
 #define RC_NVME_ADMIN_OP_IDENTIFY	0x06
+
+/* NVM I/O opcodes */
+#define RC_NVME_NVM_OP_READ		0x02
+
+/* I/O queue depth; clamped against CAP.MQES. 64 is plenty for what we
+ * currently submit (one READ at a time) and well under MQES (=65536). */
+#define RC_NVME_IO_QUEUE_DEPTH		64
+#define RC_NVME_IO_QID			1u
 
 /* Identify CNS values (NVMe 1.4 §5.15.1) */
 #define RC_NVME_IDENTIFY_CNS_NS		0x00	/* Identify Namespace (requires NSID) */

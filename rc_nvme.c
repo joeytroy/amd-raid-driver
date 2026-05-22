@@ -339,6 +339,122 @@ out:
 	return ret;
 }
 
+/* Allocate one I/O completion + submission queue pair (qid=1) and ask the
+ * controller to wire them up via Create I/O CQ then Create I/O SQ admin
+ * commands.  Interrupts stay disabled — we'll poll the CQ for now. */
+static int rc_nvme_create_io_queues(struct rc_adapter *adapter)
+{
+	struct device *dev = &adapter->pdev->dev;
+	struct rc_nvme_state *nvme = &adapter->ctx.nvme;
+	struct rc_nvme_sqe cmd;
+	size_t sq_bytes, cq_bytes;
+	u16 depth;
+	int ret;
+
+	depth = RC_NVME_IO_QUEUE_DEPTH;
+	if (depth > nvme->mqes)
+		depth = nvme->mqes;
+
+	sq_bytes = (size_t)depth * RC_NVME_SQ_ENTRY_SIZE;
+	cq_bytes = (size_t)depth * RC_NVME_CQ_ENTRY_SIZE;
+
+	nvme->io_sq = dma_alloc_coherent(dev, sq_bytes, &nvme->io_sq_dma, GFP_KERNEL);
+	if (!nvme->io_sq)
+		return -ENOMEM;
+	nvme->io_cq = dma_alloc_coherent(dev, cq_bytes, &nvme->io_cq_dma, GFP_KERNEL);
+	if (!nvme->io_cq) {
+		ret = -ENOMEM;
+		goto err_free_sq;
+	}
+	memset(nvme->io_sq, 0, sq_bytes);
+	memset(nvme->io_cq, 0, cq_bytes);
+	nvme->io_sq_depth = depth;
+	nvme->io_cq_depth = depth;
+	nvme->io_sq_tail = 0;
+	nvme->io_cq_head = 0;
+	nvme->io_cq_phase = 1;
+
+	/* Create I/O Completion Queue (NVMe 1.4 §5.3, Figure 110).
+	 * CDW10[31:16] = QSIZE-1 (0's based), [15:0] = QID
+	 * CDW11[31:16] = IV, [1] = IEN, [0] = PC */
+	memset(&cmd, 0, sizeof(cmd));
+	cmd.opc   = RC_NVME_ADMIN_OP_CREATE_IO_CQ;
+	cmd.prp1  = cpu_to_le64(nvme->io_cq_dma);
+	cmd.cdw10 = cpu_to_le32(((u32)(depth - 1) << 16) | RC_NVME_IO_QID);
+	cmd.cdw11 = cpu_to_le32(0x1u);	/* PC=1, IEN=0 (polled), IV=0 */
+	ret = rc_nvme_admin_cmd(adapter, &cmd);
+	if (ret) {
+		rc_printk(RC_ERROR,
+			  "rc_nvme_create_io_queues: Create I/O CQ failed (%d)\n", ret);
+		goto err_free_cq;
+	}
+
+	/* Create I/O Submission Queue (NVMe 1.4 §5.4).
+	 * CDW10[31:16] = QSIZE-1, [15:0] = QID
+	 * CDW11[31:16] = CQID, [2:1] = QPRIO (0=urgent for admin/0=medium for I/O,
+	 *                                     value 0 means "Medium" which is fine),
+	 *               [0] = PC */
+	memset(&cmd, 0, sizeof(cmd));
+	cmd.opc   = RC_NVME_ADMIN_OP_CREATE_IO_SQ;
+	cmd.prp1  = cpu_to_le64(nvme->io_sq_dma);
+	cmd.cdw10 = cpu_to_le32(((u32)(depth - 1) << 16) | RC_NVME_IO_QID);
+	cmd.cdw11 = cpu_to_le32(((u32)RC_NVME_IO_QID << 16) | 0x1u);  /* CQID, PC=1 */
+	ret = rc_nvme_admin_cmd(adapter, &cmd);
+	if (ret) {
+		rc_printk(RC_ERROR,
+			  "rc_nvme_create_io_queues: Create I/O SQ failed (%d)\n", ret);
+		goto err_delete_cq;
+	}
+
+	rc_printk(RC_NOTE,
+		  "rc_nvme_create_io_queues: qid=%u up — SQ depth=%u CQ depth=%u\n",
+		  RC_NVME_IO_QID, depth, depth);
+	return 0;
+
+err_delete_cq:
+	memset(&cmd, 0, sizeof(cmd));
+	cmd.opc   = RC_NVME_ADMIN_OP_DELETE_IO_CQ;
+	cmd.cdw10 = cpu_to_le32(RC_NVME_IO_QID);
+	(void)rc_nvme_admin_cmd(adapter, &cmd);
+err_free_cq:
+	dma_free_coherent(dev, cq_bytes, nvme->io_cq, nvme->io_cq_dma);
+	nvme->io_cq = NULL;
+err_free_sq:
+	dma_free_coherent(dev, sq_bytes, nvme->io_sq, nvme->io_sq_dma);
+	nvme->io_sq = NULL;
+	return ret;
+}
+
+/* Counterpart to create_io_queues; called from cleanup_controller. Sends
+ * Delete SQ then Delete CQ (order matters per spec) before freeing DMA. */
+static void rc_nvme_destroy_io_queues(struct rc_adapter *adapter)
+{
+	struct device *dev = &adapter->pdev->dev;
+	struct rc_nvme_state *nvme = &adapter->ctx.nvme;
+	struct rc_nvme_sqe cmd;
+
+	if (nvme->io_sq) {
+		memset(&cmd, 0, sizeof(cmd));
+		cmd.opc   = RC_NVME_ADMIN_OP_DELETE_IO_SQ;
+		cmd.cdw10 = cpu_to_le32(RC_NVME_IO_QID);
+		(void)rc_nvme_admin_cmd(adapter, &cmd);
+		dma_free_coherent(dev,
+				  (size_t)nvme->io_sq_depth * RC_NVME_SQ_ENTRY_SIZE,
+				  nvme->io_sq, nvme->io_sq_dma);
+		nvme->io_sq = NULL;
+	}
+	if (nvme->io_cq) {
+		memset(&cmd, 0, sizeof(cmd));
+		cmd.opc   = RC_NVME_ADMIN_OP_DELETE_IO_CQ;
+		cmd.cdw10 = cpu_to_le32(RC_NVME_IO_QID);
+		(void)rc_nvme_admin_cmd(adapter, &cmd);
+		dma_free_coherent(dev,
+				  (size_t)nvme->io_cq_depth * RC_NVME_CQ_ENTRY_SIZE,
+				  nvme->io_cq, nvme->io_cq_dma);
+		nvme->io_cq = NULL;
+	}
+}
+
 int rc_nvme_init_controller(struct rc_adapter *adapter)
 {
 	void __iomem *base = adapter->ctx.mmio_base;
@@ -456,12 +572,23 @@ int rc_nvme_init_controller(struct rc_adapter *adapter)
 			  "rc_nvme_init_controller: identify namespace nsid=1 failed (%d)\n",
 			  ret);
 
+	/* One I/O queue pair so the upper layer can submit NVM commands. */
+	ret = rc_nvme_create_io_queues(adapter);
+	if (ret)
+		rc_printk(RC_WARN,
+			  "rc_nvme_init_controller: I/O queue creation failed (%d) — admin still works\n",
+			  ret);
+
 	return 0;
 }
 
 void rc_nvme_cleanup_controller(struct rc_adapter *adapter)
 {
 	void __iomem *base = adapter->ctx.mmio_base;
+
+	/* Tear down I/O queues *before* disabling the controller so the
+	 * Delete SQ / Delete CQ admin commands still go through. */
+	rc_nvme_destroy_io_queues(adapter);
 
 	if (base) {
 		/* Best-effort graceful shutdown. */
