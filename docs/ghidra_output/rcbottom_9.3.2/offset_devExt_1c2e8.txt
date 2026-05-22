@@ -1,0 +1,8 @@
+### Accesses with displacement 0x1c2e8  (devExt_1c2e8)
+### 0 writes, 2 reads/other
+
+--- WRITES (likely install/store) ---
+
+--- READS / LEA / CALL through this offset ---
+0x140008aa1 op1  LEA R8,[RBX + 0x1c2e8]  in FUN_140008a48
+0x140008d48 op1  MOV RDX,qword ptr [RBX + 0x1c2e8]  in FUN_140008bc0

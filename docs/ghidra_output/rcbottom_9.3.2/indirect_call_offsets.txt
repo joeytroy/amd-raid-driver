@@ -1,0 +1,454 @@
+### Indirect calls bucketed by displacement (StorPort service slot candidates)
+### 83 unique offsets
+
+-- offset 0xa8 (7 hits) --
+  0x140002406  CALL qword ptr [RAX + 0xa8]  in FUN_1400021d4
+  0x14000660a  CALL qword ptr [RAX + 0xa8]  in FUN_140005ff4
+  0x14000662f  CALL qword ptr [RAX + 0xa8]  in FUN_140005ff4
+  0x14000c45e  CALL qword ptr [RAX + 0xa8]  in FUN_14000c3d4
+  0x14000c561  CALL qword ptr [RAX + 0xa8]  in FUN_14000c3d4
+  0x14000def0  CALL qword ptr [RAX + 0xa8]  in FUN_14000dd44
+  0x14000f66c  CALL qword ptr [RAX + 0xa8]  in FUN_14000f608
+
+-- offset 0xb0 (7 hits) --
+  0x14000243b  CALL qword ptr [RAX + 0xb0]  in FUN_1400021d4
+  0x140009b80  CALL qword ptr [RAX + 0xb0]  in FUN_140009a14
+  0x140009ca1  CALL qword ptr [RAX + 0xb0]  in FUN_140009a14
+  0x14000c49f  CALL qword ptr [RAX + 0xb0]  in FUN_14000c3d4
+  0x14000c5b8  CALL qword ptr [RAX + 0xb0]  in FUN_14000c3d4
+  0x14000df25  CALL qword ptr [RAX + 0xb0]  in FUN_14000dd44
+  0x14000f6a2  CALL qword ptr [RAX + 0xb0]  in FUN_14000f608
+
+-- offset 0xb8 (7 hits) --
+  0x14000241f  CALL qword ptr [RAX + 0xb8]  in FUN_1400021d4
+  0x140009b5e  CALL qword ptr [RAX + 0xb8]  in FUN_140009a14
+  0x140009c83  CALL qword ptr [RAX + 0xb8]  in FUN_140009a14
+  0x14000c47f  CALL qword ptr [RAX + 0xb8]  in FUN_14000c3d4
+  0x14000c59c  CALL qword ptr [RAX + 0xb8]  in FUN_14000c3d4
+  0x14000df09  CALL qword ptr [RAX + 0xb8]  in FUN_14000dd44
+  0x14000f685  CALL qword ptr [RAX + 0xb8]  in FUN_14000f608
+
+-- offset 0xe8 (2 hits) --
+  0x140006ba0  CALL qword ptr [RAX + 0xe8]  in FUN_1400067fc
+  0x140008949  CALL qword ptr [RAX + 0xe8]  in FUN_140008638
+
+-- offset 0xf8 (1 hits) --
+  0x14000675f  CALL qword ptr [RAX + 0xf8]  in FUN_140005ff4
+
+-- offset 0x100 (5 hits) --
+  0x14000228b  CALL qword ptr [RAX + 0x100]  in FUN_1400021d4
+  0x14000677f  CALL qword ptr [RAX + 0x100]  in FUN_140005ff4
+  0x14000b202  CALL qword ptr [RAX + 0x100]  in FUN_14000b1c8
+  0x14000b3f8  CALL qword ptr [RAX + 0x100]  in FUN_14000b3c4
+  0x14000b4a4  CALL qword ptr [RAX + 0x100]  in FUN_14000b460
+
+-- offset 0x108 (11 hits) --
+  0x140006399  CALL qword ptr [RAX + 0x108]  in FUN_140005ff4
+  0x1400098d0  CALL qword ptr [R8 + 0x108]  in FUN_140009804
+  0x14000a620  CALL qword ptr [R8 + 0x108]  in FUN_14000a564
+  0x14000a638  CALL qword ptr [R8 + 0x108]  in FUN_14000a564
+  0x14000a682  CALL qword ptr [RAX + 0x108]  in FUN_14000a564
+  0x14000a699  CALL qword ptr [RAX + 0x108]  in FUN_14000a564
+  0x14000a800  CALL qword ptr [R8 + 0x108]  in FUN_14000a72c
+  0x14000a818  CALL qword ptr [R8 + 0x108]  in FUN_14000a72c
+  0x14000a860  CALL qword ptr [RAX + 0x108]  in FUN_14000a72c
+  0x14000a877  CALL qword ptr [RAX + 0x108]  in FUN_14000a72c
+  0x14000b21d  CALL qword ptr [R8 + 0x108]  in FUN_14000b1c8
+
+-- offset 0x110 (3 hits) --
+  0x140006d22  CALL qword ptr [RAX + 0x110]  in FUN_140006c34
+  0x140006e1b  CALL qword ptr [RAX + 0x110]  in FUN_140006da0
+  0x140009f8a  CALL qword ptr [RAX + 0x110]  in FUN_140009a14
+
+-- offset 0x118 (2 hits) --
+  0x14000a899  CALL qword ptr [R9 + 0x118]  in FUN_14000a72c
+  0x14000a8b4  CALL qword ptr [RAX + 0x118]  in FUN_14000a72c
+
+-- offset 0x120 (1 hits) --
+  0x14000a8ce  CALL qword ptr [RAX + 0x120]  in FUN_14000a72c
+
+-- offset 0x128 (1 hits) --
+  0x14000a6f0  CALL qword ptr [RAX + 0x128]  in FUN_14000a564
+
+-- offset 0x150 (1 hits) --
+  0x1400098ec  CALL qword ptr [RAX + 0x150]  in FUN_140009804
+
+-- offset 0x170 (2 hits) --
+  0x1400085af  CALL qword ptr [RAX + 0x170]  in FUN_140008540
+  0x1400085dc  CALL qword ptr [RAX + 0x170]  in FUN_140008540
+
+-- offset 0x188 (11 hits) --
+  0x140006bbd  CALL qword ptr [RAX + 0x188]  in FUN_1400067fc
+  0x140006bda  CALL qword ptr [RAX + 0x188]  in FUN_1400067fc
+  0x140006bf8  CALL qword ptr [RAX + 0x188]  in FUN_1400067fc
+  0x140008969  CALL qword ptr [RAX + 0x188]  in FUN_140008638
+  0x140008989  CALL qword ptr [RAX + 0x188]  in FUN_140008638
+  0x1400089a6  CALL qword ptr [RAX + 0x188]  in FUN_140008638
+  0x1400089c6  CALL qword ptr [RAX + 0x188]  in FUN_140008638
+  0x1400092e1  CALL qword ptr [RAX + 0x188]  in FUN_14000924c
+  0x140009303  CALL qword ptr [RAX + 0x188]  in FUN_14000924c
+  0x140009325  CALL qword ptr [RAX + 0x188]  in FUN_14000924c
+  0x140009347  CALL qword ptr [RAX + 0x188]  in FUN_14000924c
+
+-- offset 0x1a8 (1 hits) --
+  0x140006420  CALL qword ptr [RAX + 0x1a8]  in FUN_140005ff4
+
+-- offset 0x1b8 (1 hits) --
+  0x14000888e  CALL qword ptr [RAX + 0x1b8]  in FUN_140008638
+
+-- offset 0x1f8 (2 hits) --
+  0x1400069f7  CALL qword ptr [RAX + 0x1f8]  in FUN_1400067fc
+  0x1400088f2  CALL qword ptr [RAX + 0x1f8]  in FUN_140008638
+
+-- offset 0x210 (1 hits) --
+  0x14000691e  CALL qword ptr [R9 + 0x210]  in FUN_1400067fc
+
+-- offset 0x248 (2 hits) --
+  0x1400060ce  CALL qword ptr [R10 + 0x248]  in FUN_140005ff4
+  0x1400060fb  CALL qword ptr [RAX + 0x248]  in FUN_140005ff4
+
+-- offset 0x258 (2 hits) --
+  0x140006323  CALL qword ptr [RAX + 0x258]  in FUN_140005ff4
+  0x140006a1f  CALL qword ptr [RAX + 0x258]  in FUN_1400067fc
+
+-- offset 0x260 (1 hits) --
+  0x140006d7e  CALL qword ptr [RAX + 0x260]  in FUN_140006d3c
+
+-- offset 0x298 (2 hits) --
+  0x1400065a1  CALL qword ptr [RAX + 0x298]  in FUN_140005ff4
+  0x140006acc  CALL qword ptr [RAX + 0x298]  in FUN_1400067fc
+
+-- offset 0x2a0 (1 hits) --
+  0x140006b41  CALL qword ptr [RAX + 0x2a0]  in FUN_1400067fc
+
+-- offset 0x2f0 (1 hits) --
+  0x140006471  CALL qword ptr [RAX + 0x2f0]  in FUN_140005ff4
+
+-- offset 0x310 (2 hits) --
+  0x140003e21  CALL qword ptr [RAX + 0x310]  in FUN_140003d94
+  0x14000f253  CALL qword ptr [RAX + 0x310]  in FUN_14000f178
+
+-- offset 0x318 (2 hits) --
+  0x140003ee0  CALL qword ptr [RAX + 0x318]  in FUN_140003d94
+  0x14000f2ce  CALL qword ptr [RAX + 0x318]  in FUN_14000f178
+
+-- offset 0x328 (2 hits) --
+  0x140003f0b  CALL qword ptr [RAX + 0x328]  in FUN_140003d94
+  0x14000f2ef  CALL qword ptr [RAX + 0x328]  in FUN_14000f178
+
+-- offset 0x338 (3 hits) --
+  0x14000124d  CALL qword ptr [RAX + 0x338]  in FUN_140001180
+  0x140001aaf  CALL qword ptr [RAX + 0x338]  in FUN_140001868
+  0x14000c93a  CALL qword ptr [RAX + 0x338]  in FUN_14000c900
+
+-- offset 0x350 (1 hits) --
+  0x1400075d7  CALL qword ptr [RAX + 0x350]  in FUN_1400075ac
+
+-- offset 0x3a0 (1 hits) --
+  0x1405da2e6  CALL qword ptr [RAX + 0x3a0]  in FUN_1405da008
+
+-- offset 0x3b0 (1 hits) --
+  0x1400091f5  CALL qword ptr [RAX + 0x3b0]  in FUN_1400091a4
+
+-- offset 0x3b8 (1 hits) --
+  0x140007c49  CALL qword ptr [RAX + 0x3b8]  in FUN_140007ba0
+
+-- offset 0x3f0 (5 hits) --
+  0x14000615a  CALL qword ptr [RAX + 0x3f0]  in FUN_140005ff4
+  0x140006195  CALL qword ptr [RAX + 0x3f0]  in FUN_140005ff4
+  0x140006223  CALL qword ptr [RAX + 0x3f0]  in FUN_140005ff4
+  0x1400086cc  CALL qword ptr [RAX + 0x3f0]  in FUN_140008638
+  0x140008705  CALL qword ptr [RAX + 0x3f0]  in FUN_140008638
+
+-- offset 0x400 (1 hits) --
+  0x1400088db  CALL qword ptr [RAX + 0x400]  in FUN_140008638
+
+-- offset 0x418 (4 hits) --
+  0x140006551  CALL qword ptr [R10 + 0x418]  in FUN_140005ff4
+  0x14000805c  CALL qword ptr [RAX + 0x418]  in FUN_140007d40
+  0x1400081b8  CALL qword ptr [RAX + 0x418]  in FUN_140007d40
+  0x1400084b0  CALL qword ptr [R10 + 0x418]  in FUN_140008434
+
+-- offset 0x428 (1 hits) --
+  0x140006b66  CALL qword ptr [RAX + 0x428]  in FUN_1400067fc
+
+-- offset 0x468 (1 hits) --
+  0x140007a9a  CALL qword ptr [RAX + 0x468]  in FUN_1400079a4
+
+-- offset 0x470 (2 hits) --
+  0x140007595  CALL qword ptr [R8 + 0x470]  in FUN_14000751c
+  0x140008b9c  CALL qword ptr [R8 + 0x470]  in FUN_140008b44
+
+-- offset 0x4a8 (1 hits) --
+  0x140007ae2  CALL qword ptr [RAX + 0x4a8]  in FUN_1400079a4
+
+-- offset 0x4b8 (1 hits) --
+  0x14000753d  CALL qword ptr [RAX + 0x4b8]  in FUN_14000751c
+
+-- offset 0x4c0 (3 hits) --
+  0x14000a4b7  CALL qword ptr [RAX + 0x4c0]  in FUN_14000a430
+  0x14000a547  CALL qword ptr [RAX + 0x4c0]  in FUN_14000a430
+  0x1405d94be  CALL qword ptr [RAX + 0x4c0]  in FUN_1405d9448
+
+-- offset 0x4e8 (2 hits) --
+  0x140009894  CALL qword ptr [RAX + 0x4e8]  in FUN_140009804
+  0x140009a67  CALL qword ptr [RAX + 0x4e8]  in FUN_140009a14
+
+-- offset 0x4f0 (2 hits) --
+  0x140006fb2  CALL qword ptr [RAX + 0x4f0]  in FUN_140006e3c
+  0x14000a075  CALL qword ptr [RAX + 0x4f0]  in FUN_140009a14
+
+-- offset 0x5d0 (1 hits) --
+  0x1400099d7  CALL qword ptr [RAX + 0x5d0]  in FUN_140009804
+
+-- offset 0x650 (41 hits) --
+  0x14000634b  CALL qword ptr [RAX + 0x650]  in FUN_140005ff4
+  0x140006668  CALL qword ptr [RAX + 0x650]  in FUN_140005ff4
+  0x1400066b9  CALL qword ptr [RAX + 0x650]  in FUN_140005ff4
+  0x140006710  CALL qword ptr [RAX + 0x650]  in FUN_140005ff4
+  0x1400068dd  CALL qword ptr [RAX + 0x650]  in FUN_1400067fc
+  0x140006a5e  CALL qword ptr [RAX + 0x650]  in FUN_1400067fc
+  0x140006c60  CALL qword ptr [RAX + 0x650]  in FUN_140006c34
+  0x140006ddc  CALL qword ptr [RAX + 0x650]  in FUN_140006da0
+  0x140006e91  CALL qword ptr [RAX + 0x650]  in FUN_140006e3c
+  0x140007408  CALL qword ptr [RAX + 0x650]  in FUN_1400073e0
+  0x140007455  CALL qword ptr [RAX + 0x650]  in FUN_140007428
+  0x1400074fc  CALL qword ptr [RAX + 0x650]  in FUN_1400074d4
+  0x14000755b  CALL qword ptr [RAX + 0x650]  in FUN_14000751c
+  0x140007b67  CALL qword ptr [RAX + 0x650]  in FUN_140007b2c
+  0x140007bd3  CALL qword ptr [RAX + 0x650]  in FUN_140007ba0
+  0x14000846b  CALL qword ptr [RAX + 0x650]  in FUN_140008434
+  0x140008a73  CALL qword ptr [RAX + 0x650]  in FUN_140008a48
+  0x140008b6f  CALL qword ptr [RAX + 0x650]  in FUN_140008b44
+  0x140008bf2  CALL qword ptr [RAX + 0x650]  in FUN_140008bc0
+  0x140008cce  CALL qword ptr [R9 + 0x650]  in FUN_140008bc0
+  0x140008d05  CALL qword ptr [RAX + 0x650]  in FUN_140008bc0
+  0x140008db0  CALL qword ptr [RAX + 0x650]  in FUN_140008d88
+  0x140008e30  CALL qword ptr [R9 + 0x650]  in FUN_140008dec
+  0x140008f69  CALL qword ptr [RAX + 0x650]  in FUN_140008f34
+  0x140009145  CALL qword ptr [RAX + 0x650]  in FUN_14000911c
+  0x140009233  CALL qword ptr [RAX + 0x650]  in FUN_140009210
+  0x140009270  CALL qword ptr [RAX + 0x650]  in FUN_14000924c
+  0x1400098b2  CALL qword ptr [RAX + 0x650]  in FUN_140009804
+  0x140009a88  CALL qword ptr [R9 + 0x650]  in FUN_140009a14
+  0x14000a37a  CALL qword ptr [RAX + 0x650]  in FUN_14000a350
+
+-- offset 0x680 (13 hits) --
+  0x140001265  CALL qword ptr [RAX + 0x680]  in FUN_140001180
+  0x140001ac7  CALL qword ptr [RAX + 0x680]  in FUN_140001868
+  0x140003efc  CALL qword ptr [RAX + 0x680]  in FUN_140003d94
+  0x140003f2b  CALL qword ptr [RAX + 0x680]  in FUN_140003d94
+  0x140003fa8  CALL qword ptr [RAX + 0x680]  in FUN_140003f7c
+  0x140003fee  CALL qword ptr [RAX + 0x680]  in FUN_140003f7c
+  0x140004006  CALL qword ptr [RAX + 0x680]  in FUN_140003f7c
+  0x140008d33  CALL qword ptr [RAX + 0x680]  in FUN_140008bc0
+  0x140008d56  CALL qword ptr [RAX + 0x680]  in FUN_140008bc0
+  0x14000c952  CALL qword ptr [RAX + 0x680]  in FUN_14000c900
+  0x14000d2dc  CALL qword ptr [RAX + 0x680]  in FUN_14000d29c
+  0x14000d305  CALL qword ptr [RAX + 0x680]  in FUN_14000d29c
+  0x14000f325  CALL qword ptr [RAX + 0x680]  in FUN_14000f178
+
+-- offset 0x690 (1 hits) --
+  0x1400068fc  CALL qword ptr [R8 + 0x690]  in FUN_1400067fc
+
+-- offset 0x6a0 (1 hits) --
+  0x14000693d  CALL qword ptr [RAX + 0x6a0]  in FUN_1400067fc
+
+-- offset 0x6a8 (1 hits) --
+  0x1400069a9  CALL qword ptr [RAX + 0x6a8]  in FUN_1400067fc
+
+-- offset 0x6b0 (1 hits) --
+  0x14000695b  CALL qword ptr [RAX + 0x6b0]  in FUN_1400067fc
+
+-- offset 0x6b8 (1 hits) --
+  0x140006979  CALL qword ptr [RAX + 0x6b8]  in FUN_1400067fc
+
+-- offset 0x6d8 (1 hits) --
+  0x140008c98  CALL qword ptr [RAX + 0x6d8]  in FUN_140008bc0
+
+-- offset 0x6e8 (6 hits) --
+  0x14000664a  CALL qword ptr [RAX + 0x6e8]  in FUN_140005ff4
+  0x14000a605  CALL qword ptr [R8 + 0x6e8]  in FUN_14000a564
+  0x14000a66a  CALL qword ptr [R8 + 0x6e8]  in FUN_14000a564
+  0x14000a798  CALL qword ptr [R8 + 0x6e8]  in FUN_14000a72c
+  0x14000a7e6  CALL qword ptr [RAX + 0x6e8]  in FUN_14000a72c
+  0x14000a848  CALL qword ptr [R8 + 0x6e8]  in FUN_14000a72c
+
+-- offset 0x720 (1 hits) --
+  0x140008519  CALL qword ptr [RAX + 0x720]  in FUN_140008434
+
+-- offset 0x728 (1 hits) --
+  0x140007c82  CALL qword ptr [RAX + 0x728]  in FUN_140007ba0
+
+-- offset 0x738 (2 hits) --
+  0x140007d0b  CALL qword ptr [RAX + 0x738]  in FUN_140007ba0
+  0x140007d23  CALL qword ptr [RAX + 0x738]  in FUN_140007ba0
+
+-- offset 0x780 (3 hits) --
+  0x140007cad  CALL qword ptr [RAX + 0x780]  in FUN_140007ba0
+  0x140007cd0  CALL qword ptr [RAX + 0x780]  in FUN_140007ba0
+  0x140007cf3  CALL qword ptr [RAX + 0x780]  in FUN_140007ba0
+
+-- offset 0x7b8 (1 hits) --
+  0x140009935  CALL qword ptr [RAX + 0x7b8]  in FUN_140009804
+
+-- offset 0x838 (13 hits) --
+  0x1400012b2  CALL qword ptr [RAX + 0x838]  in FUN_140001180
+  0x1400014b7  CALL qword ptr [RAX + 0x838]  in FUN_140001438
+  0x140001b28  CALL qword ptr [RAX + 0x838]  in FUN_140001868
+  0x140001fc2  CALL qword ptr [RAX + 0x838]  in FUN_140001ed8
+  0x140003f69  CALL qword ptr [RAX + 0x838]  in FUN_140003d94
+  0x140004288  CALL qword ptr [RAX + 0x838]  in FUN_140004170
+  0x140007380  CALL qword ptr [RAX + 0x838]  in FUN_140006e3c
+  0x1400099f1  CALL qword ptr [RAX + 0x838]  in FUN_140009804
+  0x14000a097  CALL qword ptr [RAX + 0x838]  in FUN_140009a14
+  0x14000a0f7  CALL qword ptr [RAX + 0x838]  in FUN_140009a14
+  0x14000c9c6  CALL qword ptr [RAX + 0x838]  in FUN_14000c900
+  0x14000d0e1  CALL qword ptr [RAX + 0x838]  in FUN_14000d06c
+  0x14000f348  CALL qword ptr [RAX + 0x838]  in FUN_14000f178
+
+-- offset 0x850 (3 hits) --
+  0x140007042  CALL qword ptr [RAX + 0x850]  in FUN_140006e3c
+  0x14000986a  CALL qword ptr [RAX + 0x850]  in FUN_140009804
+  0x140009abf  CALL qword ptr [R9 + 0x850]  in FUN_140009a14
+
+-- offset 0x858 (1 hits) --
+  0x140009950  CALL qword ptr [RAX + 0x858]  in FUN_140009804
+
+-- offset 0x860 (1 hits) --
+  0x14000996b  CALL qword ptr [RAX + 0x860]  in FUN_140009804
+
+-- offset 0x8c8 (1 hits) --
+  0x140009deb  CALL qword ptr [RAX + 0x8c8]  in FUN_140009a14
+
+-- offset 0x910 (1 hits) --
+  0x140008e6a  CALL qword ptr [RAX + 0x910]  in FUN_140008dec
+
+-- offset 0x918 (1 hits) --
+  0x140008e93  CALL qword ptr [R9 + 0x918]  in FUN_140008dec
+
+-- offset 0x950 (1 hits) --
+  0x140008eae  CALL qword ptr [R8 + 0x950]  in FUN_140008dec
+
+-- offset 0x958 (1 hits) --
+  0x140008ed1  CALL qword ptr [R9 + 0x958]  in FUN_140008dec
+
+-- offset 0x960 (1 hits) --
+  0x140008efa  CALL qword ptr [RAX + 0x960]  in FUN_140008dec
+
+-- offset 0x980 (2 hits) --
+  0x14000905b  CALL qword ptr [RAX + 0x980]  in FUN_140008f34
+  0x1400090f9  CALL qword ptr [RAX + 0x980]  in FUN_140008f34
+
+-- offset 0x988 (2 hits) --
+  0x14000907e  CALL qword ptr [RAX + 0x988]  in FUN_140008f34
+  0x14000909c  CALL qword ptr [R9 + 0x988]  in FUN_140008f34
+
+-- offset 0x9d8 (5 hits) --
+  0x1400023b0  CALL qword ptr [RAX + 0x9d8]  in FUN_1400021d4
+  0x140002648  CALL qword ptr [RAX + 0x9d8]  in FUN_1400021d4
+  0x140002665  CALL qword ptr [RAX + 0x9d8]  in FUN_1400021d4
+  0x140008a93  CALL qword ptr [R9 + 0x9d8]  in FUN_140008a48
+  0x140008ab1  CALL qword ptr [R9 + 0x9d8]  in FUN_140008a48
+
+-- offset 0x9e0 (28 hits) --
+  0x1400011d3  CALL qword ptr [RAX + 0x9e0]  in FUN_140001180
+  0x140001382  CALL qword ptr [RAX + 0x9e0]  in FUN_140001318
+  0x1400016ff  CALL qword ptr [RAX + 0x9e0]  in FUN_1400016b0
+  0x1400018d1  CALL qword ptr [RAX + 0x9e0]  in FUN_140001868
+  0x140001d30  CALL qword ptr [RAX + 0x9e0]  in FUN_140001cfc
+  0x140001e60  CALL qword ptr [RAX + 0x9e0]  in FUN_140001df0
+  0x140001f42  CALL qword ptr [RAX + 0x9e0]  in FUN_140001ed8
+  0x140002869  CALL qword ptr [RAX + 0x9e0]  in FUN_140002820
+  0x1400029ff  CALL qword ptr [RAX + 0x9e0]  in FUN_1400028f8
+  0x140002b48  CALL qword ptr [RAX + 0x9e0]  in FUN_1400028f8
+  0x140002c8e  CALL qword ptr [RAX + 0x9e0]  in FUN_1400028f8
+  0x14000343c  CALL qword ptr [RAX + 0x9e0]  in FUN_140003364
+  0x14000353f  CALL qword ptr [RAX + 0x9e0]  in FUN_140003498
+  0x14000374a  CALL qword ptr [RAX + 0x9e0]  in FUN_1400036e0
+  0x140003946  CALL qword ptr [RAX + 0x9e0]  in FUN_140003838
+  0x1400044a3  CALL qword ptr [RAX + 0x9e0]  in FUN_14000445c
+  0x140004681  CALL qword ptr [RAX + 0x9e0]  in FUN_14000464c
+  0x140004a39  CALL qword ptr [RAX + 0x9e0]  in FUN_140004a0c
+  0x140005026  CALL qword ptr [RAX + 0x9e0]  in FUN_140004fb8
+  0x1400059c7  CALL qword ptr [RAX + 0x9e0]  in FUN_140005934
+  0x140005ab4  CALL qword ptr [RAX + 0x9e0]  in FUN_140005a58
+  0x140005b7a  CALL qword ptr [RAX + 0x9e0]  in FUN_140005af8
+  0x140005ca0  CALL qword ptr [RAX + 0x9e0]  in FUN_140005c10
+  0x140006f4d  CALL qword ptr [RAX + 0x9e0]  in FUN_140006e3c
+  0x140007132  CALL qword ptr [RAX + 0x9e0]  in FUN_140006e3c
+  0x1400076d8  CALL qword ptr [RAX + 0x9e0]  in FUN_1400076b0
+  0x1400077f9  CALL qword ptr [RAX + 0x9e0]  in FUN_1400077b8
+  0x14000e9d9  CALL qword ptr [RAX + 0x9e0]  in FUN_14000e960
+
+-- offset 0x9e8 (34 hits) --
+  0x1400012f2  CALL qword ptr [RAX + 0x9e8]  in FUN_140001180
+  0x1400013c0  CALL qword ptr [RAX + 0x9e8]  in FUN_140001318
+  0x14000175f  CALL qword ptr [RAX + 0x9e8]  in FUN_1400016b0
+  0x14000192f  CALL qword ptr [RAX + 0x9e8]  in FUN_140001868
+  0x14000195c  CALL qword ptr [RAX + 0x9e8]  in FUN_140001868
+  0x140001d8f  CALL qword ptr [RAX + 0x9e8]  in FUN_140001cfc
+  0x140001ec0  CALL qword ptr [RAX + 0x9e8]  in FUN_140001df0
+  0x140002010  CALL qword ptr [RAX + 0x9e8]  in FUN_140001ed8
+  0x1400028e3  CALL qword ptr [RAX + 0x9e8]  in FUN_140002820
+  0x140002a3f  CALL qword ptr [RAX + 0x9e8]  in FUN_1400028f8
+  0x140002a73  CALL qword ptr [RAX + 0x9e8]  in FUN_1400028f8
+  0x140002b8c  CALL qword ptr [RAX + 0x9e8]  in FUN_1400028f8
+  0x140002cb9  CALL qword ptr [RAX + 0x9e8]  in FUN_1400028f8
+  0x140003484  CALL qword ptr [RAX + 0x9e8]  in FUN_140003364
+  0x140003582  CALL qword ptr [RAX + 0x9e8]  in FUN_140003498
+  0x140003788  CALL qword ptr [RAX + 0x9e8]  in FUN_1400036e0
+  0x14000381c  CALL qword ptr [RAX + 0x9e8]  in FUN_1400036e0
+  0x140003a05  CALL qword ptr [RAX + 0x9e8]  in FUN_140003838
+  0x140003c8d  CALL qword ptr [RAX + 0x9e8]  in FUN_140003838
+  0x140003d0f  CALL qword ptr [RAX + 0x9e8]  in FUN_140003838
+  0x140003d35  CALL qword ptr [RAX + 0x9e8]  in FUN_140003838
+  0x14000455f  CALL qword ptr [RAX + 0x9e8]  in FUN_14000445c
+  0x1400046d3  CALL qword ptr [RAX + 0x9e8]  in FUN_14000464c
+  0x140004a78  CALL qword ptr [RAX + 0x9e8]  in FUN_140004a0c
+  0x140005051  CALL qword ptr [RAX + 0x9e8]  in FUN_140004fb8
+  0x1400059f2  CALL qword ptr [RAX + 0x9e8]  in FUN_140005934
+  0x140005adf  CALL qword ptr [RAX + 0x9e8]  in FUN_140005a58
+  0x140005ba7  CALL qword ptr [RAX + 0x9e8]  in FUN_140005af8
+  0x140005ccb  CALL qword ptr [RAX + 0x9e8]  in FUN_140005c10
+  0x140006f80  CALL qword ptr [RAX + 0x9e8]  in FUN_140006e3c
+
+-- offset 0x9f0 (1 hits) --
+  0x140006515  CALL qword ptr [RAX + 0x9f0]  in FUN_140005ff4
+
+-- offset 0x9f8 (1 hits) --
+  0x140008b0e  CALL qword ptr [RAX + 0x9f8]  in FUN_140008a48
+
+-- offset 0xa00 (1 hits) --
+  0x140008c67  CALL qword ptr [RAX + 0xa00]  in FUN_140008bc0
+
+-- offset 0xa08 (1 hits) --
+  0x140007b49  CALL qword ptr [RAX + 0xa08]  in FUN_140007b2c
+
+-- offset 0xbd8 (4 hits) --
+  0x14000b03f  CALL qword ptr [RAX + 0xbd8]  in FUN_14000af8c
+  0x14000b59f  CALL qword ptr [RAX + 0xbd8]  in FUN_14000b500
+  0x14000b6b4  CALL qword ptr [RAX + 0xbd8]  in FUN_14000b610
+  0x14000e723  CALL qword ptr [RAX + 0xbd8]  in FUN_14000e68c
+
+-- offset 0xbe0 (4 hits) --
+  0x14000b07e  CALL qword ptr [RAX + 0xbe0]  in FUN_14000af8c
+  0x14000b5ee  CALL qword ptr [R8 + 0xbe0]  in FUN_14000b500
+  0x14000b706  CALL qword ptr [RAX + 0xbe0]  in FUN_14000b610
+  0x14000e762  CALL qword ptr [R8 + 0xbe0]  in FUN_14000e68c
+
+-- offset 0xbe8 (1 hits) --
+  0x14000b3e1  CALL qword ptr [RAX + 0xbe8]  in FUN_14000b3c4
+
+-- offset 0xc18 (2 hits) --
+  0x14000a6bb  CALL qword ptr [R9 + 0xc18]  in FUN_14000a564
+  0x14000a6d6  CALL qword ptr [RAX + 0xc18]  in FUN_14000a564
+
+-- offset 0xdb0 (3 hits) --
+  0x140002269  CALL qword ptr [RAX + 0xdb0]  in FUN_1400021d4
+  0x14000a04d  CALL qword ptr [RAX + 0xdb0]  in FUN_140009a14
+  0x14000dde2  CALL qword ptr [RAX + 0xdb0]  in FUN_14000dd44
+
+-- offset 0xdb8 (1 hits) --
+  0x140009fff  CALL qword ptr [RAX + 0xdb8]  in FUN_140009a14
+

@@ -1,0 +1,8 @@
+### Accesses with displacement 0x1606c  (devExt_1606c_qVariant2)
+### 2 writes, 0 reads/other
+
+--- WRITES (likely install/store) ---
+0x140007f10 op0  MOV byte ptr [RBX + 0x1606c],R12B  in FUN_140007d40
+0x140007f19 op0  MOV byte ptr [RBX + 0x1606c],DIL  in FUN_140007d40
+
+--- READS / LEA / CALL through this offset ---

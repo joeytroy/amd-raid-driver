@@ -1,0 +1,12 @@
+### Accesses with displacement 0x16100  (devExt_16100_cbTableLo)
+### 3 writes, 3 reads/other
+
+--- WRITES (likely install/store) ---
+0x140007f4d op0  MOV qword ptr [RBX + 0x16100],RAX  in FUN_140007d40
+0x1400080ca op0  MOV qword ptr [RBX + 0x16100],RAX  in FUN_140007d40
+0x14000827e op0  MOV qword ptr [RBX + 0x16100],RAX  in FUN_140007d40
+
+--- READS / LEA / CALL through this offset ---
+0x140009576 op0  CALL qword ptr [R10 + 0x16100]  in FUN_1400093f0
+0x140009daf op0  CALL qword ptr [R10 + 0x16100]  in FUN_140009a14
+0x14000a3bf op0  CALL qword ptr [RAX + 0x16100]  in FUN_14000a350

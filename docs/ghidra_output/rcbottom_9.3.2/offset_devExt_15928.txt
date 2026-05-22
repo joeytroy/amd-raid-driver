@@ -1,0 +1,16 @@
+### Accesses with displacement 0x15928  (devExt_15928)
+### 0 writes, 10 reads/other
+
+--- WRITES (likely install/store) ---
+
+--- READS / LEA / CALL through this offset ---
+0x1400016f1 op1  MOV RDX,qword ptr [RBX + 0x15928]  in FUN_1400016b0
+0x140001751 op1  MOV RDX,qword ptr [RBX + 0x15928]  in FUN_1400016b0
+0x140001e52 op1  MOV RDX,qword ptr [RDI + 0x15928]  in FUN_140001df0
+0x140001eb2 op1  MOV RDX,qword ptr [RDI + 0x15928]  in FUN_140001df0
+0x140003f90 op1  MOV RDX,qword ptr [RCX + 0x15928]  in FUN_140003f7c
+0x14000710b op1  MOV RDX,qword ptr [RDI + 0x15928]  in FUN_140006e3c
+0x1400072b2 op1  MOV RDX,qword ptr [RDI + 0x15928]  in FUN_140006e3c
+0x1400073c3 op1  MOV RDX,qword ptr [RDI + 0x15928]  in FUN_140006e3c
+0x1400077eb op1  MOV RDX,qword ptr [RBX + 0x15928]  in FUN_1400077b8
+0x1400078bb op1  MOV RDX,qword ptr [RBX + 0x15928]  in FUN_1400077b8

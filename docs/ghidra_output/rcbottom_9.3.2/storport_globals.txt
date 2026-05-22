@@ -1,0 +1,6 @@
+# StorPort dispatch globals
+# DAT_140014958 - service table base pointer
+# DAT_140014980 - StorPort context handle (first arg to services)
+DAT_140014958 = 0x0000000000000000
+DAT_140014980 = 0x0000000000000000
+DAT_140014090 = 0x0000000140014078

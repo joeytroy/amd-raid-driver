@@ -1,0 +1,7 @@
+### Accesses with displacement 0x15920  (devExt_15920_qstate)
+### 0 writes, 1 reads/other
+
+--- WRITES (likely install/store) ---
+
+--- READS / LEA / CALL through this offset ---
+0x140001bae op1  MOV AL,byte ptr [RAX + 0x15920]  in FUN_140001ba4

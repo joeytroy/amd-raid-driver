@@ -1,0 +1,7 @@
+### Accesses with displacement 0x1c2d8  (devExt_1c2d8_fwCapWord)
+### 1 writes, 0 reads/other
+
+--- WRITES (likely install/store) ---
+0x1400080ab op0  MOV dword ptr [RBX + 0x1c2d8],EDI  in FUN_140007d40
+
+--- READS / LEA / CALL through this offset ---

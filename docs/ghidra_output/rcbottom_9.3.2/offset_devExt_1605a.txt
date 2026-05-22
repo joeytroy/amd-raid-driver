@@ -1,0 +1,7 @@
+### Accesses with displacement 0x1605a  (devExt_1605a)
+### 1 writes, 0 reads/other
+
+--- WRITES (likely install/store) ---
+0x140007e8d op0  MOV word ptr [RBX + 0x1605a],AX  in FUN_140007d40
+
+--- READS / LEA / CALL through this offset ---

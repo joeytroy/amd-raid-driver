@@ -1,0 +1,14 @@
+### Accesses with displacement 0x1c2d0  (devExt_1c2d0_descAccessor)
+### 0 writes, 8 reads/other
+
+--- WRITES (likely install/store) ---
+
+--- READS / LEA / CALL through this offset ---
+0x140008079 op0  CALL qword ptr [RBX + 0x1c2d0]  in FUN_140007d40
+0x140008096 op0  CALL qword ptr [RBX + 0x1c2d0]  in FUN_140007d40
+0x1400081d7 op0  CALL qword ptr [RBX + 0x1c2d0]  in FUN_140007d40
+0x140008201 op0  CALL qword ptr [RBX + 0x1c2d0]  in FUN_140007d40
+0x14000822f op0  CALL qword ptr [RBX + 0x1c2d0]  in FUN_140007d40
+0x140008f9a op0  CALL qword ptr [RAX + 0x1c2d0]  in FUN_140008f34
+0x140008fcd op0  CALL qword ptr [RBX + 0x1c2d0]  in FUN_140008f34
+0x140009003 op0  CALL qword ptr [RBX + 0x1c2d0]  in FUN_140008f34

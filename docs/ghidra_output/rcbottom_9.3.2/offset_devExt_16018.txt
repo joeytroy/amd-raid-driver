@@ -1,0 +1,9 @@
+### Accesses with displacement 0x16018  (devExt_16018)
+### 1 writes, 2 reads/other
+
+--- WRITES (likely install/store) ---
+0x140006696 op0  MOV qword ptr [RDI + 0x16018],RAX  in FUN_140005ff4
+
+--- READS / LEA / CALL through this offset ---
+0x1400069fd op1  LEA RDI,[R15 + 0x16018]  in FUN_1400067fc
+0x14000a5b0 op1  MOV RDX,qword ptr [RAX + 0x16018]  in FUN_14000a564

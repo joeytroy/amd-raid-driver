@@ -1,0 +1,20 @@
+### Accesses with displacement 0x16020  (devExt_16020_adapterHandle)
+### 1 writes, 13 reads/other
+
+--- WRITES (likely install/store) ---
+0x140006a28 op0  MOV qword ptr [R15 + 0x16020],RAX  in FUN_1400067fc
+
+--- READS / LEA / CALL through this offset ---
+0x140006702 op1  MOV RDX,qword ptr [RAX + 0x16020]  in FUN_140005ff4
+0x140006e83 op1  MOV RDX,qword ptr [RAX + 0x16020]  in FUN_140006e3c
+0x140008c8a op1  MOV RDX,qword ptr [RBX + 0x16020]  in FUN_140008bc0
+0x140008cb9 op1  MOV RDX,qword ptr [RBX + 0x16020]  in FUN_140008bc0
+0x140008cf0 op1  MOV RDX,qword ptr [RDX + 0x16020]  in FUN_140008bc0
+0x1400092cf op1  MOV RDX,qword ptr [RBX + 0x16020]  in FUN_14000924c
+0x1400092f1 op1  MOV RDX,qword ptr [RBX + 0x16020]  in FUN_14000924c
+0x140009313 op1  MOV RDX,qword ptr [RBX + 0x16020]  in FUN_14000924c
+0x140009335 op1  MOV RDX,qword ptr [RBX + 0x16020]  in FUN_14000924c
+0x14000a5fb op1  MOV RSI,qword ptr [RDX + 0x16020]  in FUN_14000a564
+0x14000a660 op1  MOV RBP,qword ptr [RDX + 0x16020]  in FUN_14000a564
+0x14000a7d5 op1  MOV R14,qword ptr [RCX + 0x16020]  in FUN_14000a72c
+0x14000a83e op1  MOV RSI,qword ptr [RDX + 0x16020]  in FUN_14000a72c

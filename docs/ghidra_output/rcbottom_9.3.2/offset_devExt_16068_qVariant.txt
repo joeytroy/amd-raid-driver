@@ -1,0 +1,13 @@
+### Accesses with displacement 0x16068  (devExt_16068_qVariant)
+### 3 writes, 4 reads/other
+
+--- WRITES (likely install/store) ---
+0x140007f06 op0  MOV dword ptr [RBX + 0x16068],R12D  in FUN_140007d40
+0x140007f26 op0  MOV dword ptr [RBX + 0x16068],R13D  in FUN_140007d40
+0x140007f37 op0  MOV dword ptr [RBX + 0x16068],EAX  in FUN_140007d40
+
+--- READS / LEA / CALL through this offset ---
+0x140006ebe op1  MOV EAX,dword ptr [RBX + 0x16068]  in FUN_140006e3c
+0x14000707a op1  MOV EAX,dword ptr [RDI + 0x16068]  in FUN_140006e3c
+0x1400077cc op1  MOV EAX,dword ptr [RBX + 0x16068]  in FUN_1400077b8
+0x14000a23d op1  MOV EAX,dword ptr [RCX + 0x16068]  in FUN_14000a18c
