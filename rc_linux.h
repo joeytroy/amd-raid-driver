@@ -212,6 +212,10 @@ struct rc_nvme_state {
     u8             dstrd;             // CAP.DSTRD doorbell stride
     u8             timeout_500ms;     // CAP.TO * 500 ms = boot timeout
 
+    // Namespace 1 (per Identify NS); populated only after identify_namespace.
+    u32            ns1_lba_bytes;     // LBA size in bytes (e.g. 512 or 4096)
+    u64            ns1_nsze;          // total LBAs in the namespace
+
     // Per-doorbell pointers (computed once after CAP read)
     void __iomem  *sq_doorbell_base;  // BAR0 + 0x1000
 };
@@ -597,6 +601,7 @@ int rc_raid_array_ioctl(struct block_device *bdev, fmode_t mode, unsigned int cm
 #define RC_NVME_ADMIN_OP_IDENTIFY	0x06
 
 /* Identify CNS values (NVMe 1.4 §5.15.1) */
+#define RC_NVME_IDENTIFY_CNS_NS		0x00	/* Identify Namespace (requires NSID) */
 #define RC_NVME_IDENTIFY_CNS_CTRL	0x01
 
 /* Identify response is always 4 KiB. */
@@ -610,6 +615,14 @@ int rc_raid_array_ioctl(struct block_device *bdev, fmode_t mode, unsigned int cm
 #define RC_NVME_ID_CTRL_MN		24	/* 40 bytes ASCII, space-padded */
 #define RC_NVME_ID_CTRL_FR		64	/* 8 bytes ASCII, space-padded */
 #define RC_NVME_ID_CTRL_NN		516	/* u32, number of namespaces */
+
+/* Field offsets within the Identify Namespace response (NVMe 1.4 §5.15.2.1). */
+#define RC_NVME_ID_NS_NSZE		0	/* u64, namespace size in LBAs */
+#define RC_NVME_ID_NS_NCAP		8	/* u64, namespace capacity in LBAs */
+#define RC_NVME_ID_NS_NUSE		16	/* u64, used LBAs */
+#define RC_NVME_ID_NS_FLBAS		26	/* u8, [3:0] = active LBA Format index */
+#define RC_NVME_ID_NS_LBAF		128	/* base of LBAF table; entry i at +4*i */
+/* LBAF entry: u32 where [16:23] is LBADS (log2 of LBA size in bytes). */
 
 /* Admin command timeout — generous enough for cold controllers but bounded
  * so a misbehaving device doesn't hang module init forever. */

@@ -189,36 +189,23 @@ static int rc_nvme_wait_admin_completion(struct rc_adapter *adapter)
 	return -ETIMEDOUT;
 }
 
-/* Submit a single Identify Controller (CNS=01h) admin command, poll for
- * completion, and log the controller's VID/SSVID/SN/MN/FR/NN. Non-fatal:
- * callers should treat failure as "we got CSTS.RDY but can't talk to it."
+/* Copy a caller-built SQE into the admin SQ tail slot, ring the doorbell,
+ * poll for completion, advance the CQ head, and return 0 on success or
+ * -errno (timeout, controller error). The caller fills opc/nsid/prp1/cdwN;
+ * we manage CID = 0 since only one admin command is in flight during init.
  */
-static int rc_nvme_identify_controller(struct rc_adapter *adapter)
+static int rc_nvme_admin_cmd(struct rc_adapter *adapter, struct rc_nvme_sqe *cmd)
 {
-	struct device *dev = &adapter->pdev->dev;
 	struct rc_nvme_state *nvme = &adapter->ctx.nvme;
-	struct rc_nvme_sqe *sqe;
+	struct rc_nvme_sqe *slot;
 	struct rc_nvme_cqe *cqe;
-	void *id_buf;
-	dma_addr_t id_dma;
 	u32 tail;
 	u16 status, sc_sct;
 	int ret;
 
-	id_buf = dma_alloc_coherent(dev, RC_NVME_IDENTIFY_BYTES, &id_dma,
-				    GFP_KERNEL);
-	if (!id_buf)
-		return -ENOMEM;
-
-	/* Build SQE in slot admin_sq_tail. CID 0 is safe — only one admin
-	 * command is in flight at a time during init. */
-	sqe = (struct rc_nvme_sqe *)nvme->admin_sq + nvme->admin_sq_tail;
-	memset(sqe, 0, sizeof(*sqe));
-	sqe->opc   = RC_NVME_ADMIN_OP_IDENTIFY;
-	sqe->cid   = cpu_to_le16(0);
-	sqe->nsid  = cpu_to_le32(0);
-	sqe->prp1  = cpu_to_le64(id_dma);
-	sqe->cdw10 = cpu_to_le32(RC_NVME_IDENTIFY_CNS_CTRL);
+	slot = (struct rc_nvme_sqe *)nvme->admin_sq + nvme->admin_sq_tail;
+	cmd->cid = cpu_to_le16(0);
+	memcpy(slot, cmd, sizeof(*cmd));
 
 	tail = (nvme->admin_sq_tail + 1) % nvme->admin_sq_depth;
 	nvme->admin_sq_tail = tail;
@@ -228,20 +215,53 @@ static int rc_nvme_identify_controller(struct rc_adapter *adapter)
 	ret = rc_nvme_wait_admin_completion(adapter);
 	if (ret) {
 		rc_printk(RC_ERROR,
-			  "rc_nvme_identify_controller: timeout waiting for CQE\n");
-		goto out;
+			  "rc_nvme_admin_cmd: timeout waiting for CQE (opc=0x%02x)\n",
+			  cmd->opc);
+		return ret;
 	}
 
 	cqe = (struct rc_nvme_cqe *)nvme->admin_cq + nvme->admin_cq_head;
 	status = le16_to_cpu(cqe->status);
 	sc_sct = (status >> 1) & 0x7fff;
+
+	nvme->admin_cq_head = (nvme->admin_cq_head + 1) % nvme->admin_cq_depth;
+	if (nvme->admin_cq_head == 0)
+		nvme->admin_cq_phase ^= 1;
+	rc_nvme_ring_cq_doorbell(adapter, 0, nvme->admin_cq_head);
+
 	if (sc_sct) {
 		rc_printk(RC_ERROR,
-			  "rc_nvme_identify_controller: controller returned error 0x%04x (status=0x%04x)\n",
-			  sc_sct, status);
-		ret = -EIO;
-		goto advance_cq;
+			  "rc_nvme_admin_cmd: opc=0x%02x SC/SCT=0x%04x (status=0x%04x)\n",
+			  cmd->opc, sc_sct, status);
+		return -EIO;
 	}
+	return 0;
+}
+
+/* Submit a single Identify Controller (CNS=01h) admin command, poll for
+ * completion, and log the controller's VID/SSVID/SN/MN/FR/NN. Non-fatal:
+ * callers should treat failure as "we got CSTS.RDY but can't talk to it."
+ */
+static int rc_nvme_identify_controller(struct rc_adapter *adapter)
+{
+	struct device *dev = &adapter->pdev->dev;
+	struct rc_nvme_sqe cmd = {};
+	void *id_buf;
+	dma_addr_t id_dma;
+	int ret;
+
+	id_buf = dma_alloc_coherent(dev, RC_NVME_IDENTIFY_BYTES, &id_dma,
+				    GFP_KERNEL);
+	if (!id_buf)
+		return -ENOMEM;
+
+	cmd.opc   = RC_NVME_ADMIN_OP_IDENTIFY;
+	cmd.prp1  = cpu_to_le64(id_dma);
+	cmd.cdw10 = cpu_to_le32(RC_NVME_IDENTIFY_CNS_CTRL);
+
+	ret = rc_nvme_admin_cmd(adapter, &cmd);
+	if (ret)
+		goto out;
 
 	{
 		const u8 *b = id_buf;
@@ -259,11 +279,60 @@ static int rc_nvme_identify_controller(struct rc_adapter *adapter)
 			  vid, ssvid, sn, mn, fr, nn);
 	}
 
-advance_cq:
-	nvme->admin_cq_head = (nvme->admin_cq_head + 1) % nvme->admin_cq_depth;
-	if (nvme->admin_cq_head == 0)
-		nvme->admin_cq_phase ^= 1;
-	rc_nvme_ring_cq_doorbell(adapter, 0, nvme->admin_cq_head);
+out:
+	dma_free_coherent(dev, RC_NVME_IDENTIFY_BYTES, id_buf, id_dma);
+	return ret;
+}
+
+/* Submit Identify Namespace (CNS=00h) for the given NSID, parse NSZE/NCAP/
+ * NUSE and the active LBA format, and log the result. Also stashes the LBA
+ * size into adapter->ctx.nvme so the I/O path can size its buffers. */
+static int rc_nvme_identify_namespace(struct rc_adapter *adapter, u32 nsid)
+{
+	struct device *dev = &adapter->pdev->dev;
+	struct rc_nvme_state *nvme = &adapter->ctx.nvme;
+	struct rc_nvme_sqe cmd = {};
+	void *id_buf;
+	dma_addr_t id_dma;
+	int ret;
+
+	id_buf = dma_alloc_coherent(dev, RC_NVME_IDENTIFY_BYTES, &id_dma,
+				    GFP_KERNEL);
+	if (!id_buf)
+		return -ENOMEM;
+
+	cmd.opc   = RC_NVME_ADMIN_OP_IDENTIFY;
+	cmd.nsid  = cpu_to_le32(nsid);
+	cmd.prp1  = cpu_to_le64(id_dma);
+	cmd.cdw10 = cpu_to_le32(RC_NVME_IDENTIFY_CNS_NS);
+
+	ret = rc_nvme_admin_cmd(adapter, &cmd);
+	if (ret)
+		goto out;
+
+	{
+		const u8 *b = id_buf;
+		u64 nsze = le64_to_cpup((const __le64 *)(b + RC_NVME_ID_NS_NSZE));
+		u64 ncap = le64_to_cpup((const __le64 *)(b + RC_NVME_ID_NS_NCAP));
+		u64 nuse = le64_to_cpup((const __le64 *)(b + RC_NVME_ID_NS_NUSE));
+		u8  flbas = b[RC_NVME_ID_NS_FLBAS] & 0xf;
+		u32 lbaf  = le32_to_cpup((const __le32 *)
+					 (b + RC_NVME_ID_NS_LBAF + 4 * flbas));
+		u8  lbads = (lbaf >> 16) & 0xff;
+		u32 lba_bytes = 1u << lbads;
+
+		nvme->ns1_lba_bytes = lba_bytes;
+		nvme->ns1_nsze = nsze;
+
+		rc_printk(RC_NOTE,
+			  "rc_nvme_identify_namespace: nsid=%u NSZE=%llu NCAP=%llu NUSE=%llu LBA=%u B (LBADS=%u, FLBAS=%u) => %llu MiB\n",
+			  nsid,
+			  (unsigned long long)nsze,
+			  (unsigned long long)ncap,
+			  (unsigned long long)nuse,
+			  lba_bytes, lbads, flbas,
+			  (unsigned long long)((nsze * lba_bytes) >> 20));
+	}
 
 out:
 	dma_free_coherent(dev, RC_NVME_IDENTIFY_BYTES, id_buf, id_dma);
@@ -377,6 +446,14 @@ int rc_nvme_init_controller(struct rc_adapter *adapter)
 	if (ret)
 		rc_printk(RC_WARN,
 			  "rc_nvme_init_controller: identify controller failed (%d) — admin queue is up but the controller didn't answer cleanly\n",
+			  ret);
+
+	/* Namespace inventory. Only NSID 1 is exercised — Identify Controller
+	 * reports NN=1 on the Crucial drives behind 1022:b000. */
+	ret = rc_nvme_identify_namespace(adapter, 1);
+	if (ret)
+		rc_printk(RC_WARN,
+			  "rc_nvme_init_controller: identify namespace nsid=1 failed (%d)\n",
 			  ret);
 
 	return 0;
