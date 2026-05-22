@@ -49,11 +49,20 @@ MODULE_PARM_DESC(reverse_member_order,
 /* gendisk state — at most one volume right now. */
 static struct gendisk *rc_volume_disk;
 static struct blk_mq_tag_set rc_volume_tagset;
-/* Per-member persistent DMA buffer (LBA-sized, allocated once at volume
- * create).  With queue depth = 1 there's only one outstanding read per
- * member, so a single buffer is safe. */
+
+/* Per-member persistent DMA buffer + PRP list buffer (allocated once at
+ * volume create).  Queue depth is 1 so a single buffer per member is safe.
+ *
+ *   data buf is 64 KiB (16 pages) — biggest single NVMe READ we issue.
+ *   PRP list buf is PAGE_SIZE — easily holds 16 entries.
+ */
+#define RC_VOLUME_DATA_PAGES	16
+#define RC_VOLUME_DATA_BYTES	(RC_VOLUME_DATA_PAGES * PAGE_SIZE)
+
 static void       *rc_volume_dma_va[RC_VOLUME_MAX_MEMBERS];
 static dma_addr_t  rc_volume_dma_pa[RC_VOLUME_MAX_MEMBERS];
+static __le64     *rc_volume_prp_va[RC_VOLUME_MAX_MEMBERS];
+static dma_addr_t  rc_volume_prp_pa[RC_VOLUME_MAX_MEMBERS];
 
 #define RC_NVME_CC_DEFAULT	\
 	(RC_NVME_CC_IOSQES_64 | RC_NVME_CC_IOCQES_16 | \
@@ -830,6 +839,40 @@ out:
 	mutex_unlock(&rc_volume_lock);
 }
 
+/* Submit a multi-page NVMe READ for one member, using PRP1/PRP2 directly or
+ * a PRP list as needed.  Up to RC_VOLUME_DATA_BYTES per call.  Reads into
+ * rc_volume_dma_va[member_idx]. */
+static int rc_volume_read_member(int member_idx, u64 slba, u16 nlb_zbased)
+{
+	struct rc_adapter *adapter = rc_volume_members[member_idx];
+	u32 bytes = ((u32)nlb_zbased + 1) * 512u;
+	u32 pages = (bytes + PAGE_SIZE - 1) / PAGE_SIZE;
+	dma_addr_t data_dma = rc_volume_dma_pa[member_idx];
+	struct rc_nvme_sqe cmd;
+
+	if (WARN_ON_ONCE(bytes > RC_VOLUME_DATA_BYTES))
+		return -EINVAL;
+
+	memset(&cmd, 0, sizeof(cmd));
+	cmd.opc   = RC_NVME_NVM_OP_READ;
+	cmd.nsid  = cpu_to_le32(1);
+	cmd.prp1  = cpu_to_le64(data_dma);
+	cmd.cdw10 = cpu_to_le32((u32)(slba & 0xffffffff));
+	cmd.cdw11 = cpu_to_le32((u32)(slba >> 32));
+	cmd.cdw12 = cpu_to_le32(nlb_zbased);
+
+	if (pages == 2) {
+		cmd.prp2 = cpu_to_le64(data_dma + PAGE_SIZE);
+	} else if (pages > 2) {
+		__le64 *list = rc_volume_prp_va[member_idx];
+		u32 i;
+		for (i = 0; i + 1 < pages; i++)
+			list[i] = cpu_to_le64(data_dma + (i + 1) * PAGE_SIZE);
+		cmd.prp2 = cpu_to_le64(rc_volume_prp_pa[member_idx]);
+	}
+	return rc_nvme_io_cmd(adapter, &cmd);
+}
+
 /* blk-mq request handler.  With chunk_sectors == stripe_sectors set in the
  * queue limits, every request is guaranteed to stay within a single stripe
  * and therefore maps to one member.  So we issue exactly one NVMe READ per
@@ -855,7 +898,7 @@ static blk_status_t rc_volume_queue_rq(struct blk_mq_hw_ctx *hctx,
 		return BLK_STS_OK;
 	}
 
-	if (nr_sectors == 0 || nr_sectors > ((2 * PAGE_SIZE) / 512) ||
+	if (nr_sectors == 0 || nr_sectors > (RC_VOLUME_DATA_BYTES / 512) ||
 	    pos + nr_sectors >
 	    rc_volume_members[0]->ctx.nvme.ns1_nsze * rc_volume_member_count) {
 		blk_mq_end_request(req, BLK_STS_IOERR);
@@ -863,9 +906,7 @@ static blk_status_t rc_volume_queue_rq(struct blk_mq_hw_ctx *hctx,
 	}
 
 	rc_volume_map_lba(pos, &member_idx, &phys_lba);
-	ret = rc_nvme_read_lba(rc_volume_members[member_idx], phys_lba,
-			       (u16)(nr_sectors - 1),
-			       rc_volume_dma_pa[member_idx]);
+	ret = rc_volume_read_member(member_idx, phys_lba, (u16)(nr_sectors - 1));
 	if (ret) {
 		blk_mq_end_request(req, BLK_STS_IOERR);
 		return BLK_STS_OK;
@@ -900,14 +941,22 @@ static int rc_volume_create_disk(void)
 	u64 total_sectors;
 	int i, ret;
 
-	/* Two-page persistent DMA buffer per member (8 KiB), allowing up to a
-	 * PRP1+PRP2-style transfer = 16 sectors per request. */
+	/* Per-member: a 64 KiB data buffer plus a PAGE_SIZE PRP-list buffer.
+	 * Allows one NVMe READ of up to 16 contiguous pages.  Queue depth = 1
+	 * so a single buffer per member is safe. */
 	for (i = 0; i < rc_volume_member_count; i++) {
 		struct device *dev = &rc_volume_members[i]->pdev->dev;
 		rc_volume_dma_va[i] =
-			dma_alloc_coherent(dev, 2 * PAGE_SIZE,
+			dma_alloc_coherent(dev, RC_VOLUME_DATA_BYTES,
 					   &rc_volume_dma_pa[i], GFP_KERNEL);
 		if (!rc_volume_dma_va[i]) {
+			ret = -ENOMEM;
+			goto err_free_dma;
+		}
+		rc_volume_prp_va[i] =
+			dma_alloc_coherent(dev, PAGE_SIZE,
+					   &rc_volume_prp_pa[i], GFP_KERNEL);
+		if (!rc_volume_prp_va[i]) {
 			ret = -ENOMEM;
 			goto err_free_dma;
 		}
@@ -929,10 +978,10 @@ static int rc_volume_create_disk(void)
 		struct queue_limits lim = {
 			.logical_block_size  = 512,
 			.physical_block_size = 512,
-			/* PRP1+PRP2 spans up to 2*PAGE_SIZE.  PRP list support
-			 * for larger transfers is a follow-up. */
-			.max_hw_sectors      = (2 * PAGE_SIZE) / 512,
-			.max_segments        = 16,
+			/* PRP list lets us span up to RC_VOLUME_DATA_BYTES per
+			 * request.  Caller's bvecs sum into one NVMe READ. */
+			.max_hw_sectors      = RC_VOLUME_DATA_BYTES / 512,
+			.max_segments        = RC_VOLUME_DATA_PAGES,
 			.max_segment_size    = PAGE_SIZE,
 			/* Requests never cross a RAID0 stripe boundary, so every
 			 * request maps to one member and one NVMe READ. */
@@ -977,12 +1026,18 @@ err_free_tagset:
 	blk_mq_free_tag_set(&rc_volume_tagset);
 err_free_dma:
 	for (i = 0; i < rc_volume_member_count; i++) {
+		struct device *dev = &rc_volume_members[i]->pdev->dev;
 		if (rc_volume_dma_va[i]) {
-			struct device *dev = &rc_volume_members[i]->pdev->dev;
-			dma_free_coherent(dev, 2 * PAGE_SIZE,
+			dma_free_coherent(dev, RC_VOLUME_DATA_BYTES,
 					  rc_volume_dma_va[i],
 					  rc_volume_dma_pa[i]);
 			rc_volume_dma_va[i] = NULL;
+		}
+		if (rc_volume_prp_va[i]) {
+			dma_free_coherent(dev, PAGE_SIZE,
+					  rc_volume_prp_va[i],
+					  rc_volume_prp_pa[i]);
+			rc_volume_prp_va[i] = NULL;
 		}
 	}
 	return ret;
@@ -1003,13 +1058,22 @@ void rc_volume_teardown(void)
 		blk_mq_free_tag_set(&rc_volume_tagset);
 	}
 	for (i = 0; i < RC_VOLUME_MAX_MEMBERS; i++) {
-		if (rc_volume_dma_va[i] && rc_volume_members[i]) {
+		if (rc_volume_members[i]) {
 			struct device *dev = &rc_volume_members[i]->pdev->dev;
-			dma_free_coherent(dev, 2 * PAGE_SIZE,
-					  rc_volume_dma_va[i],
-					  rc_volume_dma_pa[i]);
-			rc_volume_dma_va[i] = NULL;
-			rc_volume_dma_pa[i] = 0;
+			if (rc_volume_dma_va[i]) {
+				dma_free_coherent(dev, RC_VOLUME_DATA_BYTES,
+						  rc_volume_dma_va[i],
+						  rc_volume_dma_pa[i]);
+				rc_volume_dma_va[i] = NULL;
+				rc_volume_dma_pa[i] = 0;
+			}
+			if (rc_volume_prp_va[i]) {
+				dma_free_coherent(dev, PAGE_SIZE,
+						  rc_volume_prp_va[i],
+						  rc_volume_prp_pa[i]);
+				rc_volume_prp_va[i] = NULL;
+				rc_volume_prp_pa[i] = 0;
+			}
 		}
 		rc_volume_members[i] = NULL;
 	}
