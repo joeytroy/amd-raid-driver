@@ -9,9 +9,12 @@
 *.markers
 Module.symvers
 modules.order
-.ko.cmd
-.mod.cmd
+# kernel build per-object command files (e.g. .rcraid.o.cmd, ..module-common.o.cmd)
+.*.cmd
 .tmp_versions/
+
+# Driver test output
+driver_diagnostics_*.txt
 
 # Kernel build directory
 /usr/
