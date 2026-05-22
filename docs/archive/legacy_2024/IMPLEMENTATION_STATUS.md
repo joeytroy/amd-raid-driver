@@ -1,4 +1,11 @@
-# Implementation Status Tracking
+# Implementation Status Tracking — ARCHIVED
+
+> **⚠️ Archived 2026-05-22.** The "~72% complete" figure here is based on
+> counting AHCI-path functions; PCI `1022:B000` doesn't use any of them.
+> The actual current state of the Linux port lives in
+> **`docs/STATUS.md`** at the repo top level. The "descriptor accessor"
+> and "controller descriptor table" gaps listed here have been debunked
+> — see `docs/GHIDRA_FINDINGS_2026.md`.
 
 This document tracks the implementation status of features documented in `TECHNICAL_REFERENCE.md`.
 

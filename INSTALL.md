@@ -1,403 +1,281 @@
-# AMD RAID Driver Installation Guide
+# AMD RAID Driver — Build and Test
 
-> **Alpha Status**: This driver now implements real hardware communication with the AMD RAID controller.
-> - ✅ Hardware register access via BAR5 MMIO
-> - ✅ Command/completion queues with DMA
-> - ✅ MSI interrupt handling
-> - ✅ Sysfs monitoring interface
-> - ✅ Automated test script (`test_driver.sh`)
+> **Status (2026-05-22)**: Active development on the NVMe path for PCI
+> `1022:B000` (TRX50 RAID Bottom). The driver currently brings the
+> controller up to `CSTS.RDY = 1` (admin queue programmed, ready to
+> accept commands). It does **not yet** create I/O queues, discover
+> namespaces, or present block devices. See `docs/STATUS.md` for what's
+> done and what's next, and `docs/GHIDRA_FINDINGS_2026.md` for the
+> reverse-engineering background.
 
-## Quick Start (For Testing)
+The fastest, safest setup is described first. The Live USB approach is
+kept at the bottom as a fallback for when no separate Linux drive is
+available.
 
-After building the driver, use the automated test script:
+---
+
+## Recommended setup: Kubuntu on a non-RAID drive
+
+This is the path with the lowest friction and zero risk of corrupting
+the RAID data. You boot a permanent Linux install from a drive that
+isn't behind the AMD RAID controller, leave the Crucial RAID0 (or
+whatever you have on the controller) untouched, and iterate on
+`rcraid.ko` from there.
+
+### What you need
+
+- **Kubuntu 24.04 LTS** installed on a non-RAID drive (e.g. a Samsung
+  NVMe in a slot that bypasses the AMD RAID controller).
+- BIOS still configured with **SATA / NVMe mode = RAID**. This is what
+  makes the controller expose itself as `1022:B000`. If you switched
+  BIOS to AHCI, the underlying drives appear as raw NVMe / SATA and
+  this driver is not relevant.
+- The Crucial NVMe drives (or whatever you have in the RAID array)
+  configured into a RAID volume from the BIOS RAID utility. Don't
+  reconfigure the volume during driver development — losing the
+  metadata would scrub the array.
+
+### Boot setup (one-time)
+
+When BIOS is in RAID mode but the kernel has both the AHCI driver and
+this driver compiled in, you want the AHCI driver disabled so it
+doesn't grab the AMD controller before `rcraid.ko` does. Add to the
+kernel command line via GRUB:
 
 ```bash
-# Build driver
-./build.sh
+sudo sed -i 's/GRUB_CMDLINE_LINUX_DEFAULT="\(.*\)"/GRUB_CMDLINE_LINUX_DEFAULT="\1 modprobe.blacklist=ahci,sata_ahci"/' /etc/default/grub
+sudo update-grub
+sudo reboot
+```
 
-# Run comprehensive tests (includes load, sysfs checks, I/O test)
-sudo ./test_driver.sh
+After reboot, verify:
 
-# Monitor in real-time
+```bash
+lspci -nn | grep -iE 'raid|non-volatile'
+# Should list something like:
+#   46:00.0 Non-Volatile memory controller [0108]: Advanced Micro Devices [AMD] Device [1022:b000]
+# Plus your Samsung OS drive as a separate NVMe.
+```
+
+Do **not** blacklist `nvme` — the kernel still uses it for the Samsung
+OS drive, and `test_driver.sh` relies on `nvme` being available so it
+can unbind only the AMD controller while leaving Samsung alone.
+
+### One-time package install
+
+```bash
+sudo apt update
+sudo apt install -y \
+    build-essential \
+    linux-headers-$(uname -r) \
+    git \
+    flex bison libssl-dev libelf-dev dwarves
+```
+
+### Get the source
+
+```bash
+git clone https://github.com/joeytroy/amd-raid-driver.git
+cd amd-raid-driver
+```
+
+If you already have the repo: `git pull`.
+
+### The iteration loop
+
+```bash
+sudo ./build.sh         # builds rcraid.ko (uses Makefile under the hood)
+sudo ./test_driver.sh   # loads the driver, runs the full check battery,
+                        # writes driver_diagnostics_<ts>.txt, prompts to unload
+```
+
+Read the new **TEST 4.6 (NVMe init check)** first — it tells you in
+plain English whether:
+
+- The driver routed to the NVMe path (mode=2) vs accidentally falling
+  back to AHCI / stub.
+- `CAP` was readable.
+- `AQA / ASQ / ACQ` got programmed and the read-back matched.
+- The controller actually reached `CSTS.RDY = 1`.
+
+Between iterations:
+
+```bash
+sudo ./unload.sh        # only if you skipped the script's unload prompt
+```
+
+### Useful live monitoring
+
+In a second terminal during the test:
+
+```bash
+dmesg -w | grep -iE 'rc_|rcraid|rcbottom'
+```
+
+Or, once the driver is loaded:
+
+```bash
 watch -n1 'cat /sys/bus/pci/drivers/rcbottom/*/rcraid/queue_stats'
 ```
 
-## 1. Setup Live USB and GRUB Configuration
+### What you will NOT see yet
 
-### Create Live USB
-1. Download Kubuntu 24.04 LTS ISO
-2. Burn ISO to USB using Rufus on Windows only
+Don't be surprised by either of these — they're expected at the
+current implementation state:
 
-### Modify GRUB Configuration
+- **No `/dev/sd*` or `/dev/rcraid*`** for the RAID volume. The driver
+  doesn't create block devices yet.
+- **No SCSI host entry** in `lsblk`. Same reason.
+- **`lspci -k` showing `Kernel driver in use: rcbottom`** *is* expected
+  once the driver loads successfully. That's the binding milestone.
 
-**For SATA drives (RAID mode):**
-```bash
-# Edit USB:/boot/grub/grub.cfg - append AHCI blacklist to the END:
-# FROM: linux /casper/vmlinuz --- quiet splash
-# TO:   linux /casper/vmlinuz --- quiet splash modprobe.blacklist=ahci,sata_ahci
+---
 
-# FROM: linux /casper/vmlinuz nomodeset --- quiet splash  
-# TO:   linux /casper/vmlinuz nomodeset --- quiet splash modprobe.blacklist=ahci,sata_ahci
-```
+## Safety notes
 
-**For NVMe drives (RAID mode):**
-```bash
-# Edit USB:/boot/grub/grub.cfg - append AHCI blacklist to the END:
-# FROM: linux /casper/vmlinuz --- quiet splash
-# TO:   linux /casper/vmlinuz --- quiet splash modprobe.blacklist=ahci,sata_ahci
+### Don't develop kernel code inside a VM
 
-# FROM: linux /casper/vmlinuz nomodeset --- quiet splash  
-# TO:   linux /casper/vmlinuz nomodeset --- quiet splash modprobe.blacklist=ahci,sata_ahci
-```
+VMware / VirtualBox / QEMU guests don't see the host's PCI devices
+unless you do passthrough, and you can't pass through hardware the host
+is itself using. So:
 
-**For Mixed SATA + NVMe (RAID mode):**
-```bash
-# Edit USB:/boot/grub/grub.cfg - append AHCI blacklist to the END:
-# FROM: linux /casper/vmlinuz --- quiet splash
-# TO:   linux /casper/vmlinuz --- quiet splash modprobe.blacklist=ahci,sata_ahci
+- ✅ Edit code in a VM — fine, share the folder back to the host.
+- ✅ Compile in a VM — fine if the kernel version matches the host's.
+- ❌ `insmod rcraid.ko` in a VM — module loads but binds to nothing.
+- ❌ `test_driver.sh` in a VM — every hardware check fails.
 
-# FROM: linux /casper/vmlinuz nomodeset --- quiet splash  
-# TO:   linux /casper/vmlinuz nomodeset --- quiet splash modprobe.blacklist=ahci,sata_ahci
-```
+The build-and-test loop has to run on the bare-metal Kubuntu install.
 
-**Edit USB:/boot/grub/loopback.cfg:**
-```bash
-# For SATA drives - append AHCI blacklist to the END:
-# FROM: linux /casper/vmlinuz iso-scan/filename=${iso_path} --- quiet splash
-# TO:   linux /casper/vmlinuz iso-scan/filename=${iso_path} --- quiet splash modprobe.blacklist=ahci,sata_ahci
+### `test_driver.sh` is safe by design
 
-# For NVMe drives - append AHCI blacklist to the END:
-# FROM: linux /casper/vmlinuz iso-scan/filename=${iso_path} --- quiet splash
-# TO:   linux /casper/vmlinuz iso-scan/filename=${iso_path} --- quiet splash modprobe.blacklist=ahci,sata_ahci
+Two things to know:
 
-# FROM: linux /casper/vmlinuz nomodeset iso-scan/filename=${iso_path} --- quiet splash
-# TO:   linux /casper/vmlinuz nomodeset iso-scan/filename=${iso_path} --- quiet splash modprobe.blacklist=ahci,sata_ahci
-```
+- It unbinds **only** PCI devices matching `1022:b000` (the AMD RAID
+  controller). It can never touch your Samsung OS drive, even if the
+  Samsung-protection branch is irrelevant to your model.
+- It does no writes against the RAID volume. The driver doesn't even
+  implement writes yet — it can't.
 
-**Important:** 
-- **SATA drives only**: Use `modprobe.blacklist=ahci,sata_ahci` (both AHCI drivers)
-- **NVMe drives only**: Use `modprobe.blacklist=ahci,sata_ahci` (both AHCI drivers, DO NOT blacklist nvme)
-- **Mixed SATA + NVMe**: Use `modprobe.blacklist=ahci,sata_ahci` (both AHCI drivers, DO NOT blacklist nvme)
-- **"Append"** means add to the END of the line, not the beginning!
-- **TRX50 Note**: The AMD RAID driver needs the NVMe driver loaded to work with NVMe drives
-- **AMD Official Note**: AMD's official guide uses `modprobe.blacklist=ahci,nvme` but this driver needs NVMe support
+### Kernel oopses still hang you
 
-## 2. BIOS Configuration
+We're writing to MMIO on real hardware. If the driver does something
+the controller dislikes, the machine may freeze and need a hard reboot.
+Commit your code before each test run; don't leave unsaved work in
+editors.
 
-1. **Boot into BIOS/UEFI** (F2, F12, or Del during boot)
-2. **Find SATA Configuration** (Advanced or Storage section)
-3. **Change SATA Mode** from "AHCI" to "RAID"
-4. **Configure RAID arrays** (RAID 0, RAID 1, etc.)
-   - **SATA drives only**: Create RAID with SATA drives
-   - **NVMe drives only**: Create RAID with NVMe drives  
-   - **Mixed configuration**: Create RAID with both SATA and NVMe drives
-5. **Save and exit BIOS**
+---
 
-## 3. Install Driver and Verify RAID
+## After a kernel update
 
-### Improved Build System
-
-The driver now includes an improved build system that automatically handles kernel header issues:
-
-- **`build.sh`**: Robust build script that finds working kernel directories and handles compilation errors
-- **Enhanced Makefile**: Better error handling and compiler flags
-- **Automatic fallbacks**: Tries multiple kernel versions if the primary build fails
-
-### Driver Improvements
-
-Recent fixes include:
-
-- **Fixed debug macros**: Proper printk level handling
-- **SCSI template cleanup**: Removed deprecated fields for better compatibility
-- **Build system robustness**: Handles kernel header issues gracefully
-- **Better error handling**: More informative build messages and fallback options
-
-### Boot from Live USB
-1. Boot from your modified USB
-2. Open terminal
-
-### Install Driver
-```bash
-# Update and install dependencies
-sudo apt-get update
-sudo apt install -y build-essential linux-headers-$(uname -r) git flex bison libssl-dev libelf-dev dwarves
-
-# Clone and build driver
-git clone https://github.com/joeytroy/amd-raid-driver.git
-cd amd-raid-driver
-sudo cp /sys/kernel/btf/vmlinux /usr/lib/modules/`uname -r`/build/
-
-# Build driver (use the improved build script)
-sudo ./build.sh
-
-# Alternative: manual build if script fails
-# sudo make clean
-# sudo make simple
-
-# Create AMD-compatible driver structure
-sudo mkdir -p /dd
-sudo cp rcraid.ko /dd/
-sudo cp rcraid.ko /dd/rcraid_generic.ko  # Generic version for compatibility
-
-# Install driver
-sudo cp rcraid.ko /lib/modules/`uname -r`/kernel/drivers/scsi
-sudo depmod -a
-sudo modprobe rcraid
-
-# Verify RAID arrays are detected
-lsblk
-```
-
-## 4. Install Kubuntu
-
-1. **Run Kubuntu installer** - it should now detect your RAID arrays
-2. **Complete installation** normally
-3. **DO NOT RESTART YET**
-
-## 5. Post-Installation Setup
-
-**Before rebooting, run these commands:**
+`linux-headers-*` for your new kernel must be installed, then rebuild:
 
 ```bash
-# Configure GRUB to blacklist AHCI
-sudo chroot /target sed -i.bak -e '/^GRUB_CMDLINE_LINUX_DEFAULT/ s/ *modprobe.blacklist=ahci// ; /^GRUB_CMDLINE_LINUX_DEFAULT/ s/"$/ modprobe.blacklist=ahci"/' /etc/default/grub
-sudo chroot /target sed -i.bak -e '/\/boot\/vmlin/ s/ *modprobe.blacklist=ahci// ; /\/boot\/vmlin/ s/$/ modprobe.blacklist=ahci/' /boot/grub/grub.cfg
-
-# Copy driver to installed system
-sudo cp rcraid.ko /target/lib/modules/`uname -r`/kernel/drivers/scsi/rcraid.ko
-sudo chroot /target depmod -a `uname -r`
-
-# Update initramfs
-sudo chroot /target cp -ap /boot/initrd.img-`uname -r` /boot/initrd.img-`uname -r`.bak
-sudo chroot /target mkinitramfs -o /boot/initrd.img-`uname -r` `uname -r`
-
-# Reboot
-sudo reboot
-```
-
-## 6. Update Driver After Kernel Updates
-
-When you update your kernel, reinstall the driver:
-
-```bash
-# Install new kernel first
-sudo apt update && sudo apt upgrade
-
-# Install build dependencies for new kernel
-sudo apt install -y build-essential linux-headers-{new-kernel-version} flex bison libssl-dev libelf-dev dwarves
-
-# Rebuild driver for new kernel
+sudo apt install -y linux-headers-$(uname -r)
 cd ~/amd-raid-driver
 sudo ./build.sh
-
-# Alternative: manual build if script fails
-# sudo make clean
-# sudo make simple
-
-# Install driver
-sudo cp rcraid.ko /lib/modules/{new-kernel-version}/kernel/drivers/scsi/rcraid.ko
-sudo depmod -a {new-kernel-version}
-
-# Update initramfs
-sudo cp -ap /boot/initrd.img-{new-kernel-version} /boot/initrd.img-{new-kernel-version}.bak
-sudo mkinitramfs -o /boot/initrd.img-{new-kernel-version} {new-kernel-version}
-
-# Reboot
-sudo reboot
 ```
+
+The Makefile picks up the running kernel's headers automatically. No
+chroot or initramfs gymnastics are needed while the driver is still in
+development (you're loading it manually with `insmod` each time, not
+booting from it).
+
+---
 
 ## Troubleshooting
 
-### Verify Driver is Working
+### Driver builds but `lspci` shows the device with no driver bound
 
-**Check if driver is loaded:**
+Check that BIOS is in **RAID mode**, not AHCI. In AHCI mode the
+controller doesn't expose itself as `1022:B000` at all.
+
+### Build fails on Debian-family kernels newer than 6.8
+
 ```bash
-lsmod | grep rcraid
-```
-**Expected output:**
-```
-rcraid               5025792  0
+sudo make clean
+sudo make simple    # less strict warning set, kept for compatibility
 ```
 
-**Check hardware detection:**
+Paste the build log if it still fails — there may be a kernel API
+change to deal with.
+
+### `insmod` fails with `No such device`
+
+The driver loaded but the PCI table doesn't match. Confirm:
+
 ```bash
-sudo dmesg | grep -i rcraid
-```
-**Expected output (TRX50/WRX80 platforms on Kubuntu 24.04 LTS):**
-```
-[  145.856658] rcraid: rc_init: AMD RAID Driver version 9.3.2.00255
-[  145.856758] rcraid: rc_init: Based on Windows driver architecture
-[  145.856793] rcraid: rc_bottom_init: initializing hardware layer
-[  145.857350] rcraid: rc_bottom_probe: initializing hardware - VID=0x1022 DID=0x43bd
-[  145.857400] rcraid: rc_bottom_probe: using 64-bit DMA
-[  145.857450] rcraid: rc_bottom_probe: MSI enabled with 5 vectors
-[  145.857500] rcraid: rc_bottom_probe: adapter 0 initialized successfully
-[  145.857550] rcraid: rc_config_init: initializing configuration layer
-[  145.857600] rcraid: rc_config_init: configuration layer initialized
-[  145.857650] rcraid: rc_raid_init: initializing RAID layer
-[  145.857700] rcraid: rc_raid_init: RAID layer initialized successfully
-[  145.857750] rcraid: rc_init: AMD RAID Driver initialized successfully
-[  145.857800] rcraid: rc_init: Found 1 adapters
-[  146.899682] scsi host1: AMD-RAID
-[  146.900915] scsi 1:0:24:0: Processor         AMD-RAID Configuration    V1.2 PQ: 0 ANSI: 5
+lspci -d 1022: -nn
 ```
 
-**Check RAID controller detection:**
+Both `1022:43bd` (AHCI variant) and `1022:b000` (NVMe variant) should
+be claimed by the driver via the table in `rc_bottom.c`. If your
+device ID is something else, it's not currently supported.
+
+### Driver loads, NVMe init runs, but `ASQ/ACQ` read-back mismatch
+
+That means we wrote the right registers but they didn't stick — likely
+the controller needs a vendor-specific config write before MMIO comes
+up. See `docs/OPEN_QUESTIONS.md` item 6 and 7. Capture the full dmesg
+and paste it into a new development session.
+
+### "I just want to compare against the working Windows driver"
+
+The Windows binaries are at `drivers/windows/trx50/9.3.3-00291/` (CVE
+patched) and `drivers/windows/trx50/9.3.2-00255/` (the version all
+Ghidra docs reference). Use Ghidra headless via the script in
+`scripts/ghidra/HuntBlockers.java`. See `docs/README.md` for the
+command line.
+
+---
+
+## Alternative: Live USB (fallback)
+
+Use this path only if you don't have a usable Linux install on a
+non-RAID drive — for example, on a fresh system where Windows still
+owns the RAID and you have nowhere else to boot Linux from.
+
+### Create the USB
+
+1. Download **Kubuntu 24.04 LTS** ISO.
+2. Burn to USB with Rufus (Windows) or `dd` / Ventoy (Linux).
+
+### Modify GRUB on the USB
+
+Edit `USB:/boot/grub/grub.cfg` and `USB:/boot/grub/loopback.cfg`. For
+each `linux /casper/vmlinuz …` line, append at the **end**:
+
+```
+modprobe.blacklist=ahci,sata_ahci
+```
+
+This stops the kernel AHCI driver from grabbing the controller while
+the Live USB is booting. **Do not blacklist `nvme`** — this driver
+relies on the kernel `nvme` driver being loaded (it unbinds the AMD
+device from it, then takes over).
+
+### Boot and build
+
+After booting the Live USB:
+
 ```bash
-lspci | grep -i raid
-```
-**Expected output (TRX50/WRX80 platforms on Kubuntu 24.04 LTS):**
-```
-# Promontory SATA controller
-4a:00.0 RAID bus controller: Advanced Micro Devices, Inc. [AMD] Device 43bd (rev 01)
+sudo apt update
+sudo apt install -y build-essential linux-headers-$(uname -r) git \
+    flex bison libssl-dev libelf-dev dwarves
 
-# Bristol RAID mode (if present)
-4b:00.0 RAID bus controller: Advanced Micro Devices, Inc. [AMD] Device 7905 (rev 01)
+git clone https://github.com/joeytroy/amd-raid-driver.git
+cd amd-raid-driver
+sudo cp /sys/kernel/btf/vmlinux /usr/lib/modules/$(uname -r)/build/ 2>/dev/null || true
 
-# Summit RAID mode (if present)  
-4c:00.0 RAID bus controller: Advanced Micro Devices, Inc. [AMD] Device 7916 (rev 01)
-
-# X570S chipset RAID mode (if present)
-4d:00.0 RAID bus controller: Advanced Micro Devices, Inc. [AMD] Device 7917 (rev 01)
-
-# NVMe RAID Bottom Device (if present)
-4e:00.0 Non-Volatile memory controller: Advanced Micro Devices, Inc. [AMD] Device b000 (rev 01)
-```
-
-**AMD Official Specifications:**
-- **Supported Processors**: 3rd Gen AMD Ryzen™ Threadripper Processors
-- **Supported Chipsets**: TRX40/WRX80
-- **Max Devices**: 14 total (SATA + NVMe)
-- **Max NVMe Devices**: 10
-- **Max Controllers**: 11
-
-### Verify RAID Arrays are Detected
-
-**Check SCSI hosts:**
-```bash
-ls -la /sys/class/scsi_host/
-```
-**Expected output:**
-```
-host1 -> ../../devices/pci0000:40/0000:40:03.6/0000:46:00.0/0000:47:0d.0/0000:4a:00.0/host1/scsi_host/host1
-```
-
-**Check configuration device:**
-```bash
-ls -la /dev/rcfg
-```
-**Expected output:**
-```
-crw-rw-rw- 1 root root 10, 60 Dec 12 10:30 /dev/rcfg
-```
-
-**Check for RAID arrays:**
-```bash
-lsblk
-```
-**Expected output (with working RAID):**
-```
-sdb    8:16   0   3.6T  0 disk
-└─sdb1 8:17   0   3.6T  0 part
-```
-
-**If RAID arrays not showing:**
-```bash
-# Check SCSI devices
-ls -la /sys/class/scsi_device/
-
-# Check configuration device
-ls -la /dev/rcfg
-
-# Try rescanning
-echo "- - -" | sudo tee /sys/class/scsi_host/host*/scan
-
-# Check again
-lsblk
-```
-
-### Driver-Specific Features
-
-**Check driver parameters:**
-```bash
-# Check all driver parameters
-cat /sys/module/rcraid/parameters/*
-
-# Check debug level
-cat /sys/module/rcraid/parameters/debug_level
-```
-
-**Check configuration device:**
-```bash
-# Read configuration device info
-cat /dev/rcfg
-
-# Check device permissions
-ls -la /dev/rcfg
-```
-
-**Check MSI status:**
-```bash
-# Check MSI configuration
-lspci -vvv | grep -i msi
-
-# Check interrupt handling
-cat /proc/interrupts | grep rcraid
-```
-
-### Common Issues
-
-**Driver not loading:**
-```bash
-# Load manually
-sudo modprobe rcraid
-
-# Check for errors
-sudo dmesg | tail -20
-```
-
-**RAID arrays not detected:**
-- Check BIOS is set to RAID mode (not AHCI)
-- Verify RAID arrays are configured in BIOS
-- Check GRUB has correct blacklist parameters:
-  - SATA: `modprobe.blacklist=ahci,sata_ahci`
-  - NVMe: `modprobe.blacklist=ahci,sata_ahci` (DO NOT blacklist nvme - driver needs it)
-- Verify SCSI host is created: `ls -la /sys/class/scsi_host/`
-- Check configuration device: `ls -la /dev/rcfg`
-
-**Driver-specific issues:**
-- Verify MSI/MSI-X is working: `dmesg | grep -i msi`
-- Check driver parameters: `cat /sys/module/rcraid/parameters/*`
-- Verify configuration device: `ls -la /dev/rcfg`
-- Check interrupt handling: `cat /proc/interrupts | grep rcraid`
-
-**System won't boot:**
-- Check BIOS is set to RAID mode
-- Verify GRUB has correct blacklist parameters
-- Check that driver is in initramfs
-
-**Build fails:**
-```bash
-# First try the improved build script:
 sudo ./build.sh
-
-# If script fails, try manual build:
-sudo make clean
-sudo make simple
-
-# If still failing, try with older kernel:
-sudo apt install -y linux-source-6.8.0-* linux-headers-6.8.0-*
-sudo make clean
-sudo make KDIR=/usr/src/linux-source-6.8.0-*/build/
-
-# Check for specific build errors:
-sudo dmesg | tail -20
-sudo make clean && sudo make simple 2>&1 | tee build.log
+sudo ./test_driver.sh
 ```
 
-**Common build issues and solutions:**
+Changes you make to the source on the Live USB session don't persist
+across reboots unless you set up persistence on the USB. Push to git or
+copy to external storage before powering down.
 
-1. **Kernel header issues**: The build script automatically handles this
-2. **Missing dependencies**: Install with `sudo apt install -y build-essential linux-headers-$(uname -r) flex bison libssl-dev libelf-dev dwarves`
-3. **Permission issues**: Ensure you're running as root with `sudo`
-4. **Module compilation errors**: Check the build log for specific error messages
+The previous workflow in this file (chroot into `/target`, copy
+`rcraid.ko` into the installed system's `/lib/modules`, regenerate
+initramfs, boot from RAID) is **not appropriate yet** — the driver
+can't present block devices for booting. Don't try to install onto the
+RAID until the port is far more complete.

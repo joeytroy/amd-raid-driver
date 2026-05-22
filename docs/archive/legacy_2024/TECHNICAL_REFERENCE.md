@@ -1,4 +1,20 @@
-# TRX50 RAID Miniport Notes (Ghidra Recon)
+# TRX50 RAID Miniport Notes (Ghidra Recon) — ARCHIVED
+
+> **⚠️ Archived 2026-05-22.** Significant claims in this document have
+> been debunked. In particular:
+> - The "descriptor accessor at `devExt+0x1C2D0`" and the blob
+>   `DAT_140012258` are the WDF/KMDF version-bind machinery, not a
+>   firmware-capability interface.
+> - PCI device `1022:B000` takes the Windows driver's `nvme.c` code
+>   path (`FUN_14000dd44`), not the AHCI completion-register path
+>   discussed here.
+> - `FUN_14002ce29` is outside `rcbottom.sys` and does not exist in
+>   the binary.
+>
+> See **`docs/GHIDRA_FINDINGS_2026.md`** at the repo top level for the
+> corrected picture. The `rcraid.sys` analysis below is mostly still
+> valid (that binary is byte-identical between 9.3.2 and 9.3.3); the
+> `rcbottom.sys` analysis needs to be read against the 2026 findings.
 
 These notes capture what we have learned from the Windows TRX50 StorPort
 driver (`rcraid.sys` 9.3.2-00255) so we can implement the same behaviour in

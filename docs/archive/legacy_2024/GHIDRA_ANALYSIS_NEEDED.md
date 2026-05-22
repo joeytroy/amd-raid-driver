@@ -1,4 +1,18 @@
-# Ghidra Analysis Needed for TRX50 Driver
+# Ghidra Analysis Needed for TRX50 Driver — ARCHIVED
+
+> **⚠️ Archived 2026-05-22.** Most of the "TO DO" items in this document
+> have either been answered (and the answers contradicted the
+> hypothesis) or were chasing things that don't exist:
+> - Hunting for `0xB000` register offsets — the controller uses NVMe
+>   register layout (`BAR0 + 0x14/0x24/0x28/0x30`), not the AHCI
+>   `0x100+` offsets.
+> - Hunting for the descriptor accessor at `devExt+0x1C2D0` — it's the
+>   WDF/KMDF version-bind function pointer, not a firmware accessor.
+> - Hunting for `FUN_14002ce29` — outside the binary; does not exist.
+>
+> Current Ghidra TODOs live in **`docs/OPEN_QUESTIONS.md`** at the repo
+> top level. Keep this archived file only as a record of what we used
+> to think.
 
 **Note**: All analysis results are documented in `TECHNICAL_REFERENCE.md`. Use function addresses from that file as starting points in Ghidra.
 
