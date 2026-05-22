@@ -1,83 +1,101 @@
 /****************************************************************************
  * AMD RAID Driver for Linux - Firmware Capability Parsing
- * Implements FUN_140007d40 equivalent - firmware variant detection
+ *
+ * This file picks the hardware code path (AHCI vs NVMe vs stub) based on the
+ * PCI device ID. It mirrors the Windows driver's FUN_140007d40, with one big
+ * simplification: the Windows function does its selection via wcsncmp on the
+ * PnP HW-ID string + a class-code byte from the StorPort service +0x3f0; on
+ * Linux the same information is just sitting in pdev->device and pdev->class,
+ * so there is no need to recreate the WDF class-bind dance (service +0x418).
+ *
+ * See docs/GHIDRA_FINDINGS_2026.md for the full reasoning. The previous
+ * version of this file was a stub that always defaulted to AHCI mode, which
+ * is why DEV_B000 never came up.
+ *
  * Copyright (c) 2024 Advanced Micro Devices, Inc.
  ****************************************************************************/
 
 #include "rc_linux.h"
+#include "rc_pci_ids.h"
 
-/*
- * rc_parse_firmware_capabilities - Parse firmware capability blob
- * 
- * Mirrors Windows FUN_140007d40 behavior:
- * - Parses firmware ASCII/Unicode capability blob
- * - Stores four 16-bit values at devExt+0x16056/58/5A/5C
- * - Sets queue variant flags (devExt+0x16068, +0x1606C)
- * - Detects controller type (NVMe vs AHCI) by matching vendor strings
- * - Assigns callback table based on detected type
- * - Populates devExt+0x1C2D8 (packed firmware capability word)
- * 
- * NOTE: Currently defaults to safe dispatcher mode until we discover
- * where the firmware capability blob is located (PCI config? MMIO? ACPI?).
- */
-int rc_parse_firmware_capabilities(struct rc_adapter *adapter)
+static enum rc_ctrl_mode rc_classify_device(struct pci_dev *pdev)
 {
-    struct rc_doorbell_state *doorbell = &adapter->ctx.doorbell;
-    bool fast_path = false;
-    int ret;
+	/* Windows fast-path: explicit per-device matches all go to ahci.c. */
+	switch (pdev->device) {
+	case RC_PD_DID_BRISTOL:
+	case RC_PD_DID_PROMONTORY:
+	case RC_PD_DID_SUMMIT:
+	case RC_PD_DID_X570S:
+		return RC_CTRL_MODE_AHCI;
+	}
 
-    rc_printk(RC_INFO, "rc_parse_firmware_capabilities: parsing firmware for adapter %d\n",
-              adapter->instance);
+	/* Anything else with PCI class "NVM Express controller" (0x010802) goes
+	 * to nvme.c on Windows. That's how DEV_B000 (CC_0108) is picked up. */
+	if ((pdev->class >> 8) == 0x0108)
+		return RC_CTRL_MODE_NVME;
 
-    /* TODO: Read firmware capability blob from hardware */
-    /* Possible locations:
-     * - PCI config space (vendor-specific capabilities)
-     * - MMIO region (firmware-provided capability structure)
-     * - ACPI tables (firmware-provided capability data)
-     * 
-     * For now, we'll default to safe dispatcher mode and initialize
-     * the fields with default values.
-     */
-
-    /* Initialize variant fields with defaults (devExt+0x16056/58/5A/5C) */
-    doorbell->variant[0] = 0x0000;
-    doorbell->variant[1] = 0x0000;
-    doorbell->variant[2] = 0x0000;
-    doorbell->variant[3] = 0x0000;
-
-    /* Set queue state (devExt+0x16068) - default to 0x00 (safe mode) */
-    /* Windows sets this to 0x63 + increment for NVMe controllers */
-    doorbell->queue_state = 0x00;
-
-    /* Set queue mode (devExt+0x1606C) - bit0 selects fast-path */
-    /* 0x00 = safe dispatcher, 0x01 = fast-path */
-    doorbell->queue_mode = 0x00;  /* Default to safe dispatcher */
-
-    /* Initialize capability word (devExt+0x1C2D8) */
-    doorbell->capability_word = 0x00000000;
-
-    /* Try to detect controller type from PCI device */
-    /* For TRX50, we know it's 0x1022:0x43bd, but we need to check
-     * if it's configured as NVMe or AHCI mode */
-    
-    /* For now, default to safe dispatcher (AHCI-compatible mode) */
-    fast_path = false;
-
-    rc_printk(RC_INFO, "rc_parse_firmware_capabilities: "
-              "queue_state=0x%02x queue_mode=0x%02x fast_path=%s\n",
-              doorbell->queue_state, doorbell->queue_mode,
-              fast_path ? "yes" : "no");
-
-    /* Install callbacks based on detected controller type */
-    ret = rc_install_callbacks(adapter, fast_path);
-    if (ret) {
-        rc_printk(RC_WARN, "rc_parse_firmware_capabilities: "
-                  "callback installation failed\n");
-        return ret;
-    }
-
-    rc_printk(RC_INFO, "rc_parse_firmware_capabilities: completed (safe mode)\n");
-
-    return 0;
+	/* Unknown vendor-specific RAID class → stub callbacks (controller will
+	 * load but issue no I/O). Matches Windows iVar7=99 path. */
+	return RC_CTRL_MODE_STUB;
 }
 
+int rc_parse_firmware_capabilities(struct rc_adapter *adapter)
+{
+	struct rc_doorbell_state *doorbell = &adapter->ctx.doorbell;
+	enum rc_ctrl_mode mode;
+	int ret;
+
+	mode = rc_classify_device(adapter->pdev);
+	adapter->ctx.ctrl_mode = mode;
+
+	rc_printk(RC_NOTE,
+		  "rc_parse_firmware_capabilities: PCI %04x:%04x class=0x%06x → mode=%d (%s)\n",
+		  adapter->pdev->vendor, adapter->pdev->device,
+		  adapter->pdev->class, mode,
+		  mode == RC_CTRL_MODE_AHCI ? "AHCI" :
+		  mode == RC_CTRL_MODE_NVME ? "NVMe" :
+		  mode == RC_CTRL_MODE_STUB ? "stub" : "unknown");
+
+	/* Variant fields are only meaningful on the AHCI fast path where the
+	 * controller reports per-device firmware caps. NVMe controllers carry
+	 * their own capability registers (CAP/VS); we read those in
+	 * rc_nvme_init_controller(). For the stub path nothing matters. */
+	doorbell->variant[0] = 0;
+	doorbell->variant[1] = 0;
+	doorbell->variant[2] = 0;
+	doorbell->variant[3] = 0;
+	doorbell->queue_state = 0;
+	doorbell->queue_mode = 0;
+	doorbell->capability_word = 0;
+
+	switch (mode) {
+	case RC_CTRL_MODE_NVME:
+		/* Bring the controller through reset → admin queue → enable. */
+		ret = rc_nvme_init_controller(adapter);
+		if (ret) {
+			rc_printk(RC_ERROR,
+				  "rc_parse_firmware_capabilities: NVMe init failed (%d)\n",
+				  ret);
+			return ret;
+		}
+		/* No AHCI-style callback table; the NVMe path dispatches through
+		 * its own helpers. Mark queue_mode so the rest of the driver
+		 * knows not to ring AHCI doorbells. */
+		doorbell->queue_mode = 0x01;
+		return 0;
+
+	case RC_CTRL_MODE_AHCI:
+		ret = rc_install_callbacks(adapter, false);
+		if (ret)
+			rc_printk(RC_WARN,
+				  "rc_parse_firmware_capabilities: AHCI callback install failed (%d)\n",
+				  ret);
+		return ret;
+
+	case RC_CTRL_MODE_STUB:
+	default:
+		rc_printk(RC_WARN,
+			  "rc_parse_firmware_capabilities: device not recognised, using stub callbacks\n");
+		return rc_install_callbacks(adapter, false);
+	}
+}

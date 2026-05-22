@@ -36,6 +36,63 @@ ensure_debugfs_mounted() {
     fi
 }
 
+# Verify the NVMe init path completed for DEV_B000 controllers.
+# This is the decisive check after the May 2026 driver restructure:
+# rc_nvme_init_controller logs CAP, then writes AQA/ASQ/ACQ and reads
+# them back. If the read-back values don't match what was written, the
+# function returns -EIO and logs an error — that means we're still
+# poking at the wrong register set and need to re-investigate.
+check_nvme_init() {
+    echo -e "${YELLOW}[TEST 4.6]${NC} Checking NVMe controller init path..."
+
+    local mode_line cap_line aqa_line ready_line err_line skip_line
+
+    mode_line=$(dmesg | grep "rc_parse_firmware_capabilities:" | tail -1 || true)
+    cap_line=$(dmesg | grep "rc_nvme_init_controller: CAP=" | tail -1 || true)
+    aqa_line=$(dmesg | grep "rc_nvme_init_controller: AQA=" | tail -1 || true)
+    ready_line=$(dmesg | grep "rc_nvme_init_controller: ready" | tail -1 || true)
+    err_line=$(dmesg | grep "rc_nvme_init_controller:" | grep -iE 'failed|did not persist|wrong register|fatal' | tail -1 || true)
+    skip_line=$(dmesg | grep "rc_hw_init: skipping AHCI" | tail -1 || true)
+
+    if [ -z "$mode_line" ]; then
+        echo -e "${YELLOW}  ⚠ rc_parse_firmware_capabilities log line not found — driver may not have probed${NC}"
+        echo
+        return
+    fi
+    echo "  $mode_line"
+
+    if echo "$mode_line" | grep -q "mode=2"; then
+        echo -e "${GREEN}  ✓ Routed to NVMe path (DEV_B000)${NC}"
+    elif echo "$mode_line" | grep -q "mode=1"; then
+        echo -e "${YELLOW}  ⚠ Routed to AHCI path — NVMe init checks below will be skipped${NC}"
+        echo
+        return
+    else
+        echo -e "${YELLOW}  ⚠ Routed to unknown/stub path${NC}"
+        echo
+        return
+    fi
+
+    [ -n "$cap_line" ]   && echo "  $cap_line"
+    [ -n "$aqa_line" ]   && echo "  $aqa_line"
+    [ -n "$ready_line" ] && echo "  $ready_line"
+    [ -n "$skip_line" ]  && echo "  $skip_line"
+
+    if [ -n "$err_line" ]; then
+        echo -e "${RED}  ✗ NVMe init error detected:${NC}"
+        echo "    $err_line"
+        echo -e "${YELLOW}    → Register write-back failed. See docs/STATUS.md for next steps.${NC}"
+    elif [ -n "$ready_line" ]; then
+        echo -e "${GREEN}  ✓ Controller reached CSTS.RDY — admin queue programmed successfully${NC}"
+    elif [ -n "$aqa_line" ]; then
+        echo -e "${YELLOW}  ⚠ AQA/ASQ/ACQ programmed but controller did not signal ready (timeout?)${NC}"
+    else
+        echo -e "${YELLOW}  ⚠ NVMe init log lines missing — bring-up may not have run${NC}"
+    fi
+
+    echo
+}
+
 # Check dmesg for rcraid-related error keywords
 check_driver_logs_for_errors() {
     echo -e "${YELLOW}[TEST 4.5]${NC} Checking driver logs for errors..."
@@ -378,6 +435,7 @@ echo "Recent driver messages:"
 dmesg | grep -i "rcraid\|rcbottom\|rc_bottom\|rc_hw\|rc_queue" | tail -20 || echo "(no messages found)"
 echo
 
+check_nvme_init
 check_driver_logs_for_errors
 
 # Test 5: Check sysfs entries

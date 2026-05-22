@@ -148,30 +148,42 @@ int rc_hw_init(struct rc_adapter *adapter)
     hw->cmd_queue_tail = 0;
     hw->comp_queue_head = 0;
 
-    rc_hw_program_queues(hw);
+    /* AHCI-style register programming (offsets 0x20/0x24/0x28/0x30/0x34/0x38)
+     * and GHC enable only apply to the AHCI variants (DEV_7905/7916/7917/43BD).
+     * For NVMe controllers the bring-up was already done by
+     * rc_nvme_init_controller() from rc_parse_firmware_capabilities(). */
+    if (adapter->ctx.ctrl_mode == RC_CTRL_MODE_AHCI) {
+        rc_hw_program_queues(hw);
 
-    ret = rc_hw_start_controller(hw);
-    if (ret)
-        goto err_free_cmd;
+        ret = rc_hw_start_controller(hw);
+        if (ret)
+            goto err_free_cmd;
 
-    /* Enable all interrupt sources we understand (vector 244). */
-    writel(0xffffffff, hw->mmio_base + RC_REG_INTERRUPT_STATUS);
-    writel(0x0000000f, hw->mmio_base + RC_REG_INTERRUPT_MASK);
+        /* Enable all interrupt sources we understand (vector 244). */
+        writel(0xffffffff, hw->mmio_base + RC_REG_INTERRUPT_STATUS);
+        writel(0x0000000f, hw->mmio_base + RC_REG_INTERRUPT_MASK);
 
-    rc_printk(RC_INFO, "rc_hw_init: queues programmed (cmd=0x%llx comp=0x%llx)\n",
-              (unsigned long long)hw->cmd_queue_dma,
-              (unsigned long long)hw->comp_queue_dma);
+        rc_printk(RC_INFO, "rc_hw_init: AHCI queues programmed (cmd=0x%llx comp=0x%llx)\n",
+                  (unsigned long long)hw->cmd_queue_dma,
+                  (unsigned long long)hw->comp_queue_dma);
+    } else {
+        rc_printk(RC_INFO,
+                  "rc_hw_init: skipping AHCI register programming (ctrl_mode=%d)\n",
+                  adapter->ctx.ctrl_mode);
+    }
 
     /* Initialize work item queue (FUN_14000e960) */
     spin_lock_init(&adapter->ctx.doorbell.work_queue_lock);
     adapter->ctx.doorbell.work_queue_head = NULL;
     adapter->ctx.doorbell.work_queue_tail = NULL;
 
-    /* Install callback slots (default to safe dispatcher until firmware detection) */
-    ret = rc_install_callbacks(adapter, false);
-    if (ret) {
-        rc_printk(RC_WARN, "rc_hw_init: callback installation failed (non-fatal)\n");
-        /* Continue anyway - callbacks are optional for basic functionality */
+    /* Callback table is only meaningful in AHCI mode; in NVMe mode the
+     * dispatch table is the NVMe queue itself. */
+    if (adapter->ctx.ctrl_mode == RC_CTRL_MODE_AHCI) {
+        ret = rc_install_callbacks(adapter, false);
+        if (ret) {
+            rc_printk(RC_WARN, "rc_hw_init: callback installation failed (non-fatal)\n");
+        }
     }
 
     return 0;

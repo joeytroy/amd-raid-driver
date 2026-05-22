@@ -182,6 +182,40 @@ struct rc_queue_handle {
     void *descriptors[0];       // Descriptor array (variable size)
 };
 
+// Controller mode — selects the init/dispatch path.
+// Mirrors the Windows AMD driver's split between ahci.c (iVar7==1) and
+// nvme.c (iVar7==2). See docs/GHIDRA_FINDINGS_2026.md.
+enum rc_ctrl_mode {
+    RC_CTRL_MODE_UNKNOWN = 0,
+    RC_CTRL_MODE_AHCI    = 1,   // DEV_7905/7916/7917/43BD (CC_0104)
+    RC_CTRL_MODE_NVME    = 2,   // DEV_B000 and other CC_0108 devices
+    RC_CTRL_MODE_STUB    = 99,  // unknown device, fallback to no-op stubs
+};
+
+// NVMe controller state (per NVMe 1.4 spec, populated for RC_CTRL_MODE_NVME).
+// All DMA addresses are bus addresses; depths are entry counts (not bytes).
+struct rc_nvme_state {
+    // Admin queue (queue 0)
+    void          *admin_sq;          // virtual addr of admin SQ buffer
+    dma_addr_t     admin_sq_dma;      // bus addr (4 KiB aligned)
+    void          *admin_cq;          // virtual addr of admin CQ buffer
+    dma_addr_t     admin_cq_dma;      // bus addr (4 KiB aligned)
+    u16            admin_sq_depth;    // number of admin SQ entries (max 4096)
+    u16            admin_cq_depth;    // number of admin CQ entries (max 4096)
+    u16            admin_sq_tail;     // next free admin SQ slot
+    u16            admin_cq_head;     // next admin CQ slot to read
+    u8             admin_cq_phase;    // phase bit, toggles each wrap
+
+    // Capability snapshot (CAP at BAR0 + 0x00)
+    u64            cap;
+    u16            mqes;              // CAP.MQES + 1 = max queue depth
+    u8             dstrd;             // CAP.DSTRD doorbell stride
+    u8             timeout_500ms;     // CAP.TO * 500 ms = boot timeout
+
+    // Per-doorbell pointers (computed once after CAP read)
+    void __iomem  *sq_doorbell_base;  // BAR0 + 0x1000
+};
+
 // Device context layout (clean-room mirror of the Windows device extension)
 struct rc_dev_context {
     struct rc_bar bar[RC_MAX_BARS];
@@ -192,6 +226,13 @@ struct rc_dev_context {
     void *descriptor_table;         // devExt+0x1C2A0
     struct rc_irq_state irq;
     struct rc_doorbell_state doorbell;
+
+    // Hardware code-path selector. Set by rc_parse_firmware_capabilities()
+    // based on PCI device ID. Gates AHCI vs NVMe vs stub init paths.
+    enum rc_ctrl_mode ctrl_mode;
+
+    // NVMe controller bookkeeping. Only valid when ctrl_mode == RC_CTRL_MODE_NVME.
+    struct rc_nvme_state nvme;
     
     // Queue handles (from FUN_14000c2fc and FUN_14000fafc)
     struct rc_queue_handle *queue_handles[RC_MAX_QUEUE_DESCRIPTORS]; // devExt+0x15948
@@ -508,6 +549,50 @@ int rc_raid_array_ioctl(struct block_device *bdev, fmode_t mode, unsigned int cm
 #define RC_REG_COMP_Q_BASE_HI		0x034
 #define RC_REG_COMP_Q_SIZE		0x038
 
+/* NVMe controller registers (BAR0), per NVMe 1.4 spec.
+ * Used when ctx->ctrl_mode == RC_CTRL_MODE_NVME (DEV_B000).
+ */
+#define RC_NVME_REG_CAP			0x00	/* 64-bit Controller Capabilities */
+#define RC_NVME_REG_VS			0x08	/* Version */
+#define RC_NVME_REG_INTMS		0x0c	/* Interrupt Mask Set */
+#define RC_NVME_REG_INTMC		0x10	/* Interrupt Mask Clear */
+#define RC_NVME_REG_CC			0x14	/* Controller Configuration */
+#define RC_NVME_REG_CSTS		0x1c	/* Controller Status */
+#define RC_NVME_REG_NSSR		0x20	/* NVM Subsystem Reset */
+#define RC_NVME_REG_AQA			0x24	/* Admin Queue Attributes */
+#define RC_NVME_REG_ASQ			0x28	/* 64-bit Admin SQ base */
+#define RC_NVME_REG_ACQ			0x30	/* 64-bit Admin CQ base */
+#define RC_NVME_REG_DBL_BASE		0x1000	/* Doorbell registers begin here */
+
+/* CAP field accessors (64-bit register) */
+#define RC_NVME_CAP_MQES(cap)		((u16)((cap) & 0xffff))		/* Max queue entries supported - 1 */
+#define RC_NVME_CAP_TO(cap)		((u8)(((cap) >> 24) & 0xff))	/* Timeout (500 ms units) */
+#define RC_NVME_CAP_DSTRD(cap)		((u8)(((cap) >> 32) & 0xf))	/* Doorbell stride */
+#define RC_NVME_CAP_CSS(cap)		((u8)(((cap) >> 37) & 0xff))	/* Command sets supported */
+
+/* CC fields (32-bit) */
+#define RC_NVME_CC_EN			BIT(0)
+#define RC_NVME_CC_CSS_NVM		(0u << 4)
+#define RC_NVME_CC_MPS_4K		(0u << 7)	/* memory page size = 2^(12+MPS) */
+#define RC_NVME_CC_AMS_RR		(0u << 11)
+#define RC_NVME_CC_SHN_NONE		(0u << 14)
+#define RC_NVME_CC_IOSQES_64		(6u << 16)	/* log2(64) */
+#define RC_NVME_CC_IOCQES_16		(4u << 20)	/* log2(16) */
+
+/* CSTS fields */
+#define RC_NVME_CSTS_RDY		BIT(0)
+#define RC_NVME_CSTS_CFS		BIT(1)		/* controller fatal status */
+
+/* AQA helpers (each depth is encoded as count-1, 12 bits each) */
+#define RC_NVME_AQA(sq_depth, cq_depth)	\
+	((u32)(((sq_depth) - 1) & 0xfff) | ((u32)(((cq_depth) - 1) & 0xfff) << 16))
+
+/* Admin queue: 64-byte SQ entries, 16-byte CQ entries. Linux NVMe driver uses
+ * 32 entries for the admin queue; we follow the same convention. */
+#define RC_NVME_ADMIN_QUEUE_DEPTH	32
+#define RC_NVME_SQ_ENTRY_SIZE		64
+#define RC_NVME_CQ_ENTRY_SIZE		16
+
 /* Per-port register block (AHCI compatible) */
 #define RC_PORT_REG_BASE(idx)		(0x100 + ((idx) * 0x80))
 #define RC_PORT_CLB			0x00
@@ -586,6 +671,10 @@ int rc_hw_submit_request(struct rc_adapter *adapter, struct request *rq,
                          dma_addr_t dma_addr, void *dma_buf);
 int rc_install_callbacks(struct rc_adapter *adapter, bool fast_path);
 int rc_parse_firmware_capabilities(struct rc_adapter *adapter);
+
+// NVMe controller path (rc_nvme.c). Used when ctx->ctrl_mode == RC_CTRL_MODE_NVME.
+int rc_nvme_init_controller(struct rc_adapter *adapter);
+void rc_nvme_cleanup_controller(struct rc_adapter *adapter);
 
 // Queue management functions (StorPort service slot equivalents)
 int rc_queue_init(struct rc_adapter *adapter);

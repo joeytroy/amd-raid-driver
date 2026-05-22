@@ -301,24 +301,31 @@ static int rc_bottom_probe(struct pci_dev *pdev, const struct pci_device_id *id)
     if (ret)
         goto err_release_vectors;
 
+    /* Classify the PCI device first (sets adapter->ctx.ctrl_mode) and, for
+     * NVMe controllers, run the controller boot sequence. We do this BEFORE
+     * rc_hw_init so the AHCI register programming inside rc_hw_init can be
+     * skipped when the device is NVMe (DEV_B000). */
+    ret = rc_parse_firmware_capabilities(adapter);
+    if (ret) {
+        rc_printk(RC_WARN, "rc_bottom: firmware capability parsing failed (%d)\n", ret);
+        /* Continue with whatever ctrl_mode was set; rc_hw_init will gate. */
+    }
+
     ret = rc_hw_init(adapter);
     if (ret)
         goto err_free_irq;
-
-    /* Parse firmware capabilities to detect controller variant */
-    ret = rc_parse_firmware_capabilities(adapter);
-    if (ret) {
-        rc_printk(RC_WARN, "rc_bottom: firmware capability parsing failed (non-fatal)\n");
-        /* Continue anyway - will use safe dispatcher defaults */
-    }
 
     ret = rc_queue_init(adapter);
     if (ret)
         goto err_hw_cleanup;
 
-    ret = rc_activate_doorbells(adapter);
-    if (ret)
-        goto err_queue_cleanup;
+    /* AHCI doorbell sequence (1,4,2,3) is meaningless for NVMe controllers;
+     * NVMe queues are armed by writes to BAR0+0x1000. */
+    if (adapter->ctx.ctrl_mode == RC_CTRL_MODE_AHCI) {
+        ret = rc_activate_doorbells(adapter);
+        if (ret)
+            goto err_queue_cleanup;
+    }
 
     rc_bottom_attach_adapter(adapter);
     pci_set_drvdata(pdev, adapter);
