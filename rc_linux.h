@@ -593,6 +593,57 @@ int rc_raid_array_ioctl(struct block_device *bdev, fmode_t mode, unsigned int cm
 #define RC_NVME_SQ_ENTRY_SIZE		64
 #define RC_NVME_CQ_ENTRY_SIZE		16
 
+/* Admin command opcodes (NVMe 1.4 §5) — only what we currently submit. */
+#define RC_NVME_ADMIN_OP_IDENTIFY	0x06
+
+/* Identify CNS values (NVMe 1.4 §5.15.1) */
+#define RC_NVME_IDENTIFY_CNS_CTRL	0x01
+
+/* Identify response is always 4 KiB. */
+#define RC_NVME_IDENTIFY_BYTES		4096
+
+/* Field offsets within the Identify Controller response (NVMe 1.4 §5.15.2.2).
+ * The full structure is 4 KiB; we only access the fields we log. */
+#define RC_NVME_ID_CTRL_VID		0	/* u16 */
+#define RC_NVME_ID_CTRL_SSVID		2	/* u16 */
+#define RC_NVME_ID_CTRL_SN		4	/* 20 bytes ASCII, space-padded */
+#define RC_NVME_ID_CTRL_MN		24	/* 40 bytes ASCII, space-padded */
+#define RC_NVME_ID_CTRL_FR		64	/* 8 bytes ASCII, space-padded */
+#define RC_NVME_ID_CTRL_NN		516	/* u32, number of namespaces */
+
+/* Admin command timeout — generous enough for cold controllers but bounded
+ * so a misbehaving device doesn't hang module init forever. */
+#define RC_NVME_ADMIN_TIMEOUT_MS	2000
+
+/* NVMe Submission Queue Entry (NVMe 1.4 figure 105). Exactly 64 bytes. */
+struct rc_nvme_sqe {
+	u8	opc;
+	u8	fuse_psdt;	/* [1:0]=FUSE, [7:6]=PSDT (0=PRP) */
+	__le16	cid;
+	__le32	nsid;
+	__le64	rsvd2;
+	__le64	mptr;
+	__le64	prp1;
+	__le64	prp2;
+	__le32	cdw10;
+	__le32	cdw11;
+	__le32	cdw12;
+	__le32	cdw13;
+	__le32	cdw14;
+	__le32	cdw15;
+} __packed;
+
+/* NVMe Completion Queue Entry (NVMe 1.4 figure 78). Exactly 16 bytes.
+ * status bit 0 is the phase tag; bits [15:1] are SC/SCT/M/DNR. */
+struct rc_nvme_cqe {
+	__le32	result;
+	__le32	rsvd;
+	__le16	sq_head;
+	__le16	sq_id;
+	__le16	cid;
+	__le16	status;
+} __packed;
+
 /* Per-port register block (AHCI compatible) */
 #define RC_PORT_REG_BASE(idx)		(0x100 + ((idx) * 0x80))
 #define RC_PORT_CLB			0x00

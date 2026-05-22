@@ -35,6 +35,27 @@ static inline void rc_nvme_writeq(u64 v, void __iomem *base, u32 off)
 	writel((u32)(v >> 32), base + off + 4);
 }
 
+/* Doorbells live at BAR0 + 0x1000, striped by (4 << DSTRD). For each queue
+ * pair qid, the SQ tail doorbell is at offset 2*qid and the CQ head doorbell
+ * at 2*qid+1, both scaled by the stride. */
+static inline void rc_nvme_ring_sq_doorbell(struct rc_adapter *adapter,
+					    u16 qid, u32 value)
+{
+	struct rc_nvme_state *nvme = &adapter->ctx.nvme;
+	u32 stride = 4u << nvme->dstrd;
+	writel(value, adapter->ctx.mmio_base + RC_NVME_REG_DBL_BASE +
+		      (u32)(2 * qid) * stride);
+}
+
+static inline void rc_nvme_ring_cq_doorbell(struct rc_adapter *adapter,
+					    u16 qid, u32 value)
+{
+	struct rc_nvme_state *nvme = &adapter->ctx.nvme;
+	u32 stride = 4u << nvme->dstrd;
+	writel(value, adapter->ctx.mmio_base + RC_NVME_REG_DBL_BASE +
+		      (u32)(2 * qid + 1) * stride);
+}
+
 static int rc_nvme_wait_csts(struct rc_adapter *adapter, u32 mask, u32 want)
 {
 	void __iomem *base = adapter->ctx.mmio_base;
@@ -134,6 +155,119 @@ static void rc_nvme_free_admin_queues(struct rc_adapter *adapter)
 				  nvme->admin_cq, nvme->admin_cq_dma);
 		nvme->admin_cq = NULL;
 	}
+}
+
+/* Copy an NVMe ASCII string field (space-padded, not NUL-terminated) into a
+ * caller buffer of size len+1 and strip trailing spaces. */
+static void rc_nvme_ascii_field(const u8 *src, size_t len, char *dst)
+{
+	memcpy(dst, src, len);
+	while (len > 0 && dst[len - 1] == ' ')
+		len--;
+	dst[len] = '\0';
+}
+
+/* Poll the next admin CQE slot until its phase bit flips to the expected
+ * value or the timeout expires. No CQ-head advance is done here; the caller
+ * must consume the entry and ring the doorbell. */
+static int rc_nvme_wait_admin_completion(struct rc_adapter *adapter)
+{
+	struct rc_nvme_state *nvme = &adapter->ctx.nvme;
+	struct rc_nvme_cqe *cqe;
+	u8 expected_phase = nvme->admin_cq_phase;
+	unsigned long deadline;
+
+	cqe = (struct rc_nvme_cqe *)nvme->admin_cq + nvme->admin_cq_head;
+	deadline = jiffies + msecs_to_jiffies(RC_NVME_ADMIN_TIMEOUT_MS);
+
+	while (time_before(jiffies, deadline)) {
+		u16 status = le16_to_cpu(READ_ONCE(cqe->status));
+		if ((status & 1) == expected_phase)
+			return 0;
+		usleep_range(10, 50);
+	}
+	return -ETIMEDOUT;
+}
+
+/* Submit a single Identify Controller (CNS=01h) admin command, poll for
+ * completion, and log the controller's VID/SSVID/SN/MN/FR/NN. Non-fatal:
+ * callers should treat failure as "we got CSTS.RDY but can't talk to it."
+ */
+static int rc_nvme_identify_controller(struct rc_adapter *adapter)
+{
+	struct device *dev = &adapter->pdev->dev;
+	struct rc_nvme_state *nvme = &adapter->ctx.nvme;
+	struct rc_nvme_sqe *sqe;
+	struct rc_nvme_cqe *cqe;
+	void *id_buf;
+	dma_addr_t id_dma;
+	u32 tail;
+	u16 status, sc_sct;
+	int ret;
+
+	id_buf = dma_alloc_coherent(dev, RC_NVME_IDENTIFY_BYTES, &id_dma,
+				    GFP_KERNEL);
+	if (!id_buf)
+		return -ENOMEM;
+
+	/* Build SQE in slot admin_sq_tail. CID 0 is safe — only one admin
+	 * command is in flight at a time during init. */
+	sqe = (struct rc_nvme_sqe *)nvme->admin_sq + nvme->admin_sq_tail;
+	memset(sqe, 0, sizeof(*sqe));
+	sqe->opc   = RC_NVME_ADMIN_OP_IDENTIFY;
+	sqe->cid   = cpu_to_le16(0);
+	sqe->nsid  = cpu_to_le32(0);
+	sqe->prp1  = cpu_to_le64(id_dma);
+	sqe->cdw10 = cpu_to_le32(RC_NVME_IDENTIFY_CNS_CTRL);
+
+	tail = (nvme->admin_sq_tail + 1) % nvme->admin_sq_depth;
+	nvme->admin_sq_tail = tail;
+	wmb();
+	rc_nvme_ring_sq_doorbell(adapter, 0, tail);
+
+	ret = rc_nvme_wait_admin_completion(adapter);
+	if (ret) {
+		rc_printk(RC_ERROR,
+			  "rc_nvme_identify_controller: timeout waiting for CQE\n");
+		goto out;
+	}
+
+	cqe = (struct rc_nvme_cqe *)nvme->admin_cq + nvme->admin_cq_head;
+	status = le16_to_cpu(cqe->status);
+	sc_sct = (status >> 1) & 0x7fff;
+	if (sc_sct) {
+		rc_printk(RC_ERROR,
+			  "rc_nvme_identify_controller: controller returned error 0x%04x (status=0x%04x)\n",
+			  sc_sct, status);
+		ret = -EIO;
+		goto advance_cq;
+	}
+
+	{
+		const u8 *b = id_buf;
+		u16 vid   = le16_to_cpup((const __le16 *)(b + RC_NVME_ID_CTRL_VID));
+		u16 ssvid = le16_to_cpup((const __le16 *)(b + RC_NVME_ID_CTRL_SSVID));
+		u32 nn    = le32_to_cpup((const __le32 *)(b + RC_NVME_ID_CTRL_NN));
+		char sn[21], mn[41], fr[9];
+
+		rc_nvme_ascii_field(b + RC_NVME_ID_CTRL_SN, 20, sn);
+		rc_nvme_ascii_field(b + RC_NVME_ID_CTRL_MN, 40, mn);
+		rc_nvme_ascii_field(b + RC_NVME_ID_CTRL_FR, 8,  fr);
+
+		rc_printk(RC_NOTE,
+			  "rc_nvme_identify_controller: VID=0x%04x SSVID=0x%04x SN='%s' MN='%s' FR='%s' NN=%u\n",
+			  vid, ssvid, sn, mn, fr, nn);
+	}
+
+advance_cq:
+	nvme->admin_cq_head = (nvme->admin_cq_head + 1) % nvme->admin_cq_depth;
+	if (nvme->admin_cq_head == 0)
+		nvme->admin_cq_phase ^= 1;
+	rc_nvme_ring_cq_doorbell(adapter, 0, nvme->admin_cq_head);
+
+out:
+	dma_free_coherent(dev, RC_NVME_IDENTIFY_BYTES, id_buf, id_dma);
+	return ret;
 }
 
 int rc_nvme_init_controller(struct rc_adapter *adapter)
@@ -236,6 +370,14 @@ int rc_nvme_init_controller(struct rc_adapter *adapter)
 	rc_printk(RC_NOTE,
 		  "rc_nvme_init_controller: ready — admin SQ depth=%u CQ depth=%u, doorbell stride=%u\n",
 		  nvme->admin_sq_depth, nvme->admin_cq_depth, nvme->dstrd);
+
+	/* First real command — proves the admin queue plumbing works. Non-fatal
+	 * because reaching CSTS.RDY=1 is still progress worth keeping visible. */
+	ret = rc_nvme_identify_controller(adapter);
+	if (ret)
+		rc_printk(RC_WARN,
+			  "rc_nvme_init_controller: identify controller failed (%d) — admin queue is up but the controller didn't answer cleanly\n",
+			  ret);
 
 	return 0;
 }
