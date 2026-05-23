@@ -208,17 +208,34 @@ static int rc_bottom_setup_interrupts(struct rc_adapter *adapter)
     struct pci_dev *pdev = adapter->pdev;
     int ret;
 
-    ret = pci_alloc_irq_vectors(pdev, 1, 1, PCI_IRQ_MSI);
-    if (ret > 0) {
-        adapter->irq_mode = RC_IRQ_MODE_MSI;
-        adapter->irq_vector = pci_irq_vector(pdev, 0);
-        rc_printk(RC_INFO, "rc_bottom: MSI vector %d assigned\n", adapter->irq_vector);
-    } else {
-        adapter->irq_mode = RC_IRQ_MODE_LEGACY;
-        adapter->irq_vector = pdev->irq;
-        rc_printk(RC_WARN, "rc_bottom: falling back to legacy IRQ %d\n", adapter->irq_vector);
+    /* Prefer MSI-X (per-vector affinity, supports the per-queue ISR
+     * routing we'll need for multi-queue), fall back to MSI, then
+     * legacy.  Single vector for now — multi-queue work bumps this
+     * to N+1 in a later step. */
+    ret = pci_alloc_irq_vectors(pdev, 1, 1,
+                                PCI_IRQ_MSIX | PCI_IRQ_MSI | PCI_IRQ_INTX);
+    if (ret < 1) {
+        rc_printk(RC_ERROR,
+                  "rc_bottom: pci_alloc_irq_vectors failed (%d)\n", ret);
+        return ret < 0 ? ret : -ENODEV;
     }
 
+    if (pdev->msix_enabled) {
+        adapter->irq_mode = RC_IRQ_MODE_MSIX;
+        adapter->irq_vector = pci_irq_vector(pdev, 0);
+        rc_printk(RC_INFO, "rc_bottom: MSI-X vector %d assigned\n",
+                  adapter->irq_vector);
+    } else if (pdev->msi_enabled) {
+        adapter->irq_mode = RC_IRQ_MODE_MSI;
+        adapter->irq_vector = pci_irq_vector(pdev, 0);
+        rc_printk(RC_INFO, "rc_bottom: MSI vector %d assigned\n",
+                  adapter->irq_vector);
+    } else {
+        adapter->irq_mode = RC_IRQ_MODE_LEGACY;
+        adapter->irq_vector = pci_irq_vector(pdev, 0);
+        rc_printk(RC_WARN, "rc_bottom: falling back to legacy IRQ %d\n",
+                  adapter->irq_vector);
+    }
     return 0;
 }
 
@@ -226,7 +243,9 @@ static void rc_bottom_release_interrupts(struct rc_adapter *adapter)
 {
     struct pci_dev *pdev = adapter->pdev;
 
-    if (adapter->irq_mode == RC_IRQ_MODE_MSI)
+    /* pci_free_irq_vectors handles all of MSI-X, MSI, and INTx that
+     * pci_alloc_irq_vectors set up.  No-op on RC_IRQ_MODE_NONE. */
+    if (adapter->irq_mode != RC_IRQ_MODE_NONE)
         pci_free_irq_vectors(pdev);
 }
 
@@ -234,6 +253,9 @@ static int rc_bottom_request_irq(struct rc_adapter *adapter)
 {
     int ret;
 
+    /* IRQF_SHARED is only needed for legacy INTx (multiple devices on one
+     * line).  MSI / MSI-X are dedicated per-vector — sharing flag would
+     * fail the kernel's strict mode check. */
     ret = request_irq(adapter->irq_vector,
                       rc_hw_interrupt_handler,
                       adapter->irq_mode == RC_IRQ_MODE_LEGACY ? IRQF_SHARED : 0,
