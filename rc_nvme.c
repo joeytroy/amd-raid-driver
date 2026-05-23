@@ -750,7 +750,10 @@ static int rc_nvme_create_one_io_queue(struct rc_adapter *adapter,
 	q->adapter    = adapter;
 	q->qid        = qid;
 	q->irq_vector = -1;
-	q->hctx_idx   = -1;
+	/* hctx i ↔ io_queues[i] across every member.  Setting it here so
+	 * the per-queue ISR's blk_mq_tag_to_rq lookup uses the right
+	 * tags[hctx_idx] array once nr_hw_queues > 1. */
+	q->hctx_idx   = qid - 1;
 	spin_lock_init(&q->lock);
 	init_waitqueue_head(&q->cq_wait);
 
@@ -1785,10 +1788,11 @@ static blk_status_t rc_volume_queue_rq(struct blk_mq_hw_ctx *hctx,
 		rc_volume_build_flush_sqe(&cmd, tag);
 
 		blk_mq_start_request(req);
-		/* Step 3a: always submit on each member's I/O queue 0.
-		 * Step 3b will route via blk-mq's hctx_idx. */
+		/* Use this hctx's NVMe queue on every member.  Completions
+		 * land on the same hctx so blk_mq_tag_to_rq's tags[hctx_idx]
+		 * lookup resolves to the right request. */
 		for (i = 0; i < rc_volume_member_count; i++)
-			rc_nvme_io_submit(rc_volume_members[i]->ctx.nvme.io_queues[0],
+			rc_nvme_io_submit(rc_volume_members[i]->ctx.nvme.io_queues[hctx->queue_num],
 					  &cmd);
 		return BLK_STS_OK;
 	}
@@ -1816,7 +1820,7 @@ static blk_status_t rc_volume_queue_rq(struct blk_mq_hw_ctx *hctx,
 		rc_volume_build_discard_sqe(&cmd, member_idx, tag,
 					    phys_lba, nr_sectors);
 		blk_mq_start_request(req);
-		rc_nvme_io_submit(rc_volume_members[member_idx]->ctx.nvme.io_queues[0],
+		rc_nvme_io_submit(rc_volume_members[member_idx]->ctx.nvme.io_queues[hctx->queue_num],
 				  &cmd);
 		return BLK_STS_OK;
 	}
@@ -1840,7 +1844,7 @@ static blk_status_t rc_volume_queue_rq(struct blk_mq_hw_ctx *hctx,
 	/* Must call blk_mq_start_request BEFORE submitting — otherwise the
 	 * ISR could complete the request before blk-mq considers it started. */
 	blk_mq_start_request(req);
-	rc_nvme_io_submit(rc_volume_members[member_idx]->ctx.nvme.io_queues[0],
+	rc_nvme_io_submit(rc_volume_members[member_idx]->ctx.nvme.io_queues[hctx->queue_num],
 			  &cmd);
 	return BLK_STS_OK;
 }
@@ -2087,17 +2091,39 @@ static int rc_volume_create_disk(void)
 		}
 	}
 
-	memset(&rc_volume_tagset, 0, sizeof(rc_volume_tagset));
-	rc_volume_tagset.ops          = &rc_volume_mq_ops;
-	rc_volume_tagset.nr_hw_queues = 1;
-	rc_volume_tagset.queue_depth  = RC_VOLUME_QUEUE_DEPTH;
-	rc_volume_tagset.numa_node    = NUMA_NO_NODE;
-	rc_volume_tagset.cmd_size     = sizeof(struct rc_volume_pdu);
-	/* Async dispatch — queue_rq returns BLK_STS_OK immediately and
-	 * completion lands via rc_nvme_irq → blk_mq_complete_request →
-	 * rc_volume_complete.  No sleeping on the dispatch path → no
-	 * BLK_MQ_F_BLOCKING required. */
-	rc_volume_tagset.flags        = 0;
+	/* nr_hw_queues = min(member->nr_io_queues) across all members.  Each
+	 * hctx i routes to io_queues[i] on every member, so we can't ask
+	 * blk-mq for more hctxs than the smallest member supports.  All
+	 * T700s grant 128 (we cap at RC_NVME_IO_QUEUE_TARGET=4) so this
+	 * just resolves to 4 in practice, but the min is a future-proofing
+	 * safety net. */
+	{
+		u32 nr_hw = m0->ctx.nvme.nr_io_queues;
+		for (i = 1; i < rc_volume_member_count; i++) {
+			u32 m = rc_volume_members[i]->ctx.nvme.nr_io_queues;
+			if (m < nr_hw)
+				nr_hw = m;
+		}
+		if (nr_hw == 0)
+			nr_hw = 1;
+
+		memset(&rc_volume_tagset, 0, sizeof(rc_volume_tagset));
+		rc_volume_tagset.ops          = &rc_volume_mq_ops;
+		rc_volume_tagset.nr_hw_queues = nr_hw;
+		rc_volume_tagset.queue_depth  = RC_VOLUME_QUEUE_DEPTH;
+		rc_volume_tagset.numa_node    = NUMA_NO_NODE;
+		rc_volume_tagset.cmd_size     = sizeof(struct rc_volume_pdu);
+		/* Async dispatch — queue_rq returns BLK_STS_OK immediately
+		 * and completion lands via the per-queue ISR → blk_mq_complete
+		 * → rc_volume_complete.  No sleeping on the dispatch path → no
+		 * BLK_MQ_F_BLOCKING required. */
+		rc_volume_tagset.flags        = 0;
+
+		rc_printk(RC_NOTE,
+			  "rc_volume_create_disk: blk-mq nr_hw_queues=%u (queue_depth=%u → %u total outstanding)\n",
+			  nr_hw, RC_VOLUME_QUEUE_DEPTH,
+			  nr_hw * RC_VOLUME_QUEUE_DEPTH);
+	}
 
 	ret = blk_mq_alloc_tag_set(&rc_volume_tagset);
 	if (ret)
