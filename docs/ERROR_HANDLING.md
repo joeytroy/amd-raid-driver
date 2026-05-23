@@ -238,16 +238,67 @@ The split between locked-inner and public-wrapper admin-command paths
 can hold `admin_mutex` across steps 5-9 without deadlocking when it
 issues the Create I/O CQ/SQ admin commands in step 9.
 
+## Automatic reset on timeout
+
+`.timeout` now schedules `rc_nvme_reset_controller` automatically for
+each adapter it flags dead.  The mechanism is one `work_struct` per
+adapter (`nvme.auto_reset_work`) plus a `nvme.auto_reset_disabled`
+latch.
+
+Flow:
+
+```
+.timeout marks adapter dead, drains in-flight
+   │
+   └── rc_volume_schedule_auto_reset_for_req(pdu)
+        │
+        └── for each involved member, if dead && !auto_reset_disabled:
+             schedule_work(&nvme->auto_reset_work)
+             │
+             └── rc_nvme_auto_reset_fn (workqueue context)
+                  │
+                  ├── if !dead anymore (e.g. operator beat us with
+                  │   sysfs reset), return — nothing to do
+                  │
+                  └── rc_nvme_reset_controller(adapter)
+                       │
+                       ├── success: dead = false, auto_reset_disabled = false
+                       │   → new I/O resumes automatically
+                       │
+                       └── failure: auto_reset_disabled = true
+                          → controller stays dead, no further auto attempts
+                          → operator must run sysfs reset to recover
+```
+
+Policy is **one auto-reset attempt per death episode**:
+
+- **Episode**: from the moment `dead` flips true until either reset
+  succeeds (clearing both flags) or reset fails (latching
+  `auto_reset_disabled`).
+- During an episode `schedule_work` is the only entry point and the
+  workqueue's own "already queued" check coalesces multiple
+  `.timeout` invocations into a single attempt.
+- After a **successful** reset both flags are clear, so a fresh death
+  later (controller dies again hours from now) gets its own attempt.
+- After a **failed** reset `auto_reset_disabled` is latched; further
+  `.timeout` invocations drain and end requests but don't re-attempt
+  reset.  Operator runs `echo 1 > .../rcraid/reset`; a successful
+  manual reset clears the latch, restoring auto-recovery.
+
+This avoids the obvious thrash failure mode (genuinely-fried silicon →
+30 s timeout → 50 ms reset → timeout → reset → ...) while still
+self-healing the common cases (a single hung command, a transient
+fault) without operator intervention.
+
+`cancel_work_sync(&nvme->auto_reset_work)` is the first thing
+`rc_nvme_cleanup_controller` does, so an in-flight auto-reset finishes
+before module teardown frees admin queues / MMIO.
+
 ## Limits (out of scope for this pass)
 
 These are the next problems on the list, in roughly the order they
 should be tackled:
 
-- **Automatic reset on `.timeout`.**  Currently a stuck command still
-  takes the volume offline — operator must run the sysfs trigger to
-  recover.  Auto-reset needs a retry counter, backoff, and a check
-  for "genuinely fried silicon" so we don't thrash.  Belongs in its
-  own commit.
 - **Retry on transient SCs.**  Distinguish DNR=0 (retryable) from DNR=1
   (don't) and re-dispatch the failed request rather than ending it.
   Lives on top of reset (a recovered controller is the right place to
@@ -267,11 +318,13 @@ The visible difference from the prior behaviour:
 - **Before**: a stuck command wedged its tag forever and printed a
   ratelimited warning on every subsequent attempt.  No way to recover
   short of reboot.
-- **After**: stuck commands time out at 30 s.  The volume goes offline
-  (every subsequent dispatch returns `BLK_STS_IOERR`) and every
-  in-flight request fails promptly.  `echo 1 > .../rcraid/reset` on
-  the offending PCI device recovers the volume in place; module reload
-  is only needed if the reset itself fails.
+- **After**: stuck commands time out at 30 s and trigger an automatic
+  controller reset.  The offending request still fails with
+  `BLK_STS_TIMEOUT`, but the controller is back online ~50 ms later
+  and subsequent I/O succeeds without operator intervention.  If the
+  auto-reset itself fails (CSTS.RDY never comes back, Create I/O CQ
+  fails, etc.), the controller stays dead and `echo 1 >
+  .../rcraid/reset` is the manual escape hatch.
 
 If you see the volume go offline unexpectedly, check `dmesg` for one of:
 

@@ -249,8 +249,21 @@ quiesce + drain → `disable_irq` → mask + `CC.EN=0` → wait `CSTS.RDY=0`
 + Create I/O SQ → clear `dead` → unquiesce.  Whole thing held under
 `admin_mutex`; DMA buffers (admin queues, I/O queues, per-tag I/O
 buffers) are reused.  Any failure beyond the disable leaves the
-adapter dead and returns `-EIO`.  Auto-reset from `.timeout` is the
-natural next commit but is not in this pass — operator action only.
+adapter dead and returns `-EIO`.
+
+### Automatic reset on timeout
+
+`.timeout` schedules `rc_nvme_reset_controller` automatically for any
+adapter it flags dead, via a per-adapter `work_struct`.  Policy is one
+attempt per death episode: a successful reset clears both `dead` and
+the `auto_reset_disabled` latch (so the next death is also
+auto-treatable); a failed reset latches `auto_reset_disabled` and
+further `.timeout` invocations only drain — operator must run the
+sysfs `reset` to recover, which clears the latch on success.  Avoids
+thrashing genuinely-fried silicon while self-healing the common cases
+without operator intervention.  `cancel_work_sync` runs first in
+`rc_nvme_cleanup_controller` so an in-flight auto-reset can't race
+admin/MMIO teardown at module unload.
 
 ### Not started
 

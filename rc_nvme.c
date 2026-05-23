@@ -779,6 +779,7 @@ static int rc_nvme_read_lba(struct rc_adapter *adapter, u64 slba,
 			    u16 nlb_zbased, dma_addr_t buf_dma);
 static int rc_volume_create_disk(void);
 static void rc_volume_parse_logical_device(struct rc_adapter *adapter);
+static void rc_nvme_auto_reset_fn(struct work_struct *w);
 void rc_volume_teardown(void);
 
 /* AMD RAIDCore metadata checksum (ported from rcraid.sys FUN_1400014ec).
@@ -1595,6 +1596,35 @@ static bool rc_volume_drain_iter(struct request *req, void *priv)
 	return true;
 }
 
+/* Schedule the per-adapter auto-reset work for one member, but only if
+ * the adapter is actually dead and auto-reset hasn't been latched off
+ * by a prior failed attempt.  schedule_work is a no-op if the work is
+ * already queued, so multiple .timeout invocations during one death
+ * episode coalesce into a single reset attempt. */
+static void rc_nvme_schedule_auto_reset(struct rc_adapter *adapter)
+{
+	struct rc_nvme_state *nvme = &adapter->ctx.nvme;
+
+	if (READ_ONCE(nvme->dead) && !READ_ONCE(nvme->auto_reset_disabled))
+		schedule_work(&nvme->auto_reset_work);
+}
+
+/* Walk the request's involved members and schedule auto-reset for each
+ * that is currently dead.  Called from .timeout after marking adapters
+ * dead and draining in-flight. */
+static void rc_volume_schedule_auto_reset_for_req(struct rc_volume_pdu *pdu)
+{
+	int i;
+
+	if (pdu->op == REQ_OP_FLUSH) {
+		for (i = 0; i < rc_volume_member_count; i++)
+			rc_nvme_schedule_auto_reset(rc_volume_members[i]);
+	} else if (pdu->member_idx >= 0 &&
+		   pdu->member_idx < rc_volume_member_count) {
+		rc_nvme_schedule_auto_reset(rc_volume_members[pdu->member_idx]);
+	}
+}
+
 /* Build the dead-member mask and run the drain iterator.  No-op if no
  * member is currently flagged dead or the disk hasn't been created yet. */
 static void rc_volume_drain_dead(void)
@@ -1649,6 +1679,7 @@ static enum blk_eh_timer_return rc_volume_timeout(struct request *req)
 			  "rc_volume_timeout: tag=%u op=%u: member dead — draining in-flight\n",
 			  req->tag, pdu->op);
 		rc_volume_drain_dead();
+		rc_volume_schedule_auto_reset_for_req(pdu);
 		if (!blk_mq_request_completed(req))
 			blk_mq_end_request(req, BLK_STS_IOERR);
 		return BLK_EH_DONE;
@@ -1678,6 +1709,7 @@ static enum blk_eh_timer_return rc_volume_timeout(struct request *req)
 		WRITE_ONCE(rc_volume_members[pdu->member_idx]->ctx.nvme.dead, true);
 	}
 	rc_volume_drain_dead();
+	rc_volume_schedule_auto_reset_for_req(pdu);
 	if (!blk_mq_request_completed(req))
 		blk_mq_end_request(req, BLK_STS_TIMEOUT);
 	return BLK_EH_DONE;
@@ -1914,6 +1946,43 @@ static void rc_nvme_destroy_io_queues(struct rc_adapter *adapter)
 	}
 }
 
+/* workqueue handler scheduled from rc_volume_timeout when an adapter
+ * is flagged dead.  Resolves rc_adapter via container_of, race-checks
+ * `dead` (a manual reset may have already recovered it), attempts the
+ * reset, and latches auto_reset_disabled=true if it fails so we don't
+ * thrash a genuinely-fried controller.  One auto-reset attempt per
+ * death episode; the next .timeout for a fresh death still fires after
+ * a successful recovery clears the latch. */
+static void rc_nvme_auto_reset_fn(struct work_struct *w)
+{
+	struct rc_nvme_state *nvme =
+		container_of(w, struct rc_nvme_state, auto_reset_work);
+	struct rc_dev_context *ctx =
+		container_of(nvme, struct rc_dev_context, nvme);
+	struct rc_adapter *adapter =
+		container_of(ctx, struct rc_adapter, ctx);
+	int ret;
+
+	if (!READ_ONCE(nvme->dead)) {
+		rc_printk(RC_INFO,
+			  "rc_nvme_auto_reset_fn: %s already recovered — skipping\n",
+			  pci_name(adapter->pdev));
+		return;
+	}
+
+	rc_printk(RC_NOTE,
+		  "rc_nvme_auto_reset_fn: %s attempting automatic reset\n",
+		  pci_name(adapter->pdev));
+
+	ret = rc_nvme_reset_controller(adapter);
+	if (ret) {
+		WRITE_ONCE(nvme->auto_reset_disabled, true);
+		rc_printk(RC_ERROR,
+			  "rc_nvme_auto_reset_fn: %s reset failed (%d); auto-reset disabled — manual sysfs reset required\n",
+			  pci_name(adapter->pdev), ret);
+	}
+}
+
 /* Manual recovery for a stuck or dead adapter.  Triggered via the sysfs
  * `reset` attribute.  Brings the controller down, re-initialises the
  * admin queue against the existing DMA buffers, re-creates the I/O queue
@@ -2089,6 +2158,10 @@ int rc_nvme_reset_controller(struct rc_adapter *adapter)
 	}
 
 	WRITE_ONCE(nvme->dead, false);
+	/* A successful reset (auto or manual) re-enables future auto-reset
+	 * attempts.  If the controller dies again later, .timeout will get
+	 * to try recovery once more before giving up. */
+	WRITE_ONCE(nvme->auto_reset_disabled, false);
 	mutex_unlock(&nvme->admin_mutex);
 	if (rc_volume_disk)
 		blk_mq_unquiesce_queue(rc_volume_disk->queue);
@@ -2138,6 +2211,7 @@ int rc_nvme_init_controller(struct rc_adapter *adapter)
 	init_waitqueue_head(&nvme->io_cq_wait);
 	spin_lock_init(&nvme->io_lock);
 	mutex_init(&nvme->admin_mutex);
+	INIT_WORK(&nvme->auto_reset_work, rc_nvme_auto_reset_fn);
 
 	rc_printk(RC_NOTE,
 		  "rc_nvme_init_controller: CAP=0x%016llx VS=0x%08x MQES=%u DSTRD=%u TO=%u (%u ms)\n",
@@ -2264,6 +2338,11 @@ int rc_nvme_init_controller(struct rc_adapter *adapter)
 void rc_nvme_cleanup_controller(struct rc_adapter *adapter)
 {
 	void __iomem *base = adapter->ctx.mmio_base;
+
+	/* Cancel any in-flight or queued auto-reset before we start tearing
+	 * down — otherwise the work could race with destroy_io_queues and
+	 * try to re-bind queues we just freed. */
+	cancel_work_sync(&adapter->ctx.nvme.auto_reset_work);
 
 	/* Tear down I/O queues *before* disabling the controller so the
 	 * Delete SQ / Delete CQ admin commands still go through. */

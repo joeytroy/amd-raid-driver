@@ -225,6 +225,20 @@ struct rc_nvme_state {
     // with module teardown or with another timeout's admin issue.  Held
     // across SQE write + doorbell + CQE wait + CQ-head advance.
     struct mutex      admin_mutex;
+
+    // Scheduled from rc_volume_timeout when an adapter is flagged dead.
+    // Calls rc_nvme_reset_controller and clears `dead` on success.
+    // workqueue serialises duplicate schedules: queuing while already
+    // queued is a no-op, so multiple timeouts on the same death episode
+    // coalesce into one reset attempt.
+    struct work_struct auto_reset_work;
+
+    // Latched true after an auto-reset attempt fails.  Suppresses further
+    // automatic attempts until either a manual sysfs reset succeeds (the
+    // reset path clears this) or the module is reloaded.  Without this
+    // latch a genuinely-fried controller would thrash 30 s per timeout
+    // forever.
+    bool              auto_reset_disabled;
 };
 
 // Device context layout (clean-room mirror of the Windows device extension)
