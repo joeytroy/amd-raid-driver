@@ -2053,10 +2053,35 @@ static enum blk_eh_timer_return rc_volume_timeout(struct request *req)
 	return BLK_EH_DONE;
 }
 
+/* Map CPUs to hctxs using member 0's MSI-X vector affinity.  Vector 0
+ * is admin (skipped via offset=1); vectors 1..N are the I/O queues,
+ * already affinitized by the kernel to disjoint CPU sets during
+ * pci_alloc_irq_vectors_affinity.  Mirroring blk-mq's hctx-to-CPU
+ * mapping onto that affinity means each request's submission CPU
+ * matches the CPU its completion will land on.
+ *
+ * We use member 0 as the affinity source for the whole tagset.  In
+ * practice all members get the same affinity layout because each
+ * controller goes through the same pci_alloc_irq_vectors_affinity
+ * call, and CPU set assignment for the i-th vector is the same
+ * regardless of which device requested it.  If they ever diverge,
+ * the worst case is cross-CPU completion landings (loss of cache
+ * locality), not correctness. */
+static void rc_volume_map_queues(struct blk_mq_tag_set *set)
+{
+	if (rc_volume_member_count > 0) {
+		struct device *dev = &rc_volume_members[0]->pdev->dev;
+		blk_mq_map_hw_queues(&set->map[HCTX_TYPE_DEFAULT], dev, 1);
+	} else {
+		blk_mq_map_queues(&set->map[HCTX_TYPE_DEFAULT]);
+	}
+}
+
 static const struct blk_mq_ops rc_volume_mq_ops = {
-	.queue_rq = rc_volume_queue_rq,
-	.complete = rc_volume_complete,
-	.timeout  = rc_volume_timeout,
+	.queue_rq   = rc_volume_queue_rq,
+	.complete   = rc_volume_complete,
+	.timeout    = rc_volume_timeout,
+	.map_queues = rc_volume_map_queues,
 };
 
 static const struct block_device_operations rc_volume_bops = {

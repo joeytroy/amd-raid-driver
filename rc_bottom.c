@@ -207,19 +207,29 @@ static int rc_bottom_setup_interrupts(struct rc_adapter *adapter)
 {
     struct pci_dev *pdev = adapter->pdev;
     int desired = RC_NVME_IO_QUEUE_TARGET + 1;  /* 1 admin + N I/O */
+    /* pre_vectors=1 = vector 0 (admin) doesn't get auto-affinity.
+     * The remaining N I/O vectors get spread across CPUs by the
+     * kernel's irq spreading algorithm — completions then naturally
+     * land on the same CPU set that dispatched them, which
+     * blk_mq_map_hw_queues mirrors when picking which hctx to use
+     * per CPU. */
+    struct irq_affinity affd = { .pre_vectors = 1 };
     int ret;
 
     /* Prefer MSI-X with N+1 vectors so we can pin one vector per
-     * NVMe I/O queue (per-CPU completion in step 3b).  Fall back to
-     * MSI/INTx with 1 vector if MSI-X is unavailable; the I/O path
-     * then shares vector 0 (single-queue effective even if multiple
-     * queues are created).  adapter->irq_vector always holds vector
-     * 0 — used for the admin handler. */
-    ret = pci_alloc_irq_vectors(pdev, 1, desired,
-                                PCI_IRQ_MSIX | PCI_IRQ_MSI | PCI_IRQ_INTX);
+     * NVMe I/O queue, with per-vector CPU affinity (step 3c).  Fall
+     * back to MSI/INTx with 1 vector if MSI-X is unavailable; the
+     * I/O path then shares vector 0 (single-queue effective even if
+     * multiple queues are created).  adapter->irq_vector always
+     * holds vector 0 — used for the admin handler. */
+    ret = pci_alloc_irq_vectors_affinity(pdev, 1, desired,
+                                         PCI_IRQ_MSIX | PCI_IRQ_MSI |
+                                         PCI_IRQ_INTX | PCI_IRQ_AFFINITY,
+                                         &affd);
     if (ret < 1) {
         rc_printk(RC_ERROR,
-                  "rc_bottom: pci_alloc_irq_vectors failed (%d)\n", ret);
+                  "rc_bottom: pci_alloc_irq_vectors_affinity failed (%d)\n",
+                  ret);
         return ret < 0 ? ret : -ENODEV;
     }
 
