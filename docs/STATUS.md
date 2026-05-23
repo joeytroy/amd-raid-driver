@@ -124,6 +124,24 @@ are best-effort/untested.
   followed by read-back — patterns match exactly, adjacent sectors
   untouched, no AMD-Vi events or kernel warnings.
 
+### FLUSH + FUA support
+
+`REQ_OP_FLUSH` is now handled: fans out one NVMe FLUSH (opcode 0x00)
+to every member's I/O queue, atomically tracks completions in a new
+per-request `atomic_t members_pending`, and only the last ISR to land
+calls `blk_mq_complete_request`.  `REQ_FUA` writes pass the FUA bit
+through into the SQE's CDW12.
+
+Queue limits now advertise `BLK_FEAT_WRITE_CACHE | BLK_FEAT_FUA`, so
+filesystems will route fsync/sync as REQ_OP_FLUSH and use FUA for
+sync writes.  Verified on the dev box: `/sys/block/rcraid0/queue/`
+shows `write_cache: write back` and `fua: 1`; a `dd ... conv=fsync`
+generates IRQs on both members.
+
+Cumulative I/O status (`pdu->sc_sct`) is logged via
+`printk_ratelimited` if any member returns a non-zero NVMe SC, and
+the request ends with `BLK_STS_IOERR`.
+
 ### True async completion (Stage 2)
 
 `rc_volume_queue_rq` now submits + returns `BLK_STS_OK` immediately;

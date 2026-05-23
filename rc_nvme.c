@@ -99,12 +99,24 @@ static dma_addr_t  rc_volume_dma_pa[RC_VOLUME_MAX_MEMBERS][RC_VOLUME_QUEUE_DEPTH
 static __le64     *rc_volume_prp_va[RC_VOLUME_MAX_MEMBERS][RC_VOLUME_QUEUE_DEPTH];
 static dma_addr_t  rc_volume_prp_pa[RC_VOLUME_MAX_MEMBERS][RC_VOLUME_QUEUE_DEPTH];
 
-/* blk-mq per-request command data: the routing decision (which member,
- * what op) and the CQE status the ISR writes back. */
+/* blk-mq per-request command data.
+ *
+ * For READ/WRITE the request targets ONE member, members_pending is set
+ * to 1, and the ISR completes immediately on its single CQE.
+ *
+ * For FLUSH the driver fans out one NVMe FLUSH command to every member;
+ * members_pending starts at rc_volume_member_count and each member's ISR
+ * does atomic_dec_and_test — only the last one to land calls
+ * blk_mq_complete_request.
+ *
+ * sc_sct is the cumulative status: 0 if all members succeeded; non-zero
+ * if any member returned an error.  (For multi-member FLUSH the writes
+ * are racy under concurrency but error-vs-not is preserved correctly.) */
 struct rc_volume_pdu {
-	int member_idx;
-	u8  op;             /* REQ_OP_READ or REQ_OP_WRITE */
-	u16 sc_sct;         /* NVMe SC/SCT (0 = success), set by ISR */
+	int       member_idx;
+	u8        op;             /* req_op() value */
+	u16       sc_sct;         /* NVMe SC/SCT, 0 = success */
+	atomic_t  members_pending;
 };
 
 #define RC_NVME_CC_DEFAULT	\
@@ -187,9 +199,15 @@ irqreturn_t rc_nvme_irq(struct rc_adapter *adapter)
 		cid = le16_to_cpu(cqe->cid);
 		req = blk_mq_tag_to_rq(tags, cid);
 		if (req) {
+			u16 sc = (status >> 1) & 0x7fff;
 			pdu = blk_mq_rq_to_pdu(req);
-			pdu->sc_sct = (status >> 1) & 0x7fff;
-			blk_mq_complete_request(req);
+			/* Preserve any prior error from a sibling member's
+			 * completion (relevant only for multi-member FLUSH);
+			 * single-shot READ/WRITE only land here once. */
+			if (sc)
+				pdu->sc_sct = sc;
+			if (atomic_dec_and_test(&pdu->members_pending))
+				blk_mq_complete_request(req);
 		} else {
 			rc_printk(RC_WARN,
 				  "rc_nvme_irq: %s CQE for unknown CID=%u (status=0x%04x)\n",
@@ -1213,13 +1231,19 @@ out:
 
 /* Build an NVMe READ/WRITE SQE for one volume member.  PRP1 is the per-tag
  * data buffer on that member's pdev; PRP list (also per-tag-per-member) is
- * filled in for transfers spanning more than 2 pages.  CID = tag. */
+ * filled in for transfers spanning more than 2 pages.  CID = tag.  FUA is
+ * passed through when the request has REQ_FUA set. */
 static void rc_volume_build_io_sqe(struct rc_nvme_sqe *cmd, int member_idx,
-				   u32 tag, u8 opc, u64 slba, u16 nlb_zbased)
+				   u32 tag, u8 opc, u64 slba, u16 nlb_zbased,
+				   bool fua)
 {
 	u32 bytes = ((u32)nlb_zbased + 1) * 512u;
 	u32 pages = (bytes + PAGE_SIZE - 1) / PAGE_SIZE;
 	dma_addr_t data_dma = rc_volume_dma_pa[member_idx][tag];
+	u32 cdw12 = nlb_zbased;
+
+	if (fua)
+		cdw12 |= (1u << 30);	/* CDW12.FUA */
 
 	memset(cmd, 0, sizeof(*cmd));
 	cmd->opc   = opc;
@@ -1228,7 +1252,7 @@ static void rc_volume_build_io_sqe(struct rc_nvme_sqe *cmd, int member_idx,
 	cmd->prp1  = cpu_to_le64(data_dma);
 	cmd->cdw10 = cpu_to_le32((u32)(slba & 0xffffffff));
 	cmd->cdw11 = cpu_to_le32((u32)(slba >> 32));
-	cmd->cdw12 = cpu_to_le32(nlb_zbased);
+	cmd->cdw12 = cpu_to_le32(cdw12);
 
 	if (pages == 2) {
 		cmd->prp2 = cpu_to_le64(data_dma + PAGE_SIZE);
@@ -1239,6 +1263,17 @@ static void rc_volume_build_io_sqe(struct rc_nvme_sqe *cmd, int member_idx,
 			list[i] = cpu_to_le64(data_dma + (i + 1) * PAGE_SIZE);
 		cmd->prp2 = cpu_to_le64(rc_volume_prp_pa[member_idx][tag]);
 	}
+}
+
+/* Build an NVMe FLUSH SQE for one member.  No data, no PRPs, just opcode +
+ * NSID + CID.  Fanned out to all members for RAID0 — the request only
+ * completes when every member has acknowledged its flush. */
+static void rc_volume_build_flush_sqe(struct rc_nvme_sqe *cmd, u32 tag)
+{
+	memset(cmd, 0, sizeof(*cmd));
+	cmd->opc  = RC_NVME_NVM_OP_FLUSH;
+	cmd->cid  = cpu_to_le16((u16)tag);
+	cmd->nsid = cpu_to_le32(1);
 }
 
 /* blk-mq request handler.  chunk_sectors=stripe_sectors in queue_limits
@@ -1263,6 +1298,25 @@ static blk_status_t rc_volume_queue_rq(struct blk_mq_hw_ctx *hctx,
 	u32 tag = req->tag;
 	struct rc_nvme_sqe cmd;
 	size_t off;
+	int i;
+
+	pdu->op = op;
+	pdu->sc_sct = 0;
+
+	/* FLUSH fans out to every member: set the pending counter to the
+	 * member count, build a single FLUSH SQE template (CID=tag, no
+	 * data), and submit it on every member's I/O SQ.  Each member's
+	 * ISR atomically decrements; the last one calls blk_mq_complete. */
+	if (op == REQ_OP_FLUSH) {
+		atomic_set(&pdu->members_pending, rc_volume_member_count);
+		pdu->member_idx = -1;
+		rc_volume_build_flush_sqe(&cmd, tag);
+
+		blk_mq_start_request(req);
+		for (i = 0; i < rc_volume_member_count; i++)
+			rc_nvme_io_submit(rc_volume_members[i], &cmd);
+		return BLK_STS_OK;
+	}
 
 	if (op != REQ_OP_READ && op != REQ_OP_WRITE) {
 		blk_mq_start_request(req);
@@ -1279,8 +1333,7 @@ static blk_status_t rc_volume_queue_rq(struct blk_mq_hw_ctx *hctx,
 
 	rc_volume_map_lba(pos, &member_idx, &phys_lba);
 	pdu->member_idx = member_idx;
-	pdu->op = op;
-	pdu->sc_sct = 0;
+	atomic_set(&pdu->members_pending, 1);
 
 	if (op == REQ_OP_WRITE) {
 		off = 0;
@@ -1297,7 +1350,8 @@ static blk_status_t rc_volume_queue_rq(struct blk_mq_hw_ctx *hctx,
 	rc_volume_build_io_sqe(&cmd, member_idx, tag,
 			       op == REQ_OP_WRITE ? RC_NVME_NVM_OP_WRITE
 						  : RC_NVME_NVM_OP_READ,
-			       phys_lba, (u16)(nr_sectors - 1));
+			       phys_lba, (u16)(nr_sectors - 1),
+			       (req->cmd_flags & REQ_FUA) != 0);
 
 	/* Must call blk_mq_start_request BEFORE submitting — otherwise the
 	 * ISR could complete the request before blk-mq considers it started. */
@@ -1307,8 +1361,8 @@ static blk_status_t rc_volume_queue_rq(struct blk_mq_hw_ctx *hctx,
 }
 
 /* Tagset .complete callback — runs in softirq after blk_mq_complete_request
- * is called from the ISR.  For READ ops, copy the per-tag DMA buffer back
- * out to the bvecs; then end the request with the status the ISR recorded. */
+ * is called from the ISR.  Copy the per-tag DMA buffer back out to bvecs
+ * for READ; end the request with the recorded status. */
 static void rc_volume_complete(struct request *req)
 {
 	struct rc_volume_pdu *pdu = blk_mq_rq_to_pdu(req);
@@ -1318,6 +1372,12 @@ static void rc_volume_complete(struct request *req)
 	size_t off;
 
 	if (pdu->sc_sct) {
+		printk_ratelimited(KERN_WARNING
+			"rcraid: %s failed with NVMe SC/SCT=0x%04x (op=%u, lba=%llu, nsec=%u)\n",
+			rc_volume_disk ? rc_volume_disk->disk_name : "?",
+			pdu->sc_sct, pdu->op,
+			(unsigned long long)blk_rq_pos(req),
+			blk_rq_sectors(req));
 		blk_mq_end_request(req, BLK_STS_IOERR);
 		return;
 	}
@@ -1406,8 +1466,13 @@ static int rc_volume_create_disk(void)
 			.max_segments        = RC_VOLUME_DATA_PAGES,
 			.max_segment_size    = PAGE_SIZE,
 			/* Requests never cross a RAID0 stripe boundary, so every
-			 * request maps to one member and one NVMe READ. */
+			 * non-flush request maps to one member and one NVMe READ
+			 * or WRITE.  FLUSH is fanned out separately. */
 			.chunk_sectors       = rc_volume_stripe_sectors,
+			/* Advertise that the underlying controllers have a volatile
+			 * write cache and that we honour FUA — filesystems will
+			 * now route REQ_OP_FLUSH and REQ_FUA writes through. */
+			.features            = BLK_FEAT_WRITE_CACHE | BLK_FEAT_FUA,
 		};
 
 		rc_volume_disk = blk_mq_alloc_disk(&rc_volume_tagset, &lim, NULL);
