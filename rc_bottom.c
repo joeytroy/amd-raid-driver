@@ -206,13 +206,16 @@ static void rc_bottom_disable_device(struct rc_adapter *adapter)
 static int rc_bottom_setup_interrupts(struct rc_adapter *adapter)
 {
     struct pci_dev *pdev = adapter->pdev;
+    int desired = RC_NVME_IO_QUEUE_TARGET + 1;  /* 1 admin + N I/O */
     int ret;
 
-    /* Prefer MSI-X (per-vector affinity, supports the per-queue ISR
-     * routing we'll need for multi-queue), fall back to MSI, then
-     * legacy.  Single vector for now — multi-queue work bumps this
-     * to N+1 in a later step. */
-    ret = pci_alloc_irq_vectors(pdev, 1, 1,
+    /* Prefer MSI-X with N+1 vectors so we can pin one vector per
+     * NVMe I/O queue (per-CPU completion in step 3b).  Fall back to
+     * MSI/INTx with 1 vector if MSI-X is unavailable; the I/O path
+     * then shares vector 0 (single-queue effective even if multiple
+     * queues are created).  adapter->irq_vector always holds vector
+     * 0 — used for the admin handler. */
+    ret = pci_alloc_irq_vectors(pdev, 1, desired,
                                 PCI_IRQ_MSIX | PCI_IRQ_MSI | PCI_IRQ_INTX);
     if (ret < 1) {
         rc_printk(RC_ERROR,
@@ -223,12 +226,12 @@ static int rc_bottom_setup_interrupts(struct rc_adapter *adapter)
     if (pdev->msix_enabled) {
         adapter->irq_mode = RC_IRQ_MODE_MSIX;
         adapter->irq_vector = pci_irq_vector(pdev, 0);
-        rc_printk(RC_INFO, "rc_bottom: MSI-X vector %d assigned\n",
-                  adapter->irq_vector);
+        rc_printk(RC_INFO, "rc_bottom: MSI-X enabled with %d vectors (admin=%d)\n",
+                  ret, adapter->irq_vector);
     } else if (pdev->msi_enabled) {
         adapter->irq_mode = RC_IRQ_MODE_MSI;
         adapter->irq_vector = pci_irq_vector(pdev, 0);
-        rc_printk(RC_INFO, "rc_bottom: MSI vector %d assigned\n",
+        rc_printk(RC_INFO, "rc_bottom: MSI vector %d assigned (no MSI-X — multi-queue will share vector 0)\n",
                   adapter->irq_vector);
     } else {
         adapter->irq_mode = RC_IRQ_MODE_LEGACY;

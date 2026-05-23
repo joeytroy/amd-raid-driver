@@ -174,63 +174,83 @@ static inline void rc_nvme_ring_cq_doorbell(struct rc_adapter *adapter,
 		      (u32)(2 * qid + 1) * stride);
 }
 
-/* MSI handler called from rc_hw_interrupt_handler when ctrl_mode == NVMe.
- *
- * Admin path: just wake admin_cq_wait.  The single admin submitter that
- * may be in flight at boot consumes its own CQE.
- *
- * I/O path: walk io_cq for all CQEs at the expected phase; for each one
- * look up the in-flight request via blk_mq_tag_to_rq(cid) and complete
- * it with blk_mq_complete_request — the .complete callback then runs in
- * softirq, does the bvec memcpy (for READ) and blk_mq_end_request. */
-irqreturn_t rc_nvme_irq(struct rc_adapter *adapter)
+/* Shared CSTS canary used by both ISR types.  Returns true if the
+ * controller has gone fatal (CFS) or the device has been hot-unplugged
+ * (CSTS reads as ~0).  Marks the adapter dead exactly once and wakes
+ * the admin waiter so any in-flight init/abort sleeper returns promptly
+ * via its wait_event_timeout. */
+static bool rc_nvme_irq_csts_check(struct rc_adapter *adapter)
 {
 	struct rc_nvme_state *nvme = &adapter->ctx.nvme;
+	u32 csts;
+
+	if (!adapter->ctx.mmio_base)
+		return false;
+	csts = readl(adapter->ctx.mmio_base + RC_NVME_REG_CSTS);
+	if (csts != 0xffffffff && !(csts & RC_NVME_CSTS_CFS))
+		return false;
+
+	if (!READ_ONCE(nvme->dead)) {
+		rc_printk(RC_ERROR,
+			  "rc_nvme: %s controller dead (CSTS=0x%08x) — failing in-flight I/O\n",
+			  pci_name(adapter->pdev), csts);
+		WRITE_ONCE(nvme->dead, true);
+	}
+	wake_up(&nvme->admin_cq_wait);
+	return true;
+}
+
+/* Admin ISR — registered with request_irq for MSI-X vector 0.
+ * Admin queue completions wake the synchronous admin_cmd path; we don't
+ * walk the admin CQ here (the submitter consumes its own CQE). */
+irqreturn_t rc_nvme_admin_irq(int irq, void *dev_id)
+{
+	struct rc_adapter *adapter = dev_id;
+	struct rc_nvme_state *nvme = &adapter->ctx.nvme;
+
+	if (rc_nvme_irq_csts_check(adapter))
+		return IRQ_HANDLED;
+	wake_up(&nvme->admin_cq_wait);
+	return IRQ_HANDLED;
+}
+
+/* Per-I/O-queue ISR — registered for MSI-X vector qid.  Walks this
+ * queue's CQ only.  Boot-time sync helpers sleep on q->cq_wait; once
+ * rc_volume_disk is up the ISR completes blk-mq requests via
+ * blk_mq_complete_request and the softirq .complete callback finishes
+ * them (dma_unmap + blk_mq_end_request). */
+irqreturn_t rc_nvme_io_queue_irq(int irq, void *dev_id)
+{
+	struct rc_nvme_io_queue *q = dev_id;
+	struct rc_adapter *adapter = q->adapter;
 	struct blk_mq_tags *tags;
 	bool advanced = false;
 
-	/* Health canary: if the controller has gone fatal or the device has
-	 * been hot-unplugged (CSTS reads as ~0), don't trust the CQ contents.
-	 * Mark the adapter dead so queue_rq fast-fails and the next .timeout
-	 * pass drains everything in flight.  Wakeups still fire so admin /
-	 * sync-init waiters return promptly via their wait_event_timeout. */
-	if (nvme->io_cq && adapter->ctx.mmio_base) {
-		u32 csts = readl(adapter->ctx.mmio_base + RC_NVME_REG_CSTS);
-		if (csts == 0xffffffff || (csts & RC_NVME_CSTS_CFS)) {
-			if (!READ_ONCE(nvme->dead)) {
-				rc_printk(RC_ERROR,
-					  "rc_nvme_irq: %s controller dead (CSTS=0x%08x) — failing in-flight I/O\n",
-					  pci_name(adapter->pdev), csts);
-				WRITE_ONCE(nvme->dead, true);
-			}
-			wake_up(&nvme->admin_cq_wait);
-			wake_up(&nvme->io_cq_wait);
-			return IRQ_HANDLED;
-		}
+	if (rc_nvme_irq_csts_check(adapter)) {
+		wake_up(&q->cq_wait);
+		return IRQ_HANDLED;
 	}
+	wake_up(&q->cq_wait);
 
-	/* Always wake admin + io waiters first — the boot-time sync I/O
-	 * helper (rc_nvme_io_cmd_sync) sleeps on io_cq_wait and consumes
-	 * its own CQE before the disk exists.  Only after rc_volume_disk
-	 * is up do we own the CQ in the ISR. */
-	wake_up(&nvme->admin_cq_wait);
-	wake_up(&nvme->io_cq_wait);
-
-	if (!nvme->io_cq || !rc_volume_disk)
+	if (!rc_volume_disk)
 		return IRQ_HANDLED;
 
-	tags = rc_volume_tagset.tags[0];
+	/* In 3a, all blk-mq dispatch lands on hctx 0 → only queue[0] sees
+	 * traffic.  In 3b each queue maps to its own hctx and uses
+	 * tags[q->hctx_idx].  For now fall back to tags[0] if hctx_idx is
+	 * unset (-1) so single-hctx behaviour is preserved. */
+	tags = rc_volume_tagset.tags[q->hctx_idx >= 0 ? q->hctx_idx : 0];
 
-	spin_lock(&nvme->io_lock);
+	spin_lock(&q->lock);
 	for (;;) {
-		struct rc_nvme_cqe *cqe = (struct rc_nvme_cqe *)nvme->io_cq +
-					  nvme->io_cq_head;
+		struct rc_nvme_cqe *cqe =
+			(struct rc_nvme_cqe *)q->cq + q->cq_head;
 		u16 status = le16_to_cpu(READ_ONCE(cqe->status));
 		u16 cid;
 		struct request *req;
 		struct rc_volume_pdu *pdu;
 
-		if ((status & 1) != nvme->io_cq_phase)
+		if ((status & 1) != q->cq_phase)
 			break;
 
 		cid = le16_to_cpu(cqe->cid);
@@ -238,29 +258,33 @@ irqreturn_t rc_nvme_irq(struct rc_adapter *adapter)
 		if (req) {
 			u16 sc = (status >> 1) & 0x7fff;
 			pdu = blk_mq_rq_to_pdu(req);
-			/* Preserve any prior error from a sibling member's
-			 * completion (relevant only for multi-member FLUSH);
-			 * single-shot READ/WRITE only land here once. */
 			if (sc)
 				pdu->sc_sct = sc;
 			if (atomic_dec_and_test(&pdu->members_pending))
 				blk_mq_complete_request(req);
 		} else {
 			rc_printk(RC_WARN,
-				  "rc_nvme_irq: %s CQE for unknown CID=%u (status=0x%04x)\n",
-				  pci_name(adapter->pdev), cid, status);
+				  "rc_nvme_io_queue_irq: %s qid=%u CQE for unknown CID=%u (status=0x%04x)\n",
+				  pci_name(adapter->pdev), q->qid, cid, status);
 		}
 
-		nvme->io_cq_head = (nvme->io_cq_head + 1) % nvme->io_cq_depth;
-		if (nvme->io_cq_head == 0)
-			nvme->io_cq_phase ^= 1;
+		q->cq_head = (q->cq_head + 1) % q->cq_depth;
+		if (q->cq_head == 0)
+			q->cq_phase ^= 1;
 		advanced = true;
 	}
 	if (advanced)
-		rc_nvme_ring_cq_doorbell(adapter, RC_NVME_IO_QID,
-					 nvme->io_cq_head);
-	spin_unlock(&nvme->io_lock);
+		rc_nvme_ring_cq_doorbell(adapter, q->qid, q->cq_head);
+	spin_unlock(&q->lock);
 	return IRQ_HANDLED;
+}
+
+/* Back-compat shim: rc_hw_interrupt_handler still calls rc_nvme_irq for
+ * the admin vector when ctrl_mode == NVMe.  The I/O vectors get
+ * rc_nvme_io_queue_irq registered directly by rc_nvme_create_io_queues. */
+irqreturn_t rc_nvme_irq(struct rc_adapter *adapter)
+{
+	return rc_nvme_admin_irq(0, adapter);
 }
 
 /* Cheap dead-controller probe usable from process context (timeout callback).
@@ -633,22 +657,12 @@ out:
 	return ret;
 }
 
-/* Request `requested` I/O queue pairs from the controller via Set
- * Features Number of Queues (FID 0x07).  The controller may grant
- * fewer; the granted count is parsed from CQE.result DW0:
- *
- *   bits  15:0  = NSQA (Number of SQs Allocated, 0's based)
- *   bits 31:16  = NCQA (Number of CQs Allocated, 0's based)
- *
- * We take min(NSQA+1, NCQA+1, requested) as the usable count and store
- * it in nvme->nr_io_queues for the queue-creation path to read.
- *
- * Important: per NVMe spec, the controller default is 0 I/O queues
- * unless this admin command is issued.  Without it, Create I/O CQ
- * would fail with "Invalid Queue Identifier".  Single-queue setups
- * survived without it on the dev box because the controller appears
- * to silently allow qid=1 — that's lucky, not portable. */
-static int rc_nvme_set_num_queues(struct rc_adapter *adapter, u16 requested)
+/* Inner Set Features Number of Queues; caller must hold admin_mutex.
+ * Used by the reset path which already holds the mutex for the whole
+ * bring-up sequence and would deadlock if the public wrapper tried to
+ * re-take it. */
+static int __rc_nvme_set_num_queues_locked(struct rc_adapter *adapter,
+					   u16 requested)
 {
 	struct rc_nvme_state *nvme = &adapter->ctx.nvme;
 	struct rc_nvme_sqe cmd = {};
@@ -661,12 +675,10 @@ static int rc_nvme_set_num_queues(struct rc_adapter *adapter, u16 requested)
 
 	cmd.opc   = RC_NVME_ADMIN_OP_SET_FEATURES;
 	cmd.cdw10 = cpu_to_le32(RC_NVME_FID_NUMBER_OF_QUEUES);
-	/* CDW11 carries the requested counts as 0's based.  We ask for the
-	 * same number of SQs and CQs since our model is one CQ per SQ. */
 	cmd.cdw11 = cpu_to_le32(((u32)(requested - 1) << 16) |
 				(u32)(requested - 1));
 
-	ret = rc_nvme_admin_cmd(adapter, &cmd, &result);
+	ret = __rc_nvme_admin_cmd_locked(adapter, &cmd, &result);
 	if (ret) {
 		rc_printk(RC_ERROR,
 			  "rc_nvme_set_num_queues: %s Set Features failed (%d)\n",
@@ -687,14 +699,42 @@ static int rc_nvme_set_num_queues(struct rc_adapter *adapter, u16 requested)
 	return 0;
 }
 
-/* Allocate one I/O completion + submission queue pair (qid=1) and ask the
- * controller to wire them up via Create I/O CQ then Create I/O SQ admin
- * commands.  Create I/O CQ sets IEN=1 + IV=0 so the controller raises an
- * interrupt on our single MSI vector when a CQE is posted. */
-static int rc_nvme_create_io_queues(struct rc_adapter *adapter)
+/* Request `requested` I/O queue pairs from the controller via Set
+ * Features Number of Queues (FID 0x07).  The controller may grant
+ * fewer; the granted count is parsed from CQE.result DW0:
+ *
+ *   bits  15:0  = NSQA (Number of SQs Allocated, 0's based)
+ *   bits 31:16  = NCQA (Number of CQs Allocated, 0's based)
+ *
+ * We take min(NSQA+1, NCQA+1, requested) as the usable count and store
+ * it in nvme->nr_io_queues for the queue-creation path to read.
+ *
+ * Important: per NVMe spec, the controller default is 0 I/O queues
+ * unless this admin command is issued.  Without it, Create I/O CQ
+ * would fail with "Invalid Queue Identifier".  Single-queue setups
+ * survived without it on the dev box because the controller appears
+ * to silently allow qid=1 — that's lucky, not portable. */
+static int rc_nvme_set_num_queues(struct rc_adapter *adapter, u16 requested)
+{
+	struct rc_nvme_state *nvme = &adapter->ctx.nvme;
+	int ret;
+
+	mutex_lock(&nvme->admin_mutex);
+	ret = __rc_nvme_set_num_queues_locked(adapter, requested);
+	mutex_unlock(&nvme->admin_mutex);
+	return ret;
+}
+
+/* Allocate one I/O queue pair: DMA-coherent SQ + CQ, wire it up via
+ * Create I/O CQ + Create I/O SQ admin commands, register its MSI-X
+ * vector with rc_nvme_io_queue_irq.  qid = 1-based.  vec_index is the
+ * MSI-X vector slot (also 1-based — vector 0 is admin). */
+static int rc_nvme_create_one_io_queue(struct rc_adapter *adapter,
+				       u16 qid, u16 vec_index)
 {
 	struct device *dev = &adapter->pdev->dev;
 	struct rc_nvme_state *nvme = &adapter->ctx.nvme;
+	struct rc_nvme_io_queue *q;
 	struct rc_nvme_sqe cmd;
 	size_t sq_bytes, cq_bytes;
 	u16 depth;
@@ -704,124 +744,233 @@ static int rc_nvme_create_io_queues(struct rc_adapter *adapter)
 	if (depth > nvme->mqes)
 		depth = nvme->mqes;
 
+	q = kzalloc(sizeof(*q), GFP_KERNEL);
+	if (!q)
+		return -ENOMEM;
+	q->adapter    = adapter;
+	q->qid        = qid;
+	q->irq_vector = -1;
+	q->hctx_idx   = -1;
+	spin_lock_init(&q->lock);
+	init_waitqueue_head(&q->cq_wait);
+
 	sq_bytes = (size_t)depth * RC_NVME_SQ_ENTRY_SIZE;
 	cq_bytes = (size_t)depth * RC_NVME_CQ_ENTRY_SIZE;
 
-	nvme->io_sq = dma_alloc_coherent(dev, sq_bytes, &nvme->io_sq_dma, GFP_KERNEL);
-	if (!nvme->io_sq)
-		return -ENOMEM;
-	nvme->io_cq = dma_alloc_coherent(dev, cq_bytes, &nvme->io_cq_dma, GFP_KERNEL);
-	if (!nvme->io_cq) {
-		ret = -ENOMEM;
-		goto err_free_sq;
-	}
-	memset(nvme->io_sq, 0, sq_bytes);
-	memset(nvme->io_cq, 0, cq_bytes);
-	nvme->io_sq_depth = depth;
-	nvme->io_cq_depth = depth;
-	nvme->io_sq_tail = 0;
-	nvme->io_cq_head = 0;
-	nvme->io_cq_phase = 1;
+	q->sq = dma_alloc_coherent(dev, sq_bytes, &q->sq_dma, GFP_KERNEL);
+	if (!q->sq) { ret = -ENOMEM; goto err_free_ctx; }
+	q->cq = dma_alloc_coherent(dev, cq_bytes, &q->cq_dma, GFP_KERNEL);
+	if (!q->cq) { ret = -ENOMEM; goto err_free_sq; }
+
+	memset(q->sq, 0, sq_bytes);
+	memset(q->cq, 0, cq_bytes);
+	q->sq_depth  = depth;
+	q->cq_depth  = depth;
+	q->sq_tail   = 0;
+	q->cq_head   = 0;
+	q->cq_phase  = 1;
 
 	/* Create I/O Completion Queue (NVMe 1.4 §5.3, Figure 110).
-	 * CDW10[31:16] = QSIZE-1 (0's based), [15:0] = QID
-	 * CDW11[31:16] = IV, [1] = IEN, [0] = PC */
+	 * CDW10[31:16]=QSIZE-1 (0's based), [15:0]=QID
+	 * CDW11[31:16]=IV, [1]=IEN, [0]=PC.  Each I/O queue's CQ uses its
+	 * own MSI-X vector so completions can be processed per-CPU. */
 	memset(&cmd, 0, sizeof(cmd));
 	cmd.opc   = RC_NVME_ADMIN_OP_CREATE_IO_CQ;
-	cmd.prp1  = cpu_to_le64(nvme->io_cq_dma);
-	cmd.cdw10 = cpu_to_le32(((u32)(depth - 1) << 16) | RC_NVME_IO_QID);
-	/* CDW11[31:16]=IV (vector 0), [1]=IEN (raise IRQ on completion), [0]=PC. */
-	cmd.cdw11 = cpu_to_le32((0u << 16) | 0x3u);
+	cmd.prp1  = cpu_to_le64(q->cq_dma);
+	cmd.cdw10 = cpu_to_le32(((u32)(depth - 1) << 16) | qid);
+	cmd.cdw11 = cpu_to_le32(((u32)vec_index << 16) | 0x3u);
 	ret = rc_nvme_admin_cmd(adapter, &cmd, NULL);
 	if (ret) {
 		rc_printk(RC_ERROR,
-			  "rc_nvme_create_io_queues: Create I/O CQ failed (%d)\n", ret);
+			  "rc_nvme_create_one_io_queue: %s qid=%u Create I/O CQ failed (%d)\n",
+			  pci_name(adapter->pdev), qid, ret);
 		goto err_free_cq;
 	}
 
 	/* Create I/O Submission Queue (NVMe 1.4 §5.4).
-	 * CDW10[31:16] = QSIZE-1, [15:0] = QID
-	 * CDW11[31:16] = CQID, [2:1] = QPRIO (0=urgent for admin/0=medium for I/O,
-	 *                                     value 0 means "Medium" which is fine),
-	 *               [0] = PC */
+	 * CDW10[31:16]=QSIZE-1, [15:0]=QID
+	 * CDW11[31:16]=CQID, [2:1]=QPRIO (0=Medium), [0]=PC. */
 	memset(&cmd, 0, sizeof(cmd));
 	cmd.opc   = RC_NVME_ADMIN_OP_CREATE_IO_SQ;
-	cmd.prp1  = cpu_to_le64(nvme->io_sq_dma);
-	cmd.cdw10 = cpu_to_le32(((u32)(depth - 1) << 16) | RC_NVME_IO_QID);
-	cmd.cdw11 = cpu_to_le32(((u32)RC_NVME_IO_QID << 16) | 0x1u);  /* CQID, PC=1 */
+	cmd.prp1  = cpu_to_le64(q->sq_dma);
+	cmd.cdw10 = cpu_to_le32(((u32)(depth - 1) << 16) | qid);
+	cmd.cdw11 = cpu_to_le32(((u32)qid << 16) | 0x1u);
 	ret = rc_nvme_admin_cmd(adapter, &cmd, NULL);
 	if (ret) {
 		rc_printk(RC_ERROR,
-			  "rc_nvme_create_io_queues: Create I/O SQ failed (%d)\n", ret);
+			  "rc_nvme_create_one_io_queue: %s qid=%u Create I/O SQ failed (%d)\n",
+			  pci_name(adapter->pdev), qid, ret);
 		goto err_delete_cq;
 	}
 
+	/* Wire the per-queue ISR.  The pci_irq_vector call resolves the
+	 * MSI-X slot to a Linux IRQ number; the kernel will route this
+	 * vector's interrupts to rc_nvme_io_queue_irq with `q` as dev_id. */
+	q->irq_vector = pci_irq_vector(adapter->pdev, vec_index);
+	if (q->irq_vector < 0) {
+		ret = q->irq_vector;
+		rc_printk(RC_ERROR,
+			  "rc_nvme_create_one_io_queue: %s qid=%u pci_irq_vector(%u) failed (%d)\n",
+			  pci_name(adapter->pdev), qid, vec_index, ret);
+		goto err_delete_sq;
+	}
+	ret = request_irq(q->irq_vector, rc_nvme_io_queue_irq, 0,
+			  "rcraid-ioq", q);
+	if (ret) {
+		rc_printk(RC_ERROR,
+			  "rc_nvme_create_one_io_queue: %s qid=%u request_irq(%d) failed (%d)\n",
+			  pci_name(adapter->pdev), qid, q->irq_vector, ret);
+		q->irq_vector = -1;
+		goto err_delete_sq;
+	}
+
+	nvme->io_queues[qid - 1] = q;
 	rc_printk(RC_NOTE,
-		  "rc_nvme_create_io_queues: qid=%u up — SQ depth=%u CQ depth=%u\n",
-		  RC_NVME_IO_QID, depth, depth);
+		  "rc_nvme_create_one_io_queue: %s qid=%u up — SQ/CQ depth=%u IV=%u IRQ=%d\n",
+		  pci_name(adapter->pdev), qid, depth, vec_index, q->irq_vector);
 	return 0;
 
+err_delete_sq:
+	memset(&cmd, 0, sizeof(cmd));
+	cmd.opc   = RC_NVME_ADMIN_OP_DELETE_IO_SQ;
+	cmd.cdw10 = cpu_to_le32(qid);
+	(void)rc_nvme_admin_cmd(adapter, &cmd, NULL);
 err_delete_cq:
 	memset(&cmd, 0, sizeof(cmd));
 	cmd.opc   = RC_NVME_ADMIN_OP_DELETE_IO_CQ;
-	cmd.cdw10 = cpu_to_le32(RC_NVME_IO_QID);
+	cmd.cdw10 = cpu_to_le32(qid);
 	(void)rc_nvme_admin_cmd(adapter, &cmd, NULL);
 err_free_cq:
-	dma_free_coherent(dev, cq_bytes, nvme->io_cq, nvme->io_cq_dma);
-	nvme->io_cq = NULL;
+	dma_free_coherent(dev, cq_bytes, q->cq, q->cq_dma);
 err_free_sq:
-	dma_free_coherent(dev, sq_bytes, nvme->io_sq, nvme->io_sq_dma);
-	nvme->io_sq = NULL;
+	dma_free_coherent(dev, sq_bytes, q->sq, q->sq_dma);
+err_free_ctx:
+	kfree(q);
 	return ret;
 }
 
-/* Submit one I/O command to adapter's qid=1 SQ asynchronously.  Caller
- * (blk-mq queue_rq) returns BLK_STS_OK immediately; completion lands in
- * rc_nvme_irq → blk_mq_complete_request → .complete callback. */
-static void rc_nvme_io_submit(struct rc_adapter *adapter,
-			      struct rc_nvme_sqe *cmd)
+/* Tear down one I/O queue: free_irq, Delete I/O SQ, Delete I/O CQ,
+ * release DMA + context.  Safe against partial init (any unset field
+ * just skips its cleanup). */
+static void rc_nvme_destroy_one_io_queue(struct rc_adapter *adapter,
+					 struct rc_nvme_io_queue *q)
+{
+	struct device *dev = &adapter->pdev->dev;
+	struct rc_nvme_sqe cmd;
+	size_t sq_bytes, cq_bytes;
+
+	if (!q)
+		return;
+
+	if (q->irq_vector >= 0) {
+		free_irq(q->irq_vector, q);
+		q->irq_vector = -1;
+	}
+
+	if (q->sq) {
+		memset(&cmd, 0, sizeof(cmd));
+		cmd.opc   = RC_NVME_ADMIN_OP_DELETE_IO_SQ;
+		cmd.cdw10 = cpu_to_le32(q->qid);
+		(void)rc_nvme_admin_cmd(adapter, &cmd, NULL);
+		sq_bytes = (size_t)q->sq_depth * RC_NVME_SQ_ENTRY_SIZE;
+		dma_free_coherent(dev, sq_bytes, q->sq, q->sq_dma);
+		q->sq = NULL;
+	}
+	if (q->cq) {
+		memset(&cmd, 0, sizeof(cmd));
+		cmd.opc   = RC_NVME_ADMIN_OP_DELETE_IO_CQ;
+		cmd.cdw10 = cpu_to_le32(q->qid);
+		(void)rc_nvme_admin_cmd(adapter, &cmd, NULL);
+		cq_bytes = (size_t)q->cq_depth * RC_NVME_CQ_ENTRY_SIZE;
+		dma_free_coherent(dev, cq_bytes, q->cq, q->cq_dma);
+		q->cq = NULL;
+	}
+	kfree(q);
+}
+
+/* Allocate nvme->nr_io_queues queue pairs.  qid = i+1, vec_index = i+1
+ * (vector 0 is reserved for admin).  On partial failure, rolls back
+ * everything created so far. */
+static int rc_nvme_create_io_queues(struct rc_adapter *adapter)
 {
 	struct rc_nvme_state *nvme = &adapter->ctx.nvme;
+	u16 i;
+	int ret;
+
+	if (nvme->nr_io_queues == 0)
+		nvme->nr_io_queues = 1;
+	if (nvme->nr_io_queues > RC_NVME_IO_QUEUE_TARGET)
+		nvme->nr_io_queues = RC_NVME_IO_QUEUE_TARGET;
+
+	for (i = 0; i < nvme->nr_io_queues; i++) {
+		ret = rc_nvme_create_one_io_queue(adapter, i + 1, i + 1);
+		if (ret) {
+			rc_printk(RC_ERROR,
+				  "rc_nvme_create_io_queues: %s queue %u creation failed (%d) — rolling back\n",
+				  pci_name(adapter->pdev), i + 1, ret);
+			while (i-- > 0) {
+				rc_nvme_destroy_one_io_queue(adapter,
+							     nvme->io_queues[i]);
+				nvme->io_queues[i] = NULL;
+			}
+			return ret;
+		}
+	}
+	return 0;
+}
+
+/* Submit one I/O command to a specific NVMe I/O queue asynchronously.
+ * Caller (blk-mq queue_rq) returns BLK_STS_OK immediately; completion
+ * lands in rc_nvme_io_queue_irq → blk_mq_complete_request → .complete. */
+static void rc_nvme_io_submit(struct rc_nvme_io_queue *q,
+			      struct rc_nvme_sqe *cmd)
+{
 	struct rc_nvme_sqe *slot;
 	unsigned long flags;
 	u32 tail;
 
-	spin_lock_irqsave(&nvme->io_lock, flags);
-	slot = (struct rc_nvme_sqe *)nvme->io_sq + nvme->io_sq_tail;
+	spin_lock_irqsave(&q->lock, flags);
+	slot = (struct rc_nvme_sqe *)q->sq + q->sq_tail;
 	memcpy(slot, cmd, sizeof(*cmd));
 
-	tail = (nvme->io_sq_tail + 1) % nvme->io_sq_depth;
-	nvme->io_sq_tail = tail;
+	tail = (q->sq_tail + 1) % q->sq_depth;
+	q->sq_tail = tail;
 	wmb();
-	rc_nvme_ring_sq_doorbell(adapter, RC_NVME_IO_QID, tail);
-	spin_unlock_irqrestore(&nvme->io_lock, flags);
+	rc_nvme_ring_sq_doorbell(q->adapter, q->qid, tail);
+	spin_unlock_irqrestore(&q->lock, flags);
 }
 
 /* Synchronous I/O command used at boot time to read metadata before the
- * blk-mq disk is up.  Submits a single SQE with CID=0, waits on
- * io_cq_wait until the CQE arrives (woken by rc_nvme_irq), consumes the
- * CQE, advances head + doorbell.  Safe because rc_nvme_irq returns
- * early — without touching the CQ — while rc_volume_disk is NULL. */
+ * blk-mq disk is up.  Always runs against I/O queue 0 (qid=1).  Submits
+ * a single SQE with CID=0, waits on q->cq_wait until the CQE arrives
+ * (woken by rc_nvme_io_queue_irq), consumes the CQE, advances head +
+ * doorbell.  Safe because the ISR returns early — without consuming
+ * CQEs through blk_mq_complete_request — while rc_volume_disk is NULL. */
 static int rc_nvme_io_cmd_sync(struct rc_adapter *adapter,
 			       struct rc_nvme_sqe *cmd)
 {
 	struct rc_nvme_state *nvme = &adapter->ctx.nvme;
+	struct rc_nvme_io_queue *q;
 	struct rc_nvme_cqe *cqe;
 	unsigned long deadline;
 	u8 expected_phase;
 	u16 status, sc_sct;
 
-	cmd->cid = cpu_to_le16(0);
-	rc_nvme_io_submit(adapter, cmd);
+	if (!nvme->io_queues[0])
+		return -ENODEV;
+	q = nvme->io_queues[0];
 
-	cqe = (struct rc_nvme_cqe *)nvme->io_cq + nvme->io_cq_head;
-	expected_phase = nvme->io_cq_phase;
+	cmd->cid = cpu_to_le16(0);
+	rc_nvme_io_submit(q, cmd);
+
+	cqe = (struct rc_nvme_cqe *)q->cq + q->cq_head;
+	expected_phase = q->cq_phase;
 	deadline = jiffies + msecs_to_jiffies(RC_NVME_ADMIN_TIMEOUT_MS);
 	while (time_before(jiffies, deadline)) {
 		long left = deadline - jiffies;
 		long tick = min_t(long, left, max_t(long, 1, msecs_to_jiffies(1)));
 
-		if (wait_event_timeout(nvme->io_cq_wait,
+		if (wait_event_timeout(q->cq_wait,
 				       (le16_to_cpu(READ_ONCE(cqe->status)) & 1) ==
 					       expected_phase,
 				       tick) > 0)
@@ -836,10 +985,10 @@ have_cqe:
 	status = le16_to_cpu(READ_ONCE(cqe->status));
 	sc_sct = (status >> 1) & 0x7fff;
 
-	nvme->io_cq_head = (nvme->io_cq_head + 1) % nvme->io_cq_depth;
-	if (nvme->io_cq_head == 0)
-		nvme->io_cq_phase ^= 1;
-	rc_nvme_ring_cq_doorbell(adapter, RC_NVME_IO_QID, nvme->io_cq_head);
+	q->cq_head = (q->cq_head + 1) % q->cq_depth;
+	if (q->cq_head == 0)
+		q->cq_phase ^= 1;
+	rc_nvme_ring_cq_doorbell(adapter, q->qid, q->cq_head);
 
 	if (sc_sct) {
 		rc_printk(RC_ERROR,
@@ -1636,8 +1785,11 @@ static blk_status_t rc_volume_queue_rq(struct blk_mq_hw_ctx *hctx,
 		rc_volume_build_flush_sqe(&cmd, tag);
 
 		blk_mq_start_request(req);
+		/* Step 3a: always submit on each member's I/O queue 0.
+		 * Step 3b will route via blk-mq's hctx_idx. */
 		for (i = 0; i < rc_volume_member_count; i++)
-			rc_nvme_io_submit(rc_volume_members[i], &cmd);
+			rc_nvme_io_submit(rc_volume_members[i]->ctx.nvme.io_queues[0],
+					  &cmd);
 		return BLK_STS_OK;
 	}
 
@@ -1664,7 +1816,8 @@ static blk_status_t rc_volume_queue_rq(struct blk_mq_hw_ctx *hctx,
 		rc_volume_build_discard_sqe(&cmd, member_idx, tag,
 					    phys_lba, nr_sectors);
 		blk_mq_start_request(req);
-		rc_nvme_io_submit(rc_volume_members[member_idx], &cmd);
+		rc_nvme_io_submit(rc_volume_members[member_idx]->ctx.nvme.io_queues[0],
+				  &cmd);
 		return BLK_STS_OK;
 	}
 
@@ -1687,7 +1840,8 @@ static blk_status_t rc_volume_queue_rq(struct blk_mq_hw_ctx *hctx,
 	/* Must call blk_mq_start_request BEFORE submitting — otherwise the
 	 * ISR could complete the request before blk-mq considers it started. */
 	blk_mq_start_request(req);
-	rc_nvme_io_submit(rc_volume_members[member_idx], &cmd);
+	rc_nvme_io_submit(rc_volume_members[member_idx]->ctx.nvme.io_queues[0],
+			  &cmd);
 	return BLK_STS_OK;
 }
 
@@ -2082,33 +2236,20 @@ void rc_volume_teardown(void)
 	mutex_unlock(&rc_volume_lock);
 }
 
-/* Counterpart to create_io_queues; called from cleanup_controller. Sends
- * Delete SQ then Delete CQ (order matters per spec) before freeing DMA. */
+/* Counterpart to create_io_queues; called from cleanup_controller and
+ * from the reset path.  Iterates the queue array and tears each one
+ * down via rc_nvme_destroy_one_io_queue (handles Delete SQ + CQ +
+ * free_irq + DMA release per queue). */
 static void rc_nvme_destroy_io_queues(struct rc_adapter *adapter)
 {
-	struct device *dev = &adapter->pdev->dev;
 	struct rc_nvme_state *nvme = &adapter->ctx.nvme;
-	struct rc_nvme_sqe cmd;
+	u16 i;
 
-	if (nvme->io_sq) {
-		memset(&cmd, 0, sizeof(cmd));
-		cmd.opc   = RC_NVME_ADMIN_OP_DELETE_IO_SQ;
-		cmd.cdw10 = cpu_to_le32(RC_NVME_IO_QID);
-		(void)rc_nvme_admin_cmd(adapter, &cmd, NULL);
-		dma_free_coherent(dev,
-				  (size_t)nvme->io_sq_depth * RC_NVME_SQ_ENTRY_SIZE,
-				  nvme->io_sq, nvme->io_sq_dma);
-		nvme->io_sq = NULL;
-	}
-	if (nvme->io_cq) {
-		memset(&cmd, 0, sizeof(cmd));
-		cmd.opc   = RC_NVME_ADMIN_OP_DELETE_IO_CQ;
-		cmd.cdw10 = cpu_to_le32(RC_NVME_IO_QID);
-		(void)rc_nvme_admin_cmd(adapter, &cmd, NULL);
-		dma_free_coherent(dev,
-				  (size_t)nvme->io_cq_depth * RC_NVME_CQ_ENTRY_SIZE,
-				  nvme->io_cq, nvme->io_cq_dma);
-		nvme->io_cq = NULL;
+	for (i = 0; i < RC_NVME_IO_QUEUE_TARGET; i++) {
+		if (nvme->io_queues[i]) {
+			rc_nvme_destroy_one_io_queue(adapter, nvme->io_queues[i]);
+			nvme->io_queues[i] = NULL;
+		}
 	}
 }
 
@@ -2189,6 +2330,8 @@ int rc_nvme_reset_controller(struct rc_adapter *adapter)
 	struct rc_nvme_sqe cmd;
 	u32 cc, csts, aqa, cur_cc;
 	u64 asq_rb, acq_rb;
+	u16 saved_nr_io_queues;
+	u16 i;
 	int ret;
 
 	if (!base) {
@@ -2214,8 +2357,15 @@ int rc_nvme_reset_controller(struct rc_adapter *adapter)
 
 	mutex_lock(&nvme->admin_mutex);
 
+	/* Disable all per-queue MSI-X vectors (and the admin vector via
+	 * adapter->irq_vector) so no ISR runs while we touch registers. */
 	if (adapter->irq_vector >= 0)
 		disable_irq(adapter->irq_vector);
+	for (i = 0; i < RC_NVME_IO_QUEUE_TARGET; i++) {
+		struct rc_nvme_io_queue *q = nvme->io_queues[i];
+		if (q && q->irq_vector >= 0)
+			disable_irq(q->irq_vector);
+	}
 
 	writel(0xffffffffu, base + RC_NVME_REG_INTMS);
 
@@ -2245,15 +2395,20 @@ int rc_nvme_reset_controller(struct rc_adapter *adapter)
 	nvme->admin_cq_head  = 0;
 	nvme->admin_cq_phase = 1;
 
-	if (nvme->io_sq)
-		memset(nvme->io_sq, 0,
-		       (size_t)nvme->io_sq_depth * RC_NVME_SQ_ENTRY_SIZE);
-	if (nvme->io_cq)
-		memset(nvme->io_cq, 0,
-		       (size_t)nvme->io_cq_depth * RC_NVME_CQ_ENTRY_SIZE);
-	nvme->io_sq_tail  = 0;
-	nvme->io_cq_head  = 0;
-	nvme->io_cq_phase = 1;
+	for (i = 0; i < RC_NVME_IO_QUEUE_TARGET; i++) {
+		struct rc_nvme_io_queue *q = nvme->io_queues[i];
+		if (!q)
+			continue;
+		if (q->sq)
+			memset(q->sq, 0,
+			       (size_t)q->sq_depth * RC_NVME_SQ_ENTRY_SIZE);
+		if (q->cq)
+			memset(q->cq, 0,
+			       (size_t)q->cq_depth * RC_NVME_CQ_ENTRY_SIZE);
+		q->sq_tail  = 0;
+		q->cq_head  = 0;
+		q->cq_phase = 1;
+	}
 
 	aqa = RC_NVME_AQA(nvme->admin_sq_depth, nvme->admin_cq_depth);
 	writel(aqa, base + RC_NVME_REG_AQA);
@@ -2285,40 +2440,71 @@ int rc_nvme_reset_controller(struct rc_adapter *adapter)
 		goto err_irq_disabled;
 	}
 
-	/* Unmask + re-enable IRQ before issuing admin commands so the
+	/* Unmask + re-enable IRQs before issuing admin commands so the
 	 * submitter wakes via the ISR rather than the 1 ms poll fallback. */
 	writel(0xffffffffu, base + RC_NVME_REG_INTMC);
 	if (adapter->irq_vector >= 0)
 		enable_irq(adapter->irq_vector);
+	for (i = 0; i < RC_NVME_IO_QUEUE_TARGET; i++) {
+		struct rc_nvme_io_queue *q = nvme->io_queues[i];
+		if (q && q->irq_vector >= 0)
+			enable_irq(q->irq_vector);
+	}
 
-	/* Re-create the I/O queue pair against the same DMA buffers. */
-	if (nvme->io_cq) {
+	/* Re-issue Set Features Number of Queues.  CC.EN=0 may have wiped
+	 * the controller's saved count; without re-issuing, Create I/O CQ
+	 * for qid > granted-count would fail.  Save the existing
+	 * nr_io_queues so a smaller grant doesn't silently shrink our
+	 * queue array — if the controller can't give us the same count,
+	 * fail the reset. */
+	saved_nr_io_queues = nvme->nr_io_queues;
+	ret = __rc_nvme_set_num_queues_locked(adapter, saved_nr_io_queues);
+	if (ret) {
+		rc_printk(RC_ERROR,
+			  "rc_nvme_reset_controller: %s Set Features Number of Queues failed (%d) — adapter remains dead\n",
+			  pci_name(adapter->pdev), ret);
+		goto err_irq_enabled;
+	}
+	if (nvme->nr_io_queues < saved_nr_io_queues) {
+		rc_printk(RC_ERROR,
+			  "rc_nvme_reset_controller: %s granted only %u queues, had %u before reset — adapter remains dead\n",
+			  pci_name(adapter->pdev),
+			  nvme->nr_io_queues, saved_nr_io_queues);
+		ret = -EIO;
+		goto err_irq_enabled;
+	}
+
+	/* Re-issue Create I/O CQ + Create I/O SQ for every existing queue.
+	 * DMA buffers and IRQ vectors are still ours; we just need to tell
+	 * the controller about them again. */
+	for (i = 0; i < RC_NVME_IO_QUEUE_TARGET; i++) {
+		struct rc_nvme_io_queue *q = nvme->io_queues[i];
+		if (!q)
+			continue;
+
 		memset(&cmd, 0, sizeof(cmd));
 		cmd.opc   = RC_NVME_ADMIN_OP_CREATE_IO_CQ;
-		cmd.prp1  = cpu_to_le64(nvme->io_cq_dma);
-		cmd.cdw10 = cpu_to_le32(((u32)(nvme->io_cq_depth - 1) << 16) |
-					RC_NVME_IO_QID);
-		cmd.cdw11 = cpu_to_le32((0u << 16) | 0x3u);  /* IV=0, IEN=1, PC=1 */
+		cmd.prp1  = cpu_to_le64(q->cq_dma);
+		cmd.cdw10 = cpu_to_le32(((u32)(q->cq_depth - 1) << 16) | q->qid);
+		cmd.cdw11 = cpu_to_le32(((u32)q->qid << 16) | 0x3u);
 		ret = __rc_nvme_admin_cmd_locked(adapter, &cmd, NULL);
 		if (ret) {
 			rc_printk(RC_ERROR,
-				  "rc_nvme_reset_controller: %s Create I/O CQ failed (%d) — adapter remains dead\n",
-				  pci_name(adapter->pdev), ret);
+				  "rc_nvme_reset_controller: %s qid=%u Create I/O CQ failed (%d) — adapter remains dead\n",
+				  pci_name(adapter->pdev), q->qid, ret);
 			goto err_irq_enabled;
 		}
-	}
-	if (nvme->io_sq) {
+
 		memset(&cmd, 0, sizeof(cmd));
 		cmd.opc   = RC_NVME_ADMIN_OP_CREATE_IO_SQ;
-		cmd.prp1  = cpu_to_le64(nvme->io_sq_dma);
-		cmd.cdw10 = cpu_to_le32(((u32)(nvme->io_sq_depth - 1) << 16) |
-					RC_NVME_IO_QID);
-		cmd.cdw11 = cpu_to_le32(((u32)RC_NVME_IO_QID << 16) | 0x1u);
+		cmd.prp1  = cpu_to_le64(q->sq_dma);
+		cmd.cdw10 = cpu_to_le32(((u32)(q->sq_depth - 1) << 16) | q->qid);
+		cmd.cdw11 = cpu_to_le32(((u32)q->qid << 16) | 0x1u);
 		ret = __rc_nvme_admin_cmd_locked(adapter, &cmd, NULL);
 		if (ret) {
 			rc_printk(RC_ERROR,
-				  "rc_nvme_reset_controller: %s Create I/O SQ failed (%d) — adapter remains dead\n",
-				  pci_name(adapter->pdev), ret);
+				  "rc_nvme_reset_controller: %s qid=%u Create I/O SQ failed (%d) — adapter remains dead\n",
+				  pci_name(adapter->pdev), q->qid, ret);
 			goto err_irq_enabled;
 		}
 	}
@@ -2340,6 +2526,11 @@ int rc_nvme_reset_controller(struct rc_adapter *adapter)
 err_irq_disabled:
 	if (adapter->irq_vector >= 0)
 		enable_irq(adapter->irq_vector);
+	for (i = 0; i < RC_NVME_IO_QUEUE_TARGET; i++) {
+		struct rc_nvme_io_queue *q = nvme->io_queues[i];
+		if (q && q->irq_vector >= 0)
+			enable_irq(q->irq_vector);
+	}
 err_irq_enabled:
 	mutex_unlock(&nvme->admin_mutex);
 	if (rc_volume_disk)
@@ -2374,8 +2565,8 @@ int rc_nvme_init_controller(struct rc_adapter *adapter)
 	nvme->timeout_500ms = RC_NVME_CAP_TO(cap);
 	nvme->sq_doorbell_base = base + RC_NVME_REG_DBL_BASE;
 	init_waitqueue_head(&nvme->admin_cq_wait);
-	init_waitqueue_head(&nvme->io_cq_wait);
-	spin_lock_init(&nvme->io_lock);
+	/* Per-I/O-queue waitqueue + lock are initialized in
+	 * rc_nvme_create_one_io_queue when each queue is allocated. */
 	mutex_init(&nvme->admin_mutex);
 	INIT_WORK(&nvme->auto_reset_work, rc_nvme_auto_reset_fn);
 

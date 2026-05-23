@@ -142,6 +142,52 @@ enum rc_ctrl_mode {
     RC_CTRL_MODE_STUB    = 99,  // unknown device, fallback to no-op stubs
 };
 
+/* Target number of I/O queue pairs to request at init via Set Features
+ * Number of Queues.  Matches Windows rcbottom.sys's hardcoded cap (see
+ * docs/WINDOWS_MULTIQUEUE_FINDINGS.md).  Controller may grant fewer;
+ * the granted count lands in nvme->nr_io_queues.  Step 3a creates this
+ * many queue pairs (with their own MSI-X vectors); step 3b connects
+ * them to blk-mq via per-CPU hctx mapping. */
+#define RC_NVME_IO_QUEUE_TARGET		4u
+
+// One NVMe I/O queue pair (SQ + CQ + its own MSI-X vector).  Allocated
+// per-queue at controller init, sized using nvme->nr_io_queues granted
+// by Set Features.  Doorbell offsets are computed from qid and CAP.DSTRD
+// at submit/complete time.
+struct rc_nvme_io_queue {
+    struct rc_adapter *adapter;   // back-pointer so the per-queue ISR can find peer state
+    u16            qid;           // NVMe queue ID (1, 2, ..., nr_io_queues)
+
+    void          *sq;            // 64-byte SQE array
+    dma_addr_t     sq_dma;
+    u16            sq_depth;
+    u16            sq_tail;
+
+    void          *cq;            // 16-byte CQE array
+    dma_addr_t     cq_dma;
+    u16            cq_depth;
+    u16            cq_head;
+    u8             cq_phase;
+
+    // Linux IRQ number assigned to this queue's MSI-X vector
+    // (pci_irq_vector(pdev, qid)).  -1 if not registered.
+    int            irq_vector;
+
+    // Guards sq_tail + cq_head + cq_phase against submitter/ISR race.
+    spinlock_t     lock;
+
+    // Used only by the boot-time sync helper (rc_nvme_io_cmd_sync) which
+    // sleeps here until the matching CQE wakes it.  Once rc_volume_disk
+    // is up the ISR routes CQEs to blk_mq_complete_request instead.
+    wait_queue_head_t cq_wait;
+
+    // hctx index this queue is mapped to.  Used by the per-queue ISR
+    // to look up the right blk_mq_tags array.  -1 until blk-mq mapping
+    // is established (step 3b); during 3a all queues map to hctx 0 and
+    // only queue 0 sees traffic.
+    int            hctx_idx;
+};
+
 // NVMe controller state (per NVMe 1.4 spec, populated for RC_CTRL_MODE_NVME).
 // All DMA addresses are bus addresses; depths are entry counts (not bytes).
 struct rc_nvme_state {
@@ -169,22 +215,16 @@ struct rc_nvme_state {
     u64            ns1_nsze;          // total LBAs in the namespace
 
     // I/O queue count granted by the controller in response to
-    // Set Features Number of Queues at init.  Will be 1 throughout
-    // step 2 (we don't create extras yet); step 3 grows queue
-    // creation to use this value.  See docs/WINDOWS_MULTIQUEUE_FINDINGS.md
-    // for the target architecture.
+    // Set Features Number of Queues at init.  In step 3a we create
+    // this many queue pairs but blk-mq stays single-hctx (all
+    // dispatches still go to io_queues[0]).  Step 3b makes blk-mq
+    // use them all via per-CPU hctx mapping.
     u16            nr_io_queues;
 
-    // I/O queue 1 (single pair). Allocated after admin Identify.
-    void          *io_sq;             // 64-byte SQE array
-    dma_addr_t     io_sq_dma;
-    u16            io_sq_depth;
-    u16            io_sq_tail;
-    void          *io_cq;             // 16-byte CQE array
-    dma_addr_t     io_cq_dma;
-    u16            io_cq_depth;
-    u16            io_cq_head;
-    u8             io_cq_phase;
+    // Array of allocated per-queue contexts.  io_queues[i] is qid i+1
+    // on the wire.  Sized at RC_NVME_IO_QUEUE_TARGET (the static cap)
+    // even when nr_io_queues is smaller; unused slots are NULL.
+    struct rc_nvme_io_queue *io_queues[RC_NVME_IO_QUEUE_TARGET];
 
     // Per-member RAIDCore metadata (LBA 0x5000), populated after validation.
     // Field names mirror struct RC_MetaData in AMD's SDK (rcblob.x86_64).
@@ -211,15 +251,10 @@ struct rc_nvme_state {
     // Per-doorbell pointers (computed once after CAP read)
     void __iomem  *sq_doorbell_base;  // BAR0 + 0x1000
 
-    // Wait queues woken from the MSI handler when a CQE arrives.
-    // Admin path uses admin_cq_wait + wait_event_timeout to be woken
-    // when the admin CQE arrives.  I/O completions go fully async:
-    // the ISR walks io_cq, calls blk_mq_complete_request per CQE,
-    // and the .complete callback finishes the request in softirq.
-    // io_lock guards io_sq_tail, io_cq_head, io_cq_phase.
+    // Admin wait queue, woken from rc_nvme_admin_irq when an admin CQE
+    // arrives.  Per-I/O-queue wait queues (used only by the boot-time
+    // sync helper) live inside struct rc_nvme_io_queue.
     wait_queue_head_t admin_cq_wait;
-    wait_queue_head_t io_cq_wait;
-    spinlock_t        io_lock;
 
     // Once set, no new I/O dispatches to this adapter and the next
     // .timeout callback drains every in-flight request that targeted it.
@@ -490,14 +525,6 @@ struct rc_nvme_dsm_range {
 #define RC_NVME_IO_QUEUE_DEPTH		64
 #define RC_NVME_IO_QID			1u
 
-/* Target number of I/O queue pairs to request at init via Set Features
- * Number of Queues.  Matches Windows rcbottom.sys's hardcoded cap (see
- * docs/WINDOWS_MULTIQUEUE_FINDINGS.md).  Controller may grant fewer;
- * the granted count lands in nvme->nr_io_queues.  Step 3 of the
- * multi-queue work will create this many queue pairs and use a per-CPU
- * blk-mq hctx mapping. */
-#define RC_NVME_IO_QUEUE_TARGET		4u
-
 /* AMD RAIDCore per-member metadata block (one LBA per member at LBA 0x5000).
  * Layout matches struct RC_MetaData from AMD's open Linux SDK
  * (drivers/reference/amd-sdk-9.3.0 / rcblob.x86_64 — has DWARF info).
@@ -703,6 +730,8 @@ int          rc_nvme_init_controller(struct rc_adapter *adapter);
 void         rc_nvme_cleanup_controller(struct rc_adapter *adapter);
 int          rc_nvme_reset_controller(struct rc_adapter *adapter);
 irqreturn_t  rc_nvme_irq(struct rc_adapter *adapter);
+irqreturn_t  rc_nvme_admin_irq(int irq, void *dev_id);
+irqreturn_t  rc_nvme_io_queue_irq(int irq, void *dev_id);
 
 /* Sysfs / debugfs interfaces. */
 int  rc_sysfs_create(struct rc_adapter *adapter);
