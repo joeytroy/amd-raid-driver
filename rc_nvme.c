@@ -1276,6 +1276,31 @@ static void rc_volume_build_flush_sqe(struct rc_nvme_sqe *cmd, u32 tag)
 	cmd->nsid = cpu_to_le32(1);
 }
 
+/* Build an NVMe DSM Deallocate SQE for one member.  Writes one DSM range
+ * entry into the per-tag PRP buffer (reused — same buffer that holds the
+ * PRP list for >2-page transfers, but for DSM there's no data and no PRP
+ * list, so the buffer is free for the range list).  Range count = 1 (the
+ * blk-mq split at chunk_sectors keeps each discard request to one stripe,
+ * which maps to one member). */
+static void rc_volume_build_discard_sqe(struct rc_nvme_sqe *cmd, int member_idx,
+					u32 tag, u64 slba, u32 nlb)
+{
+	struct rc_nvme_dsm_range *range = (struct rc_nvme_dsm_range *)
+					   rc_volume_prp_va[member_idx][tag];
+
+	range->context_attrs = cpu_to_le32(0);
+	range->nlb           = cpu_to_le32(nlb);
+	range->slba          = cpu_to_le64(slba);
+
+	memset(cmd, 0, sizeof(*cmd));
+	cmd->opc   = RC_NVME_NVM_OP_DSM;
+	cmd->cid   = cpu_to_le16((u16)tag);
+	cmd->nsid  = cpu_to_le32(1);
+	cmd->prp1  = cpu_to_le64(rc_volume_prp_pa[member_idx][tag]);
+	cmd->cdw10 = cpu_to_le32(0);              /* NR = 0 means 1 range */
+	cmd->cdw11 = cpu_to_le32(RC_NVME_DSM_AD); /* Deallocate */
+}
+
 /* blk-mq request handler.  chunk_sectors=stripe_sectors in queue_limits
  * keeps each request inside one stripe, so it maps to exactly one member.
  *
@@ -1318,14 +1343,16 @@ static blk_status_t rc_volume_queue_rq(struct blk_mq_hw_ctx *hctx,
 		return BLK_STS_OK;
 	}
 
-	if (op != REQ_OP_READ && op != REQ_OP_WRITE) {
+	if (op != REQ_OP_READ && op != REQ_OP_WRITE && op != REQ_OP_DISCARD) {
 		blk_mq_start_request(req);
 		blk_mq_end_request(req, BLK_STS_IOERR);
 		return BLK_STS_OK;
 	}
 
-	if (nr_sectors == 0 || nr_sectors > (RC_VOLUME_DATA_BYTES / 512) ||
-	    pos + nr_sectors > get_capacity(rc_volume_disk)) {
+	if (nr_sectors == 0 ||
+	    pos + nr_sectors > get_capacity(rc_volume_disk) ||
+	    (op != REQ_OP_DISCARD &&
+	     nr_sectors > (RC_VOLUME_DATA_BYTES / 512))) {
 		blk_mq_start_request(req);
 		blk_mq_end_request(req, BLK_STS_IOERR);
 		return BLK_STS_OK;
@@ -1334,6 +1361,14 @@ static blk_status_t rc_volume_queue_rq(struct blk_mq_hw_ctx *hctx,
 	rc_volume_map_lba(pos, &member_idx, &phys_lba);
 	pdu->member_idx = member_idx;
 	atomic_set(&pdu->members_pending, 1);
+
+	if (op == REQ_OP_DISCARD) {
+		rc_volume_build_discard_sqe(&cmd, member_idx, tag,
+					    phys_lba, nr_sectors);
+		blk_mq_start_request(req);
+		rc_nvme_io_submit(rc_volume_members[member_idx], &cmd);
+		return BLK_STS_OK;
+	}
 
 	if (op == REQ_OP_WRITE) {
 		off = 0;
@@ -1473,6 +1508,12 @@ static int rc_volume_create_disk(void)
 			 * write cache and that we honour FUA — filesystems will
 			 * now route REQ_OP_FLUSH and REQ_FUA writes through. */
 			.features            = BLK_FEAT_WRITE_CACHE | BLK_FEAT_FUA,
+			/* DISCARD via NVMe DSM Deallocate.  Each discard request
+			 * is bounded by chunk_sectors (one stripe = one member's
+			 * range), and we issue exactly one DSM range per command. */
+			.max_hw_discard_sectors  = rc_volume_stripe_sectors,
+			.discard_granularity     = 512,
+			.max_discard_segments    = 1,
 		};
 
 		rc_volume_disk = blk_mq_alloc_disk(&rc_volume_tagset, &lim, NULL);

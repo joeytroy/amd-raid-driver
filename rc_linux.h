@@ -432,9 +432,20 @@ void rc_config_cleanup(void);
 #define RC_NVME_ADMIN_OP_IDENTIFY	0x06
 
 /* NVM I/O opcodes (NVMe 1.4 §6) */
+#define RC_NVME_NVM_OP_FLUSH		0x00
 #define RC_NVME_NVM_OP_WRITE		0x01
 #define RC_NVME_NVM_OP_READ		0x02
-#define RC_NVME_NVM_OP_FLUSH		0x00
+#define RC_NVME_NVM_OP_DSM		0x09	/* Dataset Management */
+
+/* DSM CDW11 attribute bits (NVMe 1.4 §6.4.1) */
+#define RC_NVME_DSM_AD			(1u << 2)	/* AD: Deallocate */
+
+/* DSM range list entry (16 B per range) */
+struct rc_nvme_dsm_range {
+	__le32 context_attrs;	/* 0 — vendor-defined; leave zero */
+	__le32 nlb;		/* length in logical blocks (0's based? no — 1's based per spec) */
+	__le64 slba;		/* starting LBA */
+} __packed;
 
 /* I/O queue depth; clamped against CAP.MQES. 64 is plenty for what we
  * currently submit (one READ at a time) and well under MQES (=65536). */

@@ -124,6 +124,21 @@ are best-effort/untested.
   followed by read-back — patterns match exactly, adjacent sectors
   untouched, no AMD-Vi events or kernel warnings.
 
+### DISCARD (NVMe DSM Deallocate)
+
+`REQ_OP_DISCARD` is now handled: blk-mq splits each discard request
+at `chunk_sectors` (one stripe = one member), and `queue_rq` issues
+exactly one NVMe DSM command (opcode 0x09) with the AD attribute to
+that member's I/O queue.  The DSM range list (16 bytes for one
+range) is staged in the per-tag PRP buffer that already exists.
+
+Queue limits expose `max_hw_discard_sectors = stripe_sectors`,
+`discard_granularity = 512`, `max_discard_segments = 1`.  Verified
+on the dev box with `blkdiscard`: returned 0, IRQs counted on both
+members, post-discard reads return zeros (the Crucial T700 happens
+to zero on deallocate even though we conservatively don't advertise
+that guarantee).  No regressions.
+
 ### FLUSH + FUA support
 
 `REQ_OP_FLUSH` is now handled: fans out one NVMe FLUSH (opcode 0x00)
