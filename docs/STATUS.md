@@ -238,6 +238,35 @@ Behaviour change worth flagging: one stuck command takes the volume
 offline until either the operator runs the sysfs reset or the module
 is reloaded.  Full design notes in [`ERROR_HANDLING.md`](ERROR_HANDLING.md).
 
+### Scatterlist-native DMA
+
+Hardware now reads/writes the bio's user pages directly via
+`dma_map_sg` + PRP enumeration.  Per-tag `rc_volume_dma_va[][]`
+bounce buffers are gone (~33 MiB freed at QD=32); the WRITE
+bvec→DMA-buffer memcpy in `queue_rq` and the READ DMA→bvec memcpy
+in `.complete` are both gone with them.
+
+Queue limits added `virt_boundary_mask = PAGE_SIZE - 1` so blk-mq
+splits bios so every segment after the first is page-aligned —
+which is what NVMe PRP semantics require (PRP1 may have an in-page
+offset, PRP2+ must be page-aligned).  `rc_volume_build_prp` walks
+the dma_map_sg output one page at a time, handling IOMMU-coalesced
+multi-page sg entries correctly.
+
+`pdu->sg[RC_VOLUME_DATA_PAGES]` is inline in the per-request command
+data (cmd_size += ~5 KiB per tag = ~165 KiB total at QD=32 vs the
+33 MiB it replaced).  `rc_volume_unmap_request_sg` is idempotent and
+called from `.complete` for the normal path; the timeout direct-end
+safety-nets call it too so an unmapped sg never leaks through the
+no-`.complete` paths.
+
+Bench impact on the dev box: ~2× at 64 K reads (2.1 GB/s vs 1.1 GB/s
+before — the eliminated READ memcpy in softirq was the bottleneck),
+~6.7 GB/s at 1 M (was ~4.4), flat at 4 M (already bandwidth-bound).
+4 K direct slightly worse (249 MB/s vs 1.3 reported in earlier
+benches) — single-page transfers see `dma_map_sg` overhead without
+amortising it, but most workloads aren't 4 K direct anyway.
+
 ### Controller reset (manual)
 
 `rc_nvme_reset_controller(adapter)` is the recovery path out of the

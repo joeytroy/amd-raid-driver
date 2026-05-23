@@ -37,6 +37,8 @@
 #include <linux/blkdev.h>
 #include <linux/blk-mq.h>
 #include <linux/highmem.h>
+#include <linux/scatterlist.h>
+#include <linux/dma-mapping.h>
 
 /* Trivial global volume registry — assumes a single RAID0 volume.  Members
  * are inserted as their metadata validates.  Ordered by PCI BDF so the
@@ -75,27 +77,30 @@ MODULE_PARM_DESC(enable_writes,
 static struct gendisk *rc_volume_disk;
 static struct blk_mq_tag_set rc_volume_tagset;
 
-/* Per-tag-per-member persistent DMA buffer + PRP list buffer (allocated
- * once at volume create).  We size the blk-mq tag pool to match — each
- * tag has a dedicated 512 KiB data buffer on every member, since at
- * submit time we don't yet know which member the request will route to
- * (and the same tag can route to either member on different requests).
+/* Per-tag-per-member PRP-list buffer (allocated once at volume create).
+ * Used for two distinct purposes — never simultaneously, since they
+ * correspond to different NVMe opcodes:
  *
- *   data buf is 512 KiB per tag — the largest single NVMe READ this
- *   controller allows (Crucial T700 reports Identify Controller MDTS=7
- *   at CAP.MPSMIN=0, so 2^7 * 4 KiB = 512 KiB).  A full 1 MiB stripe
- *   becomes two READs.
- *   PRP list buf is PAGE_SIZE per tag — holds 512 8-byte entries, well
- *   above the 127 needed for 128 pages.
- *   Total: QD * 2 members * (512K + 4K) = QD * 1.03 MB.  At QD=32 that's
- *   ~33 MB on the dev box.
+ *   - READ/WRITE > 2 pages: holds the PRP list entries the controller
+ *     reads to walk through page 2..N of the transfer.
+ *   - DSM Deallocate (DISCARD): holds the range list (one 16-byte entry).
+ *
+ * Per-tag-per-member because (a) the same tag may route to different
+ * members on different requests, and (b) each member sits in its own
+ * IOMMU domain so the DMA handle is only valid on the owning pdev.
+ *
+ * Data buffers themselves are no longer per-tag.  Hardware DMAs directly
+ * to/from the bio's user pages via blk_rq_map_sg + dma_map_sg, and
+ * rc_volume_build_prp enumerates the resulting scatterlist into PRPs.
+ *
+ * Total memory cost: PAGE_SIZE × QD × member_count = 256 KiB at QD=32 on
+ * a 2-member volume.  (Was ~33 MiB before the scatterlist-native
+ * refactor, which dominated by the per-tag 512 KiB bounce buffers.)
  */
 #define RC_VOLUME_DATA_PAGES	128
 #define RC_VOLUME_DATA_BYTES	(RC_VOLUME_DATA_PAGES * PAGE_SIZE)
 #define RC_VOLUME_QUEUE_DEPTH	32
 
-static void       *rc_volume_dma_va[RC_VOLUME_MAX_MEMBERS][RC_VOLUME_QUEUE_DEPTH];
-static dma_addr_t  rc_volume_dma_pa[RC_VOLUME_MAX_MEMBERS][RC_VOLUME_QUEUE_DEPTH];
 static __le64     *rc_volume_prp_va[RC_VOLUME_MAX_MEMBERS][RC_VOLUME_QUEUE_DEPTH];
 static dma_addr_t  rc_volume_prp_pa[RC_VOLUME_MAX_MEMBERS][RC_VOLUME_QUEUE_DEPTH];
 
@@ -111,12 +116,18 @@ static dma_addr_t  rc_volume_prp_pa[RC_VOLUME_MAX_MEMBERS][RC_VOLUME_QUEUE_DEPTH
  *
  * sc_sct is the cumulative status: 0 if all members succeeded; non-zero
  * if any member returned an error.  (For multi-member FLUSH the writes
- * are racy under concurrency but error-vs-not is preserved correctly.) */
+ * are racy under concurrency but error-vs-not is preserved correctly.)
+ *
+ * sg + nents hold the dma_map_sg result for READ/WRITE so .complete (or
+ * the timeout safety-net) can dma_unmap_sg.  nents=0 means no mapping is
+ * outstanding (FLUSH, DISCARD, early-error path). */
 struct rc_volume_pdu {
-	int       member_idx;
-	u8        op;             /* req_op() value */
-	u16       sc_sct;         /* NVMe SC/SCT, 0 = success */
-	atomic_t  members_pending;
+	int                member_idx;
+	u8                 op;             /* req_op() value */
+	u16                sc_sct;         /* NVMe SC/SCT, 0 = success */
+	atomic_t           members_pending;
+	int                nents;          /* dma_map_sg output count, 0 = not mapped */
+	struct scatterlist sg[RC_VOLUME_DATA_PAGES];
 };
 
 /* Sentinel value stored into pdu->sc_sct by the drain path so .complete
@@ -1317,17 +1328,136 @@ out:
 	mutex_unlock(&rc_volume_lock);
 }
 
-/* Build an NVMe READ/WRITE SQE for one volume member.  PRP1 is the per-tag
- * data buffer on that member's pdev; PRP list (also per-tag-per-member) is
- * filled in for transfers spanning more than 2 pages.  CID = tag.  FUA is
- * passed through when the request has REQ_FUA set. */
+/* DMA direction for the data phase of a READ/WRITE request. */
+static inline enum dma_data_direction rc_volume_dma_dir(u8 op)
+{
+	return (op == REQ_OP_READ) ? DMA_FROM_DEVICE : DMA_TO_DEVICE;
+}
+
+/* Map the request's bvecs into a scatterlist DMA-mapped on the target
+ * member's pdev.  Stashes nents in the pdu so .complete (and the
+ * timeout safety-net) can unmap.  Returns 0 on success or a blk_status_t
+ * suitable for ending the request. */
+static blk_status_t rc_volume_map_request_sg(struct request *req,
+					      struct rc_volume_pdu *pdu,
+					      int member_idx)
+{
+	struct device *dma_dev = &rc_volume_members[member_idx]->pdev->dev;
+	int input_nents, mapped_nents;
+
+	sg_init_table(pdu->sg, RC_VOLUME_DATA_PAGES);
+	input_nents = blk_rq_map_sg(req, pdu->sg);
+	if (input_nents <= 0)
+		return BLK_STS_IOERR;
+	if (input_nents > RC_VOLUME_DATA_PAGES) {
+		/* virt_boundary + max_segments should make this impossible;
+		 * keep it as a defence-in-depth check rather than trusting
+		 * blk-mq's accounting silently. */
+		rc_printk(RC_ERROR,
+			  "rc_volume_map_request_sg: %d input segments > %d max — request rejected\n",
+			  input_nents, RC_VOLUME_DATA_PAGES);
+		return BLK_STS_IOERR;
+	}
+
+	mapped_nents = dma_map_sg(dma_dev, pdu->sg, input_nents,
+				  rc_volume_dma_dir(pdu->op));
+	if (mapped_nents == 0)
+		return BLK_STS_IOERR;
+
+	pdu->nents = mapped_nents;
+	return BLK_STS_OK;
+}
+
+/* Idempotent dma_unmap_sg.  Safe to call when no mapping is outstanding
+ * (nents=0 — true for FLUSH, DISCARD, or early-error paths). */
+static void rc_volume_unmap_request_sg(struct rc_volume_pdu *pdu)
+{
+	struct device *dma_dev;
+
+	if (!pdu->nents)
+		return;
+	if (pdu->member_idx < 0 || pdu->member_idx >= rc_volume_member_count) {
+		pdu->nents = 0;
+		return;
+	}
+	dma_dev = &rc_volume_members[pdu->member_idx]->pdev->dev;
+	dma_unmap_sg(dma_dev, pdu->sg, pdu->nents, rc_volume_dma_dir(pdu->op));
+	pdu->nents = 0;
+}
+
+/* Enumerate DMA-mapped scatterlist into NVMe PRP1 / PRP2 / PRP list.
+ *
+ * Rules:
+ *   - PRP1 may have an in-page offset.
+ *   - PRP2 onwards must point at the start of a page.  blk-mq's
+ *     virt_boundary_mask=PAGE_SIZE-1 enforces page-aligned segment starts
+ *     after the first, so a single scatterlist entry can span multiple
+ *     pages only when dma_map_sg coalesces them — in which case
+ *     successive page-aligned addresses inside that entry are still
+ *     valid PRP entries.
+ *
+ * The page-walk handles both cases: for the first sg entry, peel off
+ * the partial first page into PRP1 then walk page-aligned chunks; for
+ * subsequent entries, every PAGE_SIZE chunk is a fresh PRP entry.
+ *
+ * For >2 pages, PRP2 is replaced with the address of the per-tag PRP
+ * list buffer (filled in along the way).  Two-page transfers use PRP2
+ * directly.  Single-page transfers leave PRP2 zero. */
+static void rc_volume_build_prp(struct rc_nvme_sqe *cmd, int member_idx, u32 tag,
+				struct scatterlist *sgl, int nents)
+{
+	__le64 *prp_list      = rc_volume_prp_va[member_idx][tag];
+	dma_addr_t prp_list_pa = rc_volume_prp_pa[member_idx][tag];
+	struct scatterlist *sg;
+	unsigned int n_pages = 0;
+	int i;
+
+	cmd->prp1 = 0;
+	cmd->prp2 = 0;
+
+	for_each_sg(sgl, sg, nents, i) {
+		dma_addr_t addr = sg_dma_address(sg);
+		unsigned int len = sg_dma_len(sg);
+
+		if (i == 0) {
+			unsigned int off = offset_in_page(addr);
+			unsigned int first = min_t(unsigned int,
+						   len, PAGE_SIZE - off);
+
+			cmd->prp1 = cpu_to_le64(addr);
+			n_pages++;
+			addr += first;
+			len  -= first;
+			/* addr is now page-aligned (either the next page
+			 * after the offset-adjusted first page, or right at
+			 * len==0 if the transfer fit in the first page). */
+		}
+
+		while (len) {
+			unsigned int chunk = min_t(unsigned int, len, PAGE_SIZE);
+
+			if (n_pages == 1)
+				cmd->prp2 = cpu_to_le64(addr);
+			prp_list[n_pages - 1] = cpu_to_le64(addr);
+
+			n_pages++;
+			addr += PAGE_SIZE;
+			len  -= chunk;
+		}
+	}
+
+	if (n_pages > 2)
+		cmd->prp2 = cpu_to_le64(prp_list_pa);
+}
+
+/* Build an NVMe READ/WRITE SQE.  CID = tag.  FUA passed through when the
+ * request has REQ_FUA set.  Caller has already dma_map_sg'd the bvecs
+ * into pdu->sg / pdu->nents; rc_volume_build_prp enumerates those pages
+ * into PRP1/PRP2 (and the per-tag PRP list if > 2 pages). */
 static void rc_volume_build_io_sqe(struct rc_nvme_sqe *cmd, int member_idx,
 				   u32 tag, u8 opc, u64 slba, u16 nlb_zbased,
-				   bool fua)
+				   bool fua, struct scatterlist *sgl, int nents)
 {
-	u32 bytes = ((u32)nlb_zbased + 1) * 512u;
-	u32 pages = (bytes + PAGE_SIZE - 1) / PAGE_SIZE;
-	dma_addr_t data_dma = rc_volume_dma_pa[member_idx][tag];
 	u32 cdw12 = nlb_zbased;
 
 	if (fua)
@@ -1337,20 +1467,11 @@ static void rc_volume_build_io_sqe(struct rc_nvme_sqe *cmd, int member_idx,
 	cmd->opc   = opc;
 	cmd->cid   = cpu_to_le16((u16)tag);
 	cmd->nsid  = cpu_to_le32(1);
-	cmd->prp1  = cpu_to_le64(data_dma);
 	cmd->cdw10 = cpu_to_le32((u32)(slba & 0xffffffff));
 	cmd->cdw11 = cpu_to_le32((u32)(slba >> 32));
 	cmd->cdw12 = cpu_to_le32(cdw12);
 
-	if (pages == 2) {
-		cmd->prp2 = cpu_to_le64(data_dma + PAGE_SIZE);
-	} else if (pages > 2) {
-		__le64 *list = rc_volume_prp_va[member_idx][tag];
-		u32 i;
-		for (i = 0; i + 1 < pages; i++)
-			list[i] = cpu_to_le64(data_dma + (i + 1) * PAGE_SIZE);
-		cmd->prp2 = cpu_to_le64(rc_volume_prp_pa[member_idx][tag]);
-	}
+	rc_volume_build_prp(cmd, member_idx, tag, sgl, nents);
 }
 
 /* Build an NVMe FLUSH SQE for one member.  No data, no PRPs, just opcode +
@@ -1405,17 +1526,17 @@ static inline bool rc_volume_any_member_dead(void)
 /* blk-mq request handler.  chunk_sectors=stripe_sectors in queue_limits
  * keeps each request inside one stripe, so it maps to exactly one member.
  *
- * Async submission: stage the bvec for WRITE → submit SQE with CID=tag →
- * return BLK_STS_OK.  Completion lands in rc_nvme_irq, which calls
- * blk_mq_complete_request(req); rc_volume_complete then runs in softirq
- * and finishes the request (memcpy out for READ, blk_mq_end_request). */
+ * Async submission: dma_map_sg the bio's pages, build PRPs from the
+ * resulting scatterlist, submit SQE with CID=tag, return BLK_STS_OK.
+ * Completion lands in rc_nvme_irq, which calls blk_mq_complete_request;
+ * rc_volume_complete then runs in softirq, dma_unmap_sg's the pages, and
+ * ends the request.  Hardware DMAs directly to/from the bio's user
+ * pages — no bounce buffers, no memcpy on either side. */
 static blk_status_t rc_volume_queue_rq(struct blk_mq_hw_ctx *hctx,
 				       const struct blk_mq_queue_data *bd)
 {
 	struct request *req = bd->rq;
 	struct rc_volume_pdu *pdu = blk_mq_rq_to_pdu(req);
-	struct bio_vec bvec;
-	struct req_iterator iter;
 	sector_t pos = blk_rq_pos(req);
 	unsigned int nr_sectors = blk_rq_sectors(req);
 	enum req_op op = req_op(req);
@@ -1423,11 +1544,12 @@ static blk_status_t rc_volume_queue_rq(struct blk_mq_hw_ctx *hctx,
 	u64 phys_lba;
 	u32 tag = req->tag;
 	struct rc_nvme_sqe cmd;
-	size_t off;
+	blk_status_t st;
 	int i;
 
 	pdu->op = op;
 	pdu->sc_sct = 0;
+	pdu->nents = 0;
 
 	/* If any member adapter has been flagged dead (by the ISR's CSTS
 	 * check, by a prior timeout, or by drain), the RAID0 volume can't
@@ -1481,23 +1603,21 @@ static blk_status_t rc_volume_queue_rq(struct blk_mq_hw_ctx *hctx,
 		return BLK_STS_OK;
 	}
 
-	if (op == REQ_OP_WRITE) {
-		off = 0;
-		rq_for_each_segment(bvec, req, iter) {
-			u8 *kaddr = kmap_local_page(bvec.bv_page);
-			memcpy((u8 *)rc_volume_dma_va[member_idx][tag] + off,
-			       kaddr + bvec.bv_offset,
-			       bvec.bv_len);
-			kunmap_local(kaddr);
-			off += bvec.bv_len;
-		}
+	/* READ/WRITE: dma_map_sg the request's bvecs onto the target member,
+	 * then build the SQE with PRPs derived from the mapped scatterlist. */
+	st = rc_volume_map_request_sg(req, pdu, member_idx);
+	if (st != BLK_STS_OK) {
+		blk_mq_start_request(req);
+		blk_mq_end_request(req, st);
+		return BLK_STS_OK;
 	}
 
 	rc_volume_build_io_sqe(&cmd, member_idx, tag,
 			       op == REQ_OP_WRITE ? RC_NVME_NVM_OP_WRITE
 						  : RC_NVME_NVM_OP_READ,
 			       phys_lba, (u16)(nr_sectors - 1),
-			       (req->cmd_flags & REQ_FUA) != 0);
+			       (req->cmd_flags & REQ_FUA) != 0,
+			       pdu->sg, pdu->nents);
 
 	/* Must call blk_mq_start_request BEFORE submitting — otherwise the
 	 * ISR could complete the request before blk-mq considers it started. */
@@ -1507,15 +1627,15 @@ static blk_status_t rc_volume_queue_rq(struct blk_mq_hw_ctx *hctx,
 }
 
 /* Tagset .complete callback — runs in softirq after blk_mq_complete_request
- * is called from the ISR.  Copy the per-tag DMA buffer back out to bvecs
- * for READ; end the request with the recorded status. */
+ * is called from the ISR (or from the drain path).  dma_unmap_sg releases
+ * the IOMMU mapping for the bio's user pages; the data is already in place
+ * (hardware DMA'd to/from the user pages directly).  Ends the request with
+ * the recorded status. */
 static void rc_volume_complete(struct request *req)
 {
 	struct rc_volume_pdu *pdu = blk_mq_rq_to_pdu(req);
-	struct bio_vec bvec;
-	struct req_iterator iter;
-	u32 tag = req->tag;
-	size_t off;
+
+	rc_volume_unmap_request_sg(pdu);
 
 	if (pdu->sc_sct) {
 		/* pdu->sc_sct holds CQE.status >> 1, so:
@@ -1548,18 +1668,6 @@ static void rc_volume_complete(struct request *req)
 		}
 		blk_mq_end_request(req, BLK_STS_IOERR);
 		return;
-	}
-
-	if (pdu->op == REQ_OP_READ) {
-		off = 0;
-		rq_for_each_segment(bvec, req, iter) {
-			u8 *kaddr = kmap_local_page(bvec.bv_page);
-			memcpy(kaddr + bvec.bv_offset,
-			       (u8 *)rc_volume_dma_va[pdu->member_idx][tag] + off,
-			       bvec.bv_len);
-			kunmap_local(kaddr);
-			off += bvec.bv_len;
-		}
 	}
 
 	blk_mq_end_request(req, BLK_STS_OK);
@@ -1680,8 +1788,13 @@ static enum blk_eh_timer_return rc_volume_timeout(struct request *req)
 			  req->tag, pdu->op);
 		rc_volume_drain_dead();
 		rc_volume_schedule_auto_reset_for_req(pdu);
-		if (!blk_mq_request_completed(req))
+		if (!blk_mq_request_completed(req)) {
+			/* Drain should have caught it; if it didn't (e.g.,
+			 * member_idx out of range for some reason) the
+			 * direct end path bypasses .complete, so unmap here. */
+			rc_volume_unmap_request_sg(pdu);
 			blk_mq_end_request(req, BLK_STS_IOERR);
+		}
 		return BLK_EH_DONE;
 	}
 
@@ -1710,8 +1823,10 @@ static enum blk_eh_timer_return rc_volume_timeout(struct request *req)
 	}
 	rc_volume_drain_dead();
 	rc_volume_schedule_auto_reset_for_req(pdu);
-	if (!blk_mq_request_completed(req))
+	if (!blk_mq_request_completed(req)) {
+		rc_volume_unmap_request_sg(pdu);
 		blk_mq_end_request(req, BLK_STS_TIMEOUT);
+	}
 	return BLK_EH_DONE;
 }
 
@@ -1732,22 +1847,16 @@ static int rc_volume_create_disk(void)
 	u64 total_sectors;
 	int i, ret;
 
-	/* Per-tag, per-member: a 512 KiB data buffer + PAGE_SIZE PRP list.
-	 * Tag = NVMe CID; the same tag may route to different members on
-	 * different requests, so each member needs its own buffer pool. */
+	/* Per-tag, per-member PRP-list buffer (PAGE_SIZE each).  Tag = NVMe
+	 * CID; the same tag may route to different members on different
+	 * requests, so each member needs its own pool.  Data buffers no
+	 * longer exist here — hardware DMAs directly to the bio's pages via
+	 * dma_map_sg in rc_volume_queue_rq. */
 	for (i = 0; i < rc_volume_member_count; i++) {
 		struct device *dev = &rc_volume_members[i]->pdev->dev;
 		u32 t;
 
 		for (t = 0; t < RC_VOLUME_QUEUE_DEPTH; t++) {
-			rc_volume_dma_va[i][t] =
-				dma_alloc_coherent(dev, RC_VOLUME_DATA_BYTES,
-						   &rc_volume_dma_pa[i][t],
-						   GFP_KERNEL);
-			if (!rc_volume_dma_va[i][t]) {
-				ret = -ENOMEM;
-				goto err_free_dma;
-			}
 			rc_volume_prp_va[i][t] =
 				dma_alloc_coherent(dev, PAGE_SIZE,
 						   &rc_volume_prp_pa[i][t],
@@ -1784,6 +1893,12 @@ static int rc_volume_create_disk(void)
 			.max_hw_sectors      = RC_VOLUME_DATA_BYTES / 512,
 			.max_segments        = RC_VOLUME_DATA_PAGES,
 			.max_segment_size    = PAGE_SIZE,
+			/* NVMe PRP semantics: PRP1 may carry an in-page offset,
+			 * PRP2 and PRP-list entries must point at page starts.
+			 * virt_boundary forces blk-mq to split bvecs so every
+			 * segment after the first is page-aligned, which is what
+			 * rc_volume_build_prp relies on. */
+			.virt_boundary_mask  = PAGE_SIZE - 1,
 			/* Requests never cross a RAID0 stripe boundary, so every
 			 * non-flush request maps to one member and one NVMe READ
 			 * or WRITE.  FLUSH is fanned out separately. */
@@ -1855,12 +1970,6 @@ err_free_dma:
 		u32 t;
 
 		for (t = 0; t < RC_VOLUME_QUEUE_DEPTH; t++) {
-			if (rc_volume_dma_va[i][t]) {
-				dma_free_coherent(dev, RC_VOLUME_DATA_BYTES,
-						  rc_volume_dma_va[i][t],
-						  rc_volume_dma_pa[i][t]);
-				rc_volume_dma_va[i][t] = NULL;
-			}
 			if (rc_volume_prp_va[i][t]) {
 				dma_free_coherent(dev, PAGE_SIZE,
 						  rc_volume_prp_va[i][t],
@@ -1892,14 +2001,6 @@ void rc_volume_teardown(void)
 			u32 t;
 
 			for (t = 0; t < RC_VOLUME_QUEUE_DEPTH; t++) {
-				if (rc_volume_dma_va[i][t]) {
-					dma_free_coherent(dev,
-							  RC_VOLUME_DATA_BYTES,
-							  rc_volume_dma_va[i][t],
-							  rc_volume_dma_pa[i][t]);
-					rc_volume_dma_va[i][t] = NULL;
-					rc_volume_dma_pa[i][t] = 0;
-				}
 				if (rc_volume_prp_va[i][t]) {
 					dma_free_coherent(dev, PAGE_SIZE,
 							  rc_volume_prp_va[i][t],

@@ -30,8 +30,12 @@ on the roadmap.
   reset on first timeout per death episode, and manual reset via
   `echo 1 > /sys/bus/pci/devices/<bdf>/rcraid/reset` as the fallback
   when auto-reset itself fails.  See `docs/ERROR_HANDLING.md`.
+- Scatterlist-native DMA: hardware reads/writes the bio's user pages
+  directly via `dma_map_sg` + PRP enumeration — no bounce buffer, no
+  memcpy on either side.  Drops ~33 MiB of pinned per-tag buffers vs
+  the prior path.
 - Bench throughput on a 2-member Crucial T700 RAID0 dev box:
-  ~1.3 GB/s @ `bs=4K`, ~4.7 GB/s @ `bs=4M`, ~11.9 GB/s aggregate
+  ~2.1 GB/s @ `bs=64K`, ~6.7 GB/s @ `bs=1M`, ~11.9 GB/s aggregate
   across 8 concurrent readers.
 
 See `docs/STATUS.md` for the full state and the next-steps list.
@@ -70,8 +74,6 @@ roadmap.
   re-dispatched after a successful controller reset rather than
   bubbling up as I/O errors.
 - Per-CPU I/O queues.  Single hw queue caps small-I/O IOPS today.
-- `scatterlist`-native DMA.  We currently bounce through per-tag-per-
-  member DMA buffers (~33 MiB pinned at QD=32).
 - Suspend / resume hooks.
 - `rcadm`-equivalent userspace tooling (create / inspect / delete
   arrays).  Today the array must already exist.
