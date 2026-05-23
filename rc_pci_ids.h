@@ -11,31 +11,54 @@
 #ifndef _RC_PCI_IDS_H_
 #define _RC_PCI_IDS_H_
 
-// AMD Vendor ID
+/*
+ * Canonical AMD-RAID PCI identifiers from the Windows driver's
+ * rcbottom.inf.  AMD ships exactly these five Device IDs.  The much
+ * larger CPU/chipset support matrix on AMD's website
+ * (X870E/X870/B850/B840/X670E/X670/B650E/B650/A620; Ryzen 7000+;
+ * Threadripper 7000/9000; Ryzen AI 300 / AI Max 300) all expose one
+ * of these five PCI IDs depending on the controller variant — the
+ * IDs themselves are not chipset-specific.
+ *
+ * Class codes:
+ *   CC_0104 = Mass Storage / RAID  → AHCI-style command path
+ *   CC_0108 = Mass Storage / NVMe  → NVMe command path
+ */
 #define RC_PD_VID_AMD                0x1022
 
-// AMD RAID Device IDs (from rcbottom.inf)
-#define RC_PD_DID_BRISTOL            0x7905  // AMD Bristol RAID mode
-#define RC_PD_DID_PROMONTORY         0x43BD  // AMD Promontory SATA controller  
-#define RC_PD_DID_SUMMIT             0x7916  // AMD Summit RAID mode
-#define RC_PD_DID_X570S              0x7917  // AMD X570S chipset RAID mode
-#define RC_PD_DID_NVME_RAID_BOTTOM   0xB000  // AMD NVMe RAID Bottom Device
+/* SATA RAID variants — class code 0x0104, AHCI-style path. */
+#define RC_PD_DID_BRISTOL            0x7905  /* older SATA RAID */
+#define RC_PD_DID_PROMONTORY         0x43BD  /* Promontory SATA RAID */
+#define RC_PD_DID_SUMMIT             0x7916  /* older SATA RAID */
+#define RC_PD_DID_X570S              0x7917  /* X570S-era SATA RAID */
 
-// PCI Class Codes (from Windows drivers)
-#define RC_PCI_CLASS_SCSI_ADAPTER    0x010400  // SCSIAdapter
-#define RC_PCI_CLASS_NVME_CONTROLLER 0x010800  // Non-Volatile memory controller
+/* NVMe RAID variant — class code 0x0108, NVMe command path.
+ * Used by TRX50/WRX90 (Threadripper 7000/9000) and by the X870/B850
+ * consumer chipsets' NVMe RAID controllers. */
+#define RC_PD_DID_NVME_RAID_BOTTOM   0xB000
 
-// Power Management Settings (from rcbottom.inf)
+/* PCI class codes the driver checks at probe / firmware-dispatch time. */
+#define RC_PCI_CLASS_SCSI_ADAPTER    0x010400
+#define RC_PCI_CLASS_NVME_CONTROLLER 0x010800
+
+/*
+ * Settings extracted from AMD's INF files; not all are wired into the
+ * Linux driver yet (most apply only to the AHCI path that's not on
+ * the live B000 code path).  Kept here so the values are documented
+ * in one place and can be referenced when the AHCI path is built.
+ */
 #define RC_HIPM_ENABLE               0xFFFFFFFF
 #define RC_DIPM_DISABLE              0x00000000
 #define RC_HMB_POLICY_DEFAULT        0x00000002
 
-// MSI Settings (from rcbottom.inf)
+/* MSI: 9.3.2 limited to 5 vectors; 9.3.3 raised to 16.  We currently
+ * request 1 (single-interrupt polling); revisit when we add
+ * interrupt-driven completion. */
 #define RC_MSI_SUPPORTED             1
-#define RC_MSI_MESSAGE_LIMIT         5
-#define RC_MSI_AFFINITY_POLICY       5  // Spread messages across all processors
+#define RC_MSI_MESSAGE_LIMIT_9_3_2   5
+#define RC_MSI_MESSAGE_LIMIT_9_3_3   16
+#define RC_MSI_AFFINITY_POLICY       5
 
-// RAID Configuration (from rcraid.inf)
 #define RC_NUMBER_OF_REQUESTS        254
 #define RC_BUS_TYPE                  0x00000008
 #define RC_ENABLE_AN                 0x00000000
@@ -44,7 +67,6 @@
 #define RC_STORAGE_FEATURES          0x1
 #define RC_DRIVER_PARAMETER          "CSMI=Limited;"
 
-// SCSI Template Constants
 #define ENABLE_CLUSTERING            1
 
 #endif /* _RC_PCI_IDS_H_ */

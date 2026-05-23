@@ -19,6 +19,31 @@ on the roadmap.
 
 See `docs/STATUS.md` for the full state and the next-steps list.
 
+## Hardware support
+
+The driver claims the same five PCI IDs as AMD's Windows
+`rcbottom.sys`, covering both the NVMe and the older SATA RAID
+controllers AMD has shipped:
+
+| PCI ID | Variant | Status here |
+|--------|---------|-------------|
+| `1022:B000` | NVMe RAID Bottom (TRX50, WRX90, X870E/X870, B850/B840, X670E/X670, etc.) | **Fully implemented, RAID0 R/W validated.** |
+| `1022:43BD` | Promontory SATA RAID | Claimed; AHCI path is stub. |
+| `1022:7905` | Older SATA RAID | Claimed; AHCI path is stub. |
+| `1022:7916` | Older SATA RAID | Claimed; AHCI path is stub. |
+| `1022:7917` | X570S-era SATA RAID | Claimed; AHCI path is stub. |
+
+These IDs cover every CPU/chipset in AMD's published support matrix
+for `rcraid` — Ryzen 7000+ desktop, Ryzen AI 300 / AI Max 300,
+Threadripper 7000 / 9000 (TRX50 / WRX90), and the X870/B850/X670/B650
+consumer chipsets.  The platform variety is in firmware, not in
+distinct PCI devices.
+
+RAID-level coverage matches AMD: RAID 0, 1, 10 are target features
+for any of the above; RAID 5 is only supported by AMD on the 3rd Gen
+Threadripper (TRX40 / Castle Peak) and is not currently on our
+roadmap.
+
 ## What's NOT here yet
 
 - RAID levels other than RAID0 (RAID1 / 5 / 10 are roadmap).

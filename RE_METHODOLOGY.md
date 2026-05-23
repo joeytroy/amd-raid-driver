@@ -52,10 +52,39 @@ The following lawfully obtained binaries are used as study material:
 | `drivers/reference/amd-sdk-9.3.0/.../*.c`, `*.h` | Same SDK | AMD's GPL'd open-source kernel-glue layer. Read for **API understanding only**. None of its code is included in this driver. |
 
 All Windows binaries (.sys / .inf / .cat) were obtained from AMD's
-publicly accessible driver download page, which serves the files
-without any click-through license agreement (EULA). No Windows
-installation media or system image was used to obtain the files; the
-distributed driver bundle is the sole source.
+publicly accessible driver download page. No Windows installation
+media or system image was used to obtain the files; the distributed
+driver bundle is the sole source.
+
+The AMD distribution page presents end-user license terms in a
+**browse-wrap** form (notice on the download page rather than a
+required "I Agree" checkbox).  Those terms purport to prohibit
+reverse engineering of the binaries.  We acknowledge this and
+proceed under the following position, which is asserted in good
+faith but not adjudicated:
+
+1. The statutory interoperability exception in 17 U.S.C. § 1201(f)
+   is a federal carve-out that, on the better view, cannot be
+   waived by a contractual term in a browse-wrap notice.  *Bowers v.
+   Baystate Technologies*, 320 F.3d 1317 (Fed. Cir. 2003) is cited
+   for the contrary position; *Specht v. Netscape Communications*,
+   306 F.3d 17 (2d Cir. 2002) and similar browse-wrap cases support
+   the view that mere notice without affirmative acceptance is
+   inadequate to form a binding contract.
+2. The interoperability work in this repository is the minimum
+   necessary to allow an independently authored Linux driver to
+   interoperate with AMD-RAID hardware that lawful purchasers of
+   that hardware already own; no AMD code is copied into this
+   project, and the produced kernel module does not link against
+   any AMD-distributed binary.
+3. The primary IP holder of the Software per the EULA's own
+   Proprietary Rights section is Seagate Technology PLC (AMD
+   distributes under license from Seagate); the analysis above
+   applies equally to either party.
+
+Maintainers and contributors who are concerned about the legal
+posture in their own jurisdiction should consult counsel before
+publishing, distributing, or contributing.
 
 The Linux SDK was likewise obtained from AMD's public driver page.
 It ships with its own license file (`LICENSE_SDK`) which restricts

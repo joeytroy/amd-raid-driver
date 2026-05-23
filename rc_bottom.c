@@ -16,11 +16,28 @@
 #include "rc_linux.h"
 
 /*----------------------------------------------------------------------
- * PCI identity table (from Windows rcbottom.inf)
+ * PCI identity table.  Mirrors the five entries in AMD's
+ * Windows rcbottom.inf (9.3.2/9.3.3): four SATA-RAID device IDs
+ * (class 0x0104, AHCI-style path) plus the NVMe RAID Bottom device
+ * (class 0x0108, NVMe path).
+ *
+ * Status of each path:
+ *   0xB000  NVMe RAID Bottom    — fully implemented and validated
+ *   0x43BD  Promontory SATA     — claimed, AHCI path is stub
+ *   0x7905  older SATA RAID     — claimed, AHCI path is stub
+ *   0x7916  older SATA RAID     — claimed, AHCI path is stub
+ *   0x7917  X570S-era SATA RAID — claimed, AHCI path is stub
+ *
+ * Binding all five so modalias matching works for any board that
+ * AMD's own driver would handle.  When the AHCI path is built out
+ * (see docs/STATUS.md), no PCI-table change will be needed.
  *----------------------------------------------------------------------*/
 static const struct pci_device_id rc_bottom_pci_tbl[] = {
-    { PCI_DEVICE(0x1022, 0x43bd) }, /* AMD Promontory SATA RAID bottom device */
-    { PCI_DEVICE(0x1022, 0xb000) }, /* AMD NVMe RAID Bottom Device (TRX50) */
+    { PCI_DEVICE(RC_PD_VID_AMD, RC_PD_DID_BRISTOL)          },
+    { PCI_DEVICE(RC_PD_VID_AMD, RC_PD_DID_PROMONTORY)       },
+    { PCI_DEVICE(RC_PD_VID_AMD, RC_PD_DID_SUMMIT)           },
+    { PCI_DEVICE(RC_PD_VID_AMD, RC_PD_DID_X570S)            },
+    { PCI_DEVICE(RC_PD_VID_AMD, RC_PD_DID_NVME_RAID_BOTTOM) },
     { 0, }
 };
 
