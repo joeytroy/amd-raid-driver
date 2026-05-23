@@ -433,9 +433,15 @@ static int rc_nvme_wait_admin_completion(struct rc_adapter *adapter)
 /* Inner admin-command path; caller must hold nvme->admin_mutex.  Used
  * directly by rc_nvme_reset_controller, which already holds the mutex
  * for the entire reset sequence and would deadlock if the public wrapper
- * tried to re-take it.  Same behaviour as rc_nvme_admin_cmd otherwise. */
+ * tried to re-take it.  Same behaviour as rc_nvme_admin_cmd otherwise.
+ *
+ * If out_result is non-NULL, the CQE's DW0 (command-specific result) is
+ * stored there before the CQ slot is released.  Used by Set Features et
+ * al. to read back their response data; pass NULL when the result isn't
+ * meaningful. */
 static int __rc_nvme_admin_cmd_locked(struct rc_adapter *adapter,
-				      struct rc_nvme_sqe *cmd)
+				      struct rc_nvme_sqe *cmd,
+				      u32 *out_result)
 {
 	struct rc_nvme_state *nvme = &adapter->ctx.nvme;
 	struct rc_nvme_sqe *slot;
@@ -464,6 +470,8 @@ static int __rc_nvme_admin_cmd_locked(struct rc_adapter *adapter,
 	cqe = (struct rc_nvme_cqe *)nvme->admin_cq + nvme->admin_cq_head;
 	status = le16_to_cpu(cqe->status);
 	sc_sct = (status >> 1) & 0x7fff;
+	if (out_result)
+		*out_result = le32_to_cpu(cqe->result);
 
 	nvme->admin_cq_head = (nvme->admin_cq_head + 1) % nvme->admin_cq_depth;
 	if (nvme->admin_cq_head == 0)
@@ -485,14 +493,17 @@ static int __rc_nvme_admin_cmd_locked(struct rc_adapter *adapter,
  * we manage CID = 0 since only one admin command is in flight at a time —
  * the admin_mutex serialises against teardown and against timeout-issued
  * Aborts that run from a different process context.
+ *
+ * out_result: see __rc_nvme_admin_cmd_locked.
  */
-static int rc_nvme_admin_cmd(struct rc_adapter *adapter, struct rc_nvme_sqe *cmd)
+static int rc_nvme_admin_cmd(struct rc_adapter *adapter,
+			     struct rc_nvme_sqe *cmd, u32 *out_result)
 {
 	struct rc_nvme_state *nvme = &adapter->ctx.nvme;
 	int ret;
 
 	mutex_lock(&nvme->admin_mutex);
-	ret = __rc_nvme_admin_cmd_locked(adapter, cmd);
+	ret = __rc_nvme_admin_cmd_locked(adapter, cmd, out_result);
 	mutex_unlock(&nvme->admin_mutex);
 	return ret;
 }
@@ -510,7 +521,7 @@ static int rc_nvme_abort(struct rc_adapter *adapter, u16 sqid, u16 cid)
 
 	cmd.opc   = RC_NVME_ADMIN_OP_ABORT;
 	cmd.cdw10 = cpu_to_le32(((u32)cid << 16) | sqid);
-	return rc_nvme_admin_cmd(adapter, &cmd);
+	return rc_nvme_admin_cmd(adapter, &cmd, NULL);
 }
 
 /* Submit a single Identify Controller (CNS=01h) admin command, poll for
@@ -534,7 +545,7 @@ static int rc_nvme_identify_controller(struct rc_adapter *adapter)
 	cmd.prp1  = cpu_to_le64(id_dma);
 	cmd.cdw10 = cpu_to_le32(RC_NVME_IDENTIFY_CNS_CTRL);
 
-	ret = rc_nvme_admin_cmd(adapter, &cmd);
+	ret = rc_nvme_admin_cmd(adapter, &cmd, NULL);
 	if (ret)
 		goto out;
 
@@ -589,7 +600,7 @@ static int rc_nvme_identify_namespace(struct rc_adapter *adapter, u32 nsid)
 	cmd.prp1  = cpu_to_le64(id_dma);
 	cmd.cdw10 = cpu_to_le32(RC_NVME_IDENTIFY_CNS_NS);
 
-	ret = rc_nvme_admin_cmd(adapter, &cmd);
+	ret = rc_nvme_admin_cmd(adapter, &cmd, NULL);
 	if (ret)
 		goto out;
 
@@ -620,6 +631,60 @@ static int rc_nvme_identify_namespace(struct rc_adapter *adapter, u32 nsid)
 out:
 	dma_free_coherent(dev, RC_NVME_IDENTIFY_BYTES, id_buf, id_dma);
 	return ret;
+}
+
+/* Request `requested` I/O queue pairs from the controller via Set
+ * Features Number of Queues (FID 0x07).  The controller may grant
+ * fewer; the granted count is parsed from CQE.result DW0:
+ *
+ *   bits  15:0  = NSQA (Number of SQs Allocated, 0's based)
+ *   bits 31:16  = NCQA (Number of CQs Allocated, 0's based)
+ *
+ * We take min(NSQA+1, NCQA+1, requested) as the usable count and store
+ * it in nvme->nr_io_queues for the queue-creation path to read.
+ *
+ * Important: per NVMe spec, the controller default is 0 I/O queues
+ * unless this admin command is issued.  Without it, Create I/O CQ
+ * would fail with "Invalid Queue Identifier".  Single-queue setups
+ * survived without it on the dev box because the controller appears
+ * to silently allow qid=1 — that's lucky, not portable. */
+static int rc_nvme_set_num_queues(struct rc_adapter *adapter, u16 requested)
+{
+	struct rc_nvme_state *nvme = &adapter->ctx.nvme;
+	struct rc_nvme_sqe cmd = {};
+	u32 result = 0;
+	u16 nsqa_plus1, ncqa_plus1, granted;
+	int ret;
+
+	if (requested == 0)
+		return -EINVAL;
+
+	cmd.opc   = RC_NVME_ADMIN_OP_SET_FEATURES;
+	cmd.cdw10 = cpu_to_le32(RC_NVME_FID_NUMBER_OF_QUEUES);
+	/* CDW11 carries the requested counts as 0's based.  We ask for the
+	 * same number of SQs and CQs since our model is one CQ per SQ. */
+	cmd.cdw11 = cpu_to_le32(((u32)(requested - 1) << 16) |
+				(u32)(requested - 1));
+
+	ret = rc_nvme_admin_cmd(adapter, &cmd, &result);
+	if (ret) {
+		rc_printk(RC_ERROR,
+			  "rc_nvme_set_num_queues: %s Set Features failed (%d)\n",
+			  pci_name(adapter->pdev), ret);
+		return ret;
+	}
+
+	nsqa_plus1 = (u16)(result & 0xffff) + 1;
+	ncqa_plus1 = (u16)((result >> 16) & 0xffff) + 1;
+	granted = min3(nsqa_plus1, ncqa_plus1, requested);
+
+	nvme->nr_io_queues = granted;
+
+	rc_printk(RC_NOTE,
+		  "rc_nvme_set_num_queues: %s requested=%u granted_sq=%u granted_cq=%u using=%u\n",
+		  pci_name(adapter->pdev), requested,
+		  nsqa_plus1, ncqa_plus1, granted);
+	return 0;
 }
 
 /* Allocate one I/O completion + submission queue pair (qid=1) and ask the
@@ -667,7 +732,7 @@ static int rc_nvme_create_io_queues(struct rc_adapter *adapter)
 	cmd.cdw10 = cpu_to_le32(((u32)(depth - 1) << 16) | RC_NVME_IO_QID);
 	/* CDW11[31:16]=IV (vector 0), [1]=IEN (raise IRQ on completion), [0]=PC. */
 	cmd.cdw11 = cpu_to_le32((0u << 16) | 0x3u);
-	ret = rc_nvme_admin_cmd(adapter, &cmd);
+	ret = rc_nvme_admin_cmd(adapter, &cmd, NULL);
 	if (ret) {
 		rc_printk(RC_ERROR,
 			  "rc_nvme_create_io_queues: Create I/O CQ failed (%d)\n", ret);
@@ -684,7 +749,7 @@ static int rc_nvme_create_io_queues(struct rc_adapter *adapter)
 	cmd.prp1  = cpu_to_le64(nvme->io_sq_dma);
 	cmd.cdw10 = cpu_to_le32(((u32)(depth - 1) << 16) | RC_NVME_IO_QID);
 	cmd.cdw11 = cpu_to_le32(((u32)RC_NVME_IO_QID << 16) | 0x1u);  /* CQID, PC=1 */
-	ret = rc_nvme_admin_cmd(adapter, &cmd);
+	ret = rc_nvme_admin_cmd(adapter, &cmd, NULL);
 	if (ret) {
 		rc_printk(RC_ERROR,
 			  "rc_nvme_create_io_queues: Create I/O SQ failed (%d)\n", ret);
@@ -700,7 +765,7 @@ err_delete_cq:
 	memset(&cmd, 0, sizeof(cmd));
 	cmd.opc   = RC_NVME_ADMIN_OP_DELETE_IO_CQ;
 	cmd.cdw10 = cpu_to_le32(RC_NVME_IO_QID);
-	(void)rc_nvme_admin_cmd(adapter, &cmd);
+	(void)rc_nvme_admin_cmd(adapter, &cmd, NULL);
 err_free_cq:
 	dma_free_coherent(dev, cq_bytes, nvme->io_cq, nvme->io_cq_dma);
 	nvme->io_cq = NULL;
@@ -2029,7 +2094,7 @@ static void rc_nvme_destroy_io_queues(struct rc_adapter *adapter)
 		memset(&cmd, 0, sizeof(cmd));
 		cmd.opc   = RC_NVME_ADMIN_OP_DELETE_IO_SQ;
 		cmd.cdw10 = cpu_to_le32(RC_NVME_IO_QID);
-		(void)rc_nvme_admin_cmd(adapter, &cmd);
+		(void)rc_nvme_admin_cmd(adapter, &cmd, NULL);
 		dma_free_coherent(dev,
 				  (size_t)nvme->io_sq_depth * RC_NVME_SQ_ENTRY_SIZE,
 				  nvme->io_sq, nvme->io_sq_dma);
@@ -2039,7 +2104,7 @@ static void rc_nvme_destroy_io_queues(struct rc_adapter *adapter)
 		memset(&cmd, 0, sizeof(cmd));
 		cmd.opc   = RC_NVME_ADMIN_OP_DELETE_IO_CQ;
 		cmd.cdw10 = cpu_to_le32(RC_NVME_IO_QID);
-		(void)rc_nvme_admin_cmd(adapter, &cmd);
+		(void)rc_nvme_admin_cmd(adapter, &cmd, NULL);
 		dma_free_coherent(dev,
 				  (size_t)nvme->io_cq_depth * RC_NVME_CQ_ENTRY_SIZE,
 				  nvme->io_cq, nvme->io_cq_dma);
@@ -2234,7 +2299,7 @@ int rc_nvme_reset_controller(struct rc_adapter *adapter)
 		cmd.cdw10 = cpu_to_le32(((u32)(nvme->io_cq_depth - 1) << 16) |
 					RC_NVME_IO_QID);
 		cmd.cdw11 = cpu_to_le32((0u << 16) | 0x3u);  /* IV=0, IEN=1, PC=1 */
-		ret = __rc_nvme_admin_cmd_locked(adapter, &cmd);
+		ret = __rc_nvme_admin_cmd_locked(adapter, &cmd, NULL);
 		if (ret) {
 			rc_printk(RC_ERROR,
 				  "rc_nvme_reset_controller: %s Create I/O CQ failed (%d) — adapter remains dead\n",
@@ -2249,7 +2314,7 @@ int rc_nvme_reset_controller(struct rc_adapter *adapter)
 		cmd.cdw10 = cpu_to_le32(((u32)(nvme->io_sq_depth - 1) << 16) |
 					RC_NVME_IO_QID);
 		cmd.cdw11 = cpu_to_le32(((u32)RC_NVME_IO_QID << 16) | 0x1u);
-		ret = __rc_nvme_admin_cmd_locked(adapter, &cmd);
+		ret = __rc_nvme_admin_cmd_locked(adapter, &cmd, NULL);
 		if (ret) {
 			rc_printk(RC_ERROR,
 				  "rc_nvme_reset_controller: %s Create I/O SQ failed (%d) — adapter remains dead\n",
@@ -2404,7 +2469,21 @@ int rc_nvme_init_controller(struct rc_adapter *adapter)
 			  "rc_nvme_init_controller: identify namespace nsid=1 failed (%d)\n",
 			  ret);
 
-	/* One I/O queue pair so the upper layer can submit NVM commands. */
+	/* Tell the controller how many I/O queue pairs we plan to use.  Per
+	 * NVMe spec this must happen before Create I/O CQ/SQ.  Step 2 of
+	 * the multi-queue work just requests RC_NVME_IO_QUEUE_TARGET and
+	 * stores the granted count; step 3 will create that many queues. */
+	ret = rc_nvme_set_num_queues(adapter, RC_NVME_IO_QUEUE_TARGET);
+	if (ret) {
+		rc_printk(RC_WARN,
+			  "rc_nvme_init_controller: Set Features Number of Queues failed (%d) — falling back to 1 I/O queue\n",
+			  ret);
+		nvme->nr_io_queues = 1;
+	}
+
+	/* One I/O queue pair so the upper layer can submit NVM commands.
+	 * Step 3 will replace this with a loop creating nvme->nr_io_queues
+	 * pairs, each with its own MSI-X vector. */
 	ret = rc_nvme_create_io_queues(adapter);
 	if (ret) {
 		rc_printk(RC_WARN,

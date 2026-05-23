@@ -168,7 +168,14 @@ struct rc_nvme_state {
     u32            ns1_lba_bytes;     // LBA size in bytes (e.g. 512 or 4096)
     u64            ns1_nsze;          // total LBAs in the namespace
 
-    // I/O queue 1 (single pair, polled). Allocated after admin Identify.
+    // I/O queue count granted by the controller in response to
+    // Set Features Number of Queues at init.  Will be 1 throughout
+    // step 2 (we don't create extras yet); step 3 grows queue
+    // creation to use this value.  See docs/WINDOWS_MULTIQUEUE_FINDINGS.md
+    // for the target architecture.
+    u16            nr_io_queues;
+
+    // I/O queue 1 (single pair). Allocated after admin Identify.
     void          *io_sq;             // 64-byte SQE array
     dma_addr_t     io_sq_dma;
     u16            io_sq_depth;
@@ -457,6 +464,10 @@ void rc_config_cleanup(void);
 #define RC_NVME_ADMIN_OP_CREATE_IO_CQ	0x05
 #define RC_NVME_ADMIN_OP_IDENTIFY	0x06
 #define RC_NVME_ADMIN_OP_ABORT		0x08
+#define RC_NVME_ADMIN_OP_SET_FEATURES	0x09
+
+/* Feature IDs for Set Features (CDW10[7:0]). */
+#define RC_NVME_FID_NUMBER_OF_QUEUES	0x07
 
 /* NVM I/O opcodes (NVMe 1.4 §6) */
 #define RC_NVME_NVM_OP_FLUSH		0x00
@@ -478,6 +489,14 @@ struct rc_nvme_dsm_range {
  * currently submit (one READ at a time) and well under MQES (=65536). */
 #define RC_NVME_IO_QUEUE_DEPTH		64
 #define RC_NVME_IO_QID			1u
+
+/* Target number of I/O queue pairs to request at init via Set Features
+ * Number of Queues.  Matches Windows rcbottom.sys's hardcoded cap (see
+ * docs/WINDOWS_MULTIQUEUE_FINDINGS.md).  Controller may grant fewer;
+ * the granted count lands in nvme->nr_io_queues.  Step 3 of the
+ * multi-queue work will create this many queue pairs and use a per-CPU
+ * blk-mq hctx mapping. */
+#define RC_NVME_IO_QUEUE_TARGET		4u
 
 /* AMD RAIDCore per-member metadata block (one LBA per member at LBA 0x5000).
  * Layout matches struct RC_MetaData from AMD's open Linux SDK
