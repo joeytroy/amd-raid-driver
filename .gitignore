@@ -47,9 +47,10 @@ dmesg.log
 *.tmp
 *.temp
 
-# Compiled binaries
-rcraid
-rcraid_generic
+# Compiled binaries (root-anchored so we don't accidentally ignore the
+# drivers/windows/.../rcraid/ source-binary directories)
+/rcraid
+/rcraid_generic
 
 # Driver installation directory
 /dd/
