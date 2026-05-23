@@ -111,6 +111,18 @@ are best-effort/untested.
   writer never sets it for RAID0; the firmware uses a hardcoded 2048
   sector (1 MiB) default. Driver now uses ChunkSize when non-zero
   and falls back to the per-DeviceType default otherwise.
+- **Write support behind `enable_writes` module parameter.** The
+  `rc_volume_io_member` helper takes an opcode (READ/WRITE), and
+  `rc_volume_queue_rq` handles both `REQ_OP_READ` and `REQ_OP_WRITE`:
+  for writes, it stages bvec data into the per-member DMA buffer
+  before submitting NVMe WRITE (opcode 0x01). The volume is read-only
+  by default; loading with `enable_writes=1` drops the
+  `set_disk_ro(1)` and routes writes through. Member positions come
+  from the on-disk `RC_LogicalElement_LE` array — corruption-safe by
+  construction once the LD parser succeeds. Verified end-to-end on
+  the dev box with paired writes at sectors ~10^9 to both members
+  followed by read-back — patterns match exactly, adjacent sectors
+  untouched, no AMD-Vi events or kernel warnings.
 
 ### Implemented before this pass, may need revisiting
 
@@ -168,16 +180,24 @@ logical sector 40960 (member 0, phys 0x5000).  Larger blocks scale
 much further now that one NVMe READ carries up to 512 KiB:
 ~3.6 GB/s @ `bs=512K`, ~4.4 GB/s @ `bs=1M`, ~4.7 GB/s @ `bs=4M`.
 
+For writes, load the module with `enable_writes=1`:
+
+```sh
+sudo modprobe -r rcraid && sudo insmod rcraid.ko enable_writes=1
+```
+
+`/dev/rcraid0` then accepts writes (lsblk's `RO` column reads 0) and
+routes them through NVMe WRITE (opcode 0x01) at the per-member
+position derived from the on-disk LD record.
+
 ## Next implementation steps (in order)
 
-1. **Write support** behind a flag — now safe because member
-   positions are sourced from the on-disk LD record. Add NVMe WRITE
-   (opcode 0x01) to the `rc_volume_read_member` path, drop the
-   `set_disk_ro(1)`, gate behind `enable_writes=1` module parameter.
-2. **Interrupt-driven completion** for both admin and I/O queues.
-3. **Per-CPU I/O queues** to improve concurrency.
-4. **Multiple-volume / non-RAID0 support** — the parser already
+1. **Interrupt-driven completion** for both admin and I/O queues.
+   Currently polls with `usleep_range`; dispatch holds a kworker per
+   outstanding I/O. MSI vectors are already registered.
+2. **Per-CPU I/O queues** to improve concurrency.
+3. **Multiple-volume / non-RAID0 support** — the LD parser already
    handles other `RC_LDT_*` device types in principle; the stripe
    mapping and elsewhere need RAID-level-specific paths.
-5. **(future)** Bigger rewrite of the legacy AHCI scaffolding (rc_blk.c,
+4. **(future)** Bigger rewrite of the legacy AHCI scaffolding (rc_blk.c,
    proven on a populated array.

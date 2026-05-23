@@ -639,8 +639,10 @@ int rc_raid_array_ioctl(struct block_device *bdev, fmode_t mode, unsigned int cm
 #define RC_NVME_ADMIN_OP_CREATE_IO_CQ	0x05
 #define RC_NVME_ADMIN_OP_IDENTIFY	0x06
 
-/* NVM I/O opcodes */
+/* NVM I/O opcodes (NVMe 1.4 §6) */
+#define RC_NVME_NVM_OP_WRITE		0x01
 #define RC_NVME_NVM_OP_READ		0x02
+#define RC_NVME_NVM_OP_FLUSH		0x00
 
 /* I/O queue depth; clamped against CAP.MQES. 64 is plenty for what we
  * currently submit (one READ at a time) and well under MQES (=65536). */

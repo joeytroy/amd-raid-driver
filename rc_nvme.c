@@ -39,12 +39,21 @@ static DEFINE_MUTEX(rc_volume_lock);
 #define RC_VOLUME_EXPECTED_MEMBERS	2
 
 /* Member-ordering override: 0 = PCI BDF ascending (default), 1 = reverse.
- * Until we decode the explicit position field in the metadata, this is the
- * escape hatch if reads come back wrong on a populated array. */
+ * Used only when the on-disk LD parser fails — normally member positions
+ * come from RC_LogicalElement_LE indexing and this is ignored. */
 static int rc_volume_reverse_order;
 module_param_named(reverse_member_order, rc_volume_reverse_order, int, 0644);
 MODULE_PARM_DESC(reverse_member_order,
-		 "If non-zero, sort members by descending PCI BDF instead of ascending");
+		 "Fallback only (no LD parsed): if non-zero, sort members by descending PCI BDF");
+
+/* Writes are read-only by default.  Setting this to 1 at load time exposes
+ * /dev/rcraid0 as read-write and routes REQ_OP_WRITE through NVMe WRITE.
+ * Off by default because a misconfigured stripe map or member ordering would
+ * corrupt the array; verify reads behave correctly first. */
+static int rc_volume_enable_writes;
+module_param_named(enable_writes, rc_volume_enable_writes, int, 0444);
+MODULE_PARM_DESC(enable_writes,
+		 "If non-zero, expose /dev/rcraid0 as read-write (default 0). Verify the array contents look right via reads BEFORE enabling.");
 
 /* gendisk state — at most one volume right now. */
 static struct gendisk *rc_volume_disk;
@@ -1076,10 +1085,13 @@ out:
 	mutex_unlock(&rc_volume_lock);
 }
 
-/* Submit a multi-page NVMe READ for one member, using PRP1/PRP2 directly or
- * a PRP list as needed.  Up to RC_VOLUME_DATA_BYTES per call.  Reads into
- * rc_volume_dma_va[member_idx]. */
-static int rc_volume_read_member(int member_idx, u64 slba, u16 nlb_zbased)
+/* Submit one NVMe NVM-set I/O command (READ or WRITE) for one member,
+ * targeting the per-member persistent DMA buffer.  Uses PRP1/PRP2 directly
+ * when the transfer fits in 2 pages, a PRP list otherwise.  Up to
+ * RC_VOLUME_DATA_BYTES per call.  Caller is responsible for staging data
+ * into the buffer before a WRITE and copying data out after a READ. */
+static int rc_volume_io_member(int member_idx, u8 opc, u64 slba,
+			       u16 nlb_zbased)
 {
 	struct rc_adapter *adapter = rc_volume_members[member_idx];
 	u32 bytes = ((u32)nlb_zbased + 1) * 512u;
@@ -1091,7 +1103,7 @@ static int rc_volume_read_member(int member_idx, u64 slba, u16 nlb_zbased)
 		return -EINVAL;
 
 	memset(&cmd, 0, sizeof(cmd));
-	cmd.opc   = RC_NVME_NVM_OP_READ;
+	cmd.opc   = opc;
 	cmd.nsid  = cpu_to_le32(1);
 	cmd.prp1  = cpu_to_le64(data_dma);
 	cmd.cdw10 = cpu_to_le32((u32)(slba & 0xffffffff));
@@ -1111,10 +1123,11 @@ static int rc_volume_read_member(int member_idx, u64 slba, u16 nlb_zbased)
 }
 
 /* blk-mq request handler.  With chunk_sectors == stripe_sectors set in the
- * queue limits, every request is guaranteed to stay within a single stripe
- * and therefore maps to one member.  So we issue exactly one NVMe READ per
- * request (NLB = nr_sectors-1) into the per-member persistent DMA buffer,
- * then copy out to the bvecs.  Read-only for now.  Sleep is OK here. */
+ * queue limits, every request stays within a single stripe and maps to one
+ * member.  Per request we either:
+ *   READ:  issue one NVMe READ into the per-member buffer, copy out to bvecs
+ *   WRITE: copy bvecs into the per-member buffer, issue one NVMe WRITE
+ * Sleep is OK here (tagset has BLK_MQ_F_BLOCKING). */
 static blk_status_t rc_volume_queue_rq(struct blk_mq_hw_ctx *hctx,
 				       const struct blk_mq_queue_data *bd)
 {
@@ -1123,6 +1136,7 @@ static blk_status_t rc_volume_queue_rq(struct blk_mq_hw_ctx *hctx,
 	struct req_iterator iter;
 	sector_t pos = blk_rq_pos(req);
 	unsigned int nr_sectors = blk_rq_sectors(req);
+	enum req_op op = req_op(req);
 	int member_idx;
 	u64 phys_lba;
 	int ret;
@@ -1130,7 +1144,7 @@ static blk_status_t rc_volume_queue_rq(struct blk_mq_hw_ctx *hctx,
 
 	blk_mq_start_request(req);
 
-	if (req_op(req) != REQ_OP_READ) {
+	if (op != REQ_OP_READ && op != REQ_OP_WRITE) {
 		blk_mq_end_request(req, BLK_STS_IOERR);
 		return BLK_STS_OK;
 	}
@@ -1142,7 +1156,30 @@ static blk_status_t rc_volume_queue_rq(struct blk_mq_hw_ctx *hctx,
 	}
 
 	rc_volume_map_lba(pos, &member_idx, &phys_lba);
-	ret = rc_volume_read_member(member_idx, phys_lba, (u16)(nr_sectors - 1));
+
+	if (op == REQ_OP_WRITE) {
+		/* Stage bvec data into the per-member DMA buffer. */
+		off = 0;
+		rq_for_each_segment(bvec, req, iter) {
+			u8 *kaddr = kmap_local_page(bvec.bv_page);
+			memcpy((u8 *)rc_volume_dma_va[member_idx] + off,
+			       kaddr + bvec.bv_offset,
+			       bvec.bv_len);
+			kunmap_local(kaddr);
+			off += bvec.bv_len;
+		}
+		ret = rc_volume_io_member(member_idx, RC_NVME_NVM_OP_WRITE,
+					  phys_lba, (u16)(nr_sectors - 1));
+		if (ret)
+			blk_mq_end_request(req, BLK_STS_IOERR);
+		else
+			blk_mq_end_request(req, BLK_STS_OK);
+		return BLK_STS_OK;
+	}
+
+	/* REQ_OP_READ */
+	ret = rc_volume_io_member(member_idx, RC_NVME_NVM_OP_READ, phys_lba,
+				  (u16)(nr_sectors - 1));
 	if (ret) {
 		blk_mq_end_request(req, BLK_STS_IOERR);
 		return BLK_STS_OK;
@@ -1250,8 +1287,14 @@ static int rc_volume_create_disk(void)
 	rc_volume_disk->minors      = 1;
 	rc_volume_disk->first_minor = 0;
 	rc_volume_disk->flags       = GENHD_FL_NO_PART;
-	/* Read-only — writes would corrupt the array. */
-	set_disk_ro(rc_volume_disk, 1);
+	/* Read-only unless the operator explicitly opted in via the module
+	 * parameter.  Note the parameter is 0444 (read-only sysfs) so it
+	 * can only be set at load time — re-load to switch modes. */
+	if (!rc_volume_enable_writes)
+		set_disk_ro(rc_volume_disk, 1);
+	rc_printk(RC_NOTE,
+		  "rc_volume_create_disk: writes %s\n",
+		  rc_volume_enable_writes ? "ENABLED" : "disabled (load with enable_writes=1 to allow)");
 
 	ret = add_disk(rc_volume_disk);
 	if (ret)
