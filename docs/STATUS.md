@@ -124,6 +124,33 @@ are best-effort/untested.
   followed by read-back — patterns match exactly, adjacent sectors
   untouched, no AMD-Vi events or kernel warnings.
 
+### True async completion (Stage 2)
+
+`rc_volume_queue_rq` now submits + returns `BLK_STS_OK` immediately;
+the dispatch path is non-blocking (no more `BLK_MQ_F_BLOCKING`).
+The MSI handler `rc_nvme_irq` walks the I/O CQ, looks each CQE's
+CID up via `blk_mq_tag_to_rq`, and completes the request with
+`blk_mq_complete_request`.  A new `.complete` callback runs in
+softirq and finishes the request: bvec memcpy for READ, then
+`blk_mq_end_request`.  Per-adapter `spin_lock_irqsave` guards the
+SQ tail (submitter) + CQ head (ISR).
+
+Queue depth raised from 1 → 32.  Per-tag-per-member DMA buffer pool
+(`rc_volume_dma_va[member][tag]`) backs the bounce-buffer staging
+for each in-flight request — memory cost ~33 MiB on the dev box.
+
+NVMe CID = blk-mq tag, so the ISR's CID→request lookup is O(1) via
+`blk_mq_tag_to_rq`.  A boot-time `rc_nvme_io_cmd_sync` helper keeps
+the metadata-read path synchronous (uses the same MSI wake path
+since `rc_volume_disk` is NULL during boot and `rc_nvme_irq`
+returns early without touching the CQ).
+
+Concurrent-reader bench on the dev box (8 × `dd bs=1M count=128`,
+spread across the volume): **11.9 GB/s aggregate**, ~2× what
+Stage 1 could sustain.  Single-threaded `bench.sh` also up
+30–70 % across block sizes (1.3 GB/s @ 4K, 1.9 GB/s @ 8K).  No
+"unknown CID" warnings, no RCU complaints, no IRQ disable.
+
 ### Interrupt-driven CQE wakeup (Stage 1)
 
 `rc_nvme_io_cmd` and `rc_nvme_admin_cmd` now sleep on per-queue

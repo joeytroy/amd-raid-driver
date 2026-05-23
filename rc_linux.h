@@ -205,12 +205,14 @@ struct rc_nvme_state {
     void __iomem  *sq_doorbell_base;  // BAR0 + 0x1000
 
     // Wait queues woken from the MSI handler when a CQE arrives.
-    // Submitters use wait_event_timeout against these with a phase-bit
-    // predicate, so spurious wakes (or wakes for the other queue) are
-    // harmless.  Stage 1 of interrupt-driven completion — submitter still
-    // consumes the CQE and advances head + doorbell.
+    // Admin path uses admin_cq_wait + wait_event_timeout to be woken
+    // when the admin CQE arrives.  I/O completions go fully async:
+    // the ISR walks io_cq, calls blk_mq_complete_request per CQE,
+    // and the .complete callback finishes the request in softirq.
+    // io_lock guards io_sq_tail, io_cq_head, io_cq_phase.
     wait_queue_head_t admin_cq_wait;
     wait_queue_head_t io_cq_wait;
+    spinlock_t        io_lock;
 };
 
 // Device context layout (clean-room mirror of the Windows device extension)

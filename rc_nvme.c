@@ -75,23 +75,37 @@ MODULE_PARM_DESC(enable_writes,
 static struct gendisk *rc_volume_disk;
 static struct blk_mq_tag_set rc_volume_tagset;
 
-/* Per-member persistent DMA buffer + PRP list buffer (allocated once at
- * volume create).  Queue depth is 1 so a single buffer per member is safe.
+/* Per-tag-per-member persistent DMA buffer + PRP list buffer (allocated
+ * once at volume create).  We size the blk-mq tag pool to match — each
+ * tag has a dedicated 512 KiB data buffer on every member, since at
+ * submit time we don't yet know which member the request will route to
+ * (and the same tag can route to either member on different requests).
  *
- *   data buf is 512 KiB (128 pages) — the largest single NVMe READ this
+ *   data buf is 512 KiB per tag — the largest single NVMe READ this
  *   controller allows (Crucial T700 reports Identify Controller MDTS=7
  *   at CAP.MPSMIN=0, so 2^7 * 4 KiB = 512 KiB).  A full 1 MiB stripe
- *   becomes two READs, which blk-mq dispatches back-to-back.
- *   PRP list buf is PAGE_SIZE — holds 512 8-byte entries, well above the
- *   127 needed for 128 pages (PRP1 covers page 0, list covers 1..127).
+ *   becomes two READs.
+ *   PRP list buf is PAGE_SIZE per tag — holds 512 8-byte entries, well
+ *   above the 127 needed for 128 pages.
+ *   Total: QD * 2 members * (512K + 4K) = QD * 1.03 MB.  At QD=32 that's
+ *   ~33 MB on the dev box.
  */
 #define RC_VOLUME_DATA_PAGES	128
 #define RC_VOLUME_DATA_BYTES	(RC_VOLUME_DATA_PAGES * PAGE_SIZE)
+#define RC_VOLUME_QUEUE_DEPTH	32
 
-static void       *rc_volume_dma_va[RC_VOLUME_MAX_MEMBERS];
-static dma_addr_t  rc_volume_dma_pa[RC_VOLUME_MAX_MEMBERS];
-static __le64     *rc_volume_prp_va[RC_VOLUME_MAX_MEMBERS];
-static dma_addr_t  rc_volume_prp_pa[RC_VOLUME_MAX_MEMBERS];
+static void       *rc_volume_dma_va[RC_VOLUME_MAX_MEMBERS][RC_VOLUME_QUEUE_DEPTH];
+static dma_addr_t  rc_volume_dma_pa[RC_VOLUME_MAX_MEMBERS][RC_VOLUME_QUEUE_DEPTH];
+static __le64     *rc_volume_prp_va[RC_VOLUME_MAX_MEMBERS][RC_VOLUME_QUEUE_DEPTH];
+static dma_addr_t  rc_volume_prp_pa[RC_VOLUME_MAX_MEMBERS][RC_VOLUME_QUEUE_DEPTH];
+
+/* blk-mq per-request command data: the routing decision (which member,
+ * what op) and the CQE status the ISR writes back. */
+struct rc_volume_pdu {
+	int member_idx;
+	u8  op;             /* REQ_OP_READ or REQ_OP_WRITE */
+	u16 sc_sct;         /* NVMe SC/SCT (0 = success), set by ISR */
+};
 
 #define RC_NVME_CC_DEFAULT	\
 	(RC_NVME_CC_IOSQES_64 | RC_NVME_CC_IOCQES_16 | \
@@ -108,20 +122,6 @@ static inline void rc_nvme_writeq(u64 v, void __iomem *base, u32 off)
 {
 	writel((u32)v, base + off);
 	writel((u32)(v >> 32), base + off + 4);
-}
-
-/* MSI handler called from rc_hw_interrupt_handler when ctrl_mode == NVMe.
- * Stage 1 of interrupt-driven completion: the handler just wakes both CQ
- * wait queues; the sleeping submitters re-evaluate the phase-bit predicate
- * and process the CQE themselves.  Returning IRQ_HANDLED is safe even when
- * the wake is spurious — Linux only counts spurious for IRQ_NONE returns. */
-irqreturn_t rc_nvme_irq(struct rc_adapter *adapter)
-{
-	struct rc_nvme_state *nvme = &adapter->ctx.nvme;
-
-	wake_up(&nvme->admin_cq_wait);
-	wake_up(&nvme->io_cq_wait);
-	return IRQ_HANDLED;
 }
 
 /* Doorbells live at BAR0 + 0x1000, striped by (4 << DSTRD). For each queue
@@ -143,6 +143,69 @@ static inline void rc_nvme_ring_cq_doorbell(struct rc_adapter *adapter,
 	u32 stride = 4u << nvme->dstrd;
 	writel(value, adapter->ctx.mmio_base + RC_NVME_REG_DBL_BASE +
 		      (u32)(2 * qid + 1) * stride);
+}
+
+/* MSI handler called from rc_hw_interrupt_handler when ctrl_mode == NVMe.
+ *
+ * Admin path: just wake admin_cq_wait.  The single admin submitter that
+ * may be in flight at boot consumes its own CQE.
+ *
+ * I/O path: walk io_cq for all CQEs at the expected phase; for each one
+ * look up the in-flight request via blk_mq_tag_to_rq(cid) and complete
+ * it with blk_mq_complete_request — the .complete callback then runs in
+ * softirq, does the bvec memcpy (for READ) and blk_mq_end_request. */
+irqreturn_t rc_nvme_irq(struct rc_adapter *adapter)
+{
+	struct rc_nvme_state *nvme = &adapter->ctx.nvme;
+	struct blk_mq_tags *tags;
+	bool advanced = false;
+
+	/* Always wake admin + io waiters first — the boot-time sync I/O
+	 * helper (rc_nvme_io_cmd_sync) sleeps on io_cq_wait and consumes
+	 * its own CQE before the disk exists.  Only after rc_volume_disk
+	 * is up do we own the CQ in the ISR. */
+	wake_up(&nvme->admin_cq_wait);
+	wake_up(&nvme->io_cq_wait);
+
+	if (!nvme->io_cq || !rc_volume_disk)
+		return IRQ_HANDLED;
+
+	tags = rc_volume_tagset.tags[0];
+
+	spin_lock(&nvme->io_lock);
+	for (;;) {
+		struct rc_nvme_cqe *cqe = (struct rc_nvme_cqe *)nvme->io_cq +
+					  nvme->io_cq_head;
+		u16 status = le16_to_cpu(READ_ONCE(cqe->status));
+		u16 cid;
+		struct request *req;
+		struct rc_volume_pdu *pdu;
+
+		if ((status & 1) != nvme->io_cq_phase)
+			break;
+
+		cid = le16_to_cpu(cqe->cid);
+		req = blk_mq_tag_to_rq(tags, cid);
+		if (req) {
+			pdu = blk_mq_rq_to_pdu(req);
+			pdu->sc_sct = (status >> 1) & 0x7fff;
+			blk_mq_complete_request(req);
+		} else {
+			rc_printk(RC_WARN,
+				  "rc_nvme_irq: %s CQE for unknown CID=%u (status=0x%04x)\n",
+				  pci_name(adapter->pdev), cid, status);
+		}
+
+		nvme->io_cq_head = (nvme->io_cq_head + 1) % nvme->io_cq_depth;
+		if (nvme->io_cq_head == 0)
+			nvme->io_cq_phase ^= 1;
+		advanced = true;
+	}
+	if (advanced)
+		rc_nvme_ring_cq_doorbell(adapter, RC_NVME_IO_QID,
+					 nvme->io_cq_head);
+	spin_unlock(&nvme->io_lock);
+	return IRQ_HANDLED;
 }
 
 static int rc_nvme_wait_csts(struct rc_adapter *adapter, u32 mask, u32 want)
@@ -531,35 +594,50 @@ err_free_sq:
 	return ret;
 }
 
-/* Same shape as rc_nvme_admin_cmd, but for I/O queue 1.  Sleeps on
- * io_cq_wait (woken by the MSI handler) with a periodic 10 ms fallback
- * poll-tick that protects against mis-delivered interrupts. */
-static int rc_nvme_io_cmd(struct rc_adapter *adapter, struct rc_nvme_sqe *cmd)
+/* Submit one I/O command to adapter's qid=1 SQ asynchronously.  Caller
+ * (blk-mq queue_rq) returns BLK_STS_OK immediately; completion lands in
+ * rc_nvme_irq → blk_mq_complete_request → .complete callback. */
+static void rc_nvme_io_submit(struct rc_adapter *adapter,
+			      struct rc_nvme_sqe *cmd)
 {
 	struct rc_nvme_state *nvme = &adapter->ctx.nvme;
 	struct rc_nvme_sqe *slot;
-	struct rc_nvme_cqe *cqe;
-	unsigned long deadline;
-	u8 expected_phase;
+	unsigned long flags;
 	u32 tail;
-	u16 status, sc_sct;
 
+	spin_lock_irqsave(&nvme->io_lock, flags);
 	slot = (struct rc_nvme_sqe *)nvme->io_sq + nvme->io_sq_tail;
-	cmd->cid = cpu_to_le16(0);
 	memcpy(slot, cmd, sizeof(*cmd));
 
 	tail = (nvme->io_sq_tail + 1) % nvme->io_sq_depth;
 	nvme->io_sq_tail = tail;
 	wmb();
 	rc_nvme_ring_sq_doorbell(adapter, RC_NVME_IO_QID, tail);
+	spin_unlock_irqrestore(&nvme->io_lock, flags);
+}
+
+/* Synchronous I/O command used at boot time to read metadata before the
+ * blk-mq disk is up.  Submits a single SQE with CID=0, waits on
+ * io_cq_wait until the CQE arrives (woken by rc_nvme_irq), consumes the
+ * CQE, advances head + doorbell.  Safe because rc_nvme_irq returns
+ * early — without touching the CQ — while rc_volume_disk is NULL. */
+static int rc_nvme_io_cmd_sync(struct rc_adapter *adapter,
+			       struct rc_nvme_sqe *cmd)
+{
+	struct rc_nvme_state *nvme = &adapter->ctx.nvme;
+	struct rc_nvme_cqe *cqe;
+	unsigned long deadline;
+	u8 expected_phase;
+	u16 status, sc_sct;
+
+	cmd->cid = cpu_to_le16(0);
+	rc_nvme_io_submit(adapter, cmd);
 
 	cqe = (struct rc_nvme_cqe *)nvme->io_cq + nvme->io_cq_head;
 	expected_phase = nvme->io_cq_phase;
 	deadline = jiffies + msecs_to_jiffies(RC_NVME_ADMIN_TIMEOUT_MS);
 	while (time_before(jiffies, deadline)) {
 		long left = deadline - jiffies;
-		/* Safety-net poll tick — kept tiny so a mis-armed MSI doesn't
-		 * tank throughput.  Real wakeups land via rc_nvme_irq. */
 		long tick = min_t(long, left, max_t(long, 1, msecs_to_jiffies(1)));
 
 		if (wait_event_timeout(nvme->io_cq_wait,
@@ -569,7 +647,7 @@ static int rc_nvme_io_cmd(struct rc_adapter *adapter, struct rc_nvme_sqe *cmd)
 			goto have_cqe;
 	}
 	rc_printk(RC_ERROR,
-		  "rc_nvme_io_cmd: timeout waiting for CQE (opc=0x%02x)\n",
+		  "rc_nvme_io_cmd_sync: timeout waiting for CQE (opc=0x%02x)\n",
 		  cmd->opc);
 	return -ETIMEDOUT;
 
@@ -584,8 +662,8 @@ have_cqe:
 
 	if (sc_sct) {
 		rc_printk(RC_ERROR,
-			  "rc_nvme_io_cmd: opc=0x%02x SC/SCT=0x%04x (status=0x%04x)\n",
-			  cmd->opc, sc_sct, status);
+			  "rc_nvme_io_cmd_sync: opc=0x%02x SC/SCT=0x%04x\n",
+			  cmd->opc, sc_sct);
 		return -EIO;
 	}
 	return 0;
@@ -758,7 +836,7 @@ static int rc_nvme_read_lba(struct rc_adapter *adapter, u64 slba, u16 nlb_zbased
 	cmd.cdw10 = cpu_to_le32((u32)(slba & 0xffffffff));
 	cmd.cdw11 = cpu_to_le32((u32)(slba >> 32));
 	cmd.cdw12 = cpu_to_le32(nlb_zbased);
-	return rc_nvme_io_cmd(adapter, &cmd);
+	return rc_nvme_io_cmd_sync(adapter, &cmd);
 }
 
 /* Compare two adapters by PCI BDF for deterministic member ordering. */
@@ -1133,53 +1211,48 @@ out:
 	mutex_unlock(&rc_volume_lock);
 }
 
-/* Submit one NVMe NVM-set I/O command (READ or WRITE) for one member,
- * targeting the per-member persistent DMA buffer.  Uses PRP1/PRP2 directly
- * when the transfer fits in 2 pages, a PRP list otherwise.  Up to
- * RC_VOLUME_DATA_BYTES per call.  Caller is responsible for staging data
- * into the buffer before a WRITE and copying data out after a READ. */
-static int rc_volume_io_member(int member_idx, u8 opc, u64 slba,
-			       u16 nlb_zbased)
+/* Build an NVMe READ/WRITE SQE for one volume member.  PRP1 is the per-tag
+ * data buffer on that member's pdev; PRP list (also per-tag-per-member) is
+ * filled in for transfers spanning more than 2 pages.  CID = tag. */
+static void rc_volume_build_io_sqe(struct rc_nvme_sqe *cmd, int member_idx,
+				   u32 tag, u8 opc, u64 slba, u16 nlb_zbased)
 {
-	struct rc_adapter *adapter = rc_volume_members[member_idx];
 	u32 bytes = ((u32)nlb_zbased + 1) * 512u;
 	u32 pages = (bytes + PAGE_SIZE - 1) / PAGE_SIZE;
-	dma_addr_t data_dma = rc_volume_dma_pa[member_idx];
-	struct rc_nvme_sqe cmd;
+	dma_addr_t data_dma = rc_volume_dma_pa[member_idx][tag];
 
-	if (WARN_ON_ONCE(bytes > RC_VOLUME_DATA_BYTES))
-		return -EINVAL;
-
-	memset(&cmd, 0, sizeof(cmd));
-	cmd.opc   = opc;
-	cmd.nsid  = cpu_to_le32(1);
-	cmd.prp1  = cpu_to_le64(data_dma);
-	cmd.cdw10 = cpu_to_le32((u32)(slba & 0xffffffff));
-	cmd.cdw11 = cpu_to_le32((u32)(slba >> 32));
-	cmd.cdw12 = cpu_to_le32(nlb_zbased);
+	memset(cmd, 0, sizeof(*cmd));
+	cmd->opc   = opc;
+	cmd->cid   = cpu_to_le16((u16)tag);
+	cmd->nsid  = cpu_to_le32(1);
+	cmd->prp1  = cpu_to_le64(data_dma);
+	cmd->cdw10 = cpu_to_le32((u32)(slba & 0xffffffff));
+	cmd->cdw11 = cpu_to_le32((u32)(slba >> 32));
+	cmd->cdw12 = cpu_to_le32(nlb_zbased);
 
 	if (pages == 2) {
-		cmd.prp2 = cpu_to_le64(data_dma + PAGE_SIZE);
+		cmd->prp2 = cpu_to_le64(data_dma + PAGE_SIZE);
 	} else if (pages > 2) {
-		__le64 *list = rc_volume_prp_va[member_idx];
+		__le64 *list = rc_volume_prp_va[member_idx][tag];
 		u32 i;
 		for (i = 0; i + 1 < pages; i++)
 			list[i] = cpu_to_le64(data_dma + (i + 1) * PAGE_SIZE);
-		cmd.prp2 = cpu_to_le64(rc_volume_prp_pa[member_idx]);
+		cmd->prp2 = cpu_to_le64(rc_volume_prp_pa[member_idx][tag]);
 	}
-	return rc_nvme_io_cmd(adapter, &cmd);
 }
 
-/* blk-mq request handler.  With chunk_sectors == stripe_sectors set in the
- * queue limits, every request stays within a single stripe and maps to one
- * member.  Per request we either:
- *   READ:  issue one NVMe READ into the per-member buffer, copy out to bvecs
- *   WRITE: copy bvecs into the per-member buffer, issue one NVMe WRITE
- * Sleep is OK here (tagset has BLK_MQ_F_BLOCKING). */
+/* blk-mq request handler.  chunk_sectors=stripe_sectors in queue_limits
+ * keeps each request inside one stripe, so it maps to exactly one member.
+ *
+ * Async submission: stage the bvec for WRITE → submit SQE with CID=tag →
+ * return BLK_STS_OK.  Completion lands in rc_nvme_irq, which calls
+ * blk_mq_complete_request(req); rc_volume_complete then runs in softirq
+ * and finishes the request (memcpy out for READ, blk_mq_end_request). */
 static blk_status_t rc_volume_queue_rq(struct blk_mq_hw_ctx *hctx,
 				       const struct blk_mq_queue_data *bd)
 {
 	struct request *req = bd->rq;
+	struct rc_volume_pdu *pdu = blk_mq_rq_to_pdu(req);
 	struct bio_vec bvec;
 	struct req_iterator iter;
 	sector_t pos = blk_rq_pos(req);
@@ -1187,68 +1260,86 @@ static blk_status_t rc_volume_queue_rq(struct blk_mq_hw_ctx *hctx,
 	enum req_op op = req_op(req);
 	int member_idx;
 	u64 phys_lba;
-	int ret;
+	u32 tag = req->tag;
+	struct rc_nvme_sqe cmd;
 	size_t off;
 
-	blk_mq_start_request(req);
-
 	if (op != REQ_OP_READ && op != REQ_OP_WRITE) {
+		blk_mq_start_request(req);
 		blk_mq_end_request(req, BLK_STS_IOERR);
 		return BLK_STS_OK;
 	}
 
 	if (nr_sectors == 0 || nr_sectors > (RC_VOLUME_DATA_BYTES / 512) ||
 	    pos + nr_sectors > get_capacity(rc_volume_disk)) {
+		blk_mq_start_request(req);
 		blk_mq_end_request(req, BLK_STS_IOERR);
 		return BLK_STS_OK;
 	}
 
 	rc_volume_map_lba(pos, &member_idx, &phys_lba);
+	pdu->member_idx = member_idx;
+	pdu->op = op;
+	pdu->sc_sct = 0;
 
 	if (op == REQ_OP_WRITE) {
-		/* Stage bvec data into the per-member DMA buffer. */
 		off = 0;
 		rq_for_each_segment(bvec, req, iter) {
 			u8 *kaddr = kmap_local_page(bvec.bv_page);
-			memcpy((u8 *)rc_volume_dma_va[member_idx] + off,
+			memcpy((u8 *)rc_volume_dma_va[member_idx][tag] + off,
 			       kaddr + bvec.bv_offset,
 			       bvec.bv_len);
 			kunmap_local(kaddr);
 			off += bvec.bv_len;
 		}
-		ret = rc_volume_io_member(member_idx, RC_NVME_NVM_OP_WRITE,
-					  phys_lba, (u16)(nr_sectors - 1));
-		if (ret)
-			blk_mq_end_request(req, BLK_STS_IOERR);
-		else
-			blk_mq_end_request(req, BLK_STS_OK);
-		return BLK_STS_OK;
 	}
 
-	/* REQ_OP_READ */
-	ret = rc_volume_io_member(member_idx, RC_NVME_NVM_OP_READ, phys_lba,
-				  (u16)(nr_sectors - 1));
-	if (ret) {
+	rc_volume_build_io_sqe(&cmd, member_idx, tag,
+			       op == REQ_OP_WRITE ? RC_NVME_NVM_OP_WRITE
+						  : RC_NVME_NVM_OP_READ,
+			       phys_lba, (u16)(nr_sectors - 1));
+
+	/* Must call blk_mq_start_request BEFORE submitting — otherwise the
+	 * ISR could complete the request before blk-mq considers it started. */
+	blk_mq_start_request(req);
+	rc_nvme_io_submit(rc_volume_members[member_idx], &cmd);
+	return BLK_STS_OK;
+}
+
+/* Tagset .complete callback — runs in softirq after blk_mq_complete_request
+ * is called from the ISR.  For READ ops, copy the per-tag DMA buffer back
+ * out to the bvecs; then end the request with the status the ISR recorded. */
+static void rc_volume_complete(struct request *req)
+{
+	struct rc_volume_pdu *pdu = blk_mq_rq_to_pdu(req);
+	struct bio_vec bvec;
+	struct req_iterator iter;
+	u32 tag = req->tag;
+	size_t off;
+
+	if (pdu->sc_sct) {
 		blk_mq_end_request(req, BLK_STS_IOERR);
-		return BLK_STS_OK;
+		return;
 	}
 
-	off = 0;
-	rq_for_each_segment(bvec, req, iter) {
-		u8 *kaddr = kmap_local_page(bvec.bv_page);
-		memcpy(kaddr + bvec.bv_offset,
-		       (u8 *)rc_volume_dma_va[member_idx] + off,
-		       bvec.bv_len);
-		kunmap_local(kaddr);
-		off += bvec.bv_len;
+	if (pdu->op == REQ_OP_READ) {
+		off = 0;
+		rq_for_each_segment(bvec, req, iter) {
+			u8 *kaddr = kmap_local_page(bvec.bv_page);
+			memcpy(kaddr + bvec.bv_offset,
+			       (u8 *)rc_volume_dma_va[pdu->member_idx][tag] + off,
+			       bvec.bv_len);
+			kunmap_local(kaddr);
+			off += bvec.bv_len;
+		}
 	}
 
 	blk_mq_end_request(req, BLK_STS_OK);
-	return BLK_STS_OK;
 }
 
 static const struct blk_mq_ops rc_volume_mq_ops = {
 	.queue_rq = rc_volume_queue_rq,
+	.complete = rc_volume_complete,
 };
 
 static const struct block_device_operations rc_volume_bops = {
@@ -1262,37 +1353,44 @@ static int rc_volume_create_disk(void)
 	u64 total_sectors;
 	int i, ret;
 
-	/* Per-member: a 64 KiB data buffer plus a PAGE_SIZE PRP-list buffer.
-	 * Allows one NVMe READ of up to 16 contiguous pages.  Queue depth = 1
-	 * so a single buffer per member is safe. */
+	/* Per-tag, per-member: a 512 KiB data buffer + PAGE_SIZE PRP list.
+	 * Tag = NVMe CID; the same tag may route to different members on
+	 * different requests, so each member needs its own buffer pool. */
 	for (i = 0; i < rc_volume_member_count; i++) {
 		struct device *dev = &rc_volume_members[i]->pdev->dev;
-		rc_volume_dma_va[i] =
-			dma_alloc_coherent(dev, RC_VOLUME_DATA_BYTES,
-					   &rc_volume_dma_pa[i], GFP_KERNEL);
-		if (!rc_volume_dma_va[i]) {
-			ret = -ENOMEM;
-			goto err_free_dma;
-		}
-		rc_volume_prp_va[i] =
-			dma_alloc_coherent(dev, PAGE_SIZE,
-					   &rc_volume_prp_pa[i], GFP_KERNEL);
-		if (!rc_volume_prp_va[i]) {
-			ret = -ENOMEM;
-			goto err_free_dma;
+		u32 t;
+
+		for (t = 0; t < RC_VOLUME_QUEUE_DEPTH; t++) {
+			rc_volume_dma_va[i][t] =
+				dma_alloc_coherent(dev, RC_VOLUME_DATA_BYTES,
+						   &rc_volume_dma_pa[i][t],
+						   GFP_KERNEL);
+			if (!rc_volume_dma_va[i][t]) {
+				ret = -ENOMEM;
+				goto err_free_dma;
+			}
+			rc_volume_prp_va[i][t] =
+				dma_alloc_coherent(dev, PAGE_SIZE,
+						   &rc_volume_prp_pa[i][t],
+						   GFP_KERNEL);
+			if (!rc_volume_prp_va[i][t]) {
+				ret = -ENOMEM;
+				goto err_free_dma;
+			}
 		}
 	}
 
 	memset(&rc_volume_tagset, 0, sizeof(rc_volume_tagset));
 	rc_volume_tagset.ops          = &rc_volume_mq_ops;
 	rc_volume_tagset.nr_hw_queues = 1;
-	rc_volume_tagset.queue_depth  = 1;
+	rc_volume_tagset.queue_depth  = RC_VOLUME_QUEUE_DEPTH;
 	rc_volume_tagset.numa_node    = NUMA_NO_NODE;
-	rc_volume_tagset.cmd_size     = 0;
-	/* queue_rq polls for NVMe CQE completion via usleep_range, so it
-	 * must run in blocking dispatch context — not inside blk-mq's
-	 * RCU/SRCU read-side critical section. */
-	rc_volume_tagset.flags        = BLK_MQ_F_BLOCKING;
+	rc_volume_tagset.cmd_size     = sizeof(struct rc_volume_pdu);
+	/* Async dispatch — queue_rq returns BLK_STS_OK immediately and
+	 * completion lands via rc_nvme_irq → blk_mq_complete_request →
+	 * rc_volume_complete.  No sleeping on the dispatch path → no
+	 * BLK_MQ_F_BLOCKING required. */
+	rc_volume_tagset.flags        = 0;
 
 	ret = blk_mq_alloc_tag_set(&rc_volume_tagset);
 	if (ret)
@@ -1364,17 +1462,21 @@ err_free_tagset:
 err_free_dma:
 	for (i = 0; i < rc_volume_member_count; i++) {
 		struct device *dev = &rc_volume_members[i]->pdev->dev;
-		if (rc_volume_dma_va[i]) {
-			dma_free_coherent(dev, RC_VOLUME_DATA_BYTES,
-					  rc_volume_dma_va[i],
-					  rc_volume_dma_pa[i]);
-			rc_volume_dma_va[i] = NULL;
-		}
-		if (rc_volume_prp_va[i]) {
-			dma_free_coherent(dev, PAGE_SIZE,
-					  rc_volume_prp_va[i],
-					  rc_volume_prp_pa[i]);
-			rc_volume_prp_va[i] = NULL;
+		u32 t;
+
+		for (t = 0; t < RC_VOLUME_QUEUE_DEPTH; t++) {
+			if (rc_volume_dma_va[i][t]) {
+				dma_free_coherent(dev, RC_VOLUME_DATA_BYTES,
+						  rc_volume_dma_va[i][t],
+						  rc_volume_dma_pa[i][t]);
+				rc_volume_dma_va[i][t] = NULL;
+			}
+			if (rc_volume_prp_va[i][t]) {
+				dma_free_coherent(dev, PAGE_SIZE,
+						  rc_volume_prp_va[i][t],
+						  rc_volume_prp_pa[i][t]);
+				rc_volume_prp_va[i][t] = NULL;
+			}
 		}
 	}
 	return ret;
@@ -1397,19 +1499,24 @@ void rc_volume_teardown(void)
 	for (i = 0; i < RC_VOLUME_MAX_MEMBERS; i++) {
 		if (rc_volume_members[i]) {
 			struct device *dev = &rc_volume_members[i]->pdev->dev;
-			if (rc_volume_dma_va[i]) {
-				dma_free_coherent(dev, RC_VOLUME_DATA_BYTES,
-						  rc_volume_dma_va[i],
-						  rc_volume_dma_pa[i]);
-				rc_volume_dma_va[i] = NULL;
-				rc_volume_dma_pa[i] = 0;
-			}
-			if (rc_volume_prp_va[i]) {
-				dma_free_coherent(dev, PAGE_SIZE,
-						  rc_volume_prp_va[i],
-						  rc_volume_prp_pa[i]);
-				rc_volume_prp_va[i] = NULL;
-				rc_volume_prp_pa[i] = 0;
+			u32 t;
+
+			for (t = 0; t < RC_VOLUME_QUEUE_DEPTH; t++) {
+				if (rc_volume_dma_va[i][t]) {
+					dma_free_coherent(dev,
+							  RC_VOLUME_DATA_BYTES,
+							  rc_volume_dma_va[i][t],
+							  rc_volume_dma_pa[i][t]);
+					rc_volume_dma_va[i][t] = NULL;
+					rc_volume_dma_pa[i][t] = 0;
+				}
+				if (rc_volume_prp_va[i][t]) {
+					dma_free_coherent(dev, PAGE_SIZE,
+							  rc_volume_prp_va[i][t],
+							  rc_volume_prp_pa[i][t]);
+					rc_volume_prp_va[i][t] = NULL;
+					rc_volume_prp_pa[i][t] = 0;
+				}
 			}
 		}
 		rc_volume_members[i] = NULL;
@@ -1477,6 +1584,7 @@ int rc_nvme_init_controller(struct rc_adapter *adapter)
 	nvme->sq_doorbell_base = base + RC_NVME_REG_DBL_BASE;
 	init_waitqueue_head(&nvme->admin_cq_wait);
 	init_waitqueue_head(&nvme->io_cq_wait);
+	spin_lock_init(&nvme->io_lock);
 
 	rc_printk(RC_NOTE,
 		  "rc_nvme_init_controller: CAP=0x%016llx VS=0x%08x MQES=%u DSTRD=%u TO=%u (%u ms)\n",
