@@ -211,6 +211,8 @@ struct rc_nvme_state {
     u32            mqes;              // CAP.MQES + 1 = max queue depth (must be wider than u16: spec max is 65536)
     u8             dstrd;             // CAP.DSTRD doorbell stride
     u8             timeout_500ms;     // CAP.TO * 500 ms = boot timeout
+    u8             mdts;              // Identify Controller MDTS (0 = unlimited)
+    u32            max_transfer_bytes;// derived from MDTS + CAP.MPSMIN (0 if unlimited)
 
     // Namespace 1 (per Identify NS); populated only after identify_namespace.
     u32            ns1_lba_bytes;     // LBA size in bytes (e.g. 512 or 4096)
@@ -669,6 +671,7 @@ struct rc_raidcore_md {
 #define RC_NVME_ID_CTRL_SN		4	/* 20 bytes ASCII, space-padded */
 #define RC_NVME_ID_CTRL_MN		24	/* 40 bytes ASCII, space-padded */
 #define RC_NVME_ID_CTRL_FR		64	/* 8 bytes ASCII, space-padded */
+#define RC_NVME_ID_CTRL_MDTS		77	/* u8, max xfer = (2^MDTS) * CAP.MPSMIN pages */
 #define RC_NVME_ID_CTRL_NN		516	/* u32, number of namespaces */
 
 /* Field offsets within the Identify Namespace response (NVMe 1.4 §5.15.2.1). */

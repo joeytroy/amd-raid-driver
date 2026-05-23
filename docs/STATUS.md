@@ -73,6 +73,15 @@ are best-effort/untested.
   The real I/O path (`rc_volume_read_member` through
   `rc_volume_create_disk`'s per-member buffer pool) was already
   correct.
+- **PRP list extended to 512 KiB per NVMe READ.** Per-member data
+  buffer raised from 64 KiB → 512 KiB (16 → 128 pages). The original
+  target was 1 MiB (one full stripe), but Identify Controller reports
+  MDTS=7 at CAP.MPSMIN=0, which caps a single command at 2^7 × 4 KiB
+  = 512 KiB. A 1 MiB request now becomes two back-to-back NVMe READs
+  instead of sixteen. The PRP list buffer is still PAGE_SIZE; it
+  needs 127 entries for a full 512 KiB transfer, well under the 512
+  entries that fit. MDTS + CAP.MPSMIN are now decoded and logged
+  alongside the existing Identify-Controller line.
 
 ### Implemented before this pass, may need revisiting
 
@@ -85,9 +94,6 @@ are best-effort/untested.
 
 ### Not started
 
-- **PRP list for transfers > 64 KiB**. Current data buffer per member
-  is 64 KiB. Bumping it up to one full stripe (1 MiB) would let the
-  kernel send max-size requests.
 - **Interrupt-driven completion**. We poll, which costs a kworker
   thread per outstanding request.
 - **Multiple I/O queues** (per-CPU). Currently one queue per controller,
@@ -127,19 +133,19 @@ rc_volume_create_disk: /dev/rcraid0 up, 7814058336 sectors (3815458 MiB, read-on
 Then `lsblk /dev/rcraid0` shows a 3.6 TiB read-only disk, and
 `dd if=/dev/rcraid0 bs=64K count=N` reads through the assembled volume.
 
-`bench.sh` after a successful load now reports ~600–850 MB/s
-sequential reads across `bs=4K..64K` and confirms the RAIDCore magic
-at logical sector 40960 (member 0, phys 0x5000).
+`bench.sh` after a successful load now reports ~760 MB/s @ `bs=4K`
+rising to ~1.1 GB/s @ `bs=64K`, and confirms the RAIDCore magic at
+logical sector 40960 (member 0, phys 0x5000).  Larger blocks scale
+much further now that one NVMe READ carries up to 512 KiB:
+~3.6 GB/s @ `bs=512K`, ~4.4 GB/s @ `bs=1M`, ~4.7 GB/s @ `bs=4M`.
 
 ## Next implementation steps (in order)
 
-1. **PRP list to one stripe** — allow 1 MiB requests for better
-   sequential perf.
-2. **Member-count auto-detect** — by reading LBA 0x5001 (volume
+1. **Member-count auto-detect** — by reading LBA 0x5001 (volume
    metadata) which appears to encode the member list.
-3. **Member-position resolution** — either decode further or send a
+2. **Member-position resolution** — either decode further or send a
    vendor-specific admin command to query controller-side state.
-4. **Interrupt-driven completion** for both admin and I/O queues.
-5. **Per-CPU I/O queues** to improve concurrency.
-6. **Write support** behind a flag, carefully gated until ordering is
+3. **Interrupt-driven completion** for both admin and I/O queues.
+4. **Per-CPU I/O queues** to improve concurrency.
+5. **Write support** behind a flag, carefully gated until ordering is
    proven on a populated array.

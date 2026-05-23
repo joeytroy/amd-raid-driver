@@ -53,10 +53,14 @@ static struct blk_mq_tag_set rc_volume_tagset;
 /* Per-member persistent DMA buffer + PRP list buffer (allocated once at
  * volume create).  Queue depth is 1 so a single buffer per member is safe.
  *
- *   data buf is 64 KiB (16 pages) — biggest single NVMe READ we issue.
- *   PRP list buf is PAGE_SIZE — easily holds 16 entries.
+ *   data buf is 512 KiB (128 pages) — the largest single NVMe READ this
+ *   controller allows (Crucial T700 reports Identify Controller MDTS=7
+ *   at CAP.MPSMIN=0, so 2^7 * 4 KiB = 512 KiB).  A full 1 MiB stripe
+ *   becomes two READs, which blk-mq dispatches back-to-back.
+ *   PRP list buf is PAGE_SIZE — holds 512 8-byte entries, well above the
+ *   127 needed for 128 pages (PRP1 covers page 0, list covers 1..127).
  */
-#define RC_VOLUME_DATA_PAGES	16
+#define RC_VOLUME_DATA_PAGES	128
 #define RC_VOLUME_DATA_BYTES	(RC_VOLUME_DATA_PAGES * PAGE_SIZE)
 
 static void       *rc_volume_dma_va[RC_VOLUME_MAX_MEMBERS];
@@ -310,19 +314,27 @@ static int rc_nvme_identify_controller(struct rc_adapter *adapter)
 		goto out;
 
 	{
+		struct rc_nvme_state *nvme = &adapter->ctx.nvme;
 		const u8 *b = id_buf;
 		u16 vid   = le16_to_cpup((const __le16 *)(b + RC_NVME_ID_CTRL_VID));
 		u16 ssvid = le16_to_cpup((const __le16 *)(b + RC_NVME_ID_CTRL_SSVID));
 		u32 nn    = le32_to_cpup((const __le32 *)(b + RC_NVME_ID_CTRL_NN));
+		u8  mdts  = b[RC_NVME_ID_CTRL_MDTS];
+		u8  mpsmin = (u8)((nvme->cap >> 48) & 0xf);
 		char sn[21], mn[41], fr[9];
 
 		rc_nvme_ascii_field(b + RC_NVME_ID_CTRL_SN, 20, sn);
 		rc_nvme_ascii_field(b + RC_NVME_ID_CTRL_MN, 40, mn);
 		rc_nvme_ascii_field(b + RC_NVME_ID_CTRL_FR, 8,  fr);
 
+		nvme->mdts = mdts;
+		nvme->max_transfer_bytes = mdts ?
+			(1u << mdts) * (1u << (12 + mpsmin)) : 0;
+
 		rc_printk(RC_NOTE,
-			  "rc_nvme_identify_controller: VID=0x%04x SSVID=0x%04x SN='%s' MN='%s' FR='%s' NN=%u\n",
-			  vid, ssvid, sn, mn, fr, nn);
+			  "rc_nvme_identify_controller: VID=0x%04x SSVID=0x%04x SN='%s' MN='%s' FR='%s' NN=%u MDTS=%u MPSMIN=%u max_xfer=%u B\n",
+			  vid, ssvid, sn, mn, fr, nn,
+			  mdts, mpsmin, nvme->max_transfer_bytes);
 	}
 
 out:
