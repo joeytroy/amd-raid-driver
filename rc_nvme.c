@@ -727,16 +727,17 @@ static int rc_volume_read_lba(u64 logical_lba, dma_addr_t buf_dma)
 
 /* Demonstrate volume assembly: walk a few logical LBAs that straddle a
  * stripe boundary and dump the first 16 bytes of each.  Shows the mapping
- * is wiring up physical reads to the expected member. */
+ * is wiring up physical reads to the expected member.
+ *
+ * Per-member DMA buffers: each member sits in its own IOMMU domain, so the
+ * IOVA returned by dma_alloc_coherent against member A's pdev is invalid
+ * when fed to member B's controller (the read either silently corrupts or
+ * the IOMMU faults).  Allocate one buffer per member, then route by index. */
 static void rc_volume_demo_reads(void)
 {
-	/* Use member 0's device for the DMA buffer; either works. */
-	struct rc_adapter *adapter = rc_volume_members[0];
-	struct device *dev = &adapter->pdev->dev;
-	void *buf;
-	dma_addr_t buf_dma;
+	void       *bufs[RC_VOLUME_MAX_MEMBERS]     = { NULL };
+	dma_addr_t  buf_dmas[RC_VOLUME_MAX_MEMBERS] = { 0 };
 	int i;
-
 	u32 stripe = rc_volume_stripe_sectors;
 	u64 probes[] = {
 		0,			/* stripe 0 → member 0 LBA 0 */
@@ -749,9 +750,13 @@ static void rc_volume_demo_reads(void)
 					 * member it's still at LBA 0x5000 of that member */
 	};
 
-	buf = dma_alloc_coherent(dev, PAGE_SIZE, &buf_dma, GFP_KERNEL);
-	if (!buf)
-		return;
+	for (i = 0; i < rc_volume_member_count; i++) {
+		struct device *dev = &rc_volume_members[i]->pdev->dev;
+		bufs[i] = dma_alloc_coherent(dev, PAGE_SIZE, &buf_dmas[i],
+					     GFP_KERNEL);
+		if (!bufs[i])
+			goto out;
+	}
 
 	rc_printk(RC_NOTE,
 		  "rc_volume_demo_reads: volume up — %d members, stripe=%u sectors\n",
@@ -763,8 +768,8 @@ static void rc_volume_demo_reads(void)
 		int ret;
 
 		rc_volume_map_lba(probes[i], &member_idx, &phys_lba);
-		memset(buf, 0, 16);
-		ret = rc_volume_read_lba(probes[i], buf_dma);
+		memset(bufs[member_idx], 0, 16);
+		ret = rc_volume_read_lba(probes[i], buf_dmas[member_idx]);
 		if (ret) {
 			rc_printk(RC_WARN,
 				  "rc_volume_demo_reads: logical %llu read failed (%d)\n",
@@ -776,10 +781,16 @@ static void rc_volume_demo_reads(void)
 			  (unsigned long long)probes[i], member_idx,
 			  (unsigned long long)phys_lba);
 		print_hex_dump(KERN_INFO, "rcraid: ", DUMP_PREFIX_OFFSET,
-			       16, 1, buf, 16, true);
+			       16, 1, bufs[member_idx], 16, true);
 	}
 
-	dma_free_coherent(dev, PAGE_SIZE, buf, buf_dma);
+out:
+	for (i = 0; i < rc_volume_member_count; i++) {
+		if (bufs[i]) {
+			struct device *dev = &rc_volume_members[i]->pdev->dev;
+			dma_free_coherent(dev, PAGE_SIZE, bufs[i], buf_dmas[i]);
+		}
+	}
 }
 
 /* Called once per adapter after its metadata block validates.  Inserts the
@@ -968,7 +979,10 @@ static int rc_volume_create_disk(void)
 	rc_volume_tagset.queue_depth  = 1;
 	rc_volume_tagset.numa_node    = NUMA_NO_NODE;
 	rc_volume_tagset.cmd_size     = 0;
-	rc_volume_tagset.flags        = 0;
+	/* queue_rq polls for NVMe CQE completion via usleep_range, so it
+	 * must run in blocking dispatch context — not inside blk-mq's
+	 * RCU/SRCU read-side critical section. */
+	rc_volume_tagset.flags        = BLK_MQ_F_BLOCKING;
 
 	ret = blk_mq_alloc_tag_set(&rc_volume_tagset);
 	if (ret)

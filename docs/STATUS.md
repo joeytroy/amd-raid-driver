@@ -51,6 +51,29 @@ are best-effort/untested.
 - **`reverse_member_order` module parameter** — escape hatch for the
   PCI BDF ordering guess.
 
+### Fixed in this pass (2026-05-23, post-lockup investigation)
+
+- **Sleep-in-RCU in `rc_volume_queue_rq`**. The blk-mq dispatch path
+  runs inside an SRCU read-side critical section. `rc_nvme_io_cmd`
+  polls completion with `usleep_range(10, 50)`, which is illegal
+  there and triggered "Voluntary context switch within RCU read-side
+  critical section" warnings under load. Fixed by setting
+  `BLK_MQ_F_BLOCKING` on `rc_volume_tagset` so dispatch is allowed
+  to sleep. This was almost certainly the cause of the post-bench
+  lockup that motivated the reboot.
+- **Wrong-pdev DMA in `rc_volume_demo_reads`**. The diagnostic
+  allocated a single DMA buffer on member 0's pdev and reused the
+  resulting IOVA for member 1 reads. Each member sits in its own
+  IOMMU group (16 and 17 on this dev box) with a distinct domain,
+  so member 1's controller saw an unmapped IOVA and AMD-Vi logged
+  `IO_PAGE_FAULT` on every member-1 demo probe. The reads
+  "succeeded" silently because the buffer was pre-zeroed and the
+  array contains all zeros. Fixed by allocating one buffer per
+  member in `rc_volume_demo_reads` and routing by `member_idx`.
+  The real I/O path (`rc_volume_read_member` through
+  `rc_volume_create_disk`'s per-member buffer pool) was already
+  correct.
+
 ### Implemented before this pass, may need revisiting
 
 - Block / SCSI scaffolding (`rc_blk.c`, `rc_raid.c`) — built for the
@@ -103,6 +126,10 @@ rc_volume_create_disk: /dev/rcraid0 up, 7814058336 sectors (3815458 MiB, read-on
 
 Then `lsblk /dev/rcraid0` shows a 3.6 TiB read-only disk, and
 `dd if=/dev/rcraid0 bs=64K count=N` reads through the assembled volume.
+
+`bench.sh` after a successful load now reports ~600–850 MB/s
+sequential reads across `bs=4K..64K` and confirms the RAIDCore magic
+at logical sector 40960 (member 0, phys 0x5000).
 
 ## Next implementation steps (in order)
 
