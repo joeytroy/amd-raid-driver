@@ -646,24 +646,25 @@ static int rc_nvme_read_validate_metadata(struct rc_adapter *adapter)
 		goto out;
 	}
 
-	nvme->md_member_uuid     = le64_to_cpu(md->member_uuid);
-	nvme->md_fld_18          = le64_to_cpu(md->fld_18);
-	nvme->md_fld_20          = le64_to_cpu(md->fld_20);
-	nvme->md_stripe_sectors  = le32_to_cpu(md->stripe_sectors);
-	nvme->md_version         = version;
-	nvme->md_fld_30          = le64_to_cpu(md->fld_30);
-	nvme->md_fld_38          = le64_to_cpu(md->fld_38);
-	nvme->md_valid           = true;
+	nvme->md_device_id         = le64_to_cpu(md->device_id);
+	nvme->md_config_commit_lba = le64_to_cpu(md->config_commit_lba);
+	nvme->md_config_ring_lba   = le64_to_cpu(md->config_ring_lba);
+	nvme->md_stripe_sectors    = le32_to_cpu(md->stripe_sectors);
+	nvme->md_version           = version;
+	nvme->md_features          = le32_to_cpu(md->features);
+	nvme->md_spare_info        = le32_to_cpu(md->spare_info);
+	nvme->md_mbr_checksum      = le64_to_cpu(md->mbr_checksum);
+	nvme->md_valid             = true;
 
 	rc_printk(RC_NOTE,
-		  "rc_nvme_read_validate_metadata: RAIDCore v0x%08x stripe=%u sectors (%u KiB) member=0x%016llx fld18=0x%016llx fld20=0x%016llx fld30=0x%016llx fld38=0x%016llx\n",
+		  "rc_nvme_read_validate_metadata: RAIDCore v0x%08x ConfigRingSize=%u (used as stripe sectors = %u KiB) device_id=0x%016llx ConfigCommit@LBA=0x%llx ConfigRing@LBA=0x%llx features=0x%08x mbr_csum=0x%016llx\n",
 		  version, nvme->md_stripe_sectors,
 		  (nvme->md_stripe_sectors * nvme->ns1_lba_bytes) >> 10,
-		  (unsigned long long)nvme->md_member_uuid,
-		  (unsigned long long)nvme->md_fld_18,
-		  (unsigned long long)nvme->md_fld_20,
-		  (unsigned long long)nvme->md_fld_30,
-		  (unsigned long long)nvme->md_fld_38);
+		  (unsigned long long)nvme->md_device_id,
+		  (unsigned long long)nvme->md_config_commit_lba,
+		  (unsigned long long)nvme->md_config_ring_lba,
+		  nvme->md_features,
+		  (unsigned long long)nvme->md_mbr_checksum);
 	ret = 0;
 
 out:

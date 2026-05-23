@@ -82,6 +82,19 @@ are best-effort/untested.
   needs 127 entries for a full 512 KiB transfer, well under the 512
   entries that fit. MDTS + CAP.MPSMIN are now decoded and logged
   alongside the existing Identify-Controller line.
+- **Per-member metadata struct corrected from AMD Linux SDK.**
+  `rcblob.x86_64` in the AMD-shipped Linux SDK ships with full DWARF
+  debug info, exposing `struct RC_MetaData` (the LBA 0x5000 block).
+  Renamed our `rc_raidcore_md` fields to match — `fld_18`→
+  `config_commit_lba`, `fld_20`→`config_ring_lba`, `fld_30`→
+  `features`+`spare_info`, `fld_38`→`mbr_checksum`, `member_uuid`→
+  `device_id`. The +0x28 field we used as `stripe_sectors` is
+  actually `ConfigRingSize`; it coincides with the real stripe on
+  this dev box (2048 sectors = 1 MiB).  Real volume-level fields
+  (member count, stripe = ChunkSize, member position) live in an
+  `RC_LogicalDevice` record reachable through the config packet at
+  LBA 0x5001 → see `docs/OPEN_QUESTIONS.md` for the layout-drift
+  blocker.
 
 ### Implemented before this pass, may need revisiting
 

@@ -229,15 +229,17 @@ struct rc_nvme_state {
     u16            io_cq_head;
     u8             io_cq_phase;
 
-    // RAIDCore metadata (LBA 0x5000), populated after validation.
+    // Per-member RAIDCore metadata (LBA 0x5000), populated after validation.
+    // Field names mirror struct RC_MetaData in AMD's SDK (rcblob.x86_64).
     bool           md_valid;
-    u64            md_member_uuid;    // offset 0x10 — per-member identity
-    u64            md_fld_18;         // offset 0x18 (purpose TBD)
-    u64            md_fld_20;         // offset 0x20 (purpose TBD)
-    u32            md_stripe_sectors; // offset 0x28 — likely stripe size in sectors
-    u32            md_version;        // offset 0x2C — must equal 0x00030000
-    u64            md_fld_30;         // offset 0x30 — count? (0x1C observed)
-    u64            md_fld_38;         // offset 0x38 — per-member info
+    u64            md_device_id;        // RC_MetaData.DeviceId
+    u64            md_config_commit_lba;// RC_MetaData.ConfigCommitOffset (= 0x5001 here)
+    u64            md_config_ring_lba;  // RC_MetaData.ConfigRingOffset  (= 0x5800 here)
+    u32            md_stripe_sectors;   // RC_MetaData.ConfigRingSize — see note in struct rc_raidcore_md
+    u32            md_version;          // RC_MetaData.Version
+    u32            md_features;         // RC_MetaData.Features
+    u32            md_spare_info;       // RC_MetaData.SpareInfo
+    u64            md_mbr_checksum;     // RC_MetaData.MBRChecksum
 
     // Per-doorbell pointers (computed once after CAP read)
     void __iomem  *sq_doorbell_base;  // BAR0 + 0x1000
@@ -635,9 +637,19 @@ int rc_raid_array_ioctl(struct block_device *bdev, fmode_t mode, unsigned int cm
 #define RC_NVME_IO_QUEUE_DEPTH		64
 #define RC_NVME_IO_QID			1u
 
-/* AMD RAIDCore metadata block (one LBA per member at LBA 0x5000). The
- * layout was recovered from rcraid.sys (RC_CheckMetaData / RC_ReadMetaData).
- * Bytes [0x08..0x1FF] are covered by a 64-bit checksum stored at [0x00]. */
+/* AMD RAIDCore per-member metadata block (one LBA per member at LBA 0x5000).
+ * Layout matches struct RC_MetaData from AMD's open Linux SDK
+ * (raid_linux_driver_930_00283 / rcblob.x86_64 — has DWARF debug info).
+ * RC_CheckMetaData validates: magic at +0x08 == "RAIDCore", version at
+ * +0x2C == 0x00030000, and the checksum at +0x00 covers bytes [0x08..0x1FF].
+ *
+ * The legacy field name `stripe_sectors` is kept for the +0x28 field for
+ * source compatibility — historically the driver used this value as the
+ * stripe size and it happens to be 2048 on the dev box, which also happens
+ * to be the correct stripe size in sectors.  The SDK calls this field
+ * `ConfigRingSize` (size of the config ring at ConfigRingOffset).  The
+ * real per-volume stripe lives in RC_LogicalDevice.ChunkSize on disk,
+ * which we don't yet parse — see docs/OPEN_QUESTIONS.md. */
 #define RC_RAIDCORE_LBA			0x5000ULL
 #define RC_RAIDCORE_BYTES		512u
 #define RC_RAIDCORE_PAYLOAD_BYTES	0x1F8u	/* 504 = 0x200 - 8 */
@@ -645,15 +657,16 @@ int rc_raid_array_ioctl(struct block_device *bdev, fmode_t mode, unsigned int cm
 #define RC_RAIDCORE_VERSION		0x00030000u
 
 struct rc_raidcore_md {
-	__le64	checksum;	/* 0x00 — XOR-with-shuffle over [0x08..0x1FF] */
-	__le64	magic;		/* 0x08 = "RAIDCore" */
-	__le64	member_uuid;	/* 0x10 — per-member identifier */
-	__le64	fld_18;		/* 0x18 (purpose TBD) */
-	__le64	fld_20;		/* 0x20 (purpose TBD) */
-	__le32	stripe_sectors;	/* 0x28 — likely stripe size in sectors */
-	__le32	version;	/* 0x2C — must be 0x00030000 */
-	__le64	fld_30;		/* 0x30 — count? (0x1C observed) */
-	__le64	fld_38;		/* 0x38 — per-member info */
+	__le64	checksum;		/* 0x00 — XOR-with-shuffle over [0x08..0x1FF] */
+	__le64	magic;			/* 0x08 — "RAIDCore" (RC_MetaData.RCIdent) */
+	__le64	device_id;		/* 0x10 — RC_MetaData.DeviceId (was member_uuid) */
+	__le64	config_commit_lba;	/* 0x18 — RC_MetaData.ConfigCommitOffset (LBA of config packet) */
+	__le64	config_ring_lba;	/* 0x20 — RC_MetaData.ConfigRingOffset  (LBA of config ring)   */
+	__le32	stripe_sectors;		/* 0x28 — RC_MetaData.ConfigRingSize; see comment above   */
+	__le32	version;		/* 0x2C — RC_MetaData.Version (must be 0x00030000) */
+	__le32	features;		/* 0x30 — RC_MetaData.Features (0x1C observed) */
+	__le32	spare_info;		/* 0x34 — RC_MetaData.SpareInfo */
+	__le64	mbr_checksum;		/* 0x38 — RC_MetaData.MBRChecksum (differs per member) */
 	u8	reserved[RC_RAIDCORE_BYTES - 0x40];
 } __packed;
 
