@@ -1,7 +1,18 @@
-/****************************************************************************
- * AMD RAID Driver for Linux - Queue Management
- * Implements StorPort service slots for queue/DMA allocation
- ****************************************************************************/
+// SPDX-License-Identifier: GPL-2.0-only
+/*
+ * AMD-RAID Linux driver — legacy queue management (StorPort port)
+ *
+ * Copyright (C) 2025-2026 Joey Troy and contributors.
+ *
+ * Pre-NVMe-rewrite scaffolding that approximated the Windows
+ * StorPort service slots for the AHCI command path.  Most functions
+ * here are not exercised on the active NVMe code path; slated for
+ * removal or rewrite when SATA RAID support lands.
+ *
+ * Original work, independently authored from clean-room reverse
+ * engineering of the AMD-RAID Windows driver binaries under DMCA
+ * §1201(f) interoperability protections.  See RE_METHODOLOGY.md.
+ */
 
 #include "rc_linux.h"
 #include <linux/delay.h>

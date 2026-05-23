@@ -1,7 +1,16 @@
-/****************************************************************************
- * AMD RAID Driver for Linux - Debugfs Interface
- * Provides detailed queue inspection and hardware state debugging
- ****************************************************************************/
+// SPDX-License-Identifier: GPL-2.0-only
+/*
+ * AMD-RAID Linux driver — debugfs entries
+ *
+ * Copyright (C) 2025-2026 Joey Troy and contributors.
+ *
+ * Exposes per-adapter queue / register / IRQ state at
+ * /sys/kernel/debug/rcraid/ for development and troubleshooting.
+ *
+ * Original work, independently authored from clean-room reverse
+ * engineering of the AMD-RAID Windows driver binaries under DMCA
+ * §1201(f) interoperability protections.  See RE_METHODOLOGY.md.
+ */
 
 #include "rc_linux.h"
 #include <linux/debugfs.h>

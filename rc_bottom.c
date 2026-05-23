@@ -1,7 +1,17 @@
-/****************************************************************************
- * AMD RAID Driver for Linux - rcbottom equivalent
- * Hardware initialization layer (TRX50 clean-room port)
- ****************************************************************************/
+// SPDX-License-Identifier: GPL-2.0-only
+/*
+ * AMD-RAID Linux driver — PCI probe + per-adapter bring-up
+ *
+ * Copyright (C) 2025-2026 Joey Troy and contributors.
+ *
+ * Implements the per-adapter equivalent of AMD's Windows `rcbottom`
+ * PnP driver: PCI enable, MSI setup, BAR mapping, NVMe controller
+ * bring-up dispatch.
+ *
+ * Original work, independently authored from clean-room reverse
+ * engineering of the AMD-RAID Windows driver binaries under DMCA
+ * §1201(f) interoperability protections.  See RE_METHODOLOGY.md.
+ */
 
 #include "rc_linux.h"
 

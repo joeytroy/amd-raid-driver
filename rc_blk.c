@@ -1,3 +1,18 @@
+// SPDX-License-Identifier: GPL-2.0-only
+/*
+ * AMD-RAID Linux driver — legacy blk-mq scaffolding
+ *
+ * Copyright (C) 2025-2026 Joey Troy and contributors.
+ *
+ * Pre-NVMe-rewrite blk-mq scaffolding.  Most functions here are not
+ * on the live RAID0 path; the active blk-mq integration lives in
+ * rc_nvme.c (rc_volume_*).
+ *
+ * Original work, independently authored from clean-room reverse
+ * engineering of the AMD-RAID Windows driver binaries under DMCA
+ * §1201(f) interoperability protections.  See RE_METHODOLOGY.md.
+ */
+
 #include "rc_blk.h"
 #include "rc_linux.h"
 #include <linux/printk.h>

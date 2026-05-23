@@ -1,5 +1,21 @@
+// SPDX-License-Identifier: GPL-2.0-only
+/*
+ * AMD-RAID Linux driver — NVMe controller + RAID0 volume I/O path
+ *
+ * Copyright (C) 2025-2026 Joey Troy and contributors.
+ *
+ * The live code path for PCI device 1022:B000 (NVMe RAID Bottom):
+ * controller bring-up per NVMe 1.4, admin queue, Identify, I/O queue
+ * creation, the volume-metadata reader and parser, and the blk-mq
+ * READ/WRITE dispatch into per-member NVMe READ/WRITE commands.
+ *
+ * Original work, independently authored from clean-room reverse
+ * engineering of the AMD-RAID Windows driver binaries under DMCA
+ * §1201(f) interoperability protections.  See RE_METHODOLOGY.md.
+ */
+
 /****************************************************************************
- * AMD RAID Driver for Linux - NVMe controller init path
+ * NVMe controller boot sequence (kept inline as documentation)
  *
  * For DEV_B000 (and any other CC_0108 device) the Windows AMD driver takes
  * its nvme.c code path, not the ahci.c one. See docs/GHIDRA_FINDINGS_2026.md.

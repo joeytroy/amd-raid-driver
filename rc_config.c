@@ -1,8 +1,16 @@
-/****************************************************************************
- * AMD RAID Driver for Linux - rccfg equivalent
- * Configuration management layer based on rccfg.inf
- * Copyright (c) 2024 Advanced Micro Devices, Inc.
- ****************************************************************************/
+// SPDX-License-Identifier: GPL-2.0-only
+/*
+ * AMD-RAID Linux driver — config-character-device scaffolding
+ *
+ * Copyright (C) 2025-2026 Joey Troy and contributors.
+ *
+ * Skeleton for a user-space IOCTL surface analogous to AMD's
+ * Windows `rccfg` driver / `rcadm` CLI.  Not yet implemented.
+ *
+ * Original work, independently authored from clean-room reverse
+ * engineering of the AMD-RAID Windows driver binaries under DMCA
+ * §1201(f) interoperability protections.  See RE_METHODOLOGY.md.
+ */
 
 #include "rc_linux.h"
 

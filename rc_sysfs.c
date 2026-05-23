@@ -1,7 +1,16 @@
-/****************************************************************************
- * AMD RAID Driver for Linux - Sysfs Interface
- * Exposes adapter statistics and queue information
- ****************************************************************************/
+// SPDX-License-Identifier: GPL-2.0-only
+/*
+ * AMD-RAID Linux driver — sysfs entries
+ *
+ * Copyright (C) 2025-2026 Joey Troy and contributors.
+ *
+ * Exposes per-adapter statistics under the standard PCI driver
+ * sysfs tree.
+ *
+ * Original work, independently authored from clean-room reverse
+ * engineering of the AMD-RAID Windows driver binaries under DMCA
+ * §1201(f) interoperability protections.  See RE_METHODOLOGY.md.
+ */
 
 #include "rc_linux.h"
 

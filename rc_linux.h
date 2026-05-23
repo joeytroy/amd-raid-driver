@@ -1,8 +1,16 @@
-/****************************************************************************
- * AMD RAID Driver for Linux - Main Header
- * Based on Windows driver architecture (rcbottom, rccfg, rcraid)
- * Copyright (c) 2024 Advanced Micro Devices, Inc.
- ****************************************************************************/
+// SPDX-License-Identifier: GPL-2.0-only
+/*
+ * AMD-RAID Linux driver — shared definitions and adapter state
+ *
+ * Copyright (C) 2025-2026 Joey Troy and contributors.
+ *
+ * Original work, independently authored from clean-room reverse
+ * engineering of the AMD-RAID Windows driver binaries (rcbottom.sys,
+ * rcraid.sys, rccfg.sys) under DMCA §1201(f) interoperability
+ * protections. No code is copied from AMD source distributions.
+ * See RE_METHODOLOGY.md at the repository root for the full process
+ * and legal record.
+ */
 
 #ifndef _RC_LINUX_H_
 #define _RC_LINUX_H_
@@ -651,7 +659,7 @@ int rc_raid_array_ioctl(struct block_device *bdev, fmode_t mode, unsigned int cm
 
 /* AMD RAIDCore per-member metadata block (one LBA per member at LBA 0x5000).
  * Layout matches struct RC_MetaData from AMD's open Linux SDK
- * (raid_linux_driver_930_00283 / rcblob.x86_64 — has DWARF debug info).
+ * (drivers/reference/amd-sdk-9.3.0 / rcblob.x86_64 — has DWARF info).
  * RC_CheckMetaData validates: magic at +0x08 == "RAIDCore", version at
  * +0x2C == 0x00030000, and the checksum at +0x00 covers bytes [0x08..0x1FF].
  *

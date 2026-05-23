@@ -1,12 +1,12 @@
 # AMD RAID Driver — Build and Test
 
-> **Status (2026-05-22)**: Active development on the NVMe path for PCI
-> `1022:B000` (TRX50 RAID Bottom). The driver currently brings the
-> controller up to `CSTS.RDY = 1` (admin queue programmed, ready to
-> accept commands). It does **not yet** create I/O queues, discover
-> namespaces, or present block devices. See `docs/STATUS.md` for what's
-> done and what's next, and `docs/GHIDRA_FINDINGS_2026.md` for the
-> reverse-engineering background.
+> **Status (2026-05-23)**: `/dev/rcraid0` is up end-to-end on the dev
+> box.  Controller bring-up, admin + I/O queues, NVMe Identify,
+> RAID0 volume assembly from on-disk metadata, blk-mq read and write
+> (writes gated behind `enable_writes=1`).  See `docs/STATUS.md` for
+> the full picture, `docs/GHIDRA_FINDINGS_2026.md` for the
+> reverse-engineering background, and `RE_METHODOLOGY.md` at the
+> repository root for the license and legal record.
 
 The fastest, safest setup is described first. The Live USB approach is
 kept at the bottom as a fallback for when no separate Linux drive is

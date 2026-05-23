@@ -1,19 +1,23 @@
-/****************************************************************************
- * AMD RAID Driver for Linux - Firmware Capability Parsing
+// SPDX-License-Identifier: GPL-2.0-only
+/*
+ * AMD-RAID Linux driver — PCI-ID-based code-path dispatch
  *
- * This file picks the hardware code path (AHCI vs NVMe vs stub) based on the
- * PCI device ID. It mirrors the Windows driver's FUN_140007d40, with one big
- * simplification: the Windows function does its selection via wcsncmp on the
- * PnP HW-ID string + a class-code byte from the StorPort service +0x3f0; on
- * Linux the same information is just sitting in pdev->device and pdev->class,
- * so there is no need to recreate the WDF class-bind dance (service +0x418).
+ * Copyright (C) 2025-2026 Joey Troy and contributors.
  *
- * See docs/GHIDRA_FINDINGS_2026.md for the full reasoning. The previous
- * version of this file was a stub that always defaulted to AHCI mode, which
- * is why DEV_B000 never came up.
+ * This file picks the hardware code path (AHCI vs NVMe vs stub) based on
+ * the PCI device ID.  The behaviour mirrors what AMD's Windows driver
+ * does in its FUN_140007d40, with one big simplification: the Windows
+ * function does its selection via wcsncmp on the PnP HW-ID string + a
+ * class-code byte from the StorPort service +0x3f0; on Linux the same
+ * information is just sitting in pdev->device and pdev->class, so there
+ * is no need to recreate the WDF class-bind dance (service +0x418).
  *
- * Copyright (c) 2024 Advanced Micro Devices, Inc.
- ****************************************************************************/
+ * See docs/GHIDRA_FINDINGS_2026.md for the full reasoning.
+ *
+ * Original work, independently authored from clean-room reverse
+ * engineering of the AMD-RAID Windows driver binaries under DMCA
+ * §1201(f) interoperability protections.  See RE_METHODOLOGY.md.
+ */
 
 #include "rc_linux.h"
 #include "rc_pci_ids.h"

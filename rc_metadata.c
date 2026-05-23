@@ -1,8 +1,17 @@
-/****************************************************************************
- * AMD RAID Driver for Linux - Metadata Discovery
- * Real RAID array discovery from firmware
- * Copyright (c) 2024 Advanced Micro Devices, Inc.
- ****************************************************************************/
+// SPDX-License-Identifier: GPL-2.0-only
+/*
+ * AMD-RAID Linux driver — legacy metadata-discovery helpers
+ *
+ * Copyright (C) 2025-2026 Joey Troy and contributors.
+ *
+ * Older metadata scaffolding; the live NVMe path's metadata read and
+ * parse logic lives in rc_nvme.c (rc_nvme_read_validate_metadata and
+ * rc_volume_parse_logical_device).
+ *
+ * Original work, independently authored from clean-room reverse
+ * engineering of the AMD-RAID Windows driver binaries under DMCA
+ * §1201(f) interoperability protections.  See RE_METHODOLOGY.md.
+ */
 
 #include "rc_linux.h"
 

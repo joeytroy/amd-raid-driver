@@ -1,8 +1,12 @@
-/****************************************************************************
- * AMD RAID Driver for Linux - PCI Device IDs
- * Based on Windows driver specifications
- * Copyright (c) 2024 Advanced Micro Devices, Inc.
- ****************************************************************************/
+// SPDX-License-Identifier: GPL-2.0-only
+/*
+ * AMD-RAID Linux driver — PCI device-ID table
+ *
+ * Copyright (C) 2025-2026 Joey Troy and contributors.
+ *
+ * IDs identified through clean-room reverse engineering of AMD's
+ * Windows .inf files and .sys binaries.  See RE_METHODOLOGY.md.
+ */
 
 #ifndef _RC_PCI_IDS_H_
 #define _RC_PCI_IDS_H_

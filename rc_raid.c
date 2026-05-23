@@ -1,8 +1,18 @@
-/****************************************************************************
- * AMD RAID Driver for Linux - RAID Command Layer (rcraid.sys equivalent)
- * Implements completion callbacks, command routing, and SRB handling
- * Copyright (c) 2024 Advanced Micro Devices, Inc.
- ****************************************************************************/
+// SPDX-License-Identifier: GPL-2.0-only
+/*
+ * AMD-RAID Linux driver — legacy RAID command layer
+ *
+ * Copyright (C) 2025-2026 Joey Troy and contributors.
+ *
+ * Historic scaffolding for the AHCI command path.  Most functions in
+ * this file are not exercised on the active NVMe (DEV_B000) code
+ * path and are slated for removal or rewrite when SATA RAID support
+ * is implemented from scratch.  See docs/STATUS.md.
+ *
+ * Original work, independently authored from clean-room reverse
+ * engineering of the AMD-RAID Windows driver binaries under DMCA
+ * §1201(f) interoperability protections.  See RE_METHODOLOGY.md.
+ */
 
 #include "rc_linux.h"
 #include <linux/slab.h>

@@ -1,8 +1,13 @@
-/****************************************************************************
- * AMD RAID Driver for Linux - Main Module
- * Based on Windows driver architecture (rcbottom, rccfg, rcraid)
- * Copyright (c) 2024 Advanced Micro Devices, Inc.
- ****************************************************************************/
+// SPDX-License-Identifier: GPL-2.0-only
+/*
+ * AMD-RAID Linux driver — module init + global state
+ *
+ * Copyright (C) 2025-2026 Joey Troy and contributors.
+ *
+ * Original work, independently authored from clean-room reverse
+ * engineering of the AMD-RAID Windows driver binaries under DMCA
+ * §1201(f) interoperability protections.  See RE_METHODOLOGY.md.
+ */
 
 #include "rc_linux.h"
 
@@ -21,10 +26,10 @@ module_param(debug_level, int, 0644);
 MODULE_PARM_DESC(debug_level, "Debug level (0=debug, 1=info, 2=note, 3=warn, 4=error)");
 
 // Module information
-MODULE_AUTHOR("Advanced Micro Devices, Inc.");
+MODULE_AUTHOR("Joey Troy and contributors");
 MODULE_DESCRIPTION(RC_DRIVER_DESCRIPTION);
 MODULE_VERSION(RC_DRIVER_VERSION);
-MODULE_LICENSE("GPL");
+MODULE_LICENSE("GPL v2");
 
 // Module initialization
 static int __init rc_init(void)
