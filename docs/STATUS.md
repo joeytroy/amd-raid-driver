@@ -217,6 +217,28 @@ old scaffolding will be reused.
 Source tree before: 9,406 lines across 15 source files.
 Source tree after:  3,927 lines across 10.
 
+### Error handling and timeouts
+
+`rc_volume_mq_ops.timeout` now fires at the blk-mq default 30 s.  Per-adapter
+`nvme.dead` flag tracks controller health: set from the ISR's CSTS canary
+(catches `CFS` and `CSTS=~0` / hot-unplug), from `.timeout` when CSTS goes
+bad mid-investigation, and from `.timeout` after a stuck command (since we
+have no controller-reset path, we can't safely recycle the CID and must
+take the adapter offline).  Dispatch fast-fails through dead members,
+`blk_mq_tagset_busy_iter` drains every in-flight request that targeted a
+dead adapter, and best-effort NVMe Abort (admin opcode 0x08) is issued
+before declaring a still-CSTS-alive controller dead.  `rc_volume_complete`
+now decodes SC / SCT / DNR / More from the stored status; a sentinel
+`RC_VOLUME_SC_DEAD = 0x7fff` is used by drain so the logs distinguish
+"controller dead" from real NVMe failures.  `rc_nvme_admin_cmd` is now
+serialised by a per-adapter `admin_mutex` so timeout-issued Aborts don't
+collide with teardown.
+
+Behaviour change worth flagging: one stuck command takes the volume
+offline until module reload — intentional and the only safe option
+until a controller-reset path lands.  Full design notes in
+[`ERROR_HANDLING.md`](ERROR_HANDLING.md).
+
 ### Not started
 
 - **Interrupt-driven completion**. We poll, which costs a kworker

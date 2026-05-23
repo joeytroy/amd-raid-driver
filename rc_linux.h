@@ -213,6 +213,18 @@ struct rc_nvme_state {
     wait_queue_head_t admin_cq_wait;
     wait_queue_head_t io_cq_wait;
     spinlock_t        io_lock;
+
+    // Once set, no new I/O dispatches to this adapter and the next
+    // .timeout callback drains every in-flight request that targeted it.
+    // Set from rc_nvme_irq (CSTS.CFS or CSTS=~0) and from rc_volume_timeout
+    // (timeout without a controller-reset path means we can't safely recycle
+    // this CID).  Read with READ_ONCE in dispatch hot paths.  Never cleared.
+    bool              dead;
+
+    // Serializes rc_nvme_admin_cmd so a timeout-issued Abort can't collide
+    // with module teardown or with another timeout's admin issue.  Held
+    // across SQE write + doorbell + CQE wait + CQ-head advance.
+    struct mutex      admin_mutex;
 };
 
 // Device context layout (clean-room mirror of the Windows device extension)
@@ -430,6 +442,7 @@ void rc_config_cleanup(void);
 #define RC_NVME_ADMIN_OP_DELETE_IO_CQ	0x04
 #define RC_NVME_ADMIN_OP_CREATE_IO_CQ	0x05
 #define RC_NVME_ADMIN_OP_IDENTIFY	0x06
+#define RC_NVME_ADMIN_OP_ABORT		0x08
 
 /* NVM I/O opcodes (NVMe 1.4 §6) */
 #define RC_NVME_NVM_OP_FLUSH		0x00

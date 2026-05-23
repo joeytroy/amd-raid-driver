@@ -119,6 +119,12 @@ struct rc_volume_pdu {
 	atomic_t  members_pending;
 };
 
+/* Sentinel value stored into pdu->sc_sct by the drain path so .complete
+ * can log "controller dead" instead of decoding it as a real NVMe status.
+ * SC=0xff (vendor-specific range), SCT=0x7 (vendor specific), DNR=1, More=1
+ * — distinguishable from any value a spec-compliant controller will post. */
+#define RC_VOLUME_SC_DEAD	0x7fff
+
 #define RC_NVME_CC_DEFAULT	\
 	(RC_NVME_CC_IOSQES_64 | RC_NVME_CC_IOCQES_16 | \
 	 RC_NVME_CC_AMS_RR | RC_NVME_CC_MPS_4K | RC_NVME_CC_CSS_NVM)
@@ -172,6 +178,26 @@ irqreturn_t rc_nvme_irq(struct rc_adapter *adapter)
 	struct blk_mq_tags *tags;
 	bool advanced = false;
 
+	/* Health canary: if the controller has gone fatal or the device has
+	 * been hot-unplugged (CSTS reads as ~0), don't trust the CQ contents.
+	 * Mark the adapter dead so queue_rq fast-fails and the next .timeout
+	 * pass drains everything in flight.  Wakeups still fire so admin /
+	 * sync-init waiters return promptly via their wait_event_timeout. */
+	if (nvme->io_cq && adapter->ctx.mmio_base) {
+		u32 csts = readl(adapter->ctx.mmio_base + RC_NVME_REG_CSTS);
+		if (csts == 0xffffffff || (csts & RC_NVME_CSTS_CFS)) {
+			if (!READ_ONCE(nvme->dead)) {
+				rc_printk(RC_ERROR,
+					  "rc_nvme_irq: %s controller dead (CSTS=0x%08x) — failing in-flight I/O\n",
+					  pci_name(adapter->pdev), csts);
+				WRITE_ONCE(nvme->dead, true);
+			}
+			wake_up(&nvme->admin_cq_wait);
+			wake_up(&nvme->io_cq_wait);
+			return IRQ_HANDLED;
+		}
+	}
+
 	/* Always wake admin + io waiters first — the boot-time sync I/O
 	 * helper (rc_nvme_io_cmd_sync) sleeps on io_cq_wait and consumes
 	 * its own CQE before the disk exists.  Only after rc_volume_disk
@@ -224,6 +250,33 @@ irqreturn_t rc_nvme_irq(struct rc_adapter *adapter)
 					 nvme->io_cq_head);
 	spin_unlock(&nvme->io_lock);
 	return IRQ_HANDLED;
+}
+
+/* Cheap dead-controller probe usable from process context (timeout callback).
+ * Returns true if the adapter has been flagged dead, or transitions it to
+ * dead now because CSTS reports a fatal status or the device has vanished.
+ * Caller must hold a reference to the adapter (always true for a member in
+ * rc_volume_members[]). */
+static bool rc_nvme_check_dead(struct rc_adapter *adapter)
+{
+	struct rc_nvme_state *nvme = &adapter->ctx.nvme;
+	void __iomem *base = adapter->ctx.mmio_base;
+	u32 csts;
+
+	if (READ_ONCE(nvme->dead))
+		return true;
+	if (!base)
+		return false;
+
+	csts = readl(base + RC_NVME_REG_CSTS);
+	if (csts == 0xffffffff || (csts & RC_NVME_CSTS_CFS)) {
+		rc_printk(RC_ERROR,
+			  "rc_nvme_check_dead: %s controller dead (CSTS=0x%08x)\n",
+			  pci_name(adapter->pdev), csts);
+		WRITE_ONCE(nvme->dead, true);
+		return true;
+	}
+	return false;
 }
 
 static int rc_nvme_wait_csts(struct rc_adapter *adapter, u32 mask, u32 want)
@@ -369,7 +422,9 @@ static int rc_nvme_wait_admin_completion(struct rc_adapter *adapter)
 /* Copy a caller-built SQE into the admin SQ tail slot, ring the doorbell,
  * poll for completion, advance the CQ head, and return 0 on success or
  * -errno (timeout, controller error). The caller fills opc/nsid/prp1/cdwN;
- * we manage CID = 0 since only one admin command is in flight during init.
+ * we manage CID = 0 since only one admin command is in flight at a time —
+ * the admin_mutex serialises against teardown and against timeout-issued
+ * Aborts that run from a different process context.
  */
 static int rc_nvme_admin_cmd(struct rc_adapter *adapter, struct rc_nvme_sqe *cmd)
 {
@@ -379,6 +434,8 @@ static int rc_nvme_admin_cmd(struct rc_adapter *adapter, struct rc_nvme_sqe *cmd
 	u32 tail;
 	u16 status, sc_sct;
 	int ret;
+
+	mutex_lock(&nvme->admin_mutex);
 
 	slot = (struct rc_nvme_sqe *)nvme->admin_sq + nvme->admin_sq_tail;
 	cmd->cid = cpu_to_le16(0);
@@ -394,7 +451,7 @@ static int rc_nvme_admin_cmd(struct rc_adapter *adapter, struct rc_nvme_sqe *cmd
 		rc_printk(RC_ERROR,
 			  "rc_nvme_admin_cmd: timeout waiting for CQE (opc=0x%02x)\n",
 			  cmd->opc);
-		return ret;
+		goto out;
 	}
 
 	cqe = (struct rc_nvme_cqe *)nvme->admin_cq + nvme->admin_cq_head;
@@ -410,9 +467,29 @@ static int rc_nvme_admin_cmd(struct rc_adapter *adapter, struct rc_nvme_sqe *cmd
 		rc_printk(RC_ERROR,
 			  "rc_nvme_admin_cmd: opc=0x%02x SC/SCT=0x%04x (status=0x%04x)\n",
 			  cmd->opc, sc_sct, status);
-		return -EIO;
+		ret = -EIO;
+		goto out;
 	}
-	return 0;
+	ret = 0;
+out:
+	mutex_unlock(&nvme->admin_mutex);
+	return ret;
+}
+
+/* Issue an NVMe Abort admin command for (sqid, cid) on this adapter.
+ * Best-effort — the spec allows the controller to return "Abort Command
+ * Limit Exceeded" or to ignore the request entirely.  The caller does not
+ * depend on the original command actually being aborted; it just wants to
+ * give the controller a chance to free the CID before the request is ended
+ * with BLK_STS_TIMEOUT.  Returns 0 on admin-command success (regardless of
+ * whether the abort actually happened), negative errno on admin failure. */
+static int rc_nvme_abort(struct rc_adapter *adapter, u16 sqid, u16 cid)
+{
+	struct rc_nvme_sqe cmd = {};
+
+	cmd.opc   = RC_NVME_ADMIN_OP_ABORT;
+	cmd.cdw10 = cpu_to_le32(((u32)cid << 16) | sqid);
+	return rc_nvme_admin_cmd(adapter, &cmd);
 }
 
 /* Submit a single Identify Controller (CNS=01h) admin command, poll for
@@ -1301,6 +1378,19 @@ static void rc_volume_build_discard_sqe(struct rc_nvme_sqe *cmd, int member_idx,
 	cmd->cdw11 = cpu_to_le32(RC_NVME_DSM_AD); /* Deallocate */
 }
 
+/* Returns true if any member adapter has been flagged dead.  Hot-path check
+ * called from rc_volume_queue_rq; if true the RAID0 volume is unusable and
+ * every incoming request fast-fails. */
+static inline bool rc_volume_any_member_dead(void)
+{
+	int i;
+
+	for (i = 0; i < rc_volume_member_count; i++)
+		if (READ_ONCE(rc_volume_members[i]->ctx.nvme.dead))
+			return true;
+	return false;
+}
+
 /* blk-mq request handler.  chunk_sectors=stripe_sectors in queue_limits
  * keeps each request inside one stripe, so it maps to exactly one member.
  *
@@ -1327,6 +1417,16 @@ static blk_status_t rc_volume_queue_rq(struct blk_mq_hw_ctx *hctx,
 
 	pdu->op = op;
 	pdu->sc_sct = 0;
+
+	/* If any member adapter has been flagged dead (by the ISR's CSTS
+	 * check, by a prior timeout, or by drain), the RAID0 volume can't
+	 * serve I/O.  Fail every incoming request rather than wedging more
+	 * CIDs against a controller we no longer trust. */
+	if (rc_volume_any_member_dead()) {
+		blk_mq_start_request(req);
+		blk_mq_end_request(req, BLK_STS_IOERR);
+		return BLK_STS_OK;
+	}
 
 	/* FLUSH fans out to every member: set the pending counter to the
 	 * member count, build a single FLUSH SQE template (CID=tag, no
@@ -1407,12 +1507,34 @@ static void rc_volume_complete(struct request *req)
 	size_t off;
 
 	if (pdu->sc_sct) {
-		printk_ratelimited(KERN_WARNING
-			"rcraid: %s failed with NVMe SC/SCT=0x%04x (op=%u, lba=%llu, nsec=%u)\n",
-			rc_volume_disk ? rc_volume_disk->disk_name : "?",
-			pdu->sc_sct, pdu->op,
-			(unsigned long long)blk_rq_pos(req),
-			blk_rq_sectors(req));
+		/* pdu->sc_sct holds CQE.status >> 1, so:
+		 *   bits  7:0  = SC (Status Code)
+		 *   bits 10:8  = SCT (Status Code Type)
+		 *   bit  13    = M (More — extended info available via Get Log)
+		 *   bit  14    = DNR (Do Not Retry) */
+		u8   sc   = pdu->sc_sct & 0xff;
+		u8   sct  = (pdu->sc_sct >> 8) & 0x7;
+		bool more = (pdu->sc_sct >> 13) & 1;
+		bool dnr  = (pdu->sc_sct >> 14) & 1;
+
+		if (pdu->sc_sct == RC_VOLUME_SC_DEAD) {
+			printk_ratelimited(KERN_ERR
+				"rcraid: %s failed: controller dead (op=%u, lba=%llu, nsec=%u)\n",
+				rc_volume_disk ? rc_volume_disk->disk_name : "?",
+				pdu->op,
+				(unsigned long long)blk_rq_pos(req),
+				blk_rq_sectors(req));
+		} else {
+			printk_ratelimited(KERN_WARNING
+				"rcraid: %s failed: NVMe SCT=0x%x SC=0x%02x%s%s (op=%u, lba=%llu, nsec=%u)\n",
+				rc_volume_disk ? rc_volume_disk->disk_name : "?",
+				sct, sc,
+				dnr  ? " DNR"  : "",
+				more ? " More" : "",
+				pdu->op,
+				(unsigned long long)blk_rq_pos(req),
+				blk_rq_sectors(req));
+		}
 		blk_mq_end_request(req, BLK_STS_IOERR);
 		return;
 	}
@@ -1432,9 +1554,129 @@ static void rc_volume_complete(struct request *req)
 	blk_mq_end_request(req, BLK_STS_OK);
 }
 
+struct rc_volume_drain_ctx {
+	unsigned int dead_mask;	/* bit i set => member i is dead */
+};
+
+/* blk_mq_tagset_busy_iter callback.  For each in-flight request, decide
+ * whether it can no longer make progress (it targeted a now-dead adapter,
+ * or it's a FLUSH that needs every member and at least one is dead) and
+ * complete it with the dead-controller sentinel if so.  blk-mq makes
+ * blk_mq_complete_request atomic against the ISR's competing call, so a
+ * naturally-arriving CQE during this iteration races safely. */
+static bool rc_volume_drain_iter(struct request *req, void *priv)
+{
+	struct rc_volume_drain_ctx *ctx = priv;
+	struct rc_volume_pdu *pdu = blk_mq_rq_to_pdu(req);
+	bool kill;
+
+	if (pdu->op == REQ_OP_FLUSH)
+		kill = ctx->dead_mask != 0;
+	else if (pdu->member_idx >= 0 &&
+		 pdu->member_idx < RC_VOLUME_MAX_MEMBERS)
+		kill = (ctx->dead_mask & BIT(pdu->member_idx)) != 0;
+	else
+		kill = false;
+
+	if (kill && !blk_mq_request_completed(req)) {
+		pdu->sc_sct = RC_VOLUME_SC_DEAD;
+		blk_mq_complete_request(req);
+	}
+	return true;
+}
+
+/* Build the dead-member mask and run the drain iterator.  No-op if no
+ * member is currently flagged dead or the disk hasn't been created yet. */
+static void rc_volume_drain_dead(void)
+{
+	struct rc_volume_drain_ctx ctx = {};
+	int i;
+
+	if (!rc_volume_disk)
+		return;
+	for (i = 0; i < rc_volume_member_count; i++)
+		if (READ_ONCE(rc_volume_members[i]->ctx.nvme.dead))
+			ctx.dead_mask |= BIT(i);
+	if (!ctx.dead_mask)
+		return;
+	blk_mq_tagset_busy_iter(&rc_volume_tagset, rc_volume_drain_iter, &ctx);
+}
+
+/* blk-mq .timeout callback.  Fires at the default 30 s when a request's
+ * CQE hasn't landed.
+ *
+ *   1. If completion raced in just before us, do nothing.
+ *   2. Probe CSTS on the involved member(s).  CSTS.CFS or CSTS=~0 means
+ *      the controller is gone — drain everyone touching that adapter and
+ *      end this request with BLK_STS_IOERR.
+ *   3. Otherwise issue NVMe Abort (best-effort) and re-check.
+ *   4. With no controller-reset path we still can't safely recycle this
+ *      CID: a late CQE from the controller would land against a request
+ *      that has since been freed and the tag reused, corrupting unrelated
+ *      I/O.  Mark the involved adapter(s) dead, drain, and end the
+ *      request with BLK_STS_TIMEOUT.  One stuck command disables the
+ *      volume; this is intentional until reset/recovery lands. */
+static enum blk_eh_timer_return rc_volume_timeout(struct request *req)
+{
+	struct rc_volume_pdu *pdu = blk_mq_rq_to_pdu(req);
+	bool any_dead = false;
+	int i;
+
+	if (blk_mq_request_completed(req))
+		return BLK_EH_DONE;
+
+	if (pdu->op == REQ_OP_FLUSH) {
+		for (i = 0; i < rc_volume_member_count; i++)
+			if (rc_nvme_check_dead(rc_volume_members[i]))
+				any_dead = true;
+	} else if (pdu->member_idx >= 0 &&
+		   pdu->member_idx < rc_volume_member_count) {
+		any_dead = rc_nvme_check_dead(rc_volume_members[pdu->member_idx]);
+	}
+
+	if (any_dead) {
+		rc_printk(RC_ERROR,
+			  "rc_volume_timeout: tag=%u op=%u: member dead — draining in-flight\n",
+			  req->tag, pdu->op);
+		rc_volume_drain_dead();
+		if (!blk_mq_request_completed(req))
+			blk_mq_end_request(req, BLK_STS_IOERR);
+		return BLK_EH_DONE;
+	}
+
+	rc_printk(RC_WARN,
+		  "rc_volume_timeout: tag=%u op=%u: issuing NVMe Abort\n",
+		  req->tag, pdu->op);
+	if (pdu->op == REQ_OP_FLUSH) {
+		for (i = 0; i < rc_volume_member_count; i++)
+			(void)rc_nvme_abort(rc_volume_members[i],
+					    RC_NVME_IO_QID, (u16)req->tag);
+	} else if (pdu->member_idx >= 0 &&
+		   pdu->member_idx < rc_volume_member_count) {
+		(void)rc_nvme_abort(rc_volume_members[pdu->member_idx],
+				    RC_NVME_IO_QID, (u16)req->tag);
+	}
+
+	if (blk_mq_request_completed(req))
+		return BLK_EH_DONE;
+
+	if (pdu->op == REQ_OP_FLUSH) {
+		for (i = 0; i < rc_volume_member_count; i++)
+			WRITE_ONCE(rc_volume_members[i]->ctx.nvme.dead, true);
+	} else if (pdu->member_idx >= 0 &&
+		   pdu->member_idx < rc_volume_member_count) {
+		WRITE_ONCE(rc_volume_members[pdu->member_idx]->ctx.nvme.dead, true);
+	}
+	rc_volume_drain_dead();
+	if (!blk_mq_request_completed(req))
+		blk_mq_end_request(req, BLK_STS_TIMEOUT);
+	return BLK_EH_DONE;
+}
+
 static const struct blk_mq_ops rc_volume_mq_ops = {
 	.queue_rq = rc_volume_queue_rq,
 	.complete = rc_volume_complete,
+	.timeout  = rc_volume_timeout,
 };
 
 static const struct block_device_operations rc_volume_bops = {
@@ -1691,6 +1933,7 @@ int rc_nvme_init_controller(struct rc_adapter *adapter)
 	init_waitqueue_head(&nvme->admin_cq_wait);
 	init_waitqueue_head(&nvme->io_cq_wait);
 	spin_lock_init(&nvme->io_lock);
+	mutex_init(&nvme->admin_mutex);
 
 	rc_printk(RC_NOTE,
 		  "rc_nvme_init_controller: CAP=0x%016llx VS=0x%08x MQES=%u DSTRD=%u TO=%u (%u ms)\n",

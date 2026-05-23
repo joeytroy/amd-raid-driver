@@ -12,10 +12,25 @@ on the roadmap.
   on-disk metadata, blk-mq read/write at `/dev/rcraid0`.
 - Member count, per-member position, and volume capacity all parsed
   from the on-disk `RC_LogicalDevice` record — no hardcoding.
+- Interrupt-driven async completion: MSI ISR walks the CQ and routes
+  each CQE to `blk_mq_complete_request`; queue depth 32; no polling
+  on the dispatch path.
+- `REQ_OP_FLUSH` (NVMe FLUSH 0x00, fanned out to every member) and
+  `REQ_FUA` (CDW12.FUA passthrough) — filesystems can fsync safely.
+- `REQ_OP_DISCARD` via NVMe DSM Deallocate (0x09), split at the
+  stripe boundary so each request lands on one member.
 - Writes gated behind `enable_writes=1` module parameter (off by
   default for safety; load with the param to allow).
+- `safe_subsys_vendor` module parameter to keep `rcraid` off the OS
+  drive — the AMD chipset shadows every NVMe as `1022:b000`, so this
+  filter is what prevents the driver from claiming the boot SSD.
+- Error handling + timeouts: blk-mq `.timeout` at 30 s, per-adapter
+  `dead` flag, ISR CSTS canary, best-effort NVMe Abort, tagset drain
+  of in-flight requests when a controller dies.  See
+  `docs/ERROR_HANDLING.md`.
 - Bench throughput on a 2-member Crucial T700 RAID0 dev box:
-  ~1.1 GB/s @ `bs=64K`, scaling up to ~4.7 GB/s at `bs=4M`.
+  ~1.3 GB/s @ `bs=4K`, ~4.7 GB/s @ `bs=4M`, ~11.9 GB/s aggregate
+  across 8 concurrent readers.
 
 See `docs/STATUS.md` for the full state and the next-steps list.
 
@@ -46,13 +61,20 @@ roadmap.
 
 ## What's NOT here yet
 
-- RAID levels other than RAID0 (RAID1 / 5 / 10 are roadmap).
-- SATA RAID (`1022:43F6` and the AHCI variants `7905 / 7916 / 7917 /
-  43BD`) — code paths exist but are stubs.
+- RAID levels other than RAID0 (RAID1 / 10 are roadmap; RAID5 is not).
+- SATA RAID (AHCI variants `7905 / 7916 / 7917 / 43BD`) — code paths
+  exist but are stubs.
+- Controller reset & recovery.  Today a stuck command takes the
+  volume offline until module reload — intentional, since without
+  reset we can't safely recycle CIDs.  See
+  `docs/ERROR_HANDLING.md` for the reasoning.
+- Retry of transient NVMe errors.  Depends on controller reset above.
+- Per-CPU I/O queues.  Single hw queue caps small-I/O IOPS today.
+- `scatterlist`-native DMA.  We currently bounce through per-tag-per-
+  member DMA buffers (~33 MiB pinned at QD=32).
 - Suspend / resume hooks.
-- `REQ_OP_FLUSH` / FUA propagation to NVMe FLUSH (0x00).
-- Interrupt-driven completion (currently polled).
-- `rcadm`-equivalent userspace tooling.
+- `rcadm`-equivalent userspace tooling (create / inspect / delete
+  arrays).  Today the array must already exist.
 
 See `docs/OPEN_QUESTIONS.md` for what still needs reverse-engineering
 work, and `docs/STATUS.md` for the implementation roadmap.
