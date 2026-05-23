@@ -296,15 +296,9 @@ static int rc_bottom_probe(struct pci_dev *pdev, const struct pci_device_id *id)
               pdev->subsystem_vendor,
               pdev->subsystem_device);
 
-    if (pdev->vendor != RC_PCI_VID) {
-        rc_printk(RC_ERROR, "rc_bottom: unexpected vendor ID 0x%04x\n", pdev->vendor);
-        return -ENODEV;
-    }
-    
-    if (pdev->device != RC_PCI_DID && pdev->device != 0xb000) {
-        rc_printk(RC_ERROR, "rc_bottom: unexpected device ID 0x%04x\n", pdev->device);
-        return -ENODEV;
-    }
+    /* The PCI core has already matched against rc_bottom_pci_tbl[]; no
+     * additional vendor/device gating needed here.  ID dispatch into
+     * NVMe vs AHCI vs stub paths happens in rc_parse_firmware_capabilities. */
 
     adapter = rc_bottom_alloc_adapter(pdev);
     if (!adapter)
@@ -328,31 +322,19 @@ static int rc_bottom_probe(struct pci_dev *pdev, const struct pci_device_id *id)
     if (ret)
         goto err_release_vectors;
 
-    /* Classify the PCI device first (sets adapter->ctx.ctrl_mode) and, for
-     * NVMe controllers, run the controller boot sequence. We do this BEFORE
-     * rc_hw_init so the AHCI register programming inside rc_hw_init can be
-     * skipped when the device is NVMe (DEV_B000). */
+    /* Classify the PCI device (sets adapter->ctx.ctrl_mode) and, for
+     * NVMe controllers, run the controller boot sequence (rc_nvme.c).
+     * For AHCI variants the hardware bring-up will land in rc_hw_init
+     * once the AHCI path is implemented; for now rc_hw_init is a stub. */
     ret = rc_parse_firmware_capabilities(adapter);
     if (ret) {
         rc_printk(RC_WARN, "rc_bottom: firmware capability parsing failed (%d)\n", ret);
-        /* Continue with whatever ctrl_mode was set; rc_hw_init will gate. */
+        /* Continue — non-NVMe paths are stubs and won't do harm. */
     }
 
     ret = rc_hw_init(adapter);
     if (ret)
         goto err_free_irq;
-
-    ret = rc_queue_init(adapter);
-    if (ret)
-        goto err_hw_cleanup;
-
-    /* AHCI doorbell sequence (1,4,2,3) is meaningless for NVMe controllers;
-     * NVMe queues are armed by writes to BAR0+0x1000. */
-    if (adapter->ctx.ctrl_mode == RC_CTRL_MODE_AHCI) {
-        ret = rc_activate_doorbells(adapter);
-        if (ret)
-            goto err_queue_cleanup;
-    }
 
     rc_bottom_attach_adapter(adapter);
     pci_set_drvdata(pdev, adapter);
@@ -365,25 +347,11 @@ static int rc_bottom_probe(struct pci_dev *pdev, const struct pci_device_id *id)
     if (ret)
         rc_printk(RC_WARN, "rc_bottom: debugfs creation failed (non-fatal)\n");
 
-	rc_printk(RC_NOTE, "rc_bottom: adapter %d ready\n", adapter->instance);
-
-	// Initialize RAID layer on first adapter - DMA allocation is now fixed
-	if (adapter->instance == 0) {
-		ret = rc_raid_init();
-		if (ret) {
-			rc_printk(RC_ERROR, "rc_bottom: RAID layer initialization failed: %d\n", ret);
-			// Non-fatal - adapter still usable for diagnostics
-		}
-	}
-
-	return 0;
+    rc_printk(RC_NOTE, "rc_bottom: adapter %d ready\n", adapter->instance);
+    return 0;
 
 err_detach:
     rc_bottom_detach_adapter(adapter);
-
-err_queue_cleanup:
-    rc_queue_cleanup(adapter);
-err_hw_cleanup:
     rc_hw_cleanup(adapter);
 err_free_irq:
     rc_bottom_free_irq(adapter);
@@ -410,7 +378,6 @@ static void rc_bottom_remove(struct pci_dev *pdev)
     rc_debugfs_remove_adapter(adapter);
     rc_sysfs_remove(adapter);
     rc_bottom_detach_adapter(adapter);
-    rc_queue_cleanup(adapter);
     rc_bottom_free_irq(adapter);
     rc_hw_cleanup(adapter);
     rc_bottom_release_interrupts(adapter);

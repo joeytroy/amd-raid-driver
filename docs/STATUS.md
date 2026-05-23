@@ -124,14 +124,19 @@ are best-effort/untested.
   followed by read-back — patterns match exactly, adjacent sectors
   untouched, no AMD-Vi events or kernel warnings.
 
-### Implemented before this pass, may need revisiting
+### AHCI scaffolding removed
 
-- Block / SCSI scaffolding (`rc_blk.c`, `rc_raid.c`) — built for the
-  AHCI model. Now superseded by the NVMe path; the AHCI-only register
-  writes in `rc_queue_init` still run but no-op against B000 because
-  the offsets aren't writable on this device.
-- Vendor mailbox builder (`rc_queue.c`, `rc_ahci_build_mailbox`) — AHCI
-  command path; not needed for DEV_B000.
+The pre-NVMe AHCI scaffolding (`rc_blk.c`, `rc_metadata.c`,
+`rc_raid.c`, `rc_queue.c`, the bulk of `rc_hw.c`, and the associated
+struct definitions in `rc_linux.h`) has been deleted.  `rc_hw.c` is
+now a small stub file that satisfies the `request_irq` /
+init/cleanup call signatures for AHCI-mode binds until a real SATA
+RAID path is built.  When that work happens it will be implemented
+fresh from the Windows `rcbottom.sys` AHCI code path; no part of the
+old scaffolding will be reused.
+
+Source tree before: 9,406 lines across 15 source files.
+Source tree after:  3,927 lines across 10.
 
 ### Not started
 
@@ -199,5 +204,7 @@ position derived from the on-disk LD record.
 3. **Multiple-volume / non-RAID0 support** — the LD parser already
    handles other `RC_LDT_*` device types in principle; the stripe
    mapping and elsewhere need RAID-level-specific paths.
-4. **(future)** Bigger rewrite of the legacy AHCI scaffolding (rc_blk.c,
-   proven on a populated array.
+4. **SATA RAID path** — claim 1022:7905 / 0x43BD / 0x7916 / 0x7917 in
+   MODULE_DEVICE_TABLE is already in place; the AHCI bring-up needs
+   to be implemented (rewrite from rcbottom.sys, not from the old
+   deleted scaffolding).

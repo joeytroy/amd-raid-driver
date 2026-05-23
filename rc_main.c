@@ -90,7 +90,6 @@ static void __exit rc_exit(void)
     rc_volume_teardown();
 
     // Cleanup in reverse order
-    rc_raid_cleanup();
     rc_config_cleanup();
     rc_bottom_cleanup();
     rc_debugfs_cleanup();

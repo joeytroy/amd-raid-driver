@@ -68,26 +68,7 @@ static inline int scsi_add_host(struct Scsi_Host *host, struct device *dev) { re
 
 // Maximum adapters and targets (AMD Official Specifications)
 #define RC_MAX_ADAPTERS              11  // Max Controller Count per AMD spec
-#define RC_MAX_SCSI_TARGETS          32
-#define RC_MAX_SCSI_LUNS             8
-#define RC_MAX_DEVICES               14  // Total devices (SATA + NVMe)
 #define RC_MAX_NVME_DEVICES          10  // Max NVMe devices per AMD spec
-#define RC_MAX_RAID_ARRAYS           8   // Maximum RAID arrays per controller
-
-// RAID Array Types
-#define RC_RAID_TYPE_RAID0           0
-#define RC_RAID_TYPE_RAID1           1
-#define RC_RAID_TYPE_RAID5           5
-#define RC_RAID_TYPE_RAID6           6
-#define RC_RAID_TYPE_RAID10          10
-#define RC_RAID_TYPE_JBOD            15
-
-// RAID Array States
-#define RC_RAID_STATE_OFFLINE        0
-#define RC_RAID_STATE_ONLINE         1
-#define RC_RAID_STATE_DEGRADED       2
-#define RC_RAID_STATE_REBUILDING     3
-#define RC_RAID_STATE_FAILED         4
 
 // Debug levels
 #define RC_DEBUG                     0
@@ -134,60 +115,21 @@ struct rc_irq_state {
     void *scratch_tail;         // devExt+0x698
 };
 
-// Callback function pointers (device extension offsets 0x16100–0x16168)
-// Windows driver installs different handlers based on controller variant
-struct rc_adapter_callbacks {
-    void (*queue_dispatcher)(struct rc_adapter *adapter, void *arg);      // +0x16100
-    void (*queue_toggle)(struct rc_adapter *adapter, u8 mode, void *ptr); // +0x16108
-    void (*spinlock_callback)(struct rc_adapter *adapter);                // +0x16110
-    void (*port_disable)(struct rc_adapter *adapter, u32 port_id);        // +0x16120
-    void (*port_resume)(struct rc_adapter *adapter, u32 port_id);         // +0x16130
-    void (*status_poll)(struct rc_adapter *adapter, void *status_buf);    // +0x16140
-    void (*secondary_queue)(struct rc_adapter *adapter, void *arg);       // +0x16148
-};
-
-// Work item for deferred queue processing (FUN_14000e960)
-// 0x28 bytes (40 bytes), matches Windows structure
-struct rc_work_item {
-    struct rc_work_item *next;      // Next pointer (linked list)
-    struct rc_work_item *prev;      // Previous pointer
-    void *srb;                      // SRB pointer (param_2)
-    void *param3;                   // Unused parameter (param_3)
-    void (*completion)(void *);     // Completion callback (param_4)
-    void *completion_arg;           // Completion callback argument
-};
-
-// Doorbell/template context (device extension offsets 0x16010–0x1C2DC)
+// Doorbell/template context — small remnant of the AHCI-era device
+// extension.  Only fields that the live NVMe path still touches are
+// kept (variant[]/queue_state/queue_mode are zeroed in
+// rc_parse_firmware_capabilities; capability_word is reserved for
+// future AHCI use).  The historic callback table and work-item queue
+// were removed with the AHCI scaffolding drop.
 struct rc_doorbell_state {
-    void __iomem *template_page;    // devExt+0x16010
-    void __iomem *doorbell_page;    // devExt+0x16020
-    bool adapter_active;            // devExt+0x16054
-    u8 queue_state;                 // devExt+0x16068
-    u8 queue_mode;                  // devExt+0x1606C
-    u16 variant[4];                 // devExt+0x16056/58/5A/5C
-    u8 fast_path_enabled;           // devExt+0x1607C
-    u32 capability_word;            // devExt+0x1C2D8
-    struct rc_adapter_callbacks callbacks; // +0x16100–0x16168
-    
-    // Work item queue (devExt+0x15f80–0x15f90) - FUN_14000e960
-    spinlock_t work_queue_lock;     // devExt+0x15f80 (spinlock)
-    struct rc_work_item *work_queue_head; // devExt+0x15f88 (head pointer)
-    struct rc_work_item *work_queue_tail; // devExt+0x15f90 (tail pointer)
-};
-
-// Queue handle structure (from FUN_14000c2fc)
-// Used for NVMe command slot allocation
-struct rc_queue_handle {
-    void *queue_base;           // +0x00: Queue handle pointer
-    u16 queue_depth;            // +0x02: Maximum number of slots
-    u16 next_slot_index;        // +0x04: Where to start searching
-    u16 producer_index;         // +0x06: Next slot to produce
-    u16 consumer_index;         // +0x08: Next slot to consume
-    u16 queue_size;             // +0x0a: Total queue size
-    u64 queue_base_addr;        // +0x0c: MMIO queue base address
-    u64 descriptor_array_base;  // +0x48: Array of 0x78-byte descriptor structures
-    u32 queue_flags;            // +0x398: Queue flags (for FUN_14000eef8)
-    void *descriptors[0];       // Descriptor array (variable size)
+    void __iomem *template_page;
+    void __iomem *doorbell_page;
+    bool adapter_active;
+    u8  queue_state;
+    u8  queue_mode;
+    u16 variant[4];
+    u8  fast_path_enabled;
+    u32 capability_word;
 };
 
 // Controller mode — selects the init/dispatch path.
@@ -266,37 +208,20 @@ struct rc_nvme_state {
 // Device context layout (clean-room mirror of the Windows device extension)
 struct rc_dev_context {
     struct rc_bar bar[RC_MAX_BARS];
-    void __iomem *mmio_base;        // devExt+0x10 (primary BAR window)
-    resource_size_t mmio_len;       // devExt+0x18
+    void __iomem *mmio_base;        // primary BAR window
+    resource_size_t mmio_len;
     resource_size_t mmio_phys;
-    u8 bar_type[RC_MAX_BARS];       // devExt+0xB5 (per BAR attributes)
-    void *descriptor_table;         // devExt+0x1C2A0
+    u8 bar_type[RC_MAX_BARS];
     struct rc_irq_state irq;
     struct rc_doorbell_state doorbell;
 
-    // Hardware code-path selector. Set by rc_parse_firmware_capabilities()
-    // based on PCI device ID. Gates AHCI vs NVMe vs stub init paths.
+    // PCI-class-based code-path selector set by
+    // rc_parse_firmware_capabilities().  Gates NVMe vs (future) AHCI vs
+    // stub init paths.
     enum rc_ctrl_mode ctrl_mode;
 
-    // NVMe controller bookkeeping. Only valid when ctrl_mode == RC_CTRL_MODE_NVME.
+    // NVMe controller bookkeeping; valid only when ctrl_mode == NVMe.
     struct rc_nvme_state nvme;
-    
-    // Queue handles (from FUN_14000c2fc and FUN_14000fafc)
-    struct rc_queue_handle *queue_handles[RC_MAX_QUEUE_DESCRIPTORS]; // devExt+0x15948
-    u32 queue_index;                // devExt+0x15968: Queue index selector
-    u32 queue_rotation_counter;     // devExt+0x1596c: Queue rotation counter
-    u8 queue_state;                 // devExt+0x15920: Queue state flag (for FUN_140001ba4)
-    u8 port_count;                  // devExt+0xb0: Port count (spinlock count)
-    
-    // NVMe-specific fields (for queue_state == 2)
-    u8 nvme_queue_state;            // devExt+0x15d00: NVMe queue state
-    u8 nvme_init_flag;              // devExt+0x15d01: NVMe initialization flag
-    u32 nvme_completion_state[2];   // devExt+0x15ce0, devExt+0x15ce1
-    u32 nvme_context;               // devExt+0x15ce8: NVMe context
-    u32 nvme_flags;                 // devExt+0x15cd8: NVMe flags
-    u64 controller_serial[8];       // devExt+0x15cf0-0x15cf7: Controller serial number
-    u32 controller_id;              // devExt+0x15c48: Controller ID
-    u32 controller_data[16];        // devExt+0x15c4c-0x15c88: Controller data
 };
 
 // Request tracking for blk-mq completion
@@ -333,94 +258,12 @@ struct rc_hw_completion {
     u32 reserved[3];
 } __packed;
 
-// SRB (SCSI Request Block) structure - mirrors Windows driver layout
-// Used for command submission and completion tracking
-struct rc_srb {
-    // Command tracking (offsets 0x00-0x60)
-    u32 original_status;        // +0x13c: Original status (saved)
-    u32 information;            // +0x140: Information field
-    u32 status;                 // +0x100: Current status
-    u32 secondary_status;       // +0x10c: Secondary status
-    u16 status_byte;            // +0x110: Status byte (0=success, 2=error)
-    u16 error_code;             // +0x10e: Error code (byte-swapped)
-    u16 command_type;           // +0x112: Command type
-    u8 srb_function;            // +0x14c: SRB function code
-    u8 command_code;            // +0x60: Command type/code
-    u8 sub_command;             // +0x61: Sub-command byte
-    u8 flags_byte;              // +0x62: Flags byte
-    
-    // Scatter-gather and DMA
-    void *scatter_gather_list;  // +0x48: Scatter-gather list pointer
-    void *sg_handle;            // +0x58: Scatter-gather list handle
-    u32 sg_flags;               // +0x64: Scatter-gather flags (bits 2-7)
-    
-    // Status and context
-    u32 status_dword[4];        // +0x84-0x90: Status DWORDs (for FUN_140010184)
-    u32 context;                // +0xc0: Context field
-    u32 context2;               // +0xc4: Context field 2
-    
-    // Completion callback
-    void (*completion_callback)(void *); // +0x70: Completion callback
-    void *completion_arg;       // +0x18: Command descriptor pointer (for callbacks)
-    
-    // Port/channel information
-    u32 port_id;                // +0x38+8: Port index
-    
-    // Command data
-    u64 lba;                    // Logical block address
-    u32 sector_count;           // Sector count
-    u32 data_length;            // Data transfer length
-    u32 reserved[20];           // Reserved fields
-} __packed;
-
-// Command descriptor structure (0x78 bytes) - from FUN_14000c2fc
-// Used for NVMe command slot allocation
-struct rc_command_descriptor {
-    u16 slot_index;             // +0x20: Slot index in queue
-    u16 queue_index;            // +0x22: Producer index when allocated
-    void *srb_ptr;              // +0x18: SRB pointer (for completion)
-    void (*callback)(void *);   // +0x28: Completion callback
-    u8 command_type;            // +0x30: Command type/opcode
-    u16 slot_index_copy;        // +0x32: Duplicate of +0x20
-    u32 context;                // +0x34: Command context
-    u64 metadata;               // +0x38: Command metadata
-    u8 command_data[64];        // +0x40-0x7f: NVMe command DWORDs (64 bytes)
-    void (*completion_cb)(void *); // +0x70: SRB completion callback
-} __packed;
-
-// Completion descriptor structure (0x68 bytes) - from FUN_140006e3c
-struct rc_completion_descriptor {
-    u8 completion_type;         // +0x00: Completion type
-    u8 reserved1[5];            // Reserved
-    void *srb_ptr;              // +0x06: SRB pointer (for type 2)
-    u32 status_dword;           // +0x0c: Status DWORD
-    u32 reserved2[3];           // Reserved
-    u32 queue_index;            // +0x18: Queue index/port number
-    u32 reserved3[2];           // Reserved
-    u32 queue_type;             // +0x24: Queue type (0x1=primary, 0x2=secondary, 0x3=tertiary)
-    u32 queue_depth;            // +0x28: Queue depth/size
-    u32 completion_type_dword;  // +0x2c: Completion type (DWORD)
-    u32 adapter_index;          // +0x30: Adapter index
-    u32 status_flags;           // +0x34: Status flags
-    u64 completion_data[4];     // +0x38-0x5f: Completion data (DMA addresses, command data)
-    void *callback;             // +0x1c: Completion callback (for type 2)
-} __packed;
-
-// Vendor mailbox structure (TRX50 firmware requirement)
-// Embedded in AHCI command table at offset 0x10e
-// Decoded from rcbottom.sys FUN_140001008
-struct rc_vendor_mailbox {
-    u16 completion_flags;  /* +0x10e: 0x4400/0x1100/0x1400/0x4703/0x0000 */
-    u8  cmd_type;          /* +0x110: 0x02 or 0x00 */
-    u8  control_flags;     /* +0x111: command-specific control */
-    u8  payload_length;    /* +0x112: 0x08, 0x14, or 0x00 */
-    u8  secondary_control; /* +0x113: command-specific flags */
-    u32 payload[5];        /* +0x114–0x124: command data */
-    u8  reserved[0x2c];    /* +0x128–0x153: unused */
-    u32 extended_flags;    /* +0x154: bit 17 = 0x20000 */
-} __packed;
-
-// Hardware adapter bookkeeping (queue/DMA resources)
+// Hardware adapter bookkeeping (queue/DMA resources).  The cmd/comp
+// queue fields and rc_hw_command/rc_hw_completion definitions are
+// kept because rc_debugfs.c still seq_prints them; the queues are
+// never allocated on the live NVMe path so they always read empty.
+// When the AHCI path is built (or debugfs is reworked), these fields
+// will either be populated or removed.
 struct rc_hw_queue_context {
     struct rc_adapter *owner;
     struct pci_dev *pdev;
@@ -501,44 +344,10 @@ struct rc_config {
     int initialized;
 };
 
-// RAID Array structure
-struct rc_raid_array {
-    int array_id;
-    int raid_type;
-    int state;
-    sector_t total_sectors;
-    sector_t used_sectors;
-    int num_disks;
-    int stripe_size;
-    char name[32];
-    struct gendisk *disk;
-    struct request_queue *queue;
-    struct blk_mq_tag_set tag_set;
-    struct rc_adapter *adapter;
-    int initialized;
-    
-    // Additional fields for blk-mq helper
-    u64 size_bytes;          /* set this before calling rc_blk_create_disk */
-    int index;               /* 0,1,2… */
-    struct list_head page_list; /* in-memory backing store buckets */
-    spinlock_t page_lock;
-};
-
-// RAID structure (rcraid equivalent)
-struct rc_raid {
-    struct Scsi_Host *host;
-    struct rc_adapter *adapter;
-    struct rc_raid_array arrays[RC_MAX_RAID_ARRAYS];
-    int num_arrays;
-    int initialized;
-    int scsi_host_created;
-};
-
 // Global state
 struct rc_global_state {
     struct rc_adapter *adapters[RC_MAX_ADAPTERS];
     struct rc_config config;
-    struct rc_raid raid;
     int num_adapters;
     int initialized;
     struct mutex lock;
@@ -547,54 +356,19 @@ struct rc_global_state {
 
 extern struct rc_global_state rc_state;
 
-// Function prototypes
-int rc_bottom_init(void);
+// Module-level lifecycle
+int  rc_bottom_init(void);
 void rc_bottom_cleanup(void);
-int rc_config_init(void);
+int  rc_config_init(void);
 void rc_config_cleanup(void);
-int rc_raid_init(void);
-void rc_raid_cleanup(void);
 
-// PCI driver functions
-int rc_pci_probe(struct pci_dev *pdev, const struct pci_device_id *id);
-void rc_pci_remove(struct pci_dev *pdev);
-
-// SCSI functions
-#if RC_SCSI_AVAILABLE
-int rc_scsi_probe(struct scsi_device *sdev);
-int rc_scsi_remove(struct scsi_device *sdev);
-int rc_scsi_queuecommand(struct Scsi_Host *host, struct scsi_cmnd *scmd);
-#else
-int rc_scsi_probe(void *sdev);
-int rc_scsi_remove(void *sdev);
-int rc_scsi_queuecommand(void *host, void *scmd);
-#endif
-
-// Block device functions
-int rc_raid_array_init(struct rc_raid_array *array);
-void rc_raid_array_cleanup(struct rc_raid_array *array);
-// Forward declaration removed - function is static
-int rc_raid_array_ioctl(struct block_device *bdev, fmode_t mode, unsigned int cmd, unsigned long arg);
-
-// Real hardware register definitions (from TRX50 testing)
-#define RC_MMIO_BASE_ADDR		0x81a80000
-#define RC_MMIO_SIZE			1024
-#define RC_MSI_VECTOR			244
-#define RC_PCI_VID			0x1022
-#define RC_PCI_DID			0x43bd
-
-// Hardware register offsets (BAR 5 mapping)
+/* Historical AHCI register offsets are kept here for the future SATA
+ * RAID path; the live NVMe code uses RC_NVME_REG_* below instead. */
 #define RC_REG_STATUS			0x000
 #define RC_REG_CONTROL			0x004
 #define RC_REG_INTERRUPT_STATUS	0x008
 #define RC_REG_INTERRUPT_MASK	0x00C
 #define RC_REG_DOORBELL		0x010
-#define RC_REG_CMD_Q_BASE_LO		0x020
-#define RC_REG_CMD_Q_BASE_HI		0x024
-#define RC_REG_CMD_Q_SIZE		0x028
-#define RC_REG_COMP_Q_BASE_LO		0x030
-#define RC_REG_COMP_Q_BASE_HI		0x034
-#define RC_REG_COMP_Q_SIZE		0x038
 
 /* NVMe controller registers (BAR0), per NVMe 1.4 spec.
  * Used when ctx->ctrl_mode == RC_CTRL_MODE_NVME (DEV_B000).
@@ -841,20 +615,6 @@ struct rc_nvme_cqe {
 #define RC_STATUS_INVALID_PARAM	0x04
 #define RC_STATUS_DEVICE_ERROR		0x05
 
-// RAID metadata structures (based on Windows driver analysis)
-struct rc_raid_metadata {
-	u32 signature;		// RAID signature
-	u32 version;		// Metadata version
-	u32 array_id;		// Array identifier
-	u32 raid_level;		// RAID level (0, 1, 5, 6, etc.)
-	u32 num_disks;		// Number of member disks
-	u64 array_size;		// Total array size in sectors
-	u64 stripe_size;	// Stripe size in sectors
-	u32 generation;		// Generation number
-	u32 checksum;		// Metadata checksum
-	u8 reserved[64];	// Reserved for future use
-} __packed;
-
 // Block major number (defined in rc_main.c)
 extern int rc_major;
 
@@ -862,270 +622,25 @@ extern int rc_major;
  * its per-member DMA buffers (defined in rc_nvme.c). */
 void rc_volume_teardown(void);
 
-// Hardware functions
-int rc_hw_init(struct rc_adapter *adapter);
-void rc_hw_cleanup(struct rc_adapter *adapter);
-int rc_hw_submit_command(struct rc_hw_queue_context *hw, struct rc_hw_command *cmd);
-int rc_hw_process_completions(struct rc_hw_queue_context *hw);
-int rc_hw_submit_sync_command(struct rc_hw_queue_context *hw,
-                             struct rc_hw_command *cmd,
-                             struct rc_hw_completion *completion,
-                             unsigned int timeout_ms);
-int rc_hw_poll_completions(struct rc_hw_queue_context *hw);
-irqreturn_t rc_hw_interrupt_handler(int irq, void *dev_id);
-int rc_hw_submit_request(struct rc_adapter *adapter, struct request *rq,
-                         u32 opcode, sector_t lba, u32 sector_count,
-                         dma_addr_t dma_addr, void *dma_buf);
-int rc_install_callbacks(struct rc_adapter *adapter, bool fast_path);
+/* PCI-ID-based code-path dispatcher (rc_firmware.c). */
 int rc_parse_firmware_capabilities(struct rc_adapter *adapter);
 
-// NVMe controller path (rc_nvme.c). Used when ctx->ctrl_mode == RC_CTRL_MODE_NVME.
-int rc_nvme_init_controller(struct rc_adapter *adapter);
+/* Hardware-layer stubs (rc_hw.c).  See file header for status. */
+int          rc_hw_init(struct rc_adapter *adapter);
+void         rc_hw_cleanup(struct rc_adapter *adapter);
+irqreturn_t  rc_hw_interrupt_handler(int irq, void *dev_id);
+int          rc_install_callbacks(struct rc_adapter *adapter, bool fast_path);
+
+/* NVMe controller bring-up + I/O path (rc_nvme.c). */
+int  rc_nvme_init_controller(struct rc_adapter *adapter);
 void rc_nvme_cleanup_controller(struct rc_adapter *adapter);
 
-// Queue management functions (StorPort service slot equivalents)
-int rc_queue_init(struct rc_adapter *adapter);
-void rc_queue_cleanup(struct rc_adapter *adapter);
-int rc_activate_doorbells(struct rc_adapter *adapter);
-int rc_queue_issue_sync(struct rc_adapter *adapter,
-                       struct rc_hw_command *cmd,
-                       bool data_in, bool data_out,
-                       unsigned int timeout_ms,
-                       struct rc_hw_completion *completion);
-
-// Queue full handler (FUN_14000e960) - deferred work item queue
-void rc_queue_full_handler(struct rc_adapter *adapter, void *srb,
-                           void *param3, void (*completion)(void *),
-                           void *completion_arg);
-int rc_process_deferred_work_items(struct rc_adapter *adapter);
-void rc_cleanup_work_item_queue(struct rc_adapter *adapter);
-
-// Queue initialization functions (FUN_140008a48, FUN_140007978, FUN_1400093c4)
-int rc_init_queue_bar(struct rc_adapter *adapter);
-int rc_program_global_completion_registers(struct rc_adapter *adapter);
-int rc_queue_state_table_lookup(struct rc_adapter *adapter);
-
-// Simple callback functions (from FUN_140007d40)
-u8 rc_get_queue_state(struct rc_adapter *adapter);
-int rc_check_queue_activity(struct rc_adapter *adapter);
-void rc_toggle_queue_mode(struct rc_adapter *adapter, u8 mode);
-void rc_noop_helper(struct rc_adapter *adapter);
-
-// SRB completion and error handling (FUN_14000c900)
-void rc_srb_completion_handler(struct rc_srb *srb,
-                                void (*completion_callback)(void *),
-                                u8 status_byte, u16 status_word);
-void rc_srb_indirect_completion(struct rc_srb *srb);
-
-// Completion callback functions (rcraid.sys)
-void rc_nvme_completion_with_sg(void *queue_handle,
-                                 void *completion_queue_desc,
-                                 struct rc_command_descriptor *cmd_desc,
-                                 struct rc_completion_descriptor *comp_desc);
-void rc_simple_completion_callback(void *unused1, void *unused2,
-                                    struct rc_command_descriptor *cmd_desc,
-                                    struct rc_completion_descriptor *comp_desc);
-void rc_completion_with_status_update(void *unused1, void *unused2,
-                                       struct rc_command_descriptor *cmd_desc,
-                                       struct rc_completion_descriptor *comp_desc);
-
-// Queue callback handler (FUN_14000eef8)
-int rc_queue_callback_handler(void *queue_handle, void *unused,
-                               struct rc_completion_descriptor *comp_desc,
-                               void *completion_queue_entry);
-
-// Command routing functions (rcraid.sys)
-int rc_primary_queue_dispatcher(struct rc_adapter *adapter,
-                                 struct rc_srb *srb,
-                                 void *unused3, void *unused4);
-int rc_secondary_queue_dispatcher(struct rc_adapter *adapter,
-                                   struct rc_srb *srb,
-                                   void *unused3, void *unused4);
-int rc_command_router(struct rc_adapter *adapter,
-                       struct rc_srb *srb,
-                       void *unused3, void *unused4);
-int rc_command_router_srb06(struct rc_adapter *adapter,
-                             struct rc_srb *srb,
-                             void *unused3, void *completion_callback);
-
-// Completion processing (FUN_140006e3c)
-int rc_process_completions_all_adapters(struct rc_adapter *adapter);
-
-// Multi-adapter support (FUN_14000a564, FUN_14000a72c)
-int rc_multi_adapter_disconnect(struct rc_adapter *adapter);
-int rc_multi_adapter_connect(struct rc_adapter *adapter, int adapter_index);
-
-// Descriptor lookup and command configuration (FUN_14000c2fc, FUN_14000c9e4, FUN_14000c1e4)
-struct rc_command_descriptor *rc_allocate_command_descriptor(
-    struct rc_queue_handle *queue_handle,
-    void (*completion_callback)(void *));
-int rc_build_scatter_gather_list(struct rc_queue_handle *queue_handle,
-                                  struct rc_srb *srb,
-                                  void *sg_list,
-                                  struct rc_command_descriptor *cmd_desc);
-int rc_configure_command_after_state_machine(struct rc_queue_handle *queue_handle,
-                                              struct rc_adapter *adapter);
-
-// NVMe command submission functions (from TECHNICAL_REFERENCE.md)
-int rc_submit_command_type0(struct rc_adapter *adapter,
-                            struct rc_srb *srb,
-                            void *unused3,
-                            void (*completion)(void *));
-int rc_submit_queue_management_cmd10(struct rc_queue_handle *queue);
-int rc_submit_queue_management_cmd6(struct rc_queue_handle *queue);
-int rc_submit_queue_management_cmd6_safe(struct rc_queue_handle *queue);
-int rc_submit_queue_management_cmd6_param(struct rc_queue_handle *queue, u32 param);
-int rc_submit_command_type9(struct rc_adapter *adapter,
-                            struct rc_srb *srb,
-                            void *command_ptr,
-                            void (*completion)(void *));
-int rc_submit_scatter_gather_cmd2(struct rc_adapter *adapter,
-                                  struct rc_srb *srb,
-                                  void *sg_list,
-                                  void (*completion)(void *));
-int rc_submit_nvme_command_type8(struct rc_adapter *adapter,
-                                  void *unused2,
-                                  struct rc_srb *srb,
-                                  void (*completion)(void *));
-int rc_submit_command_type2_or_c(struct rc_adapter *adapter,
-                                  struct rc_srb *srb,
-                                  void *sg_list,
-                                  void (*completion)(void *));
-int rc_submit_command_type5(struct rc_queue_handle *queue);
-int rc_submit_command_helper_type1(struct rc_queue_handle *queue,
-                                    void (*completion)(void *));
-int rc_submit_commands_iterative(struct rc_queue_handle *queue,
-                                  void (*completion)(void *));
-int rc_submit_state_machine_command(struct rc_queue_handle *queue,
-                                     struct rc_completion_descriptor *comp_desc,
-                                     struct rc_srb *srb,
-                                     void (*completion)(void *));
-
-// Simple helper/getter functions
-u8 rc_get_nvme_queue_state(struct rc_adapter *adapter);
-void rc_nvme_status_update(struct rc_adapter *adapter, u32 status_flags);
-int rc_nvme_command_submission_wrapper(struct rc_adapter *adapter, u32 port_index);
-int rc_steady_state_dispatcher(struct rc_adapter *adapter);
-int rc_helper_stub(struct rc_adapter *adapter, u32 param);
-void rc_early_init_stub(struct rc_adapter *adapter);
-
-// Remaining command submission functions
-int rc_submit_queue_type_selection(struct rc_adapter *adapter,
-                                   struct rc_srb *srb,
-                                   void *unused3,
-                                   void (*completion)(void *));
-int rc_submit_command_with_limits(struct rc_queue_handle *queue);
-int rc_submit_command_with_params(struct rc_queue_handle *queue,
-                                  u32 param2,
-                                  u32 param3,
-                                  void (*completion)(void *));
-int rc_submit_command_with_flags(struct rc_queue_handle *queue, u8 flags);
-int rc_submit_command_with_context(struct rc_adapter *adapter,
-                                   struct rc_srb *srb,
-                                   void (*completion)(void *),
-                                   u32 context_param);
-int rc_submit_command_context_type4(struct rc_adapter *adapter,
-                                    struct rc_srb *srb,
-                                    void *unused3,
-                                    void (*completion)(void *));
-int rc_submit_special_command_11(struct rc_adapter *adapter,
-                                 struct rc_srb *srb,
-                                 void *unused3,
-                                 void (*completion)(void *));
-
-// Simple callback functions
-void rc_queue_cleanup_all_ports(struct rc_adapter *adapter);
-void rc_status_polling_cleanup(struct rc_adapter *adapter, void *status_buf);
-int rc_early_init_wrapper(struct rc_adapter *adapter,
-                          void *port_context,
-                          struct rc_srb *srb,
-                          void (*completion)(void *));
-
-// Additional callback and command submission functions
-int rc_submit_queue_rotation_command(struct rc_adapter *adapter,
-                                     struct rc_srb *srb,
-                                     void *unused3,
-                                     void (*completion)(void *));
-int rc_submit_complex_state_machine(struct rc_queue_handle *queue,
-                                    void *unused2,
-                                    struct rc_completion_descriptor *comp_desc,
-                                    struct rc_srb *srb);
-int rc_check_nvme_completion(struct rc_adapter *adapter, int port_index);
-int rc_secondary_queue_helper_legacy(struct rc_adapter *adapter,
-                                     struct rc_srb *srb,
-                                     void *sg_list,
-                                     void (*completion)(void *));
-int rc_primary_queue_dispatcher_legacy(struct rc_adapter *adapter,
-                                       struct rc_srb *srb,
-                                       void *sg_list,
-                                       void (*completion)(void *));
-int rc_command_routing_helper(struct rc_adapter *adapter,
-                              struct rc_srb *srb,
-                              void *sg_list,
-                              void (*completion)(void *));
-void rc_ahci_command_submission(struct rc_adapter *adapter,
-                                struct rc_srb *srb,
-                                void (*completion)(void *));
-int rc_command_submission_callback(void *adapter_handle,
-                                   void *unused2,
-                                   void *srb_context,
-                                   void *unused4,
-                                   void *sg_list_ptr);
-void rc_nvme_command_submission_legacy(struct rc_adapter *adapter,
-                                       struct rc_srb *srb,
-                                       void (*completion)(void *));
-int rc_nvme_queue_initialization(void *queue_desc,
-                                 void *adapter_handle,
-                                 u32 queue_index,
-                                 u32 sub_queue_index,
-                                 u8 init_flag,
-                                 u8 enable_flag,
-                                 dma_addr_t comp_queue_base,
-                                 dma_addr_t sub_queue_base);
-int rc_mmio_register_io(void *register_context,
-                        void *unused2,
-                        void *buffer_descriptor);
-
-// Critical initialization functions
-int rc_spinlock_callback_queue_init(struct rc_adapter *adapter, u8 mode);
-int rc_port_enable_resume(struct rc_adapter *adapter);
-int rc_port_disable_quiesce(struct rc_adapter *adapter, u32 port_mask);
-int rc_nvme_spinlock_callback_init(struct rc_adapter *adapter, u8 init_flag);
-int rc_nvme_cleanup_completion(struct rc_adapter *adapter);
-int rc_adapter_init_device_enumeration(struct rc_adapter *adapter);
-int rc_adapter_object_wmi_registration(struct rc_adapter *adapter);
-
-// Special command handlers (FUN_14000f838, FUN_14000fa2c)
-int rc_special_command_handler_type12(struct rc_adapter *adapter,
-                                       struct rc_srb *srb,
-                                       void *sg_list, void *unused4);
-int rc_special_command_handler_type9e(struct rc_adapter *adapter,
-                                       struct rc_srb *srb,
-                                       void *sg_list, void *unused4);
-
-// Sysfs interface
-int rc_sysfs_create(struct rc_adapter *adapter);
+/* Sysfs / debugfs interfaces. */
+int  rc_sysfs_create(struct rc_adapter *adapter);
 void rc_sysfs_remove(struct rc_adapter *adapter);
-
-// Debugfs interface
-int rc_debugfs_init(void);
+int  rc_debugfs_init(void);
 void rc_debugfs_cleanup(void);
-int rc_debugfs_create_adapter(struct rc_adapter *adapter);
+int  rc_debugfs_create_adapter(struct rc_adapter *adapter);
 void rc_debugfs_remove_adapter(struct rc_adapter *adapter);
-
-// Metadata discovery functions
-int rc_discover_arrays(struct rc_adapter *adapter);
-int rc_read_array_metadata(struct rc_adapter *adapter, int array_id, 
-			   struct rc_raid_metadata *metadata);
-int rc_scan_physical_disks(struct rc_adapter *adapter);
-
-// RAID management functions
-int rc_raid_scan_arrays(struct rc_adapter *adapter);
-int rc_raid_get_array_info(struct rc_raid_array *array);
-int rc_raid_create_array(struct rc_adapter *adapter, int raid_type, int num_disks);
-int rc_raid_delete_array(struct rc_raid_array *array);
-
-// Interrupt handlers
-irqreturn_t rc_interrupt_handler(int irq, void *dev_id);
 
 #endif /* _RC_LINUX_H_ */

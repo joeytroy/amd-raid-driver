@@ -1317,10 +1317,11 @@ static int rc_volume_create_disk(void)
 		goto err_put_disk;
 
 	rc_printk(RC_NOTE,
-		  "rc_volume_create_disk: /dev/%s up, %llu sectors (%llu MiB, read-only)\n",
+		  "rc_volume_create_disk: /dev/%s up, %llu sectors (%llu MiB, %s)\n",
 		  rc_volume_disk->disk_name,
 		  (unsigned long long)total_sectors,
-		  (unsigned long long)(total_sectors >> 11));
+		  (unsigned long long)(total_sectors >> 11),
+		  rc_volume_enable_writes ? "read-write" : "read-only");
 	return 0;
 
 err_put_disk:

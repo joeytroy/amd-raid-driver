@@ -1,9 +1,17 @@
-# AMD RAID Driver for Linux
-# Based on Windows driver architecture (rcbottom, rccfg, rcraid)
+# SPDX-License-Identifier: GPL-2.0-only
+# AMD-RAID Linux driver
 
 obj-m += rcraid.o
 
-rcraid-objs := rc_main.o rc_bottom.o rc_config.o rc_raid.o rc_blk.o rc_hw.o rc_metadata.o rc_queue.o rc_sysfs.o rc_debugfs.o rc_firmware.o rc_nvme.o
+rcraid-objs := \
+    rc_main.o \
+    rc_bottom.o \
+    rc_firmware.o \
+    rc_nvme.o \
+    rc_hw.o \
+    rc_config.o \
+    rc_sysfs.o \
+    rc_debugfs.o
 
 # Kernel build directory
 KERNELDIR ?= /lib/modules/$(shell uname -r)/build
