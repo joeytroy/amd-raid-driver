@@ -124,6 +124,25 @@ are best-effort/untested.
   followed by read-back — patterns match exactly, adjacent sectors
   untouched, no AMD-Vi events or kernel warnings.
 
+### Interrupt-driven CQE wakeup (Stage 1)
+
+`rc_nvme_io_cmd` and `rc_nvme_admin_cmd` now sleep on per-queue
+`wait_queue_head_t`s (`io_cq_wait`, `admin_cq_wait`) instead of
+busy-polling with `usleep_range`.  Create I/O CQ programs IEN=1 + IV=0
+so the controller raises an interrupt on our MSI vector when a CQE is
+posted.  `rc_nvme_init_controller` clears INTMS so the vector is
+unmasked.  `rc_hw_interrupt_handler` dispatches to `rc_nvme_irq` on
+NVMe-mode binds; the ISR just wakes both wait queues and the
+submitter re-evaluates the phase-bit predicate inside
+`wait_event_timeout`.  A 1 ms fallback poll-tick guards against
+mis-armed MSI.
+
+IRQ counts in `/proc/interrupts` climb 1:1 with completions —
+~480 per a `dd bs=1M count=64` test.  Bench throughput improved
+~14 % at large blocks (5.4 GB/s @ `bs=4M`, up from 4.7).  Stage 2
+(full async via `blk_mq_complete_request`, queue_depth > 1, drop
+`BLK_MQ_F_BLOCKING`) is next.
+
 ### AHCI scaffolding removed
 
 The pre-NVMe AHCI scaffolding (`rc_blk.c`, `rc_metadata.c`,

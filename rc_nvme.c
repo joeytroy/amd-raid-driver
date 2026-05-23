@@ -110,6 +110,20 @@ static inline void rc_nvme_writeq(u64 v, void __iomem *base, u32 off)
 	writel((u32)(v >> 32), base + off + 4);
 }
 
+/* MSI handler called from rc_hw_interrupt_handler when ctrl_mode == NVMe.
+ * Stage 1 of interrupt-driven completion: the handler just wakes both CQ
+ * wait queues; the sleeping submitters re-evaluate the phase-bit predicate
+ * and process the CQE themselves.  Returning IRQ_HANDLED is safe even when
+ * the wake is spurious — Linux only counts spurious for IRQ_NONE returns. */
+irqreturn_t rc_nvme_irq(struct rc_adapter *adapter)
+{
+	struct rc_nvme_state *nvme = &adapter->ctx.nvme;
+
+	wake_up(&nvme->admin_cq_wait);
+	wake_up(&nvme->io_cq_wait);
+	return IRQ_HANDLED;
+}
+
 /* Doorbells live at BAR0 + 0x1000, striped by (4 << DSTRD). For each queue
  * pair qid, the SQ tail doorbell is at offset 2*qid and the CQ head doorbell
  * at 2*qid+1, both scaled by the stride. */
@@ -242,24 +256,31 @@ static void rc_nvme_ascii_field(const u8 *src, size_t len, char *dst)
 	dst[len] = '\0';
 }
 
-/* Poll the next admin CQE slot until its phase bit flips to the expected
- * value or the timeout expires. No CQ-head advance is done here; the caller
- * must consume the entry and ring the doorbell. */
+/* Wait for the next admin CQE slot's phase bit to flip to the expected
+ * value, driven by MSI wakes on admin_cq_wait.  Falls back to a 10 ms
+ * polling tick so we don't hang permanently if interrupts are mis-delivered
+ * (paranoia — once MSI has been validated in the field this can drop).
+ * No CQ-head advance is done here; the caller consumes the entry. */
 static int rc_nvme_wait_admin_completion(struct rc_adapter *adapter)
 {
 	struct rc_nvme_state *nvme = &adapter->ctx.nvme;
-	struct rc_nvme_cqe *cqe;
+	struct rc_nvme_cqe *cqe =
+		(struct rc_nvme_cqe *)nvme->admin_cq + nvme->admin_cq_head;
 	u8 expected_phase = nvme->admin_cq_phase;
-	unsigned long deadline;
-
-	cqe = (struct rc_nvme_cqe *)nvme->admin_cq + nvme->admin_cq_head;
-	deadline = jiffies + msecs_to_jiffies(RC_NVME_ADMIN_TIMEOUT_MS);
+	unsigned long total = msecs_to_jiffies(RC_NVME_ADMIN_TIMEOUT_MS);
+	unsigned long deadline = jiffies + total;
 
 	while (time_before(jiffies, deadline)) {
-		u16 status = le16_to_cpu(READ_ONCE(cqe->status));
-		if ((status & 1) == expected_phase)
+		long left = deadline - jiffies;
+		/* Safety-net poll tick — kept tiny so a mis-armed MSI doesn't
+		 * tank throughput.  Real wakeups land via rc_nvme_irq. */
+		long tick = min_t(long, left, max_t(long, 1, msecs_to_jiffies(1)));
+
+		if (wait_event_timeout(nvme->admin_cq_wait,
+				       (le16_to_cpu(READ_ONCE(cqe->status)) & 1) ==
+					       expected_phase,
+				       tick) > 0)
 			return 0;
-		usleep_range(10, 50);
 	}
 	return -ETIMEDOUT;
 }
@@ -424,7 +445,8 @@ out:
 
 /* Allocate one I/O completion + submission queue pair (qid=1) and ask the
  * controller to wire them up via Create I/O CQ then Create I/O SQ admin
- * commands.  Interrupts stay disabled — we'll poll the CQ for now. */
+ * commands.  Create I/O CQ sets IEN=1 + IV=0 so the controller raises an
+ * interrupt on our single MSI vector when a CQE is posted. */
 static int rc_nvme_create_io_queues(struct rc_adapter *adapter)
 {
 	struct device *dev = &adapter->pdev->dev;
@@ -464,7 +486,8 @@ static int rc_nvme_create_io_queues(struct rc_adapter *adapter)
 	cmd.opc   = RC_NVME_ADMIN_OP_CREATE_IO_CQ;
 	cmd.prp1  = cpu_to_le64(nvme->io_cq_dma);
 	cmd.cdw10 = cpu_to_le32(((u32)(depth - 1) << 16) | RC_NVME_IO_QID);
-	cmd.cdw11 = cpu_to_le32(0x1u);	/* PC=1, IEN=0 (polled), IV=0 */
+	/* CDW11[31:16]=IV (vector 0), [1]=IEN (raise IRQ on completion), [0]=PC. */
+	cmd.cdw11 = cpu_to_le32((0u << 16) | 0x3u);
 	ret = rc_nvme_admin_cmd(adapter, &cmd);
 	if (ret) {
 		rc_printk(RC_ERROR,
@@ -508,7 +531,9 @@ err_free_sq:
 	return ret;
 }
 
-/* Same shape as rc_nvme_admin_cmd, but for I/O queue 1 (polled). */
+/* Same shape as rc_nvme_admin_cmd, but for I/O queue 1.  Sleeps on
+ * io_cq_wait (woken by the MSI handler) with a periodic 10 ms fallback
+ * poll-tick that protects against mis-delivered interrupts. */
 static int rc_nvme_io_cmd(struct rc_adapter *adapter, struct rc_nvme_sqe *cmd)
 {
 	struct rc_nvme_state *nvme = &adapter->ctx.nvme;
@@ -532,10 +557,16 @@ static int rc_nvme_io_cmd(struct rc_adapter *adapter, struct rc_nvme_sqe *cmd)
 	expected_phase = nvme->io_cq_phase;
 	deadline = jiffies + msecs_to_jiffies(RC_NVME_ADMIN_TIMEOUT_MS);
 	while (time_before(jiffies, deadline)) {
-		status = le16_to_cpu(READ_ONCE(cqe->status));
-		if ((status & 1) == expected_phase)
+		long left = deadline - jiffies;
+		/* Safety-net poll tick — kept tiny so a mis-armed MSI doesn't
+		 * tank throughput.  Real wakeups land via rc_nvme_irq. */
+		long tick = min_t(long, left, max_t(long, 1, msecs_to_jiffies(1)));
+
+		if (wait_event_timeout(nvme->io_cq_wait,
+				       (le16_to_cpu(READ_ONCE(cqe->status)) & 1) ==
+					       expected_phase,
+				       tick) > 0)
 			goto have_cqe;
-		usleep_range(10, 50);
 	}
 	rc_printk(RC_ERROR,
 		  "rc_nvme_io_cmd: timeout waiting for CQE (opc=0x%02x)\n",
@@ -543,6 +574,7 @@ static int rc_nvme_io_cmd(struct rc_adapter *adapter, struct rc_nvme_sqe *cmd)
 	return -ETIMEDOUT;
 
 have_cqe:
+	status = le16_to_cpu(READ_ONCE(cqe->status));
 	sc_sct = (status >> 1) & 0x7fff;
 
 	nvme->io_cq_head = (nvme->io_cq_head + 1) % nvme->io_cq_depth;
@@ -1443,6 +1475,8 @@ int rc_nvme_init_controller(struct rc_adapter *adapter)
 	nvme->dstrd = RC_NVME_CAP_DSTRD(cap);
 	nvme->timeout_500ms = RC_NVME_CAP_TO(cap);
 	nvme->sq_doorbell_base = base + RC_NVME_REG_DBL_BASE;
+	init_waitqueue_head(&nvme->admin_cq_wait);
+	init_waitqueue_head(&nvme->io_cq_wait);
 
 	rc_printk(RC_NOTE,
 		  "rc_nvme_init_controller: CAP=0x%016llx VS=0x%08x MQES=%u DSTRD=%u TO=%u (%u ms)\n",
@@ -1542,6 +1576,16 @@ int rc_nvme_init_controller(struct rc_adapter *adapter)
 			  ret);
 		return 0;
 	}
+
+	/* Unmask all interrupt vectors so the MSI handler starts firing on
+	 * admin + I/O queue completions.  INTMC is "Interrupt Mask Clear"
+	 * (write-1-to-clear); writing all-1s unmasks every vector.  With one
+	 * MSI vector configured per adapter, both queues land on vector 0
+	 * and our handler wakes both admin_cq_wait and io_cq_wait. */
+	writel(0xffffffffu, base + RC_NVME_REG_INTMC);
+	rc_printk(RC_INFO,
+		  "rc_nvme_init_controller: interrupt mask cleared (INTMS=0x%08x)\n",
+		  readl(base + RC_NVME_REG_INTMS));
 
 	/* Read + validate the AMD RAIDCore metadata block at LBA 0x5000. */
 	ret = rc_nvme_read_validate_metadata(adapter);

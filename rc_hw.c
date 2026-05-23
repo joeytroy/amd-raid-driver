@@ -39,18 +39,22 @@ void rc_hw_cleanup(struct rc_adapter *adapter)
 }
 
 /*
- * Registered as the MSI handler for every adapter at probe time but
- * not actually used yet — the NVMe path polls completions and
- * doesn't enable controller interrupts.  Returning IRQ_NONE marks
- * any spurious firing as not-ours so the kernel can move on.
- *
- * When interrupt-driven completion lands (see docs/STATUS.md), this
- * grows into the real handler.
+ * Registered as the MSI handler for every adapter at probe time.
+ * Dispatches to the per-controller-mode handler — currently only NVMe
+ * is wired (Stage 1 of interrupt-driven completion).  AHCI binds get
+ * IRQ_NONE until that path is built.
  */
 irqreturn_t rc_hw_interrupt_handler(int irq, void *dev_id)
 {
+	struct rc_adapter *adapter = dev_id;
+
 	(void)irq;
-	(void)dev_id;
+	if (!adapter)
+		return IRQ_NONE;
+
+	if (adapter->ctx.ctrl_mode == RC_CTRL_MODE_NVME)
+		return rc_nvme_irq(adapter);
+
 	return IRQ_NONE;
 }
 

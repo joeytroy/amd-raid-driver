@@ -203,6 +203,14 @@ struct rc_nvme_state {
 
     // Per-doorbell pointers (computed once after CAP read)
     void __iomem  *sq_doorbell_base;  // BAR0 + 0x1000
+
+    // Wait queues woken from the MSI handler when a CQE arrives.
+    // Submitters use wait_event_timeout against these with a phase-bit
+    // predicate, so spurious wakes (or wakes for the other queue) are
+    // harmless.  Stage 1 of interrupt-driven completion — submitter still
+    // consumes the CQE and advances head + doorbell.
+    wait_queue_head_t admin_cq_wait;
+    wait_queue_head_t io_cq_wait;
 };
 
 // Device context layout (clean-room mirror of the Windows device extension)
@@ -632,8 +640,9 @@ irqreturn_t  rc_hw_interrupt_handler(int irq, void *dev_id);
 int          rc_install_callbacks(struct rc_adapter *adapter, bool fast_path);
 
 /* NVMe controller bring-up + I/O path (rc_nvme.c). */
-int  rc_nvme_init_controller(struct rc_adapter *adapter);
-void rc_nvme_cleanup_controller(struct rc_adapter *adapter);
+int          rc_nvme_init_controller(struct rc_adapter *adapter);
+void         rc_nvme_cleanup_controller(struct rc_adapter *adapter);
+irqreturn_t  rc_nvme_irq(struct rc_adapter *adapter);
 
 /* Sysfs / debugfs interfaces. */
 int  rc_sysfs_create(struct rc_adapter *adapter);
