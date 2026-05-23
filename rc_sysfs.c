@@ -165,6 +165,30 @@ static ssize_t bar_mapping_show(struct device *dev,
 }
 static DEVICE_ATTR_RO(bar_mapping);
 
+static ssize_t reset_store(struct device *dev,
+                            struct device_attribute *attr,
+                            const char *buf, size_t count)
+{
+    struct pci_dev *pdev = to_pci_dev(dev);
+    struct rc_adapter *adapter = pci_get_drvdata(pdev);
+    int ret;
+
+    if (!adapter)
+        return -ENODEV;
+
+    if (adapter->ctx.ctrl_mode != RC_CTRL_MODE_NVME)
+        return -ENOTSUPP;
+
+    /* Accept "1" or "1\n" only — avoid acting on stray writes. */
+    if (!((count == 1 && buf[0] == '1') ||
+          (count == 2 && buf[0] == '1' && buf[1] == '\n')))
+        return -EINVAL;
+
+    ret = rc_nvme_reset_controller(adapter);
+    return ret < 0 ? ret : (ssize_t)count;
+}
+static DEVICE_ATTR_WO(reset);
+
 static ssize_t pending_requests_show(struct device *dev,
                                       struct device_attribute *attr,
                                       char *buf)
@@ -200,6 +224,7 @@ static struct attribute *rc_adapter_attrs[] = {
     &dev_attr_doorbell_state.attr,
     &dev_attr_bar_mapping.attr,
     &dev_attr_pending_requests.attr,
+    &dev_attr_reset.attr,
     NULL,
 };
 

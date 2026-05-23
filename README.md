@@ -26,7 +26,9 @@ on the roadmap.
   filter is what prevents the driver from claiming the boot SSD.
 - Error handling + timeouts: blk-mq `.timeout` at 30 s, per-adapter
   `dead` flag, ISR CSTS canary, best-effort NVMe Abort, tagset drain
-  of in-flight requests when a controller dies.  See
+  of in-flight requests when a controller dies.  Manual reset via
+  `echo 1 > /sys/bus/pci/devices/<bdf>/rcraid/reset` brings a dead
+  controller back without module reload.  See
   `docs/ERROR_HANDLING.md`.
 - Bench throughput on a 2-member Crucial T700 RAID0 dev box:
   ~1.3 GB/s @ `bs=4K`, ~4.7 GB/s @ `bs=4M`, ~11.9 GB/s aggregate
@@ -64,11 +66,11 @@ roadmap.
 - RAID levels other than RAID0 (RAID1 / 10 are roadmap; RAID5 is not).
 - SATA RAID (AHCI variants `7905 / 7916 / 7917 / 43BD`) — code paths
   exist but are stubs.
-- Controller reset & recovery.  Today a stuck command takes the
-  volume offline until module reload — intentional, since without
-  reset we can't safely recycle CIDs.  See
-  `docs/ERROR_HANDLING.md` for the reasoning.
-- Retry of transient NVMe errors.  Depends on controller reset above.
+- Automatic reset on timeout.  Today a stuck command takes the volume
+  offline until the operator runs the sysfs `reset` trigger; an
+  auto-trigger from `.timeout` (with retry counter + backoff) is the
+  natural next step.
+- Retry of transient NVMe errors.  Depends on auto-reset above.
 - Per-CPU I/O queues.  Single hw queue caps small-I/O IOPS today.
 - `scatterlist`-native DMA.  We currently bounce through per-tag-per-
   member DMA buffers (~33 MiB pinned at QD=32).

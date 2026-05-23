@@ -235,9 +235,22 @@ serialised by a per-adapter `admin_mutex` so timeout-issued Aborts don't
 collide with teardown.
 
 Behaviour change worth flagging: one stuck command takes the volume
-offline until module reload — intentional and the only safe option
-until a controller-reset path lands.  Full design notes in
-[`ERROR_HANDLING.md`](ERROR_HANDLING.md).
+offline until either the operator runs the sysfs reset or the module
+is reloaded.  Full design notes in [`ERROR_HANDLING.md`](ERROR_HANDLING.md).
+
+### Controller reset (manual)
+
+`rc_nvme_reset_controller(adapter)` is the recovery path out of the
+`dead` state.  Operator triggers it via the per-adapter sysfs `reset`
+attribute under `/sys/bus/pci/devices/<bdf>/rcraid/reset`.  Sequence:
+quiesce + drain → `disable_irq` → mask + `CC.EN=0` → wait `CSTS.RDY=0`
+→ zero the SQ/CQ buffers in place → reprogram AQA/ASQ/ACQ → `CC.EN=1`
+→ wait `CSTS.RDY=1` → unmask + `enable_irq` → re-issue Create I/O CQ
++ Create I/O SQ → clear `dead` → unquiesce.  Whole thing held under
+`admin_mutex`; DMA buffers (admin queues, I/O queues, per-tag I/O
+buffers) are reused.  Any failure beyond the disable leaves the
+adapter dead and returns `-EIO`.  Auto-reset from `.timeout` is the
+natural next commit but is not in this pass — operator action only.
 
 ### Not started
 

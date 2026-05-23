@@ -419,14 +419,12 @@ static int rc_nvme_wait_admin_completion(struct rc_adapter *adapter)
 	return -ETIMEDOUT;
 }
 
-/* Copy a caller-built SQE into the admin SQ tail slot, ring the doorbell,
- * poll for completion, advance the CQ head, and return 0 on success or
- * -errno (timeout, controller error). The caller fills opc/nsid/prp1/cdwN;
- * we manage CID = 0 since only one admin command is in flight at a time —
- * the admin_mutex serialises against teardown and against timeout-issued
- * Aborts that run from a different process context.
- */
-static int rc_nvme_admin_cmd(struct rc_adapter *adapter, struct rc_nvme_sqe *cmd)
+/* Inner admin-command path; caller must hold nvme->admin_mutex.  Used
+ * directly by rc_nvme_reset_controller, which already holds the mutex
+ * for the entire reset sequence and would deadlock if the public wrapper
+ * tried to re-take it.  Same behaviour as rc_nvme_admin_cmd otherwise. */
+static int __rc_nvme_admin_cmd_locked(struct rc_adapter *adapter,
+				      struct rc_nvme_sqe *cmd)
 {
 	struct rc_nvme_state *nvme = &adapter->ctx.nvme;
 	struct rc_nvme_sqe *slot;
@@ -434,8 +432,6 @@ static int rc_nvme_admin_cmd(struct rc_adapter *adapter, struct rc_nvme_sqe *cmd
 	u32 tail;
 	u16 status, sc_sct;
 	int ret;
-
-	mutex_lock(&nvme->admin_mutex);
 
 	slot = (struct rc_nvme_sqe *)nvme->admin_sq + nvme->admin_sq_tail;
 	cmd->cid = cpu_to_le16(0);
@@ -451,7 +447,7 @@ static int rc_nvme_admin_cmd(struct rc_adapter *adapter, struct rc_nvme_sqe *cmd
 		rc_printk(RC_ERROR,
 			  "rc_nvme_admin_cmd: timeout waiting for CQE (opc=0x%02x)\n",
 			  cmd->opc);
-		goto out;
+		return ret;
 	}
 
 	cqe = (struct rc_nvme_cqe *)nvme->admin_cq + nvme->admin_cq_head;
@@ -467,11 +463,25 @@ static int rc_nvme_admin_cmd(struct rc_adapter *adapter, struct rc_nvme_sqe *cmd
 		rc_printk(RC_ERROR,
 			  "rc_nvme_admin_cmd: opc=0x%02x SC/SCT=0x%04x (status=0x%04x)\n",
 			  cmd->opc, sc_sct, status);
-		ret = -EIO;
-		goto out;
+		return -EIO;
 	}
-	ret = 0;
-out:
+	return 0;
+}
+
+/* Copy a caller-built SQE into the admin SQ tail slot, ring the doorbell,
+ * poll for completion, advance the CQ head, and return 0 on success or
+ * -errno (timeout, controller error). The caller fills opc/nsid/prp1/cdwN;
+ * we manage CID = 0 since only one admin command is in flight at a time —
+ * the admin_mutex serialises against teardown and against timeout-issued
+ * Aborts that run from a different process context.
+ */
+static int rc_nvme_admin_cmd(struct rc_adapter *adapter, struct rc_nvme_sqe *cmd)
+{
+	struct rc_nvme_state *nvme = &adapter->ctx.nvme;
+	int ret;
+
+	mutex_lock(&nvme->admin_mutex);
+	ret = __rc_nvme_admin_cmd_locked(adapter, cmd);
 	mutex_unlock(&nvme->admin_mutex);
 	return ret;
 }
@@ -1902,6 +1912,200 @@ static void rc_nvme_destroy_io_queues(struct rc_adapter *adapter)
 				  nvme->io_cq, nvme->io_cq_dma);
 		nvme->io_cq = NULL;
 	}
+}
+
+/* Manual recovery for a stuck or dead adapter.  Triggered via the sysfs
+ * `reset` attribute.  Brings the controller down, re-initialises the
+ * admin queue against the existing DMA buffers, re-creates the I/O queue
+ * pair, and clears the dead flag.  Per-tag I/O DMA buffers in
+ * rc_volume_dma_va[][] are untouched and get reused as blk-mq
+ * re-dispatches.
+ *
+ * Sequence:
+ *   1. Flag dead + quiesce + drain so no .queue_rq runs and any
+ *      in-flight request whose CID is about to be wiped fails cleanly.
+ *   2. Take admin_mutex for the whole bring-up so a concurrent
+ *      .timeout-issued Abort can't collide.
+ *   3. disable_irq → wait for any in-flight ISR to finish before we
+ *      touch hardware registers.
+ *   4. Mask INTMS, CC.EN=0, wait CSTS.RDY=0.
+ *   5. Zero SQ/CQ buffers + reset tail/head/phase so the next CQE
+ *      written by the controller is recognised.
+ *   6. Re-program AQA/ASQ/ACQ, CC.EN=1, wait CSTS.RDY=1.
+ *   7. Unmask INTMC + enable_irq.  Done before the admin commands so
+ *      the submitter wakes via the ISR rather than the 1 ms poll
+ *      fallback.
+ *   8. Re-issue Create I/O CQ + Create I/O SQ on the same DMA buffers
+ *      (the controller forgot them across CC.EN=0).
+ *   9. Clear dead, unquiesce — new I/O resumes.
+ *
+ * On any step's failure the adapter is left flagged dead and the
+ * function returns -EIO.  Module reload is then required.
+ *
+ * Identify is intentionally not re-issued: a successful reset on the
+ * same physical controller should leave CAP/MDTS/namespace values
+ * unchanged.  If a later validation step disagrees, that's a separate
+ * recovery problem (different firmware, hot-swap, etc.).
+ */
+int rc_nvme_reset_controller(struct rc_adapter *adapter)
+{
+	void __iomem *base = adapter->ctx.mmio_base;
+	struct rc_nvme_state *nvme = &adapter->ctx.nvme;
+	struct rc_nvme_sqe cmd;
+	u32 cc, csts, aqa, cur_cc;
+	u64 asq_rb, acq_rb;
+	int ret;
+
+	if (!base) {
+		rc_printk(RC_ERROR,
+			  "rc_nvme_reset_controller: %s no MMIO base\n",
+			  pci_name(adapter->pdev));
+		return -EINVAL;
+	}
+
+	rc_printk(RC_NOTE,
+		  "rc_nvme_reset_controller: %s reset requested\n",
+		  pci_name(adapter->pdev));
+
+	/* Flag dead unconditionally — even an operator-initiated reset
+	 * on a still-alive controller wipes outstanding CIDs across the
+	 * CC.EN=0 cycle, so any in-flight requests must be failed. */
+	WRITE_ONCE(nvme->dead, true);
+
+	if (rc_volume_disk) {
+		blk_mq_quiesce_queue(rc_volume_disk->queue);
+		rc_volume_drain_dead();
+	}
+
+	mutex_lock(&nvme->admin_mutex);
+
+	if (adapter->irq_vector >= 0)
+		disable_irq(adapter->irq_vector);
+
+	writel(0xffffffffu, base + RC_NVME_REG_INTMS);
+
+	cur_cc = readl(base + RC_NVME_REG_CC);
+	if (cur_cc & RC_NVME_CC_EN) {
+		writel(cur_cc & ~RC_NVME_CC_EN, base + RC_NVME_REG_CC);
+		wmb();
+	}
+	ret = rc_nvme_wait_csts(adapter, RC_NVME_CSTS_RDY, 0);
+	if (ret) {
+		rc_printk(RC_ERROR,
+			  "rc_nvme_reset_controller: %s disable failed (%d) — adapter remains dead\n",
+			  pci_name(adapter->pdev), ret);
+		goto err_irq_disabled;
+	}
+
+	/* Reset our software view of the queues.  DMA buffers are kept;
+	 * we just zero the contents and reset head/tail/phase so the next
+	 * CQE the controller writes is recognised at phase 1. */
+	if (nvme->admin_sq)
+		memset(nvme->admin_sq, 0,
+		       (size_t)nvme->admin_sq_depth * RC_NVME_SQ_ENTRY_SIZE);
+	if (nvme->admin_cq)
+		memset(nvme->admin_cq, 0,
+		       (size_t)nvme->admin_cq_depth * RC_NVME_CQ_ENTRY_SIZE);
+	nvme->admin_sq_tail  = 0;
+	nvme->admin_cq_head  = 0;
+	nvme->admin_cq_phase = 1;
+
+	if (nvme->io_sq)
+		memset(nvme->io_sq, 0,
+		       (size_t)nvme->io_sq_depth * RC_NVME_SQ_ENTRY_SIZE);
+	if (nvme->io_cq)
+		memset(nvme->io_cq, 0,
+		       (size_t)nvme->io_cq_depth * RC_NVME_CQ_ENTRY_SIZE);
+	nvme->io_sq_tail  = 0;
+	nvme->io_cq_head  = 0;
+	nvme->io_cq_phase = 1;
+
+	aqa = RC_NVME_AQA(nvme->admin_sq_depth, nvme->admin_cq_depth);
+	writel(aqa, base + RC_NVME_REG_AQA);
+	rc_nvme_writeq(nvme->admin_sq_dma, base, RC_NVME_REG_ASQ);
+	rc_nvme_writeq(nvme->admin_cq_dma, base, RC_NVME_REG_ACQ);
+	wmb();
+
+	asq_rb = rc_nvme_readq(base, RC_NVME_REG_ASQ);
+	acq_rb = rc_nvme_readq(base, RC_NVME_REG_ACQ);
+	if (asq_rb != nvme->admin_sq_dma || acq_rb != nvme->admin_cq_dma) {
+		rc_printk(RC_ERROR,
+			  "rc_nvme_reset_controller: %s admin queue writeback failed (ASQ rb=0x%llx ACQ rb=0x%llx)\n",
+			  pci_name(adapter->pdev),
+			  (unsigned long long)asq_rb,
+			  (unsigned long long)acq_rb);
+		ret = -EIO;
+		goto err_irq_disabled;
+	}
+
+	cc = RC_NVME_CC_DEFAULT | RC_NVME_CC_EN;
+	writel(cc, base + RC_NVME_REG_CC);
+	wmb();
+	ret = rc_nvme_wait_csts(adapter, RC_NVME_CSTS_RDY, RC_NVME_CSTS_RDY);
+	if (ret) {
+		csts = readl(base + RC_NVME_REG_CSTS);
+		rc_printk(RC_ERROR,
+			  "rc_nvme_reset_controller: %s did not become ready (CSTS=0x%08x) — adapter remains dead\n",
+			  pci_name(adapter->pdev), csts);
+		goto err_irq_disabled;
+	}
+
+	/* Unmask + re-enable IRQ before issuing admin commands so the
+	 * submitter wakes via the ISR rather than the 1 ms poll fallback. */
+	writel(0xffffffffu, base + RC_NVME_REG_INTMC);
+	if (adapter->irq_vector >= 0)
+		enable_irq(adapter->irq_vector);
+
+	/* Re-create the I/O queue pair against the same DMA buffers. */
+	if (nvme->io_cq) {
+		memset(&cmd, 0, sizeof(cmd));
+		cmd.opc   = RC_NVME_ADMIN_OP_CREATE_IO_CQ;
+		cmd.prp1  = cpu_to_le64(nvme->io_cq_dma);
+		cmd.cdw10 = cpu_to_le32(((u32)(nvme->io_cq_depth - 1) << 16) |
+					RC_NVME_IO_QID);
+		cmd.cdw11 = cpu_to_le32((0u << 16) | 0x3u);  /* IV=0, IEN=1, PC=1 */
+		ret = __rc_nvme_admin_cmd_locked(adapter, &cmd);
+		if (ret) {
+			rc_printk(RC_ERROR,
+				  "rc_nvme_reset_controller: %s Create I/O CQ failed (%d) — adapter remains dead\n",
+				  pci_name(adapter->pdev), ret);
+			goto err_irq_enabled;
+		}
+	}
+	if (nvme->io_sq) {
+		memset(&cmd, 0, sizeof(cmd));
+		cmd.opc   = RC_NVME_ADMIN_OP_CREATE_IO_SQ;
+		cmd.prp1  = cpu_to_le64(nvme->io_sq_dma);
+		cmd.cdw10 = cpu_to_le32(((u32)(nvme->io_sq_depth - 1) << 16) |
+					RC_NVME_IO_QID);
+		cmd.cdw11 = cpu_to_le32(((u32)RC_NVME_IO_QID << 16) | 0x1u);
+		ret = __rc_nvme_admin_cmd_locked(adapter, &cmd);
+		if (ret) {
+			rc_printk(RC_ERROR,
+				  "rc_nvme_reset_controller: %s Create I/O SQ failed (%d) — adapter remains dead\n",
+				  pci_name(adapter->pdev), ret);
+			goto err_irq_enabled;
+		}
+	}
+
+	WRITE_ONCE(nvme->dead, false);
+	mutex_unlock(&nvme->admin_mutex);
+	if (rc_volume_disk)
+		blk_mq_unquiesce_queue(rc_volume_disk->queue);
+
+	rc_printk(RC_NOTE,
+		  "rc_nvme_reset_controller: %s back online\n",
+		  pci_name(adapter->pdev));
+	return 0;
+
+err_irq_disabled:
+	if (adapter->irq_vector >= 0)
+		enable_irq(adapter->irq_vector);
+err_irq_enabled:
+	mutex_unlock(&nvme->admin_mutex);
+	if (rc_volume_disk)
+		blk_mq_unquiesce_queue(rc_volume_disk->queue);
+	return ret;
 }
 
 int rc_nvme_init_controller(struct rc_adapter *adapter)

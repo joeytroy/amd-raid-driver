@@ -183,18 +183,75 @@ admin queue.  Mutex makes that race safe.
 CID is still hardcoded to `0` — only one admin command is in flight at
 a time, guaranteed by the mutex.
 
+## Controller reset (manual)
+
+`rc_nvme_reset_controller(adapter)` is the recovery path out of the
+`dead` state.  Triggered by the operator writing `1` to the per-adapter
+sysfs attribute:
+
+```
+echo 1 | sudo tee /sys/bus/pci/devices/0000:81:00.0/rcraid/reset
+```
+
+The path returns 0 on success or `-errno` on failure (`-EIO` if the
+controller refused to come back ready, `-ENOTSUPP` for non-NVMe-mode
+adapters, `-EINVAL` for any input other than `1` or `1\n`).
+
+Sequence under `admin_mutex`:
+
+```
+1. WRITE_ONCE(dead = true)       (idempotent — usually already true)
+2. blk_mq_quiesce_queue          no new .queue_rq runs
+3. rc_volume_drain_dead          fail in-flight; their CIDs are about
+                                  to be wiped by CC.EN=0
+4. disable_irq                   wait for in-flight ISR to finish so
+                                  it doesn't race the register writes
+5. INTMS = ~0, CC.EN = 0, wait CSTS.RDY = 0
+6. memset SQ/CQ buffers; reset tail/head/phase
+7. Reprogram AQA/ASQ/ACQ, CC.EN = 1, wait CSTS.RDY = 1
+8. INTMC = ~0, enable_irq        admin commands need ISR wakes
+9. Create I/O CQ + Create I/O SQ on the existing DMA buffers
+10. WRITE_ONCE(dead = false)
+11. blk_mq_unquiesce_queue       new I/O resumes
+```
+
+Any failure between steps 5 and 9 returns `-EIO` with `dead` still set;
+the adapter stays offline and module reload becomes the only recovery.
+
+Things the reset deliberately does NOT do:
+
+- **Re-issue Identify Controller / Namespace.**  CAP/MDTS/namespace
+  values shouldn't change across a reset on the same silicon.  If they
+  do (genuine hot-swap, different firmware loaded out-of-band), that's
+  a different recovery problem and Identify-divergence detection
+  belongs there.
+- **Re-allocate DMA buffers.**  Admin SQ/CQ, I/O SQ/CQ, and the
+  per-tag `rc_volume_dma_va[][]` pool all persist.  The DMA handles
+  are still valid across CC.EN=0; the controller just forgot about
+  them and needs them re-bound via Create I/O CQ/SQ.
+- **Touch the gendisk or tagset.**  Only controller-side state moves.
+  blk-mq tags get re-dispatched to new requests post-reset and reuse
+  the same per-tag buffers.
+
+The split between locked-inner and public-wrapper admin-command paths
+(`__rc_nvme_admin_cmd_locked` vs `rc_nvme_admin_cmd`) exists so reset
+can hold `admin_mutex` across steps 5-9 without deadlocking when it
+issues the Create I/O CQ/SQ admin commands in step 9.
+
 ## Limits (out of scope for this pass)
 
 These are the next problems on the list, in roughly the order they
 should be tackled:
 
-- **Controller reset path.**  Disable CC.EN, wait CSTS.RDY=0, re-init
-  admin queue, re-create I/O queues, re-arm IRQ, replay or fail
-  in-flight.  Lots of race exposure (IOMMU state, blk-mq quiesce, MSI
-  re-arm); deserves its own commit.
+- **Automatic reset on `.timeout`.**  Currently a stuck command still
+  takes the volume offline — operator must run the sysfs trigger to
+  recover.  Auto-reset needs a retry counter, backoff, and a check
+  for "genuinely fried silicon" so we don't thrash.  Belongs in its
+  own commit.
 - **Retry on transient SCs.**  Distinguish DNR=0 (retryable) from DNR=1
-  (don't).  Doesn't make sense without reset above — we'd just
-  re-dispatch to a controller we already declared dead.
+  (don't) and re-dispatch the failed request rather than ending it.
+  Lives on top of reset (a recovered controller is the right place to
+  retry).
 - **Abort path for sync init helpers.**  `rc_nvme_admin_cmd` and
   `rc_nvme_io_cmd_sync` already time out at 2 s and surface `-ETIMEDOUT`
   to their callers (`rc_nvme_init_controller` and friends).  No caller
@@ -212,8 +269,9 @@ The visible difference from the prior behaviour:
   short of reboot.
 - **After**: stuck commands time out at 30 s.  The volume goes offline
   (every subsequent dispatch returns `BLK_STS_IOERR`) and every
-  in-flight request fails promptly.  Module reload required to get the
-  volume back.
+  in-flight request fails promptly.  `echo 1 > .../rcraid/reset` on
+  the offending PCI device recovers the volume in place; module reload
+  is only needed if the reset itself fails.
 
 If you see the volume go offline unexpectedly, check `dmesg` for one of:
 
