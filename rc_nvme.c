@@ -93,13 +93,15 @@ static struct blk_mq_tag_set rc_volume_tagset;
  * to/from the bio's user pages via blk_rq_map_sg + dma_map_sg, and
  * rc_volume_build_prp enumerates the resulting scatterlist into PRPs.
  *
- * Total memory cost: PAGE_SIZE × QD × member_count = 256 KiB at QD=32 on
- * a 2-member volume.  (Was ~33 MiB before the scatterlist-native
+ * Total memory cost: PAGE_SIZE × QD × member_count = 2 MiB at QD=256
+ * on a 2-member volume.  (Was ~33 MiB before the scatterlist-native
  * refactor, which dominated by the per-tag 512 KiB bounce buffers.)
  */
 #define RC_VOLUME_DATA_PAGES	128
 #define RC_VOLUME_DATA_BYTES	(RC_VOLUME_DATA_PAGES * PAGE_SIZE)
-#define RC_VOLUME_QUEUE_DEPTH	32
+/* blk-mq tag pool size per hctx.  Matches Windows per-queue SQ depth.
+ * Total in-flight requests = nr_hw_queues × this. */
+#define RC_VOLUME_QUEUE_DEPTH	256
 
 static __le64     *rc_volume_prp_va[RC_VOLUME_MAX_MEMBERS][RC_VOLUME_QUEUE_DEPTH];
 static dma_addr_t  rc_volume_prp_pa[RC_VOLUME_MAX_MEMBERS][RC_VOLUME_QUEUE_DEPTH];

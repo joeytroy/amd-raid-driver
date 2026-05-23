@@ -520,9 +520,11 @@ struct rc_nvme_dsm_range {
 	__le64 slba;		/* starting LBA */
 } __packed;
 
-/* I/O queue depth; clamped against CAP.MQES. 64 is plenty for what we
- * currently submit (one READ at a time) and well under MQES (=65536). */
-#define RC_NVME_IO_QUEUE_DEPTH		64
+/* Per-queue SQ/CQ depth.  Matches Windows rcbottom.sys's per-queue
+ * size of 256 (see docs/WINDOWS_MULTIQUEUE_FINDINGS.md).  Clamped
+ * against CAP.MQES at queue-create time.  With nr_hw_queues=4 this
+ * gives 1024 total outstanding NVMe commands per controller. */
+#define RC_NVME_IO_QUEUE_DEPTH		256
 #define RC_NVME_IO_QID			1u
 
 /* AMD RAIDCore per-member metadata block (one LBA per member at LBA 0x5000).
