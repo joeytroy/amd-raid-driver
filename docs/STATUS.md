@@ -90,11 +90,27 @@ are best-effort/untested.
   `features`+`spare_info`, `fld_38`→`mbr_checksum`, `member_uuid`→
   `device_id`. The +0x28 field we used as `stripe_sectors` is
   actually `ConfigRingSize`; it coincides with the real stripe on
-  this dev box (2048 sectors = 1 MiB).  Real volume-level fields
-  (member count, stripe = ChunkSize, member position) live in an
-  `RC_LogicalDevice` record reachable through the config packet at
-  LBA 0x5001 → see `docs/OPEN_QUESTIONS.md` for the layout-drift
-  blocker.
+  this dev box (2048 sectors = 1 MiB) because that's the firmware
+  default for RAID0.
+- **Member-count + member-position auto-detect.** We now walk the
+  config ring (starting at `ConfigRingOffset` = LBA 0x5800) at probe
+  time, looking for the `RC_LogicalDevice` record (tag
+  `RC_DST_LOGICAL_DEVICE = 0x25BD`) whose element array contains
+  this member's `DeviceId`. From that record we read `Devices`
+  (member count), `Capacity`, `DeviceType` (`RC_LDT_RAID0 = 0x1BF6`),
+  and the element index — that index is the member's position in the
+  stripe layout. Replaces the hardcoded `RC_VOLUME_EXPECTED_MEMBERS=2`
+  and the PCI-BDF ordering heuristic. AMD also publishes per-member
+  "raw disk" LDs (1-device with `devtype=0x1BF9`) — the parser skips
+  those by checking DeviceID membership. Capacity now comes from the
+  LD (~3,814,380 MiB), correctly accounting for per-member metadata
+  reserves vs the prior `NSZE * member_count` over-estimate.
+- **Stripe size source confirmed.** `RC_LogicalDevice.ChunkSize`
+  (offset 0xAC) is genuinely 0 for RAID0 in this firmware — verified
+  by disassembling `RC_BuildConfigMetadataFromMemory` in rcblob. The
+  writer never sets it for RAID0; the firmware uses a hardcoded 2048
+  sector (1 MiB) default. Driver now uses ChunkSize when non-zero
+  and falls back to the per-DeviceType default otherwise.
 
 ### Implemented before this pass, may need revisiting
 
@@ -154,11 +170,14 @@ much further now that one NVMe READ carries up to 512 KiB:
 
 ## Next implementation steps (in order)
 
-1. **Member-count auto-detect** — by reading LBA 0x5001 (volume
-   metadata) which appears to encode the member list.
-2. **Member-position resolution** — either decode further or send a
-   vendor-specific admin command to query controller-side state.
-3. **Interrupt-driven completion** for both admin and I/O queues.
-4. **Per-CPU I/O queues** to improve concurrency.
-5. **Write support** behind a flag, carefully gated until ordering is
+1. **Write support** behind a flag — now safe because member
+   positions are sourced from the on-disk LD record. Add NVMe WRITE
+   (opcode 0x01) to the `rc_volume_read_member` path, drop the
+   `set_disk_ro(1)`, gate behind `enable_writes=1` module parameter.
+2. **Interrupt-driven completion** for both admin and I/O queues.
+3. **Per-CPU I/O queues** to improve concurrency.
+4. **Multiple-volume / non-RAID0 support** — the parser already
+   handles other `RC_LDT_*` device types in principle; the stripe
+   mapping and elsewhere need RAID-level-specific paths.
+5. **(future)** Bigger rewrite of the legacy AHCI scaffolding (rc_blk.c,
    proven on a populated array.

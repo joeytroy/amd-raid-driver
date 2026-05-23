@@ -538,6 +538,7 @@ have_cqe:
 static int rc_nvme_read_lba(struct rc_adapter *adapter, u64 slba,
 			    u16 nlb_zbased, dma_addr_t buf_dma);
 static int rc_volume_create_disk(void);
+static void rc_volume_parse_logical_device(struct rc_adapter *adapter);
 void rc_volume_teardown(void);
 
 /* AMD RAIDCore metadata checksum (ported from rcraid.sys FUN_1400014ec).
@@ -665,6 +666,11 @@ static int rc_nvme_read_validate_metadata(struct rc_adapter *adapter)
 		  (unsigned long long)nvme->md_config_ring_lba,
 		  nvme->md_features,
 		  (unsigned long long)nvme->md_mbr_checksum);
+
+	/* Walk the config ring to find the active RC_LogicalDevice record;
+	 * gives us the real member count, per-member position, and
+	 * (where the LD writes it) the chunk size.  Logged inside. */
+	rc_volume_parse_logical_device(adapter);
 	ret = 0;
 
 out:
@@ -705,6 +711,128 @@ static int rc_volume_bdf_cmp(struct rc_adapter *a, struct rc_adapter *b)
 	unsigned int bbdf = (b->pdev->bus->number << 8) | b->pdev->devfn;
 	int cmp = (int)abdf - (int)bbdf;
 	return rc_volume_reverse_order ? -cmp : cmp;
+}
+
+/* How far into the config ring to scan for the first RC_LogicalDevice
+ * record.  On the dev box the active LD is at ring+0x1d sectors; 128
+ * sectors is plenty of headroom even for arrays with chains of older
+ * configs preceding the current one. */
+#define RC_LD_SCAN_CHUNK_SECTORS	16u	/* 8 KiB = max 2-page rc_nvme_read_lba */
+#define RC_LD_SCAN_MAX_CHUNKS		8u	/* total = 128 sectors = 64 KiB */
+
+/* Read sectors from the config ring and locate the first valid
+ * RC_LogicalDevice record (tag 0x25BD).  Parse Devices, DeviceType,
+ * Capacity, ChunkSize, and walk the LogicalElement array to find this
+ * adapter's position (where md_device_id matches an element's DeviceID).
+ * Results land in adapter->ctx.nvme.ld_*.  Failure leaves ld_valid=false
+ * — the caller falls back to the legacy BDF-ordered registration path. */
+static void rc_volume_parse_logical_device(struct rc_adapter *adapter)
+{
+	struct device *dev = &adapter->pdev->dev;
+	struct rc_nvme_state *nvme = &adapter->ctx.nvme;
+	u8 *buf;
+	dma_addr_t buf_dma;
+	const u32 chunk_bytes = RC_LD_SCAN_CHUNK_SECTORS * 512u;
+	u64 ring_lba = nvme->md_config_ring_lba;
+	u32 scan;
+
+	nvme->ld_valid = false;
+	nvme->ld_my_position = -1;
+
+	if (!ring_lba) {
+		rc_printk(RC_WARN,
+			  "rc_volume_parse_logical_device: %s no config_ring_lba in metadata\n",
+			  pci_name(adapter->pdev));
+		return;
+	}
+
+	buf = dma_alloc_coherent(dev, chunk_bytes, &buf_dma, GFP_KERNEL);
+	if (!buf)
+		return;
+
+	for (scan = 0; scan < RC_LD_SCAN_MAX_CHUNKS; scan++) {
+		u64 chunk_lba = ring_lba + scan * RC_LD_SCAN_CHUNK_SECTORS;
+		u32 i;
+		int ret;
+
+		ret = rc_nvme_read_lba(adapter, chunk_lba,
+				       (u16)(RC_LD_SCAN_CHUNK_SECTORS - 1),
+				       buf_dma);
+		if (ret) {
+			rc_printk(RC_WARN,
+				  "rc_volume_parse_logical_device: %s read LBA 0x%llx failed (%d)\n",
+				  pci_name(adapter->pdev),
+				  (unsigned long long)chunk_lba, ret);
+			break;
+		}
+
+		for (i = 0; i + 4 <= chunk_bytes; i += 4) {
+			u8 *ld;
+			u32 devtype, devices, elem_off, chunk;
+			u64 capacity;
+			int my_pos = -1;
+			u32 j;
+
+			if (get_unaligned_le32(buf + i) !=
+			    RC_DST_LOGICAL_DEVICE)
+				continue;
+
+			ld = buf + i;
+			devtype  = get_unaligned_le32(ld + RC_LD_DEVICETYPE_OFFSET);
+			devices  = get_unaligned_le32(ld + RC_LD_DEVICES_OFFSET);
+			elem_off = get_unaligned_le32(ld + RC_LD_ELEMENTOFFSET_OFFSET);
+			chunk    = get_unaligned_le32(ld + RC_LD_CHUNKSIZE_OFFSET);
+			capacity = get_unaligned_le64(ld + RC_LD_CAPACITY_OFFSET);
+
+			if (devices < 1 || devices > RC_VOLUME_MAX_MEMBERS)
+				continue;
+			if ((u64)i + elem_off +
+			    (u64)devices * RC_LE_BYTES > chunk_bytes)
+				continue;
+
+			/* AMD also publishes one single-device "raw disk"
+			 * LD per physical member.  Only the LD whose
+			 * element array contains our DeviceID is the volume
+			 * we belong to. */
+			for (j = 0; j < devices; j++) {
+				u8 *elem = ld + elem_off + j * RC_LE_BYTES;
+				u64 eid =
+					get_unaligned_le64(elem + RC_LE_DEVICEID_OFFSET);
+				if (eid == nvme->md_device_id) {
+					my_pos = (int)j;
+					break;
+				}
+			}
+
+			rc_printk(RC_INFO,
+				  "rc_volume_parse_logical_device: %s LD@ring+%u.%u devtype=0x%04x devices=%u chunk=%u capacity=%llu my_pos=%d%s\n",
+				  pci_name(adapter->pdev),
+				  scan * RC_LD_SCAN_CHUNK_SECTORS + (i / 512),
+				  i % 512,
+				  devtype, devices, chunk,
+				  (unsigned long long)capacity, my_pos,
+				  my_pos < 0 ? " (skip — not our member)" :
+					       " (match)");
+
+			if (my_pos < 0)
+				continue;
+
+			nvme->ld_device_type      = devtype;
+			nvme->ld_devices          = devices;
+			nvme->ld_chunk_sectors    = chunk;
+			nvme->ld_capacity_sectors = capacity;
+			nvme->ld_my_position      = my_pos;
+			nvme->ld_valid            = true;
+			goto done;
+		}
+	}
+	rc_printk(RC_WARN,
+		  "rc_volume_parse_logical_device: %s no matching LogicalDevice record found in first %u sectors of config ring\n",
+		  pci_name(adapter->pdev),
+		  RC_LD_SCAN_MAX_CHUNKS * RC_LD_SCAN_CHUNK_SECTORS);
+
+done:
+	dma_free_coherent(dev, chunk_bytes, buf, buf_dma);
 }
 
 /* Map a logical RAID0 LBA to (member_index, physical LBA on that member).
@@ -806,13 +934,42 @@ out:
 	}
 }
 
-/* Called once per adapter after its metadata block validates.  Inserts the
- * adapter into the global volume registry (sorted by PCI BDF) and, on
- * reaching RC_VOLUME_EXPECTED_MEMBERS, declares the volume up and runs
- * the demo reads. */
+/* Volume-level expected member count.  Set from the on-disk LD's Devices
+ * field the first time a member registers; subsequent members must agree.
+ * Zero means "no LD seen yet". */
+static u32 rc_volume_expected_members;
+
+/* Stripe size for the assembled volume in sectors.  Sourced from
+ * RC_LogicalDevice.ChunkSize when non-zero; otherwise falls back to the
+ * RAID-level firmware default (2048 sectors / 1 MiB for RAID0). */
+static u32 rc_volume_chunk_sectors_for(u32 devtype, u32 ld_chunk)
+{
+	if (ld_chunk)
+		return ld_chunk;
+	switch (devtype) {
+	case RC_LDT_RAID0:
+		/* Confirmed via RC_BuildConfigMetadataFromMemory in rcblob:
+		 * RAID0 never writes a non-zero ChunkSize; the firmware
+		 * defaults to 1 MiB. */
+		return 2048u;
+	default:
+		return 0u;
+	}
+}
+
+/* Called once per adapter after its metadata block validates.  When the LD
+ * parser succeeded for this member we use the on-disk position from the
+ * LogicalElement array directly.  Otherwise we fall back to a BDF-sorted
+ * ordering against a hardcoded count of 2 — that path is for the
+ * pre-LD-parsing legacy behavior and shouldn't normally fire. */
 static void rc_volume_register_member(struct rc_adapter *adapter)
 {
+	struct rc_nvme_state *nvme = &adapter->ctx.nvme;
+	bool have_ld = nvme->ld_valid && nvme->ld_my_position >= 0;
+	u32 expected;
+	u32 chunk_sectors;
 	int pos;
+	int i;
 
 	mutex_lock(&rc_volume_lock);
 	if (rc_volume_member_count >= RC_VOLUME_MAX_MEMBERS) {
@@ -821,35 +978,91 @@ static void rc_volume_register_member(struct rc_adapter *adapter)
 		goto out;
 	}
 
-	/* Stash stripe size on first member; verify identical on subsequent. */
-	if (rc_volume_member_count == 0) {
-		rc_volume_stripe_sectors = adapter->ctx.nvme.md_stripe_sectors;
-	} else if (rc_volume_stripe_sectors !=
-		   adapter->ctx.nvme.md_stripe_sectors) {
+	if (have_ld) {
+		expected = nvme->ld_devices;
+		chunk_sectors = rc_volume_chunk_sectors_for(nvme->ld_device_type,
+							    nvme->ld_chunk_sectors);
+		if (!chunk_sectors) {
+			rc_printk(RC_WARN,
+				  "rc_volume_register_member: %s unknown DeviceType=0x%x with ChunkSize=0 — ignoring\n",
+				  pci_name(adapter->pdev), nvme->ld_device_type);
+			goto out;
+		}
+	} else {
+		expected = RC_VOLUME_EXPECTED_MEMBERS;
+		chunk_sectors = nvme->md_stripe_sectors;
 		rc_printk(RC_WARN,
-			  "rc_volume_register_member: stripe-size mismatch %u vs %u — ignoring this member\n",
-			  rc_volume_stripe_sectors,
-			  adapter->ctx.nvme.md_stripe_sectors);
-		goto out;
+			  "rc_volume_register_member: %s no LD parsed (ld_valid=%d pos=%d) — falling back to legacy BDF ordering and stripe=%u\n",
+			  pci_name(adapter->pdev), nvme->ld_valid,
+			  nvme->ld_my_position, chunk_sectors);
 	}
 
-	/* Insert sorted by PCI BDF. */
-	for (pos = 0; pos < rc_volume_member_count; pos++) {
-		if (rc_volume_bdf_cmp(adapter, rc_volume_members[pos]) < 0)
-			break;
+	/* First member: seed expected count + stripe.  Later members must match. */
+	if (rc_volume_member_count == 0) {
+		rc_volume_expected_members = expected;
+		rc_volume_stripe_sectors   = chunk_sectors;
+	} else {
+		if (expected != rc_volume_expected_members) {
+			rc_printk(RC_WARN,
+				  "rc_volume_register_member: %s expected-member mismatch %u vs %u — ignoring\n",
+				  pci_name(adapter->pdev),
+				  expected, rc_volume_expected_members);
+			goto out;
+		}
+		if (chunk_sectors != rc_volume_stripe_sectors) {
+			rc_printk(RC_WARN,
+				  "rc_volume_register_member: %s stripe-size mismatch %u vs %u — ignoring\n",
+				  pci_name(adapter->pdev),
+				  chunk_sectors, rc_volume_stripe_sectors);
+			goto out;
+		}
 	}
-	memmove(&rc_volume_members[pos + 1], &rc_volume_members[pos],
-		(rc_volume_member_count - pos) *
-		sizeof(rc_volume_members[0]));
-	rc_volume_members[pos] = adapter;
-	rc_volume_member_count++;
+
+	if (have_ld) {
+		pos = nvme->ld_my_position;
+		if (pos < 0 || pos >= (int)expected) {
+			rc_printk(RC_WARN,
+				  "rc_volume_register_member: %s LD position %d out of range [0,%u) — ignoring\n",
+				  pci_name(adapter->pdev), pos, expected);
+			goto out;
+		}
+		if (rc_volume_members[pos]) {
+			rc_printk(RC_WARN,
+				  "rc_volume_register_member: %s LD position %d already taken by %s — ignoring\n",
+				  pci_name(adapter->pdev), pos,
+				  pci_name(rc_volume_members[pos]->pdev));
+			goto out;
+		}
+		rc_volume_members[pos] = adapter;
+		rc_volume_member_count++;
+	} else {
+		/* Legacy BDF-sorted insertion. */
+		for (pos = 0; pos < rc_volume_member_count; pos++) {
+			if (rc_volume_bdf_cmp(adapter, rc_volume_members[pos]) < 0)
+				break;
+		}
+		memmove(&rc_volume_members[pos + 1], &rc_volume_members[pos],
+			(rc_volume_member_count - pos) *
+			sizeof(rc_volume_members[0]));
+		rc_volume_members[pos] = adapter;
+		rc_volume_member_count++;
+	}
 
 	rc_printk(RC_INFO,
-		  "rc_volume_register_member: %s registered at pos %d (%d/%d)\n",
+		  "rc_volume_register_member: %s registered at pos %d (%d/%u)\n",
 		  pci_name(adapter->pdev), pos,
-		  rc_volume_member_count, RC_VOLUME_EXPECTED_MEMBERS);
+		  rc_volume_member_count, expected);
 
-	if (rc_volume_member_count == RC_VOLUME_EXPECTED_MEMBERS) {
+	if ((u32)rc_volume_member_count == expected) {
+		/* All slots populated? */
+		for (i = 0; i < (int)expected; i++) {
+			if (!rc_volume_members[i]) {
+				rc_printk(RC_WARN,
+					  "rc_volume_register_member: count reached %u but slot %d empty — not creating disk\n",
+					  expected, i);
+				goto out;
+			}
+		}
 		rc_volume_demo_reads();
 		{
 			int rc = rc_volume_create_disk();
@@ -923,8 +1136,7 @@ static blk_status_t rc_volume_queue_rq(struct blk_mq_hw_ctx *hctx,
 	}
 
 	if (nr_sectors == 0 || nr_sectors > (RC_VOLUME_DATA_BYTES / 512) ||
-	    pos + nr_sectors >
-	    rc_volume_members[0]->ctx.nvme.ns1_nsze * rc_volume_member_count) {
+	    pos + nr_sectors > get_capacity(rc_volume_disk)) {
 		blk_mq_end_request(req, BLK_STS_IOERR);
 		return BLK_STS_OK;
 	}
@@ -1023,8 +1235,14 @@ static int rc_volume_create_disk(void)
 		goto err_free_tagset;
 	}
 
-	total_sectors = m0->ctx.nvme.ns1_nsze *
-			(u64)rc_volume_member_count;
+	/* Prefer the volume capacity from the on-disk LogicalDevice record
+	 * — it accounts for the per-member reserved metadata regions.  Fall
+	 * back to NSZE * member_count when no LD was parsed (legacy path). */
+	if (m0->ctx.nvme.ld_valid && m0->ctx.nvme.ld_capacity_sectors)
+		total_sectors = m0->ctx.nvme.ld_capacity_sectors;
+	else
+		total_sectors = m0->ctx.nvme.ns1_nsze *
+				(u64)rc_volume_member_count;
 	set_capacity(rc_volume_disk, total_sectors);
 	snprintf(rc_volume_disk->disk_name, DISK_NAME_LEN, "rcraid0");
 	rc_volume_disk->fops        = &rc_volume_bops;

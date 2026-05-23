@@ -86,63 +86,38 @@ before anything queue-related runs. Most are DMA setup, but `+0xe8`
 set adapter parameters that we currently don't replicate. Worth a look
 if NVMe init produces a controller fatal status.
 
-## Volume-metadata parsing (member count + stripe size)
+## Resolved: volume-metadata parsing
 
-The driver still hardcodes `RC_VOLUME_EXPECTED_MEMBERS = 2` and uses
-`RC_MetaData.ConfigRingSize` as a proxy for stripe size.  Both happen
-to be correct on the 2-member dev box but neither is properly parsed
-from the on-disk metadata.  The fix requires reading the config packet
-at `ConfigCommitOffset` (LBA 0x5001) and the records the packet
-references in the config ring at `ConfigRingOffset` (LBA 0x5800).
+Previously a blocker; now done. The on-disk volume metadata layout is
+fully understood via DWARF in `rcblob.x86_64`. The on-disk
+`RC_LogicalDevice` (516 B `__packed__`, tagged with first u32 =
+`RC_DST_LOGICAL_DEVICE = 0x25BD`) lives in the config ring at
+`ConfigRingOffset` (LBA 0x5800 on this dev box). Driver reads it at
+probe via `rc_volume_parse_logical_device` and extracts:
 
-### What's known
+- `Devices` at +0x68 → member count
+- `LogicalElementOffset` at +0x04 → byte offset to the element array
+- `LogicalElement_LE.DeviceID` at +0 of each 64-byte element → match
+  against the member's `RC_MetaData.DeviceId` to find that member's
+  position in the volume
+- `Capacity` at +0x50 → usable volume sectors (smaller than
+  `NSZE * member_count` because per-member metadata regions are
+  reserved)
+- `DeviceType` at +0x0C → `RC_LDT_RAID0 = 0x1BF6` on the dev box;
+  the SDK 9.3.0 DWARF enum publishes only the "exotic" types
+  (RAID50/10N/etc starting at 7157), so the basic RAID-level values
+  in the 0x1BF6–0x1BFB range were inferred from the writer
+  dispatch in `RC_CreateRaidArray`.
+- `ChunkSize` at +0xAC — genuinely 0 for RAID0 (confirmed in
+  `RC_BuildConfigMetadataFromMemory`); driver falls back to 2048
+  sectors (1 MiB) which is the firmware default for that RAID
+  level. Non-RAID0 levels will need their own defaults or a
+  different source.
 
-`rcblob.x86_64` in the AMD-shipped Linux SDK (path:
-`drivers/linux/wrx80/raid_linux_driver_930_00283/.../driver_sdk/src/`)
-is **ELF with full DWARF debug info**. Use `pahole -C <struct>` to
-extract struct layouts. Key types:
-
-- `RC_MetaData` (512 B) — the LBA 0x5000 block. Layout fully known
-  and mirrored in `struct rc_raidcore_md` in `rc_linux.h`.
-- `RC_ConfigPacketHeader` (512 B, packed) — the config packet
-  header at `ConfigCommitOffset`. Has `PacketSize`, `Version`,
-  `Physical/Logical/Controller/SEP DeviceOffset+Size` field pairs.
-  `RC_BuildConfigMetadataFromRing` treats `*Offset` as a byte offset
-  into a `PacketSize`-byte buffer and expects signature `0x25bc` at
-  that location.
-- `RC_LogicalDevice` (516 B, packed) — contains the fields we need:
-  **`Devices` (u32 @ offset 104)** = member count, **`ChunkSize`
-  (u32 @ offset 172)** = stripe size.
-- `RC_LogicalElement_LE` (64 B) — per-member record inside a
-  logical device, has the linked physical-device `ID` so we can
-  match members → positions.
-- `RC_PhysicalDeviceOnDisk` (128 B, packed) — per-physical-disk
-  on-disk record.
-
-### What blocks parsing right now
-
-Our dev-box LBA 0x5001 dump has `PacketSize=302`,
-`PhysicalDeviceOffset=34192`.  Per the SDK function the offset must
-be within the packet (i.e. < PacketSize), so the SDK code would
-reject our packet outright.  Most likely the on-disk layout drifted
-between SDK 9.3.0 (the open source we have) and the Windows version
-that wrote our array (probably 9.3.2+).  Without a matching SDK we'd
-need to reverse the Windows `rcraid.sys` writer, or download a newer
-RHEL SDK build, to confirm the current layout.
-
-### Next steps when this is picked up
-
-1. Look for newer AMD Linux SDK builds (9.3.2-00255 to match
-   `drivers/windows/trx50/9.3.2-00255/`).  Diff the relevant struct
-   sizes via `pahole`.
-2. If no newer SDK is available, disassemble `RC_DiskMetaDataIO` /
-   `RC_BuildConfigMetadataFromRing` end-to-end and rebuild the
-   on-disk layout from the field access patterns.  Tools are
-   simple: `nm -S`, `objdump -d -M intel --disassemble=<sym>`,
-   `pahole -C <struct>`.
-3. Once layout is known, parse member count and stripe at probe
-   time and replace `RC_VOLUME_EXPECTED_MEMBERS` + the
-   ConfigRingSize-as-stripe workaround.
+Note that AMD also writes one single-device "raw disk" LD per
+physical member (`devtype = 0x1BF9, devices = 1, capacity = NSZE`).
+The parser walks past those by checking whether our `DeviceId`
+appears in the element array.
 
 ## Closed / debunked (do not re-investigate)
 

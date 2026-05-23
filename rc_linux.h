@@ -241,6 +241,16 @@ struct rc_nvme_state {
     u32            md_spare_info;       // RC_MetaData.SpareInfo
     u64            md_mbr_checksum;     // RC_MetaData.MBRChecksum
 
+    // Volume-level info parsed from the on-disk RC_LogicalDevice record in
+    // this member's config ring (LBA md_config_ring_lba + scan).  Populated
+    // after rc_volume_parse_logical_device runs.
+    bool           ld_valid;
+    u32            ld_device_type;      // RC_LogicalDevice.DeviceType (RC_LDT_*)
+    u32            ld_devices;          // RC_LogicalDevice.Devices (member count)
+    u32            ld_chunk_sectors;    // RC_LogicalDevice.ChunkSize (0 → use RAID-level default)
+    u64            ld_capacity_sectors; // RC_LogicalDevice.Capacity (total volume sectors)
+    int            ld_my_position;      // index of THIS adapter in LogicalElement array, -1 if not found
+
     // Per-doorbell pointers (computed once after CAP read)
     void __iomem  *sq_doorbell_base;  // BAR0 + 0x1000
 };
@@ -669,6 +679,54 @@ struct rc_raidcore_md {
 	__le64	mbr_checksum;		/* 0x38 — RC_MetaData.MBRChecksum (differs per member) */
 	u8	reserved[RC_RAIDCORE_BYTES - 0x40];
 } __packed;
+
+/* On-disk record-type tags (first u32 of each record in the config ring).
+ * From RC_DeviceStructType enum in rcblob.x86_64 DWARF. */
+#define RC_DST_PHYSICAL_DEVICE		0x25BCu
+#define RC_DST_LOGICAL_DEVICE		0x25BDu
+#define RC_DST_CONTROLLER_DEVICE	0x25BEu
+#define RC_DST_SEP_DEVICE		0x25BFu
+
+/* On-disk LogicalDevice DeviceType values.  The DWARF enum
+ * RC_LogicalDeviceTypes only publishes the "exotic" types starting at 7157;
+ * the basic RAID levels use an undocumented range that the writer dispatches
+ * on directly (see RC_CreateRaidArray in rcblob).  RAID0 = 0x1BF6 confirmed
+ * by reading the live array on the dev box.  Other values listed here are
+ * inferred from the dispatch table and are best-effort. */
+#define RC_LDT_RAID0			0x1BF6u
+#define RC_LDT_RAID1			0x1BF7u
+#define RC_LDT_RAID5			0x1BFAu
+#define RC_LDT_RAID10			0x1BFBu
+
+/* On-disk RC_LogicalDevice record — describes one RAID volume.  Layout
+ * matches `struct RC_LogicalDevice` from rcblob.x86_64 (pahole-confirmed,
+ * writer-confirmed via RC_BuildConfigMetadataFromMemory).  The struct is
+ * `__packed__` in the original — fields are byte-packed without alignment.
+ *
+ * Lives in the config ring (LBA = RC_MetaData.config_ring_lba + N), tagged
+ * by the leading u32 == RC_DST_LOGICAL_DEVICE (0x25BD).  ChunkSize at +0xAC
+ * is observed to be 0 for RAID0 — the firmware uses a hardcoded default of
+ * 2048 sectors (1 MiB) for that RAID level.  See docs/OPEN_QUESTIONS.md.
+ *
+ * We declare only the fields the driver consumes; the trailing reserved
+ * area is implicit. */
+#define RC_LD_DEVICES_OFFSET		0x68u	/* u32 — member count */
+#define RC_LD_FIRSTCOUNT_OFFSET		0x6Cu	/* u32 */
+#define RC_LD_SECONDCOUNT_OFFSET	0x70u	/* u32 */
+#define RC_LD_CHUNKSIZE_OFFSET		0xACu	/* u32 — sectors, 0 for RAID0 */
+#define RC_LD_ELEMENTOFFSET_OFFSET	0x04u	/* u32 — bytes from LD start to element array */
+#define RC_LD_DEVICETYPE_OFFSET		0x0Cu	/* u32 — RC_LDT_* */
+#define RC_LD_CAPACITY_OFFSET		0x50u	/* u64 — total volume sectors */
+#define RC_LD_PACKETSIZE_OFFSET		0x90u	/* u32 — LD record size including element array */
+
+/* On-disk RC_LogicalElement_LE — 64 bytes, one per member of a logical
+ * device.  Element index is the per-member position in the stripe layout. */
+#define RC_LE_BYTES			64u
+#define RC_LE_DEVICEID_OFFSET		0x00u	/* u64 — matches RC_MetaData.DeviceId */
+#define RC_LE_ALLOC_OFFSET_OFFSET	0x10u	/* u64 — sector offset of allocated region */
+#define RC_LE_ALLOC_SIZE_OFFSET		0x18u	/* u64 — sector count of allocated region */
+#define RC_LE_USERDATA_OFFSET_OFFSET	0x20u	/* u64 — sector offset of user-data region */
+#define RC_LE_USERDATA_SIZE_OFFSET	0x28u	/* u64 — sector count of user-data region */
 
 /* Identify CNS values (NVMe 1.4 §5.15.1) */
 #define RC_NVME_IDENTIFY_CNS_NS		0x00	/* Identify Namespace (requires NSID) */
