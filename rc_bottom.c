@@ -16,6 +16,27 @@
 #include "rc_linux.h"
 
 /*----------------------------------------------------------------------
+ * Subsystem-vendor allowlist (safety filter)
+ *
+ * The PCI device IDs we claim (especially 1022:b000) cover ALL drives
+ * the AMD RAID firmware exposes through the chipset — including drives
+ * that are NOT part of any RAID volume (e.g. an OS-only NVMe sitting on
+ * the same chipset).  Without a filter, a freshly loaded rcraid will
+ * happily bind to such an unrelated drive, reset its NVMe controller in
+ * rc_nvme_init_controller(CC.EN=0), and brick the running OS.
+ *
+ * Setting safe_subsys_vendor=<u16> at insmod time restricts probe to
+ * devices whose PCI subsystem_vendor matches.  Default 0 means no
+ * filter (legacy behaviour).  Recommended on multi-drive boxes:
+ *   insmod rcraid.ko safe_subsys_vendor=0xc0a9   (Micron/Crucial)
+ *----------------------------------------------------------------------*/
+static unsigned int rc_safe_subsys_vendor;
+module_param_named(safe_subsys_vendor, rc_safe_subsys_vendor, uint, 0444);
+MODULE_PARM_DESC(safe_subsys_vendor,
+                 "If non-zero, only bind to PCI devices whose subsystem_vendor matches this u16. "
+                 "Use to keep rcraid off the OS drive on chipsets that expose every NVMe as 1022:b000.");
+
+/*----------------------------------------------------------------------
  * PCI identity table.  Mirrors the five entries in AMD's
  * Windows rcbottom.inf (9.3.2/9.3.3): four SATA-RAID device IDs
  * (class 0x0104, AHCI-style path) plus the NVMe RAID Bottom device
@@ -295,6 +316,16 @@ static int rc_bottom_probe(struct pci_dev *pdev, const struct pci_device_id *id)
               pdev->device,
               pdev->subsystem_vendor,
               pdev->subsystem_device);
+
+    if (rc_safe_subsys_vendor &&
+        pdev->subsystem_vendor != (u16)rc_safe_subsys_vendor) {
+        rc_printk(RC_NOTE,
+                  "rc_bottom: skipping %s — subsystem_vendor 0x%04x != safe_subsys_vendor 0x%04x\n",
+                  pci_name(pdev),
+                  pdev->subsystem_vendor,
+                  (u16)rc_safe_subsys_vendor);
+        return -ENODEV;
+    }
 
     /* The PCI core has already matched against rc_bottom_pci_tbl[]; no
      * additional vendor/device gating needed here.  ID dispatch into
