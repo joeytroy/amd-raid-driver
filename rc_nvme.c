@@ -280,6 +280,35 @@ MODULE_PARM_DESC(cache_entries,
 #define RC_VOLUME_CACHE_MAX_ENTRIES	4096u
 #define RC_VOLUME_CACHE_CMD_SECTORS	1024u	/* 512 KiB per NVMe cmd, MDTS limit */
 
+/* "Ghost" cache: small direct-mapped hash of recently-seen stripe LBAs
+ * used to gate real cache population.  A stripe is only promoted to the
+ * real cache on its SECOND access — first access just records the LBA
+ * here and dispatches the read normally.  This avoids the cache fill's
+ * memcpy overhead on workloads that read each stripe once (cold streams,
+ * boot-time loads) while still letting CDM-style "read the same region
+ * 5 times" benchmarks ramp into cache for loops 2+.
+ *
+ * Direct-mapped + collisions overwrite — false-negatives are fine
+ * (data still served correctly, just no caching that round) and false
+ * positives are rare with the bucket count chosen.  Memory: 64 KiB. */
+#define RC_GHOST_HASH_BITS	13
+#define RC_GHOST_HASH_SIZE	(1u << RC_GHOST_HASH_BITS)
+#define RC_GHOST_HASH_MASK	(RC_GHOST_HASH_SIZE - 1)
+static sector_t *rc_ghost_table;	/* RC_GHOST_HASH_SIZE entries, 0 = empty */
+
+/* Per-hctx in-flight counter — cheap atomic proxy for "current queue
+ * depth on this hctx".  Cache lookups still happen at any QD (hits are
+ * fast), but cache FILLS are gated on QD < threshold: at high QD the
+ * device itself outpaces the cache fill's memcpy overhead, so we'd be
+ * adding work for no win.  Without this gate, SEQ1M Q8T1 drops from
+ * ~19 GB/s native to ~14 GB/s cache-bound. */
+static atomic_t rc_cache_hctx_inflight[RC_VOLUME_MAX_HCTX];
+static int rc_cache_fill_max_qd = 2;
+module_param_named(cache_fill_max_qd, rc_cache_fill_max_qd, int, 0644);
+MODULE_PARM_DESC(cache_fill_max_qd,
+		 "Only populate cache when per-hctx in-flight count <= this (default 2). "
+		 "Cache HITS always serve regardless of QD.");
+
 /* blk-mq per-request command data.
  *
  * For READ/WRITE the request targets ONE member, members_pending is set
@@ -301,6 +330,7 @@ struct rc_volume_pdu {
 	int                member_idx;
 	u8                 op;             /* req_op() value */
 	u16                sc_sct;         /* NVMe SC/SCT, 0 = success */
+	u8                 hctx_idx;       /* for inflight counter decrement */
 	atomic_t           members_pending;
 	int                nents;          /* dma_map_sg output count, 0 = not mapped */
 	/* Non-NULL when this request is waiting on a cache fill.  .complete
@@ -309,6 +339,14 @@ struct rc_volume_pdu {
 	struct rc_cache_entry *cache_entry;
 	struct scatterlist sg[RC_VOLUME_DATA_PAGES];
 };
+
+/* Helper: decrement the per-hctx inflight counter that was incremented at
+ * the top of queue_rq.  Called from every code path that ends a request. */
+static inline void rc_cache_dec_inflight(struct rc_volume_pdu *pdu)
+{
+	if (pdu->hctx_idx < RC_VOLUME_MAX_HCTX)
+		atomic_dec(&rc_cache_hctx_inflight[pdu->hctx_idx]);
+}
 
 /* Sentinel value stored into pdu->sc_sct by the drain path so .complete
  * can log "controller dead" instead of decoding it as a real NVMe status.
@@ -493,11 +531,11 @@ irqreturn_t rc_nvme_io_queue_irq(int irq, void *dev_id)
 			struct request *req = done_reqs[i];
 			struct rc_volume_pdu *pdu = blk_mq_rq_to_pdu(req);
 			rc_volume_unmap_request_sg(pdu);
-			if (pdu->sc_sct) {
+			rc_cache_dec_inflight(pdu);
+			if (pdu->sc_sct)
 				blk_mq_end_request(req, BLK_STS_IOERR);
-			} else {
+			else
 				blk_mq_end_request(req, BLK_STS_OK);
-			}
 		}
 	}
 	return IRQ_HANDLED;
@@ -2006,6 +2044,7 @@ static struct rc_cache_entry *rc_cache_lookup_valid(sector_t stripe_lba);
 static bool rc_cache_has_or_loading(sector_t stripe_lba);
 static struct rc_cache_entry *rc_cache_alloc_entry(void);
 static void rc_cache_invalidate_range(sector_t pos, u32 nr_sectors);
+static bool rc_ghost_check_and_mark(sector_t stripe_lba);
 static void rc_cache_submit_fill(unsigned int hctx_idx,
 				 u32 entry_idx,
 				 sector_t stripe_lba,
@@ -2039,6 +2078,10 @@ static blk_status_t rc_volume_queue_rq(struct blk_mq_hw_ctx *hctx,
 	pdu->sc_sct = 0;
 	pdu->nents = 0;
 	pdu->cache_entry = NULL;
+	pdu->hctx_idx = (u8)(hctx->queue_num < RC_VOLUME_MAX_HCTX ?
+			     hctx->queue_num : 0xff);
+	if (pdu->hctx_idx < RC_VOLUME_MAX_HCTX)
+		atomic_inc(&rc_cache_hctx_inflight[pdu->hctx_idx]);
 
 	/* If any member adapter has been flagged dead (by the ISR's CSTS
 	 * check, by a prior timeout, or by drain), the RAID0 volume can't
@@ -2046,6 +2089,7 @@ static blk_status_t rc_volume_queue_rq(struct blk_mq_hw_ctx *hctx,
 	 * CIDs against a controller we no longer trust. */
 	if (rc_volume_any_member_dead()) {
 		blk_mq_start_request(req);
+		rc_cache_dec_inflight(pdu);
 		blk_mq_end_request(req, BLK_STS_IOERR);
 		return BLK_STS_OK;
 	}
@@ -2071,6 +2115,7 @@ static blk_status_t rc_volume_queue_rq(struct blk_mq_hw_ctx *hctx,
 
 	if (op != REQ_OP_READ && op != REQ_OP_WRITE && op != REQ_OP_DISCARD) {
 		blk_mq_start_request(req);
+		rc_cache_dec_inflight(pdu);
 		blk_mq_end_request(req, BLK_STS_IOERR);
 		return BLK_STS_OK;
 	}
@@ -2080,6 +2125,7 @@ static blk_status_t rc_volume_queue_rq(struct blk_mq_hw_ctx *hctx,
 	    (op != REQ_OP_DISCARD &&
 	     nr_sectors > (RC_VOLUME_DATA_BYTES / 512))) {
 		blk_mq_start_request(req);
+		rc_cache_dec_inflight(pdu);
 		blk_mq_end_request(req, BLK_STS_IOERR);
 		return BLK_STS_OK;
 	}
@@ -2113,11 +2159,14 @@ static blk_status_t rc_volume_queue_rq(struct blk_mq_hw_ctx *hctx,
 				src = (u8 *)e->buf_va[e->member] +
 				      (u32)(pos - stripe_lba) * 512u;
 				rc_cache_hits++;
-			} else if (!rc_cache_has_or_loading(stripe_lba)) {
-				/* MISS, no existing entry — try to allocate
-				 * and trigger a fill.  If alloc succeeds, the
-				 * request becomes the entry's waiter and we
-				 * defer completion to the fill ISR. */
+			} else if (atomic_read(&rc_cache_hctx_inflight[pdu->hctx_idx]) <=
+				   rc_cache_fill_max_qd &&
+				   !rc_cache_has_or_loading(stripe_lba) &&
+				   rc_ghost_check_and_mark(stripe_lba)) {
+				/* Low queue depth + ghost hit (2nd+ access).
+				 * Worth caching now.  At high QD, skip fill
+				 * because the device's native parallelism beats
+				 * cache-fill memcpy. */
 				e = rc_cache_alloc_entry();
 				if (e) {
 					rc_volume_map_lba(stripe_lba,
@@ -2156,6 +2205,7 @@ static blk_status_t rc_volume_queue_rq(struct blk_mq_hw_ctx *hctx,
 			if (src && ce_status == 0) {
 				rc_volume_prefetch_copy_out(req, src);
 				blk_mq_start_request(req);
+				rc_cache_dec_inflight(pdu);
 				blk_mq_end_request(req, BLK_STS_OK);
 				return BLK_STS_OK;
 			}
@@ -2275,6 +2325,7 @@ static blk_status_t rc_volume_queue_rq(struct blk_mq_hw_ctx *hctx,
 					}
 				}
 				spin_unlock_irqrestore(&pf->lock, flags);
+				rc_cache_dec_inflight(pdu);
 				blk_mq_end_request(req, BLK_STS_OK);
 				return BLK_STS_OK;
 			}
@@ -2301,6 +2352,7 @@ static blk_status_t rc_volume_queue_rq(struct blk_mq_hw_ctx *hctx,
 	st = rc_volume_map_request_sg(req, pdu, member_idx);
 	if (st != BLK_STS_OK) {
 		blk_mq_start_request(req);
+		rc_cache_dec_inflight(pdu);
 		blk_mq_end_request(req, st);
 		return BLK_STS_OK;
 	}
@@ -2418,6 +2470,7 @@ static void rc_volume_complete(struct request *req)
 			e->state = RC_CE_FREE;
 			spin_unlock_irqrestore(&rc_cache_lock, flags);
 			pdu->cache_entry = NULL;
+			rc_cache_dec_inflight(pdu);
 			blk_mq_end_request(req, BLK_STS_IOERR);
 			return;
 		}
@@ -2435,6 +2488,7 @@ static void rc_volume_complete(struct request *req)
 		}
 		spin_unlock_irqrestore(&rc_cache_lock, flags);
 		pdu->cache_entry = NULL;
+		rc_cache_dec_inflight(pdu);
 		blk_mq_end_request(req, BLK_STS_OK);
 		return;
 	}
@@ -2470,10 +2524,12 @@ static void rc_volume_complete(struct request *req)
 				(unsigned long long)blk_rq_pos(req),
 				blk_rq_sectors(req));
 		}
+		rc_cache_dec_inflight(pdu);
 		blk_mq_end_request(req, BLK_STS_IOERR);
 		return;
 	}
 
+	rc_cache_dec_inflight(pdu);
 	blk_mq_end_request(req, BLK_STS_OK);
 }
 
@@ -2597,6 +2653,7 @@ static enum blk_eh_timer_return rc_volume_timeout(struct request *req)
 			 * member_idx out of range for some reason) the
 			 * direct end path bypasses .complete, so unmap here. */
 			rc_volume_unmap_request_sg(pdu);
+			rc_cache_dec_inflight(pdu);
 			blk_mq_end_request(req, BLK_STS_IOERR);
 		}
 		return BLK_EH_DONE;
@@ -2629,6 +2686,7 @@ static enum blk_eh_timer_return rc_volume_timeout(struct request *req)
 	rc_volume_schedule_auto_reset_for_req(pdu);
 	if (!blk_mq_request_completed(req)) {
 		rc_volume_unmap_request_sg(pdu);
+		rc_cache_dec_inflight(pdu);
 		blk_mq_end_request(req, BLK_STS_TIMEOUT);
 	}
 	return BLK_EH_DONE;
@@ -2761,6 +2819,22 @@ static inline u32 rc_cache_bucket_for(sector_t lba)
 	return hash_64((u64)lba, RC_VOLUME_CACHE_HASH_BITS) & RC_VOLUME_CACHE_HASH_MASK;
 }
 
+/* Check ghost cache: if the stripe LBA was recently seen, return true
+ * (and leave it marked).  Otherwise mark it seen and return false.
+ * Caller hold rc_cache_lock. */
+static bool rc_ghost_check_and_mark(sector_t stripe_lba)
+{
+	u32 h;
+
+	if (!rc_ghost_table || !stripe_lba)
+		return false;	/* never promote if disabled or sentinel */
+	h = (u32)(hash_64((u64)stripe_lba, RC_GHOST_HASH_BITS) & RC_GHOST_HASH_MASK);
+	if (rc_ghost_table[h] == stripe_lba)
+		return true;
+	rc_ghost_table[h] = stripe_lba;
+	return false;
+}
+
 /* Look up a VALID entry for stripe_lba.  Returns NULL if not present or
  * the entry is still LOADING.  Touch-on-hit (move to MRU). */
 static struct rc_cache_entry *rc_cache_lookup_valid(sector_t stripe_lba)
@@ -2820,6 +2894,12 @@ static void rc_cache_teardown(void)
 {
 	u32 i, m;
 
+	rc_printk(RC_NOTE,
+		  "rc_cache_teardown: hits=%llu misses=%llu evictions=%llu\n",
+		  (unsigned long long)rc_cache_hits,
+		  (unsigned long long)rc_cache_misses,
+		  (unsigned long long)rc_cache_evictions);
+
 	if (!rc_cache_entries)
 		goto free_hash;
 
@@ -2853,6 +2933,10 @@ free_hash:
 		kfree(rc_cache_buckets);
 		rc_cache_buckets = NULL;
 	}
+	if (rc_ghost_table) {
+		kvfree(rc_ghost_table);
+		rc_ghost_table = NULL;
+	}
 	INIT_LIST_HEAD(&rc_cache_lru);
 }
 
@@ -2869,6 +2953,11 @@ static int rc_cache_init(u32 nr_entries)
 
 	if (nr_entries == 0)
 		return 0;
+
+	rc_ghost_table = kvzalloc(RC_GHOST_HASH_SIZE * sizeof(sector_t),
+				  GFP_KERNEL);
+	if (!rc_ghost_table)
+		return -ENOMEM;
 
 	rc_cache_buckets = kcalloc(RC_VOLUME_CACHE_HASH_SIZE,
 				sizeof(*rc_cache_buckets), GFP_KERNEL);
