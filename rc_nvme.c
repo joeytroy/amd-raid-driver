@@ -123,6 +123,62 @@ static struct blk_mq_tag_set rc_volume_tagset;
 static __le64     *rc_volume_prp_va[RC_VOLUME_MAX_MEMBERS][RC_VOLUME_QUEUE_DEPTH];
 static dma_addr_t  rc_volume_prp_pa[RC_VOLUME_MAX_MEMBERS][RC_VOLUME_QUEUE_DEPTH];
 
+/* Sequential read prefetch.
+ *
+ * Per-hctx state.  When queue_rq sees a READ that's contiguous with the
+ * previous READ on this hctx, it speculatively issues a stripe-sized
+ * NVMe READ for the next stripe to the OTHER member.  Result lands in
+ * a per-hctx, per-member DMA buffer.  The next app READ that matches
+ * the prefetched LBA gets served from that buffer (memcpy) without
+ * touching the device — turning Q1 sequential streams into effective
+ * Q2 on the device.  Sized for a 1 MiB stripe.
+ *
+ * CIDs 0x100..0x1FF are reserved for prefetch (clearly outside the
+ * blk-mq tag range 0..QD-1 = 0..255).  CID = 0x100 | hctx_idx, so up
+ * to 256 hctxs are addressable. */
+#define RC_VOLUME_PREFETCH_BYTES	(1u * 1024 * 1024)
+#define RC_VOLUME_PREFETCH_SECTORS	(RC_VOLUME_PREFETCH_BYTES / 512u)
+#define RC_VOLUME_PREFETCH_PAGES	(RC_VOLUME_PREFETCH_BYTES / PAGE_SIZE)
+#define RC_VOLUME_PREFETCH_CID_BASE	0x100u
+#define RC_VOLUME_MAX_HCTX		8u
+
+enum rc_prefetch_state {
+	RC_PF_IDLE = 0,
+	RC_PF_INFLIGHT,
+	RC_PF_COMPLETE,
+};
+
+struct rc_volume_prefetch {
+	spinlock_t		lock;
+	enum rc_prefetch_state	state;
+	u16			status;		/* NVMe SC/SCT, 0 = success */
+	sector_t		lba;		/* volume LBA prefetched */
+	u32			sectors;	/* prefetch size */
+	int			member;		/* member the prefetch landed on */
+	/* Per-member DMA-coherent buffer (1 MiB) + PRP list page.  Each member
+	 * has its own KVA + DMA addr because each pdev sits in its own IOMMU
+	 * domain.  We memcpy from buf_va[member] when serving a cache hit. */
+	void			*buf_va[RC_VOLUME_MAX_MEMBERS];
+	dma_addr_t		buf_pa[RC_VOLUME_MAX_MEMBERS];
+	__le64			*prp_va[RC_VOLUME_MAX_MEMBERS];
+	dma_addr_t		prp_pa[RC_VOLUME_MAX_MEMBERS];
+	/* Sequential-stream tracking. */
+	sector_t		last_lba;
+	u32			last_sectors;
+	/* Stats. */
+	u64			hits;
+	u64			misses;
+	u64			issued;
+	u64			discarded;
+};
+
+static struct rc_volume_prefetch rc_volume_prefetch_state[RC_VOLUME_MAX_HCTX];
+
+static int rc_volume_prefetch_enabled = 1;
+module_param_named(prefetch, rc_volume_prefetch_enabled, int, 0644);
+MODULE_PARM_DESC(prefetch,
+		 "If non-zero (default), speculatively pre-issue the next stripe on sequential reads.");
+
 /* blk-mq per-request command data.
  *
  * For READ/WRITE the request targets ONE member, members_pending is set
@@ -233,6 +289,9 @@ irqreturn_t rc_nvme_admin_irq(int irq, void *dev_id)
 	return IRQ_HANDLED;
 }
 
+/* Forward declaration: handles CIDs in the prefetch range (0x100..). */
+static void rc_volume_prefetch_isr(unsigned int hctx_idx, u16 status);
+
 /* Per-I/O-queue ISR — registered for MSI-X vector qid.  Walks this
  * queue's CQ only.  Boot-time sync helpers sleep on q->cq_wait; once
  * rc_volume_disk is up the ISR completes blk-mq requests via
@@ -273,18 +332,28 @@ irqreturn_t rc_nvme_io_queue_irq(int irq, void *dev_id)
 			break;
 
 		cid = le16_to_cpu(cqe->cid);
-		req = blk_mq_tag_to_rq(tags, cid);
-		if (req) {
+		if ((cid & RC_VOLUME_PREFETCH_CID_BASE) == RC_VOLUME_PREFETCH_CID_BASE) {
+			/* Prefetch completion: CID = PREFETCH_CID_BASE |
+			 * hctx_idx.  Status is the NVMe SC/SCT.  Hand off
+			 * to the prefetch state machine and continue
+			 * walking the CQ — no blk-mq request to complete. */
 			u16 sc = (status >> 1) & 0x7fff;
-			pdu = blk_mq_rq_to_pdu(req);
-			if (sc)
-				pdu->sc_sct = sc;
-			if (atomic_dec_and_test(&pdu->members_pending))
-				blk_mq_complete_request(req);
+			unsigned int hctx_idx = cid & ~RC_VOLUME_PREFETCH_CID_BASE;
+			rc_volume_prefetch_isr(hctx_idx, sc);
 		} else {
-			rc_printk(RC_WARN,
-				  "rc_nvme_io_queue_irq: %s qid=%u CQE for unknown CID=%u (status=0x%04x)\n",
-				  pci_name(adapter->pdev), q->qid, cid, status);
+			req = blk_mq_tag_to_rq(tags, cid);
+			if (req) {
+				u16 sc = (status >> 1) & 0x7fff;
+				pdu = blk_mq_rq_to_pdu(req);
+				if (sc)
+					pdu->sc_sct = sc;
+				if (atomic_dec_and_test(&pdu->members_pending))
+					blk_mq_complete_request(req);
+			} else {
+				rc_printk(RC_WARN,
+					  "rc_nvme_io_queue_irq: %s qid=%u CQE for unknown CID=%u (status=0x%04x)\n",
+					  pci_name(adapter->pdev), q->qid, cid, status);
+			}
 		}
 
 		q->cq_head = (q->cq_head + 1) % q->cq_depth;
@@ -1789,6 +1858,15 @@ static inline bool rc_volume_any_member_dead(void)
 	return false;
 }
 
+/* Forward declarations for prefetch helpers used in queue_rq.  Definitions
+ * are kept near .complete / .map_queues / .ops to keep the prefetch module
+ * code grouped together. */
+static void rc_volume_prefetch_submit(unsigned int hctx_idx,
+				      struct rc_volume_prefetch *pf,
+				      u64 phys_lba);
+static void rc_volume_prefetch_copy_out(struct request *req, void *src);
+static void rc_volume_prefetch_invalidate(unsigned int hctx_idx);
+
 /* blk-mq request handler.  chunk_sectors=stripe_sectors in queue_limits
  * keeps each request inside one stripe, so it maps to exactly one member.
  *
@@ -1861,6 +1939,77 @@ static blk_status_t rc_volume_queue_rq(struct blk_mq_hw_ctx *hctx,
 		return BLK_STS_OK;
 	}
 
+	/* Prefetch — fast path: serve READ from prefetch buffer if a prior
+	 * speculative dispatch landed there.  Non-READ ops invalidate.
+	 *
+	 * Sequential detection + speculation happens later in this function
+	 * after the normal dispatch path, using last_lba/last_sectors. */
+	if (rc_volume_prefetch_enabled) {
+		unsigned int hctx_idx = hctx->queue_num;
+		if (op == REQ_OP_READ && hctx_idx < RC_VOLUME_MAX_HCTX) {
+			struct rc_volume_prefetch *pf =
+				&rc_volume_prefetch_state[hctx_idx];
+			unsigned long flags;
+			void *src = NULL;
+			u16 pf_status = 0;
+			bool hit = false;
+
+			spin_lock_irqsave(&pf->lock, flags);
+			if (pf->lba == pos && pf->sectors == nr_sectors &&
+			    pf->state == RC_PF_COMPLETE) {
+				pf_status = pf->status;
+				src = pf->buf_va[pf->member];
+				pf->state = RC_PF_IDLE;
+				hit = true;
+				pf->hits++;
+			}
+			spin_unlock_irqrestore(&pf->lock, flags);
+
+			if (hit && pf_status == 0) {
+				rc_volume_prefetch_copy_out(req, src);
+				blk_mq_start_request(req);
+				/* Update last_* + maybe issue next prefetch
+				 * before completing, mirroring normal path. */
+				spin_lock_irqsave(&pf->lock, flags);
+				{
+					sector_t prev_last_lba = pf->last_lba;
+					u32 prev_last_sectors = pf->last_sectors;
+					bool was_seq = (prev_last_sectors &&
+							pos == prev_last_lba + prev_last_sectors);
+					pf->last_lba = pos;
+					pf->last_sectors = nr_sectors;
+					if (was_seq &&
+					    rc_volume_stripe_sectors &&
+					    pf->state == RC_PF_IDLE) {
+						u64 next_lba = pos + rc_volume_stripe_sectors;
+						int next_mem;
+						u64 next_phys;
+						if (nr_sectors <= RC_VOLUME_PREFETCH_SECTORS &&
+						    next_lba + nr_sectors <=
+						    get_capacity(rc_volume_disk)) {
+							rc_volume_map_lba(next_lba,
+									  &next_mem,
+									  &next_phys);
+							pf->state = RC_PF_INFLIGHT;
+							pf->lba = next_lba;
+							pf->sectors = nr_sectors;
+							pf->member = next_mem;
+							rc_volume_prefetch_submit(hctx_idx,
+										  pf,
+										  next_phys);
+						}
+					}
+				}
+				spin_unlock_irqrestore(&pf->lock, flags);
+				blk_mq_end_request(req, BLK_STS_OK);
+				return BLK_STS_OK;
+			}
+		} else if (op != REQ_OP_READ && hctx_idx < RC_VOLUME_MAX_HCTX) {
+			/* Any non-READ on this hctx — invalidate the slot. */
+			rc_volume_prefetch_invalidate(hctx_idx);
+		}
+	}
+
 	rc_volume_map_lba(pos, &member_idx, &phys_lba);
 	pdu->member_idx = member_idx;
 	atomic_set(&pdu->members_pending, 1);
@@ -1895,6 +2044,58 @@ static blk_status_t rc_volume_queue_rq(struct blk_mq_hw_ctx *hctx,
 	blk_mq_start_request(req);
 	rc_nvme_io_submit(rc_volume_members[member_idx]->ctx.nvme.io_queues[hctx->queue_num],
 			  &cmd);
+
+	/* Post-dispatch: if this READ continues a sequential stream and is
+	 * stripe-sized + stripe-aligned, speculatively issue the next stripe
+	 * to the OTHER member.  The result lands in the per-hctx prefetch
+	 * buffer; the next matching app READ skips the device entirely.
+	 * No-op if a prefetch is still in flight or no stream is detected. */
+	if (rc_volume_prefetch_enabled && op == REQ_OP_READ) {
+		unsigned int hctx_idx = hctx->queue_num;
+		if (hctx_idx < RC_VOLUME_MAX_HCTX) {
+			struct rc_volume_prefetch *pf =
+				&rc_volume_prefetch_state[hctx_idx];
+			unsigned long flags;
+
+			spin_lock_irqsave(&pf->lock, flags);
+			{
+				sector_t prev_last_lba = pf->last_lba;
+				u32 prev_last_sectors = pf->last_sectors;
+				bool was_seq = (prev_last_sectors &&
+						pos == prev_last_lba + prev_last_sectors);
+				pf->last_lba = pos;
+				pf->last_sectors = nr_sectors;
+				/* Speculate the NEXT-STRIPE counterpart on the
+				 * OTHER member.  pos+stripe lands one stripe
+				 * ahead — that's the other member by definition
+				 * of striping.  Prefetch size matches our bio
+				 * (which is bounded by max_hw_sectors). */
+				if (was_seq &&
+				    rc_volume_stripe_sectors &&
+				    pf->state == RC_PF_IDLE) {
+					u64 next_lba = pos + rc_volume_stripe_sectors;
+					int next_mem;
+					u64 next_phys;
+					if (nr_sectors <= RC_VOLUME_PREFETCH_SECTORS &&
+					    next_lba + nr_sectors <=
+					    get_capacity(rc_volume_disk)) {
+						rc_volume_map_lba(next_lba, &next_mem,
+								  &next_phys);
+						pf->state = RC_PF_INFLIGHT;
+						pf->lba = next_lba;
+						pf->sectors = nr_sectors;
+						pf->member = next_mem;
+						pf->misses++;
+						rc_volume_prefetch_submit(hctx_idx, pf,
+									  next_phys);
+					}
+				} else if (!was_seq) {
+					pf->misses++;
+				}
+			}
+			spin_unlock_irqrestore(&pf->lock, flags);
+		}
+	}
 	return BLK_STS_OK;
 }
 
@@ -2126,6 +2327,197 @@ static void rc_volume_map_queues(struct blk_mq_tag_set *set)
 	}
 }
 
+/* ============================== prefetch ============================== */
+
+/* Free all prefetch buffers + PRP pages.  Idempotent: skips slots that
+ * never got allocated.  Walks every (hctx, member) tuple. */
+static void rc_volume_prefetch_free_all(void)
+{
+	int h, m;
+
+	for (h = 0; h < (int)RC_VOLUME_MAX_HCTX; h++) {
+		struct rc_volume_prefetch *pf = &rc_volume_prefetch_state[h];
+		for (m = 0; m < rc_volume_member_count; m++) {
+			struct device *dev;
+			if (!rc_volume_members[m])
+				continue;
+			dev = &rc_volume_members[m]->pdev->dev;
+			if (pf->buf_va[m]) {
+				dma_free_coherent(dev, RC_VOLUME_PREFETCH_BYTES,
+						  pf->buf_va[m], pf->buf_pa[m]);
+				pf->buf_va[m] = NULL;
+				pf->buf_pa[m] = 0;
+			}
+			if (pf->prp_va[m]) {
+				dma_free_coherent(dev, PAGE_SIZE,
+						  pf->prp_va[m], pf->prp_pa[m]);
+				pf->prp_va[m] = NULL;
+				pf->prp_pa[m] = 0;
+			}
+		}
+		pf->state = RC_PF_IDLE;
+		pf->last_lba = ~(sector_t)0;
+		pf->last_sectors = 0;
+	}
+}
+
+/* Allocate per-(hctx,member) prefetch DMA buffer + PRP list page, and
+ * fill the PRP list with the buffer's per-member DMA addresses.  The
+ * 1 MiB buffer is allocated with dma_alloc_coherent (so the kernel
+ * memcpy from KVA is safe with no extra dma_sync needed) and the PRP
+ * list mirrors what rc_volume_build_prp would have produced for that
+ * physical layout. */
+static int rc_volume_prefetch_alloc_all(unsigned int nr_hw)
+{
+	int h, m;
+	unsigned int p;
+
+	if (nr_hw > RC_VOLUME_MAX_HCTX)
+		nr_hw = RC_VOLUME_MAX_HCTX;
+
+	for (h = 0; h < (int)nr_hw; h++) {
+		struct rc_volume_prefetch *pf = &rc_volume_prefetch_state[h];
+		spin_lock_init(&pf->lock);
+		pf->state = RC_PF_IDLE;
+		pf->last_lba = ~(sector_t)0;
+		pf->last_sectors = 0;
+
+		for (m = 0; m < rc_volume_member_count; m++) {
+			struct device *dev = &rc_volume_members[m]->pdev->dev;
+
+			pf->buf_va[m] = dma_alloc_coherent(dev,
+							   RC_VOLUME_PREFETCH_BYTES,
+							   &pf->buf_pa[m],
+							   GFP_KERNEL);
+			if (!pf->buf_va[m]) {
+				rc_printk(RC_ERROR,
+					  "rc_volume_prefetch_alloc_all: hctx %d member %d buf alloc failed\n",
+					  h, m);
+				rc_volume_prefetch_free_all();
+				return -ENOMEM;
+			}
+			pf->prp_va[m] = dma_alloc_coherent(dev, PAGE_SIZE,
+							   &pf->prp_pa[m],
+							   GFP_KERNEL);
+			if (!pf->prp_va[m]) {
+				rc_volume_prefetch_free_all();
+				return -ENOMEM;
+			}
+			/* Pre-fill the PRP list: dma_alloc_coherent returned
+			 * physically contiguous memory in the device's IOMMU
+			 * domain, so successive pages of the buffer are at
+			 * buf_pa + i*PAGE_SIZE.  PRP1 carries the first page,
+			 * PRP2 carries either the second page (≤2 pages) or
+			 * the PRP-list address (>2 pages).  Our buffer is
+			 * RC_VOLUME_PREFETCH_PAGES > 2, so PRP2 → list. */
+			for (p = 0; p < RC_VOLUME_PREFETCH_PAGES - 1; p++)
+				pf->prp_va[m][p] =
+					cpu_to_le64(pf->buf_pa[m] + (p + 1) * PAGE_SIZE);
+		}
+	}
+	return 0;
+}
+
+/* Submit an NVMe READ for one prefetch slot.  Caller must hold pf->lock
+ * AND have already set state = INFLIGHT and recorded {lba, sectors,
+ * member}.  Builds SQE with CID = 0x100 | hctx_idx so the ISR can
+ * distinguish prefetch completions from blk-mq tag CIDs (0..QD-1). */
+static void rc_volume_prefetch_submit(unsigned int hctx_idx,
+				      struct rc_volume_prefetch *pf,
+				      u64 phys_lba)
+{
+	struct rc_nvme_sqe cmd;
+	int m = pf->member;
+	u16 cid = (u16)(RC_VOLUME_PREFETCH_CID_BASE | hctx_idx);
+
+	memset(&cmd, 0, sizeof(cmd));
+	cmd.opc   = RC_NVME_NVM_OP_READ;
+	cmd.cid   = cpu_to_le16(cid);
+	cmd.nsid  = cpu_to_le32(1);
+	cmd.cdw10 = cpu_to_le32((u32)(phys_lba & 0xffffffff));
+	cmd.cdw11 = cpu_to_le32((u32)(phys_lba >> 32));
+	cmd.cdw12 = cpu_to_le32((u32)(pf->sectors - 1));
+	cmd.prp1  = cpu_to_le64(pf->buf_pa[m]);
+	cmd.prp2  = cpu_to_le64(pf->prp_pa[m]);
+
+	pf->issued++;
+	rc_nvme_io_submit(rc_volume_members[m]->ctx.nvme.io_queues[hctx_idx],
+			  &cmd);
+}
+
+/* ISR helper: handle a prefetch CID completion.  Called from
+ * rc_nvme_io_queue_irq with q->lock held.  Records status and
+ * transitions INFLIGHT -> COMPLETE.  If the dispatch path marked
+ * the prefetch as discarded (write invalidation), drop the buffer
+ * back to IDLE without retaining the data. */
+static void rc_volume_prefetch_isr(unsigned int hctx_idx, u16 status)
+{
+	struct rc_volume_prefetch *pf;
+	unsigned long flags;
+
+	if (hctx_idx >= RC_VOLUME_MAX_HCTX)
+		return;
+	pf = &rc_volume_prefetch_state[hctx_idx];
+
+	spin_lock_irqsave(&pf->lock, flags);
+	pf->status = status;
+	if (pf->state == RC_PF_INFLIGHT) {
+		pf->state = RC_PF_COMPLETE;
+	} else {
+		pf->state = RC_PF_IDLE;
+		pf->discarded++;
+	}
+	spin_unlock_irqrestore(&pf->lock, flags);
+}
+
+/* Copy data from the prefetch buffer into the request's bio pages.
+ * Called from queue_rq (process context) on a cache hit.  The caller
+ * is responsible for ensuring src remains valid for the duration of
+ * the copy — true because we transitioned state to IDLE only AFTER
+ * extracting src and pf->state IDLE means no new prefetch can land
+ * (single-threaded per hctx). */
+static void rc_volume_prefetch_copy_out(struct request *req, void *src)
+{
+	struct bio *bio;
+	size_t off = 0;
+
+	__rq_for_each_bio(bio, req) {
+		struct bio_vec bv;
+		struct bvec_iter iter;
+
+		bio_for_each_segment(bv, bio, iter) {
+			void *dst = kmap_local_page(bv.bv_page) + bv.bv_offset;
+			memcpy(dst, (u8 *)src + off, bv.bv_len);
+			kunmap_local(dst - bv.bv_offset);
+			off += bv.bv_len;
+		}
+	}
+}
+
+/* Invalidate a slot — used when a write/discard targets the same
+ * volume region or the stream goes non-sequential.  If a prefetch is
+ * in flight we can't free the buffer yet (the controller may still
+ * DMA into it); flag it discarded so the ISR drops it on completion. */
+static void rc_volume_prefetch_invalidate(unsigned int hctx_idx)
+{
+	struct rc_volume_prefetch *pf;
+	unsigned long flags;
+
+	if (hctx_idx >= RC_VOLUME_MAX_HCTX)
+		return;
+	pf = &rc_volume_prefetch_state[hctx_idx];
+
+	spin_lock_irqsave(&pf->lock, flags);
+	if (pf->state == RC_PF_COMPLETE) {
+		pf->state = RC_PF_IDLE;
+		pf->discarded++;
+	}
+	/* If INFLIGHT, leave it; the ISR will see state still INFLIGHT
+	 * and transition to COMPLETE normally — the next queue_rq cycle
+	 * (which will see no match) will reset it. */
+	spin_unlock_irqrestore(&pf->lock, flags);
+}
+
 static const struct blk_mq_ops rc_volume_mq_ops = {
 	.queue_rq   = rc_volume_queue_rq,
 	.complete   = rc_volume_complete,
@@ -2202,6 +2594,15 @@ static int rc_volume_create_disk(void)
 	ret = blk_mq_alloc_tag_set(&rc_volume_tagset);
 	if (ret)
 		goto err_free_dma;
+
+	ret = rc_volume_prefetch_alloc_all(rc_volume_tagset.nr_hw_queues);
+	if (ret) {
+		rc_printk(RC_WARN,
+			  "rc_volume_create_disk: prefetch alloc failed (%d) — continuing with prefetch disabled\n",
+			  ret);
+		rc_volume_prefetch_enabled = 0;
+		ret = 0;
+	}
 
 	{
 		struct queue_limits lim = {
@@ -2332,6 +2733,7 @@ void rc_volume_teardown(void)
 		rc_volume_members[i] = NULL;
 		rc_volume_member_phys_offset[i] = 0;
 	}
+	rc_volume_prefetch_free_all();
 	rc_volume_member_count = 0;
 	rc_volume_stripe_sectors = 0;
 	mutex_unlock(&rc_volume_lock);
