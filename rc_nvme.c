@@ -204,6 +204,82 @@ module_param_named(prefetch, rc_volume_prefetch_enabled, int, 0644);
 MODULE_PARM_DESC(prefetch,
 		 "If non-zero (default), speculatively pre-issue the next stripe on sequential reads.");
 
+/* ============================ Read cache ===========================
+ *
+ * Stripe-granularity LRU buffer cache, modeled after the buffer pool we
+ * decoded in rcraid.sys (FUN_140013234).  Sits below the FS layer so
+ * O_DIRECT / FILE_FLAG_NO_BUFFERING reads still hit it, matching what
+ * Windows does.  Read path: hash-lookup by stripe LBA; on hit, memcpy
+ * from buffer to bio pages; on miss, allocate a free entry (evicting
+ * LRU if full), dispatch the read into that entry, populate on
+ * completion.  Write path: invalidate any cache entries that overlap.
+ *
+ * Each entry holds one full stripe (1 MiB) of data.  The backing buffer
+ * is allocated per-member via dma_alloc_coherent so we can DMA fill it
+ * from whichever member owns the stripe; memcpy-out uses the per-member
+ * KVA of the member that holds the data.
+ *
+ * Memory cost: nr_entries × stripe × nr_members.  Default 64 entries =
+ * 128 MiB on a 2-member array; tunable via insmod cache_entries=.
+ *
+ * Locking: one global spinlock for hash + LRU.  Held briefly across
+ * lookup + allocate/touch.  Memcpy and DMA happen with lock released. */
+#define RC_VOLUME_CACHE_HASH_BITS	10
+#define RC_VOLUME_CACHE_HASH_SIZE	(1u << RC_VOLUME_CACHE_HASH_BITS)
+#define RC_VOLUME_CACHE_HASH_MASK	(RC_VOLUME_CACHE_HASH_SIZE - 1)
+
+enum rc_cache_state {
+	RC_CE_FREE = 0,
+	RC_CE_LOADING,
+	RC_CE_VALID,
+};
+
+struct rc_cache_entry {
+	enum rc_cache_state	state;
+	sector_t		lba;		/* volume LBA, stripe-aligned */
+	u16			status;		/* NVMe SC/SCT from populating cmd, 0 = ok */
+	atomic_t		cmds_pending;	/* NVMe cmds still in flight for LOADING entries */
+	int			member;		/* member the data is read from */
+	/* Request that triggered the fill, waiting for it to complete.
+	 * Single waiter per entry — concurrent same-stripe requests just
+	 * dispatch normally (rare, suboptimal but correct).  ISR walks
+	 * this when transitioning LOADING → VALID. */
+	struct request		*waiter;
+	struct hlist_node	hash_node;
+	struct list_head	lru_node;
+	/* Per-member DMA buffer + PRP list.  buf_va[member] is the KVA we
+	 * memcpy from when serving a hit.  buf_pa[member] feeds NVMe READ
+	 * PRPs.  Only the member that actually holds the stripe is read
+	 * from / written to per entry, but the buffer is allocated for
+	 * both members so entries can be reused across members. */
+	void			*buf_va[RC_VOLUME_MAX_MEMBERS];
+	dma_addr_t		buf_pa[RC_VOLUME_MAX_MEMBERS];
+	__le64			*prp_va[RC_VOLUME_MAX_MEMBERS];
+	dma_addr_t		prp_pa[RC_VOLUME_MAX_MEMBERS];
+};
+
+static struct rc_cache_entry *rc_cache_entries;
+static u32 rc_cache_nr_entries;
+static spinlock_t rc_cache_lock;
+static struct hlist_head *rc_cache_buckets;
+static struct list_head rc_cache_lru;
+static u64 rc_cache_hits;
+static u64 rc_cache_misses;
+static u64 rc_cache_evictions;
+
+static int rc_cache_entries_param = 64;
+module_param_named(cache_entries, rc_cache_entries_param, int, 0444);
+MODULE_PARM_DESC(cache_entries,
+		 "Number of 1 MiB stripe cache entries (default 64 = 128 MiB on 2-member array). 0 disables.");
+
+/* CIDs 0x2000..0x2FFF reserved for cache fills.  Each fill issues 2 cmds
+ * (1 MiB / MDTS=512 KiB).  Layout: bit 13 = cache marker, bits 12..1 =
+ * entry_idx (up to 4096 entries), bit 0 = cmd index within the fill. */
+#define RC_VOLUME_CACHE_CID_BASE	0x2000u
+#define RC_VOLUME_CACHE_CID_MASK	0x2000u
+#define RC_VOLUME_CACHE_MAX_ENTRIES	4096u
+#define RC_VOLUME_CACHE_CMD_SECTORS	1024u	/* 512 KiB per NVMe cmd, MDTS limit */
+
 /* blk-mq per-request command data.
  *
  * For READ/WRITE the request targets ONE member, members_pending is set
@@ -227,6 +303,10 @@ struct rc_volume_pdu {
 	u16                sc_sct;         /* NVMe SC/SCT, 0 = success */
 	atomic_t           members_pending;
 	int                nents;          /* dma_map_sg output count, 0 = not mapped */
+	/* Non-NULL when this request is waiting on a cache fill.  .complete
+	 * copies from cache_entry->buf_va[member] into the bio and ends the
+	 * request without dma_unmap_sg (we never dma_map'd). */
+	struct rc_cache_entry *cache_entry;
 	struct scatterlist sg[RC_VOLUME_DATA_PAGES];
 };
 
@@ -318,6 +398,7 @@ irqreturn_t rc_nvme_admin_irq(int irq, void *dev_id)
 static void rc_volume_prefetch_isr(unsigned int hctx_idx,
 				   unsigned int slot_idx, u16 status);
 static void rc_volume_unmap_request_sg(struct rc_volume_pdu *pdu);
+static void rc_cache_isr(unsigned int entry_idx, u16 status);
 
 /* Per-I/O-queue ISR — registered for MSI-X vector qid.  Walks this
  * queue's CQ only.  Boot-time sync helpers sleep on q->cq_wait; once
@@ -361,7 +442,13 @@ irqreturn_t rc_nvme_io_queue_irq(int irq, void *dev_id)
 			break;
 
 		cid = le16_to_cpu(cqe->cid);
-		if (cid & RC_VOLUME_PREFETCH_CID_BASE) {
+		if (cid & RC_VOLUME_CACHE_CID_MASK) {
+			/* Cache fill completion (CID 0x2000..0x2FFF):
+			 * bits 12..1 = entry_idx, bit 0 = cmd index. */
+			u16 sc = (status >> 1) & 0x7fff;
+			unsigned int entry_idx = (cid >> 1) & 0xfff;
+			rc_cache_isr(entry_idx, sc);
+		} else if (cid & RC_VOLUME_PREFETCH_CID_BASE) {
 			u16 sc = (status >> 1) & 0x7fff;
 			unsigned int slot_idx = (cid >> 7) & 1;
 			unsigned int hctx_idx = (cid >> 4) & 7;
@@ -1907,15 +1994,22 @@ static inline bool rc_volume_any_member_dead(void)
 	return false;
 }
 
-/* Forward declarations for prefetch helpers used in queue_rq.  Definitions
- * are kept near .complete / .map_queues / .ops to keep the prefetch module
- * code grouped together. */
+/* Forward declarations for prefetch + cache helpers used in queue_rq. */
 static void rc_volume_prefetch_submit(unsigned int hctx_idx,
 				      unsigned int slot_idx,
 				      struct rc_volume_prefetch *pf,
 				      u64 phys_lba);
 static void rc_volume_prefetch_copy_out(struct request *req, void *src);
 static void rc_volume_prefetch_invalidate(unsigned int hctx_idx);
+static u32 rc_cache_bucket_for(sector_t lba);
+static struct rc_cache_entry *rc_cache_lookup_valid(sector_t stripe_lba);
+static bool rc_cache_has_or_loading(sector_t stripe_lba);
+static struct rc_cache_entry *rc_cache_alloc_entry(void);
+static void rc_cache_invalidate_range(sector_t pos, u32 nr_sectors);
+static void rc_cache_submit_fill(unsigned int hctx_idx,
+				 u32 entry_idx,
+				 sector_t stripe_lba,
+				 u64 phys_lba);
 
 /* blk-mq request handler.  chunk_sectors=stripe_sectors in queue_limits
  * keeps each request inside one stripe, so it maps to exactly one member.
@@ -1944,6 +2038,7 @@ static blk_status_t rc_volume_queue_rq(struct blk_mq_hw_ctx *hctx,
 	pdu->op = op;
 	pdu->sc_sct = 0;
 	pdu->nents = 0;
+	pdu->cache_entry = NULL;
 
 	/* If any member adapter has been flagged dead (by the ISR's CSTS
 	 * check, by a prior timeout, or by drain), the RAID0 volume can't
@@ -1987,6 +2082,93 @@ static blk_status_t rc_volume_queue_rq(struct blk_mq_hw_ctx *hctx,
 		blk_mq_start_request(req);
 		blk_mq_end_request(req, BLK_STS_IOERR);
 		return BLK_STS_OK;
+	}
+
+	/* Read cache — fastest path: stripe-granularity LRU cache.
+	 * Check before prefetch.  On miss, allocate an entry and dispatch
+	 * the NVMe READ INTO the cache buffer (not the bio pages).  The
+	 * request registers as the entry's waiter; when the fill completes,
+	 * the ISR calls blk_mq_complete_request on the waiter and .complete
+	 * memcpys from the cache buffer into the bio.  Future reads of the
+	 * same stripe hit synchronously here. */
+	if (op == REQ_OP_READ && rc_cache_entries && rc_volume_stripe_sectors) {
+		sector_t stripe = rc_volume_stripe_sectors;
+		sector_t stripe_lba = (pos / stripe) * stripe;
+
+		if (pos + nr_sectors <= stripe_lba + stripe) {
+			struct rc_cache_entry *e;
+			unsigned long flags;
+			void *src = NULL;
+			u16 ce_status = 0;
+			bool issued_fill = false;
+			u32 fill_entry_idx = 0;
+			int fill_member = -1;
+			u64 fill_phys_lba = 0;
+
+			spin_lock_irqsave(&rc_cache_lock, flags);
+			e = rc_cache_lookup_valid(stripe_lba);
+			if (e) {
+				/* HIT — copy out synchronously. */
+				ce_status = e->status;
+				src = (u8 *)e->buf_va[e->member] +
+				      (u32)(pos - stripe_lba) * 512u;
+				rc_cache_hits++;
+			} else if (!rc_cache_has_or_loading(stripe_lba)) {
+				/* MISS, no existing entry — try to allocate
+				 * and trigger a fill.  If alloc succeeds, the
+				 * request becomes the entry's waiter and we
+				 * defer completion to the fill ISR. */
+				e = rc_cache_alloc_entry();
+				if (e) {
+					rc_volume_map_lba(stripe_lba,
+							  &fill_member, &fill_phys_lba);
+					if (stripe_lba + stripe <= get_capacity(rc_volume_disk)) {
+						e->state = RC_CE_LOADING;
+						e->member = fill_member;
+						e->lba = stripe_lba;
+						e->status = 0;
+						e->waiter = req;
+						pdu->cache_entry = e;
+						pdu->member_idx = fill_member;
+						pdu->nents = 0;
+						atomic_set(&pdu->members_pending, 1);
+						hlist_add_head(&e->hash_node,
+							       &rc_cache_buckets[rc_cache_bucket_for(stripe_lba)]);
+						list_add_tail(&e->lru_node, &rc_cache_lru);
+						fill_entry_idx = (u32)(e - rc_cache_entries);
+						issued_fill = true;
+						rc_cache_misses++;
+					} else {
+						/* Past end of disk — put back. */
+						list_add_tail(&e->lru_node, &rc_cache_lru);
+						rc_cache_misses++;
+					}
+				} else {
+					rc_cache_misses++;
+				}
+			} else {
+				/* Already LOADING — fall through to normal
+				 * dispatch (suboptimal duplicate, but correct). */
+				rc_cache_misses++;
+			}
+			spin_unlock_irqrestore(&rc_cache_lock, flags);
+
+			if (src && ce_status == 0) {
+				rc_volume_prefetch_copy_out(req, src);
+				blk_mq_start_request(req);
+				blk_mq_end_request(req, BLK_STS_OK);
+				return BLK_STS_OK;
+			}
+			if (issued_fill) {
+				blk_mq_start_request(req);
+				rc_cache_submit_fill(hctx->queue_num,
+						     fill_entry_idx, stripe_lba,
+						     fill_phys_lba);
+				return BLK_STS_OK;
+			}
+		}
+	} else if (op == REQ_OP_WRITE && rc_cache_entries) {
+		rc_cache_invalidate_range(pos, nr_sectors);
 	}
 
 	/* Prefetch — fast path: serve READ from any prefetch slot whose
@@ -2219,6 +2401,43 @@ static blk_status_t rc_volume_queue_rq(struct blk_mq_hw_ctx *hctx,
 static void rc_volume_complete(struct request *req)
 {
 	struct rc_volume_pdu *pdu = blk_mq_rq_to_pdu(req);
+
+	/* Cache-fill waiter: memcpy from cache buffer, then transition the
+	 * entry to VALID for future readers.  No dma_unmap (we didn't map). */
+	if (pdu->cache_entry) {
+		struct rc_cache_entry *e = pdu->cache_entry;
+		unsigned long flags;
+
+		if (e->status) {
+			spin_lock_irqsave(&rc_cache_lock, flags);
+			if (!hlist_unhashed(&e->hash_node)) {
+				hlist_del(&e->hash_node);
+				INIT_HLIST_NODE(&e->hash_node);
+				list_move(&e->lru_node, &rc_cache_lru);
+			}
+			e->state = RC_CE_FREE;
+			spin_unlock_irqrestore(&rc_cache_lock, flags);
+			pdu->cache_entry = NULL;
+			blk_mq_end_request(req, BLK_STS_IOERR);
+			return;
+		}
+
+		{
+			sector_t pos = blk_rq_pos(req);
+			void *src = (u8 *)e->buf_va[e->member] +
+				    (u32)(pos - e->lba) * 512u;
+			rc_volume_prefetch_copy_out(req, src);
+		}
+		spin_lock_irqsave(&rc_cache_lock, flags);
+		if (e->state == RC_CE_LOADING) {
+			e->state = RC_CE_VALID;
+			list_move_tail(&e->lru_node, &rc_cache_lru);
+		}
+		spin_unlock_irqrestore(&rc_cache_lock, flags);
+		pdu->cache_entry = NULL;
+		blk_mq_end_request(req, BLK_STS_OK);
+		return;
+	}
 
 	rc_volume_unmap_request_sg(pdu);
 
@@ -2532,6 +2751,297 @@ static int rc_volume_prefetch_alloc_all(unsigned int nr_hw)
 	return 0;
 }
 
+/* ============================ Read cache impl ===========================
+ *
+ * See header comment near struct rc_cache_entry.  All helpers below
+ * assume rc_cache_lock is held by the caller unless noted. */
+
+static inline u32 rc_cache_bucket_for(sector_t lba)
+{
+	return hash_64((u64)lba, RC_VOLUME_CACHE_HASH_BITS) & RC_VOLUME_CACHE_HASH_MASK;
+}
+
+/* Look up a VALID entry for stripe_lba.  Returns NULL if not present or
+ * the entry is still LOADING.  Touch-on-hit (move to MRU). */
+static struct rc_cache_entry *rc_cache_lookup_valid(sector_t stripe_lba)
+{
+	u32 h = rc_cache_bucket_for(stripe_lba);
+	struct rc_cache_entry *e;
+
+	hlist_for_each_entry(e, &rc_cache_buckets[h], hash_node) {
+		if (e->state == RC_CE_VALID && e->lba == stripe_lba) {
+			list_move_tail(&e->lru_node, &rc_cache_lru);
+			return e;
+		}
+	}
+	return NULL;
+}
+
+/* Look up any entry (VALID or LOADING) for stripe_lba.  Used to suppress
+ * duplicate fills when one is already in flight. */
+static bool rc_cache_has_or_loading(sector_t stripe_lba)
+{
+	u32 h = rc_cache_bucket_for(stripe_lba);
+	struct rc_cache_entry *e;
+
+	hlist_for_each_entry(e, &rc_cache_buckets[h], hash_node) {
+		if (e->lba == stripe_lba)
+			return true;
+	}
+	return false;
+}
+
+/* Allocate a FREE entry.  If none free, evict LRU VALID entry.  Returns
+ * NULL only if every entry is currently LOADING (unusual). */
+static struct rc_cache_entry *rc_cache_alloc_entry(void)
+{
+	struct rc_cache_entry *e;
+
+	list_for_each_entry(e, &rc_cache_lru, lru_node) {
+		if (e->state == RC_CE_FREE) {
+			list_del(&e->lru_node);
+			return e;
+		}
+	}
+	list_for_each_entry(e, &rc_cache_lru, lru_node) {
+		if (e->state == RC_CE_VALID) {
+			hlist_del(&e->hash_node);
+			list_del(&e->lru_node);
+			rc_cache_evictions++;
+			e->state = RC_CE_FREE;
+			return e;
+		}
+	}
+	return NULL;
+}
+
+/* Free all cache resources.  Idempotent. */
+static void rc_cache_teardown(void)
+{
+	u32 i, m;
+
+	if (!rc_cache_entries)
+		goto free_hash;
+
+	for (i = 0; i < rc_cache_nr_entries; i++) {
+		struct rc_cache_entry *e = &rc_cache_entries[i];
+		for (m = 0; m < (u32)rc_volume_member_count; m++) {
+			struct device *dev;
+			if (!rc_volume_members[m])
+				continue;
+			dev = &rc_volume_members[m]->pdev->dev;
+			if (e->buf_va[m]) {
+				dma_free_coherent(dev, RC_VOLUME_PREFETCH_BYTES,
+						  e->buf_va[m], e->buf_pa[m]);
+				e->buf_va[m] = NULL;
+				e->buf_pa[m] = 0;
+			}
+			if (e->prp_va[m]) {
+				dma_free_coherent(dev, PAGE_SIZE,
+						  e->prp_va[m], e->prp_pa[m]);
+				e->prp_va[m] = NULL;
+				e->prp_pa[m] = 0;
+			}
+		}
+	}
+	kfree(rc_cache_entries);
+	rc_cache_entries = NULL;
+	rc_cache_nr_entries = 0;
+
+free_hash:
+	if (rc_cache_buckets) {
+		kfree(rc_cache_buckets);
+		rc_cache_buckets = NULL;
+	}
+	INIT_LIST_HEAD(&rc_cache_lru);
+}
+
+/* Allocate cache pool: nr entries with per-member DMA buffer + PRP list. */
+static int rc_cache_init(u32 nr_entries)
+{
+	u32 i, m, p;
+
+	spin_lock_init(&rc_cache_lock);
+	INIT_LIST_HEAD(&rc_cache_lru);
+	rc_cache_hits = 0;
+	rc_cache_misses = 0;
+	rc_cache_evictions = 0;
+
+	if (nr_entries == 0)
+		return 0;
+
+	rc_cache_buckets = kcalloc(RC_VOLUME_CACHE_HASH_SIZE,
+				sizeof(*rc_cache_buckets), GFP_KERNEL);
+	if (!rc_cache_buckets)
+		return -ENOMEM;
+	for (i = 0; i < RC_VOLUME_CACHE_HASH_SIZE; i++)
+		INIT_HLIST_HEAD(&rc_cache_buckets[i]);
+
+	rc_cache_entries = kcalloc(nr_entries, sizeof(*rc_cache_entries),
+				   GFP_KERNEL);
+	if (!rc_cache_entries) {
+		kfree(rc_cache_buckets);
+		rc_cache_buckets = NULL;
+		return -ENOMEM;
+	}
+	rc_cache_nr_entries = nr_entries;
+
+	for (i = 0; i < nr_entries; i++) {
+		struct rc_cache_entry *e = &rc_cache_entries[i];
+		e->state = RC_CE_FREE;
+		atomic_set(&e->cmds_pending, 0);
+		INIT_HLIST_NODE(&e->hash_node);
+		INIT_LIST_HEAD(&e->lru_node);
+		list_add_tail(&e->lru_node, &rc_cache_lru);
+
+		for (m = 0; m < (u32)rc_volume_member_count; m++) {
+			struct device *dev = &rc_volume_members[m]->pdev->dev;
+			e->buf_va[m] = dma_alloc_coherent(dev,
+							  RC_VOLUME_PREFETCH_BYTES,
+							  &e->buf_pa[m],
+							  GFP_KERNEL);
+			if (!e->buf_va[m]) {
+				rc_printk(RC_ERROR,
+					  "rc_cache_init: entry %u member %u buf alloc failed\n",
+					  i, m);
+				rc_cache_teardown();
+				return -ENOMEM;
+			}
+			e->prp_va[m] = dma_alloc_coherent(dev, PAGE_SIZE,
+							  &e->prp_pa[m],
+							  GFP_KERNEL);
+			if (!e->prp_va[m]) {
+				rc_cache_teardown();
+				return -ENOMEM;
+			}
+			for (p = 0; p < RC_VOLUME_PREFETCH_PAGES - 1; p++)
+				e->prp_va[m][p] =
+					cpu_to_le64(e->buf_pa[m] + (p + 1) * PAGE_SIZE);
+		}
+	}
+	rc_printk(RC_NOTE,
+		  "rc_cache_init: %u entries × 1 MiB × %d members = %u MiB cache\n",
+		  nr_entries, rc_volume_member_count,
+		  nr_entries * (1u) * rc_volume_member_count);
+	return 0;
+}
+
+/* Submit the multi-NVMe-cmd fill for a cache entry (1 MiB → 2 cmds at MDTS=7).
+ * Caller must have set entry->state = RC_CE_LOADING and entry->member.
+ * Caller holds rc_cache_lock during dispatch (kept short — submission is fast). */
+static void rc_cache_submit_fill(unsigned int hctx_idx,
+				 u32 entry_idx,
+				 sector_t stripe_lba,
+				 u64 phys_lba)
+{
+	struct rc_cache_entry *e = &rc_cache_entries[entry_idx];
+	int m = e->member;
+	u32 cmds = RC_VOLUME_PREFETCH_BYTES / (RC_VOLUME_CACHE_CMD_SECTORS * 512u);
+	u32 i;
+
+	atomic_set(&e->cmds_pending, (int)cmds);
+	e->status = 0;
+	e->lba = stripe_lba;
+
+	for (i = 0; i < cmds; i++) {
+		struct rc_nvme_sqe cmd;
+		u32 sec_in    = i * RC_VOLUME_CACHE_CMD_SECTORS;
+		u32 byte_off  = sec_in * 512u;
+		u32 page_off  = byte_off / (u32)PAGE_SIZE;
+		/* CID = CACHE_BASE | (entry_idx << 1) | cmd_idx.
+		 * Distinct per cmd so NVMe doesn't reject as duplicate. */
+		u16 cid       = (u16)(RC_VOLUME_CACHE_CID_BASE |
+				      ((entry_idx & 0xfff) << 1) | (i & 1));
+		u64 cmd_slba  = phys_lba + sec_in;
+
+		(void)i;
+		memset(&cmd, 0, sizeof(cmd));
+		cmd.opc   = RC_NVME_NVM_OP_READ;
+		cmd.cid   = cpu_to_le16(cid);
+		cmd.nsid  = cpu_to_le32(1);
+		cmd.cdw10 = cpu_to_le32((u32)(cmd_slba & 0xffffffff));
+		cmd.cdw11 = cpu_to_le32((u32)(cmd_slba >> 32));
+		cmd.cdw12 = cpu_to_le32(RC_VOLUME_CACHE_CMD_SECTORS - 1);
+		cmd.prp1  = cpu_to_le64(e->buf_pa[m] + byte_off);
+		cmd.prp2  = cpu_to_le64(e->prp_pa[m] + page_off * sizeof(__le64));
+
+		rc_nvme_io_submit(rc_volume_members[m]->ctx.nvme.io_queues[hctx_idx],
+				  &cmd);
+	}
+}
+
+/* ISR helper for cache fill completion.  Same shape as the prefetch ISR:
+ * decrement cmds_pending, transition LOADING → VALID on the last cmd,
+ * insert into hash + LRU. */
+static void rc_cache_isr(unsigned int entry_idx, u16 status)
+{
+	struct rc_cache_entry *e;
+	struct request *waiter = NULL;
+	unsigned long flags;
+	bool last;
+
+	if (entry_idx >= rc_cache_nr_entries)
+		return;
+	e = &rc_cache_entries[entry_idx];
+
+	spin_lock_irqsave(&rc_cache_lock, flags);
+	if (status)
+		e->status = status;
+	last = atomic_dec_and_test(&e->cmds_pending);
+	if (last) {
+		if (e->state == RC_CE_LOADING) {
+			/* Defer the LOADING → VALID transition until the
+			 * waiter's .complete handler has finished memcpy'ing
+			 * out of the buffer — otherwise an evict could free
+			 * the buffer mid-copy.  ISR just schedules the
+			 * waiter; .complete handles state + cleanup. */
+			waiter = e->waiter;
+			e->waiter = NULL;
+			if (!waiter) {
+				/* No waiter (e.g., invalidated): publish. */
+				e->state = RC_CE_VALID;
+				list_move_tail(&e->lru_node, &rc_cache_lru);
+			}
+		}
+	}
+	spin_unlock_irqrestore(&rc_cache_lock, flags);
+
+	if (waiter)
+		blk_mq_complete_request(waiter);
+}
+
+/* Invalidate every cache entry overlapping [pos, pos+nr_sectors).
+ * VALID entries are dropped immediately.  LOADING entries are marked
+ * for drop on completion (state stays LOADING; rc_cache_isr will see
+ * the lba mismatch... actually we set state = FREE so isr drops it). */
+static void rc_cache_invalidate_range(sector_t pos, u32 nr_sectors)
+{
+	u32 i;
+	unsigned long flags;
+
+	if (!rc_cache_entries)
+		return;
+
+	spin_lock_irqsave(&rc_cache_lock, flags);
+	for (i = 0; i < rc_cache_nr_entries; i++) {
+		struct rc_cache_entry *e = &rc_cache_entries[i];
+		if (e->state == RC_CE_FREE)
+			continue;
+		if (e->lba + (RC_VOLUME_PREFETCH_BYTES / 512u) <= pos ||
+		    pos + nr_sectors <= e->lba)
+			continue;
+		/* Overlap.  Remove from hash for both VALID and LOADING; if
+		 * LOADING, the ISR will see state=FREE on completion and
+		 * skip the VALID transition. */
+		hlist_del(&e->hash_node);
+		INIT_HLIST_NODE(&e->hash_node);
+		list_move(&e->lru_node, &rc_cache_lru);
+		rc_cache_evictions++;
+		e->state = RC_CE_FREE;
+	}
+	spin_unlock_irqrestore(&rc_cache_lock, flags);
+}
+
 /* Submit a multi-command prefetch.  Caller must hold pf->lock AND have
  * already set state = INFLIGHT and recorded {lba, sectors, member}.
  * Splits pf->sectors into chunks of RC_VOLUME_PREFETCH_CMD_SECTORS each
@@ -2766,6 +3276,16 @@ static int rc_volume_create_disk(void)
 		ret = 0;
 	}
 
+	if (rc_cache_entries_param > 0) {
+		ret = rc_cache_init((u32)rc_cache_entries_param);
+		if (ret) {
+			rc_printk(RC_WARN,
+				  "rc_volume_create_disk: cache init failed (%d) — continuing without cache\n",
+				  ret);
+			ret = 0;
+		}
+	}
+
 	{
 		struct queue_limits lim = {
 			.logical_block_size  = 512,
@@ -2895,6 +3415,7 @@ void rc_volume_teardown(void)
 		rc_volume_members[i] = NULL;
 		rc_volume_member_phys_offset[i] = 0;
 	}
+	rc_cache_teardown();
 	rc_volume_prefetch_free_all();
 	rc_volume_member_count = 0;
 	rc_volume_stripe_sectors = 0;
