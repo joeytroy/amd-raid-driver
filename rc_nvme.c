@@ -314,9 +314,10 @@ irqreturn_t rc_nvme_admin_irq(int irq, void *dev_id)
 	return IRQ_HANDLED;
 }
 
-/* Forward declaration: handles CIDs in the prefetch range (0x100..). */
+/* Forward declarations used inside the per-queue ISR. */
 static void rc_volume_prefetch_isr(unsigned int hctx_idx,
 				   unsigned int slot_idx, u16 status);
+static void rc_volume_unmap_request_sg(struct rc_volume_pdu *pdu);
 
 /* Per-I/O-queue ISR — registered for MSI-X vector qid.  Walks this
  * queue's CQ only.  Boot-time sync helpers sleep on q->cq_wait; once
@@ -329,6 +330,12 @@ irqreturn_t rc_nvme_io_queue_irq(int irq, void *dev_id)
 	struct rc_adapter *adapter = q->adapter;
 	struct blk_mq_tags *tags;
 	bool advanced = false;
+	/* Defer-list: collect requests ready to finish inside the q->lock
+	 * loop, then end them after releasing the lock so blk_mq_end_request
+	 * can take its own internal locks safely.  Capped to a small batch;
+	 * if more land in one IRQ window, the leftover stays for the next. */
+	struct request *done_reqs[16];
+	unsigned int done_n = 0;
 
 	if (rc_nvme_irq_csts_check(adapter)) {
 		wake_up(&q->cq_wait);
@@ -339,10 +346,6 @@ irqreturn_t rc_nvme_io_queue_irq(int irq, void *dev_id)
 	if (!rc_volume_disk)
 		return IRQ_HANDLED;
 
-	/* In 3a, all blk-mq dispatch lands on hctx 0 → only queue[0] sees
-	 * traffic.  In 3b each queue maps to its own hctx and uses
-	 * tags[q->hctx_idx].  For now fall back to tags[0] if hctx_idx is
-	 * unset (-1) so single-hctx behaviour is preserved. */
 	tags = rc_volume_tagset.tags[q->hctx_idx >= 0 ? q->hctx_idx : 0];
 
 	spin_lock(&q->lock);
@@ -359,10 +362,6 @@ irqreturn_t rc_nvme_io_queue_irq(int irq, void *dev_id)
 
 		cid = le16_to_cpu(cqe->cid);
 		if (cid & RC_VOLUME_PREFETCH_CID_BASE) {
-			/* Prefetch completion: bit 8 set, bit 7 = slot, bits
-			 * 6..4 = hctx_idx, bits 3..0 = cmd index.  Hand off
-			 * to the prefetch state machine and continue walking
-			 * the CQ — no blk-mq request to complete. */
 			u16 sc = (status >> 1) & 0x7fff;
 			unsigned int slot_idx = (cid >> 7) & 1;
 			unsigned int hctx_idx = (cid >> 4) & 7;
@@ -374,8 +373,14 @@ irqreturn_t rc_nvme_io_queue_irq(int irq, void *dev_id)
 				pdu = blk_mq_rq_to_pdu(req);
 				if (sc)
 					pdu->sc_sct = sc;
-				if (atomic_dec_and_test(&pdu->members_pending))
-					blk_mq_complete_request(req);
+				if (atomic_dec_and_test(&pdu->members_pending)) {
+					/* Try to defer to local batch; fall back
+					 * to the softirq path if the batch is full. */
+					if (done_n < ARRAY_SIZE(done_reqs))
+						done_reqs[done_n++] = req;
+					else
+						blk_mq_complete_request(req);
+				}
 			} else {
 				rc_printk(RC_WARN,
 					  "rc_nvme_io_queue_irq: %s qid=%u CQE for unknown CID=%u (status=0x%04x)\n",
@@ -391,6 +396,23 @@ irqreturn_t rc_nvme_io_queue_irq(int irq, void *dev_id)
 	if (advanced)
 		rc_nvme_ring_cq_doorbell(adapter, q->qid, q->cq_head);
 	spin_unlock(&q->lock);
+
+	/* Finish requests inline (no softirq round-trip).  Each call does
+	 * dma_unmap_sg + blk_mq_end_request.  Saves the .complete softirq
+	 * dispatch latency, which on Q1T1 dominates 5-15 us of clat. */
+	{
+		unsigned int i;
+		for (i = 0; i < done_n; i++) {
+			struct request *req = done_reqs[i];
+			struct rc_volume_pdu *pdu = blk_mq_rq_to_pdu(req);
+			rc_volume_unmap_request_sg(pdu);
+			if (pdu->sc_sct) {
+				blk_mq_end_request(req, BLK_STS_IOERR);
+			} else {
+				blk_mq_end_request(req, BLK_STS_OK);
+			}
+		}
+	}
 	return IRQ_HANDLED;
 }
 
