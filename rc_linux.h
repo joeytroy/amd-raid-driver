@@ -247,6 +247,10 @@ struct rc_nvme_state {
     u32            ld_chunk_sectors;    // RC_LogicalDevice.ChunkSize (0 → use RAID-level default)
     u64            ld_capacity_sectors; // RC_LogicalDevice.Capacity (total volume sectors)
     int            ld_my_position;      // index of THIS adapter in LogicalElement array, -1 if not found
+    u64            ld_alloc_offset;     // RC_LogicalElement_LE.AllocOffset (sector offset of allocated region)
+    u64            ld_alloc_size;       // RC_LogicalElement_LE.AllocSize
+    u64            ld_userdata_offset;  // RC_LogicalElement_LE.UserDataOffset (sector offset of user data on member)
+    u64            ld_userdata_size;    // RC_LogicalElement_LE.UserDataSize
 
     // Per-doorbell pointers (computed once after CAP read)
     void __iomem  *sq_doorbell_base;  // BAR0 + 0x1000

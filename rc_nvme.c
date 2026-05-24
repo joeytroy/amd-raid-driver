@@ -47,6 +47,12 @@
  * via further RE.  Tracked under rc_volume_lock. */
 #define RC_VOLUME_MAX_MEMBERS	8
 static struct rc_adapter *rc_volume_members[RC_VOLUME_MAX_MEMBERS];
+/* Per-member physical sector offset where user data begins.  Populated from
+ * RC_LogicalElement_LE.UserDataOffset (+0x20) when the LD parser matches.
+ * Added to every (member, phys) tuple returned by rc_volume_map_lba so the
+ * volume's logical LBA 0 actually lands on the first user-data sector of
+ * the member, not on member-LBA 0 (which holds AMD-RAID metadata). */
+static u64 rc_volume_member_phys_offset[RC_VOLUME_MAX_MEMBERS];
 static int rc_volume_member_count;
 static u32 rc_volume_stripe_sectors;
 static DEFINE_MUTEX(rc_volume_lock);
@@ -72,6 +78,17 @@ static int rc_volume_enable_writes;
 module_param_named(enable_writes, rc_volume_enable_writes, int, 0444);
 MODULE_PARM_DESC(enable_writes,
 		 "If non-zero, expose /dev/rcraid0 as read-write (default 0). Verify the array contents look right via reads BEFORE enabling.");
+
+/* Stripe-size override for diagnostic probing.  Set at insmod time to force
+ * the volume to use this many sectors per stripe, bypassing the derivation
+ * from RC_LogicalDevice.ChunkSize / firmware default.  Zero = use derived
+ * value (default).  Useful when the on-disk ChunkSize field doesn't encode
+ * the real stripe and we need to try common values (32/64/128/256/512/1024
+ * sectors = 16K/32K/64K/128K/256K/512K) until the partition table parses. */
+static u32 rc_volume_stripe_override;
+module_param_named(stripe_sectors_override, rc_volume_stripe_override, uint, 0444);
+MODULE_PARM_DESC(stripe_sectors_override,
+		 "Diagnostic: force stripe size in 512B sectors (0 = auto). Try 128 for 64KiB, 256 for 128KiB.");
 
 /* gendisk state — at most one volume right now. */
 static struct gendisk *rc_volume_disk;
@@ -1265,23 +1282,33 @@ static void rc_volume_parse_logical_device(struct rc_adapter *adapter)
 			 * LD per physical member.  Only the LD whose
 			 * element array contains our DeviceID is the volume
 			 * we belong to. */
+			u64 alloc_off = 0, alloc_sz = 0;
+			u64 user_off = 0, user_sz = 0;
 			for (j = 0; j < devices; j++) {
 				u8 *elem = ld + elem_off + j * RC_LE_BYTES;
 				u64 eid =
 					get_unaligned_le64(elem + RC_LE_DEVICEID_OFFSET);
 				if (eid == nvme->md_device_id) {
 					my_pos = (int)j;
+					alloc_off = get_unaligned_le64(elem + RC_LE_ALLOC_OFFSET_OFFSET);
+					alloc_sz  = get_unaligned_le64(elem + RC_LE_ALLOC_SIZE_OFFSET);
+					user_off  = get_unaligned_le64(elem + RC_LE_USERDATA_OFFSET_OFFSET);
+					user_sz   = get_unaligned_le64(elem + RC_LE_USERDATA_SIZE_OFFSET);
 					break;
 				}
 			}
 
 			rc_printk(RC_INFO,
-				  "rc_volume_parse_logical_device: %s LD@ring+%u.%u devtype=0x%04x devices=%u chunk=%u capacity=%llu my_pos=%d%s\n",
+				  "rc_volume_parse_logical_device: %s LD@ring+%u.%u devtype=0x%04x devices=%u chunk=%u capacity=%llu my_pos=%d alloc_off=%llu alloc_sz=%llu user_off=%llu user_sz=%llu%s\n",
 				  pci_name(adapter->pdev),
 				  scan * RC_LD_SCAN_CHUNK_SECTORS + (i / 512),
 				  i % 512,
 				  devtype, devices, chunk,
 				  (unsigned long long)capacity, my_pos,
+				  (unsigned long long)alloc_off,
+				  (unsigned long long)alloc_sz,
+				  (unsigned long long)user_off,
+				  (unsigned long long)user_sz,
 				  my_pos < 0 ? " (skip — not our member)" :
 					       " (match)");
 
@@ -1293,6 +1320,10 @@ static void rc_volume_parse_logical_device(struct rc_adapter *adapter)
 			nvme->ld_chunk_sectors    = chunk;
 			nvme->ld_capacity_sectors = capacity;
 			nvme->ld_my_position      = my_pos;
+			nvme->ld_alloc_offset     = alloc_off;
+			nvme->ld_alloc_size       = alloc_sz;
+			nvme->ld_userdata_offset  = user_off;
+			nvme->ld_userdata_size    = user_sz;
 			nvme->ld_valid            = true;
 			goto done;
 		}
@@ -1318,7 +1349,8 @@ static void rc_volume_map_lba(u64 logical_lba, int *out_member, u64 *out_phys)
 	u64 phys_stripe = div_u64(stripe_num, (u32)nmembers);
 
 	*out_member = (int)member_idx;
-	*out_phys   = phys_stripe * stripe + stripe_off;
+	*out_phys   = phys_stripe * stripe + stripe_off
+		    + rc_volume_member_phys_offset[member_idx];
 }
 
 /* Read one LBA from the assembled RAID0 volume. */
@@ -1468,6 +1500,14 @@ static void rc_volume_register_member(struct rc_adapter *adapter)
 			  nvme->ld_my_position, chunk_sectors);
 	}
 
+	if (rc_volume_stripe_override) {
+		rc_printk(RC_WARN,
+			  "rc_volume_register_member: %s OVERRIDE stripe %u -> %u sectors (insmod stripe_sectors_override)\n",
+			  pci_name(adapter->pdev), chunk_sectors,
+			  rc_volume_stripe_override);
+		chunk_sectors = rc_volume_stripe_override;
+	}
+
 	/* First member: seed expected count + stripe.  Later members must match. */
 	if (rc_volume_member_count == 0) {
 		rc_volume_expected_members = expected;
@@ -1505,6 +1545,7 @@ static void rc_volume_register_member(struct rc_adapter *adapter)
 			goto out;
 		}
 		rc_volume_members[pos] = adapter;
+		rc_volume_member_phys_offset[pos] = nvme->ld_userdata_offset;
 		rc_volume_member_count++;
 	} else {
 		/* Legacy BDF-sorted insertion. */
@@ -1515,14 +1556,20 @@ static void rc_volume_register_member(struct rc_adapter *adapter)
 		memmove(&rc_volume_members[pos + 1], &rc_volume_members[pos],
 			(rc_volume_member_count - pos) *
 			sizeof(rc_volume_members[0]));
+		memmove(&rc_volume_member_phys_offset[pos + 1],
+			&rc_volume_member_phys_offset[pos],
+			(rc_volume_member_count - pos) *
+			sizeof(rc_volume_member_phys_offset[0]));
 		rc_volume_members[pos] = adapter;
+		rc_volume_member_phys_offset[pos] = 0;
 		rc_volume_member_count++;
 	}
 
 	rc_printk(RC_INFO,
-		  "rc_volume_register_member: %s registered at pos %d (%d/%u)\n",
+		  "rc_volume_register_member: %s registered at pos %d (%d/%u) phys_offset=%llu sectors\n",
 		  pci_name(adapter->pdev), pos,
-		  rc_volume_member_count, expected);
+		  rc_volume_member_count, expected,
+		  (unsigned long long)rc_volume_member_phys_offset[pos]);
 
 	if ((u32)rc_volume_member_count == expected) {
 		/* All slots populated? */
@@ -2283,6 +2330,7 @@ void rc_volume_teardown(void)
 			}
 		}
 		rc_volume_members[i] = NULL;
+		rc_volume_member_phys_offset[i] = 0;
 	}
 	rc_volume_member_count = 0;
 	rc_volume_stripe_sectors = 0;
