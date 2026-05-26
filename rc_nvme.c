@@ -1687,17 +1687,25 @@ static u32 rc_volume_expected_members;
 
 /* Stripe size for the assembled volume in sectors.  Sourced from
  * RC_LogicalDevice.ChunkSize when non-zero; otherwise falls back to the
- * RAID-level firmware default (2048 sectors / 1 MiB for RAID0). */
+ * RAID-level firmware default (512 sectors / 256 KiB for RAID0). */
 static u32 rc_volume_chunk_sectors_for(u32 devtype, u32 ld_chunk)
 {
 	if (ld_chunk)
 		return ld_chunk;
 	switch (devtype) {
 	case RC_LDT_RAID0:
-		/* Confirmed via RC_BuildConfigMetadataFromMemory in rcblob:
-		 * RAID0 never writes a non-zero ChunkSize; the firmware
-		 * defaults to 1 MiB. */
-		return 2048u;
+		/* The on-disk ChunkSize field at RC_LD_CHUNKSIZE_OFFSET reads
+		 * back as 0 on AMD-RAID-created RAID0 volumes, so the actual
+		 * stripe size is implied rather than stored.  Verified
+		 * empirically against a 2× Crucial T700 RAID0 carrying a
+		 * Windows install: stripe=512 sectors (256 KiB) is the only
+		 * value at which ntfs3 successfully mounts /dev/rcraid0p3 and
+		 * Windows files (explorer.exe etc.) read identically to the
+		 * Windows-side hash.  64 KiB and 128 KiB give a valid boot
+		 * sector but fail at $AttrDef; 512 KiB and 1 MiB fail earlier.
+		 * If your array uses a different stripe, override with the
+		 * stripe_sectors_override module parameter. */
+		return 512u;
 	default:
 		return 0u;
 	}
