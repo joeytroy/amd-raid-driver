@@ -248,6 +248,11 @@ struct rc_cache_entry {
 	u16			status;		/* NVMe SC/SCT from populating cmd, 0 = ok */
 	atomic_t		cmds_pending;	/* NVMe cmds still in flight for LOADING entries */
 	int			member;		/* member the data is read from */
+	/* True when rc_cache_invalidate_range hit this entry while it was
+	 * still LOADING.  The fill's data must be discarded (a write made it
+	 * stale), so the ISR transitions to FREE instead of VALID on
+	 * completion.  Cleared on each LOADING transition. */
+	bool			abandoned;
 	/* Request that triggered the fill, waiting for it to complete.
 	 * Single waiter per entry — concurrent same-stripe requests just
 	 * dispatch normally (rare, suboptimal but correct).  ISR walks
@@ -2428,6 +2433,7 @@ static blk_status_t rc_volume_queue_rq(struct blk_mq_hw_ctx *hctx,
 							  &fill_member, &fill_phys_lba);
 					if (stripe_lba + stripe <= get_capacity(rc_volume_disk)) {
 						e->state = RC_CE_LOADING;
+						e->abandoned = false;
 						e->member = fill_member;
 						e->lba = stripe_lba;
 						e->status = 0;
@@ -2738,8 +2744,19 @@ static void rc_volume_complete(struct request *req)
 		}
 		spin_lock_irqsave(&rc_cache_lock, flags);
 		if (e->state == RC_CE_LOADING) {
-			e->state = RC_CE_VALID;
-			list_move_tail(&e->lru_node, &rc_cache_lru);
+			if (e->abandoned) {
+				/* Write came in mid-fill; the data we just
+				 * memcpy'd into the bio was the device's
+				 * pre-write read, which is the correct result
+				 * for this READ.  Drop the entry rather than
+				 * publishing so subsequent readers go back to
+				 * the device. */
+				e->state = RC_CE_FREE;
+				e->abandoned = false;
+			} else {
+				e->state = RC_CE_VALID;
+				list_move_tail(&e->lru_node, &rc_cache_lru);
+			}
 		}
 		spin_unlock_irqrestore(&rc_cache_lock, flags);
 		pdu->cache_entry = NULL;
@@ -3209,6 +3226,23 @@ static int rc_cache_init(u32 nr_entries)
 	if (nr_entries == 0)
 		return 0;
 
+	/* Clamp to the CID-space we actually have.  The cache-fill CID is
+	 *
+	 *   cid = RC_VOLUME_CACHE_CID_BASE
+	 *         | ((entry_idx & 0xfff) << 1)
+	 *         | (i & 1)
+	 *
+	 * so we have 12 bits of entry_idx = 4096 entries max.  Beyond that
+	 * the mask wraps and entries N and N+4096 would share a CID, routing
+	 * the wrong completion to the wrong entry — silent data corruption.
+	 * Clamp loudly so the user can see they've over-asked. */
+	if (nr_entries > RC_VOLUME_CACHE_MAX_ENTRIES) {
+		rc_printk(RC_WARN,
+			  "rc_cache_init: cache_entries=%u exceeds CID-space limit of %u — clamping\n",
+			  nr_entries, RC_VOLUME_CACHE_MAX_ENTRIES);
+		nr_entries = RC_VOLUME_CACHE_MAX_ENTRIES;
+	}
+
 	rc_ghost_table = kvzalloc(RC_GHOST_HASH_SIZE * sizeof(sector_t),
 				  GFP_KERNEL);
 	if (!rc_ghost_table)
@@ -3334,17 +3368,27 @@ static void rc_cache_isr(unsigned int entry_idx, u16 status)
 	last = atomic_dec_and_test(&e->cmds_pending);
 	if (last) {
 		if (e->state == RC_CE_LOADING) {
-			/* Defer the LOADING → VALID transition until the
+			/* Defer the LOADING → final-state transition until the
 			 * waiter's .complete handler has finished memcpy'ing
 			 * out of the buffer — otherwise an evict could free
 			 * the buffer mid-copy.  ISR just schedules the
-			 * waiter; .complete handles state + cleanup. */
+			 * waiter; .complete handles the state transition
+			 * (LOADING → VALID normally; LOADING → FREE if the
+			 * entry was abandoned mid-fill by a write).
+			 *
+			 * If there is no waiter (rare — concurrent invalidate
+			 * already extracted it, or fill was issued from a
+			 * non-blocking path), do the final transition here. */
 			waiter = e->waiter;
 			e->waiter = NULL;
 			if (!waiter) {
-				/* No waiter (e.g., invalidated): publish. */
-				e->state = RC_CE_VALID;
-				list_move_tail(&e->lru_node, &rc_cache_lru);
+				if (e->abandoned) {
+					e->state = RC_CE_FREE;
+					e->abandoned = false;
+				} else {
+					e->state = RC_CE_VALID;
+					list_move_tail(&e->lru_node, &rc_cache_lru);
+				}
 			}
 		}
 	}
@@ -3374,14 +3418,24 @@ static void rc_cache_invalidate_range(sector_t pos, u32 nr_sectors)
 		if (e->lba + (RC_VOLUME_PREFETCH_BYTES / 512u) <= pos ||
 		    pos + nr_sectors <= e->lba)
 			continue;
-		/* Overlap.  Remove from hash for both VALID and LOADING; if
-		 * LOADING, the ISR will see state=FREE on completion and
-		 * skip the VALID transition. */
+		/* Overlap.  Remove from hash so subsequent lookups miss.  For
+		 * a VALID entry we can also free it immediately.  For LOADING
+		 * we have to leave state==LOADING (NVMe cmds are still in
+		 * flight referencing this entry's CID / buf_pa) — instead mark
+		 * it abandoned so the ISR transitions it to FREE rather than
+		 * VALID on completion, dropping the now-stale fill data.  The
+		 * waiter still rides the fill to completion and gets the data
+		 * it read from the device, which is correct: the WRITE that
+		 * triggered this invalidation hadn't completed when the fill
+		 * was issued, so the fill's data is a valid pre-write read. */
 		hlist_del(&e->hash_node);
 		INIT_HLIST_NODE(&e->hash_node);
 		list_move(&e->lru_node, &rc_cache_lru);
 		rc_cache_evictions++;
-		e->state = RC_CE_FREE;
+		if (e->state == RC_CE_LOADING)
+			e->abandoned = true;
+		else
+			e->state = RC_CE_FREE;
 	}
 	spin_unlock_irqrestore(&rc_cache_lock, flags);
 }
