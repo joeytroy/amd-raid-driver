@@ -114,8 +114,12 @@ static struct blk_mq_tag_set rc_volume_tagset;
  * on a 2-member volume.  (Was ~33 MiB before the scatterlist-native
  * refactor, which dominated by the per-tag 512 KiB bounce buffers.)
  */
-#define RC_VOLUME_DATA_PAGES	128
+#define RC_VOLUME_DATA_PAGES	256
 #define RC_VOLUME_DATA_BYTES	(RC_VOLUME_DATA_PAGES * PAGE_SIZE)
+/* Each NVMe member command is bounded by MDTS=512 KiB on the T700.
+ * For multi-member dispatch on a 2-member RAID0, a 1 MiB request maps
+ * 512 KiB to each member, which is exactly 128 pages per member. */
+#define RC_VOLUME_MS_PAGES_PER_MEMBER	128
 /* blk-mq tag pool size per hctx.  Matches Windows per-queue SQ depth.
  * Total in-flight requests = nr_hw_queues × this. */
 #define RC_VOLUME_QUEUE_DEPTH	256
@@ -333,11 +337,19 @@ struct rc_volume_pdu {
 	u8                 hctx_idx;       /* for inflight counter decrement */
 	atomic_t           members_pending;
 	int                nents;          /* dma_map_sg output count, 0 = not mapped */
+	/* Multi-stripe (multi-member) dispatch.  When ms_active is true, the
+	 * request was split across multiple members in queue_rq; ms_nents[m]
+	 * and ms_sg[m] hold each member's portion.  members_pending is set to
+	 * the number of members with non-zero ms_nents.  The pdu->sg/nents
+	 * fields above are unused in this path. */
+	bool               ms_active;
+	int                ms_nents[RC_VOLUME_MAX_MEMBERS];
 	/* Non-NULL when this request is waiting on a cache fill.  .complete
 	 * copies from cache_entry->buf_va[member] into the bio and ends the
 	 * request without dma_unmap_sg (we never dma_map'd). */
 	struct rc_cache_entry *cache_entry;
 	struct scatterlist sg[RC_VOLUME_DATA_PAGES];
+	struct scatterlist ms_sg[RC_VOLUME_MAX_MEMBERS][RC_VOLUME_MS_PAGES_PER_MEMBER];
 };
 
 /* Helper: decrement the per-hctx inflight counter that was incremented at
@@ -1907,10 +1919,27 @@ static blk_status_t rc_volume_map_request_sg(struct request *req,
 }
 
 /* Idempotent dma_unmap_sg.  Safe to call when no mapping is outstanding
- * (nents=0 — true for FLUSH, DISCARD, or early-error paths). */
+ * (nents=0 — true for FLUSH, DISCARD, or early-error paths).  Handles
+ * both single-member (pdu->sg + pdu->nents) and multi-stripe
+ * (pdu->ms_sg[m] + pdu->ms_nents[m]) paths. */
 static void rc_volume_unmap_request_sg(struct rc_volume_pdu *pdu)
 {
 	struct device *dma_dev;
+	int m;
+
+	if (pdu->ms_active) {
+		for (m = 0; m < rc_volume_member_count &&
+			    m < RC_VOLUME_MAX_MEMBERS; m++) {
+			if (!pdu->ms_nents[m])
+				continue;
+			dma_dev = &rc_volume_members[m]->pdev->dev;
+			dma_unmap_sg(dma_dev, pdu->ms_sg[m], pdu->ms_nents[m],
+				     rc_volume_dma_dir(pdu->op));
+			pdu->ms_nents[m] = 0;
+		}
+		pdu->ms_active = false;
+		return;
+	}
 
 	if (!pdu->nents)
 		return;
@@ -2088,6 +2117,170 @@ static void rc_cache_submit_fill(unsigned int hctx_idx,
  * rc_volume_complete then runs in softirq, dma_unmap_sg's the pages, and
  * ends the request.  Hardware DMAs directly to/from the bio's user
  * pages — no bounce buffers, no memcpy on either side. */
+
+/* Dispatch a READ/WRITE that spans multiple RAID0 stripes (and thus
+ * multiple members).  Walks the request's bvec stripe-by-stripe, building
+ * per-member scatterlists; the pages belonging to member 0 are
+ * non-contiguous in the bio (stripes 0,2,4,…) but contiguous on member 0's
+ * drive once mapped to per-member phys LBAs.  We then dma_map_sg each
+ * member's portion, build PRPs, and submit one NVMe command per affected
+ * member.  members_pending is set to the count so the ISR's
+ * atomic_dec_and_test completes the request when both members finish.
+ *
+ * This is the path that gives parity with Windows on SEQ writes:
+ * a 1 MiB write becomes 2 NVMe commands (one per member, each 512 KiB =
+ * MDTS) instead of the 4 we'd issue if blk-mq split at stripe boundary.
+ *
+ * The blk-mq queue_limits enforce that nr_sectors fits in
+ * RC_VOLUME_DATA_BYTES (1 MiB by default) and that no member's portion
+ * exceeds MDTS — combined with the per-member sg array sizing
+ * (RC_VOLUME_MS_PAGES_PER_MEMBER), neither overflow is possible from
+ * within these limits. */
+static blk_status_t rc_volume_dispatch_multi_stripe(
+		struct blk_mq_hw_ctx *hctx, struct request *req,
+		struct rc_volume_pdu *pdu, sector_t pos, u32 nr_sectors,
+		enum req_op op)
+{
+	const u32 stripe = rc_volume_stripe_sectors;
+	const int nm = rc_volume_member_count;
+	struct req_iterator iter;
+	struct bio_vec bv;
+	sector_t cur_lba = pos;
+	u32 sg_used[RC_VOLUME_MAX_MEMBERS] = {0};
+	u32 member_sectors[RC_VOLUME_MAX_MEMBERS] = {0};
+	u64 member_start_lba[RC_VOLUME_MAX_MEMBERS] = {0};
+	bool member_has_data[RC_VOLUME_MAX_MEMBERS] = {0};
+	int members_with_data = 0;
+	int m;
+
+	if (nm <= 0 || nm > RC_VOLUME_MAX_MEMBERS || !stripe)
+		return BLK_STS_IOERR;
+
+	for (m = 0; m < nm; m++)
+		sg_init_table(pdu->ms_sg[m], RC_VOLUME_MS_PAGES_PER_MEMBER);
+
+	/* Walk the bvec, assigning pages to per-member sgs based on which
+	 * stripe each section of the bvec lands in.  A single bvec entry can
+	 * span a stripe boundary — split it at the boundary into two sg
+	 * entries on different members. */
+	rq_for_each_segment(bv, req, iter) {
+		u32 seg_len_sectors = bv.bv_len / 512;
+		u32 seg_off_in_page = bv.bv_offset;
+		struct page *seg_page = bv.bv_page;
+		u32 seg_remaining = bv.bv_len;
+
+		while (seg_remaining) {
+			sector_t stripe_idx = cur_lba / stripe;
+			sector_t stripe_end = (stripe_idx + 1) * stripe;
+			u32 sectors_to_boundary =
+				(u32)(stripe_end - cur_lba);
+			u32 chunk_sectors = min(seg_len_sectors,
+						sectors_to_boundary);
+			u32 chunk_bytes = chunk_sectors * 512u;
+			int mbr = (int)(stripe_idx % nm);
+
+			if (chunk_bytes == 0 || chunk_bytes > seg_remaining)
+				return BLK_STS_IOERR;
+			if (sg_used[mbr] >= RC_VOLUME_MS_PAGES_PER_MEMBER)
+				return BLK_STS_IOERR;
+
+			if (!member_has_data[mbr]) {
+				u64 phys_lba;
+				int phys_member;
+				rc_volume_map_lba(cur_lba, &phys_member,
+						  &phys_lba);
+				if (phys_member != mbr)
+					return BLK_STS_IOERR;
+				member_start_lba[mbr] = phys_lba;
+				member_has_data[mbr] = true;
+				members_with_data++;
+			}
+
+			sg_set_page(&pdu->ms_sg[mbr][sg_used[mbr]],
+				    seg_page, chunk_bytes, seg_off_in_page);
+			sg_used[mbr]++;
+			member_sectors[mbr] += chunk_sectors;
+
+			seg_off_in_page += chunk_bytes;
+			seg_remaining   -= chunk_bytes;
+			seg_len_sectors -= chunk_sectors;
+			cur_lba         += chunk_sectors;
+		}
+	}
+
+	if (members_with_data < 2)
+		return BLK_STS_IOERR;	/* shouldn't reach here for single-member */
+
+	/* Mark each member's sg array as the active subset. */
+	for (m = 0; m < nm; m++) {
+		if (!member_has_data[m])
+			continue;
+		sg_mark_end(&pdu->ms_sg[m][sg_used[m] - 1]);
+	}
+
+	/* dma_map_sg each member's portion.  On failure, unwind whatever
+	 * already mapped. */
+	pdu->ms_active = true;
+	for (m = 0; m < nm; m++) {
+		struct device *dma_dev;
+		int mapped;
+
+		if (!member_has_data[m]) {
+			pdu->ms_nents[m] = 0;
+			continue;
+		}
+		dma_dev = &rc_volume_members[m]->pdev->dev;
+		mapped = dma_map_sg(dma_dev, pdu->ms_sg[m], sg_used[m],
+				    rc_volume_dma_dir(op));
+		if (mapped == 0) {
+			/* Unwind: undo previously mapped members. */
+			pdu->ms_nents[m] = 0;
+			for (--m; m >= 0; m--) {
+				if (!pdu->ms_nents[m])
+					continue;
+				dma_dev = &rc_volume_members[m]->pdev->dev;
+				dma_unmap_sg(dma_dev, pdu->ms_sg[m],
+					     pdu->ms_nents[m],
+					     rc_volume_dma_dir(op));
+				pdu->ms_nents[m] = 0;
+			}
+			pdu->ms_active = false;
+			return BLK_STS_IOERR;
+		}
+		pdu->ms_nents[m] = mapped;
+	}
+
+	pdu->member_idx = -1;	/* multi-member — no single member to attribute */
+	atomic_set(&pdu->members_pending, members_with_data);
+
+	/* Submit one NVMe cmd per member.  Must call blk_mq_start_request
+	 * before the first submit (an ISR completion racing us would otherwise
+	 * call blk_mq_complete on a request blk-mq doesn't yet consider
+	 * started). */
+	blk_mq_start_request(req);
+	for (m = 0; m < nm; m++) {
+		struct rc_nvme_sqe cmd;
+		u32 tag = req->tag;
+		u32 nvme_nlb = member_sectors[m];
+
+		if (!pdu->ms_nents[m])
+			continue;
+
+		rc_volume_build_io_sqe(&cmd, m, tag,
+				       op == REQ_OP_WRITE ?
+					 RC_NVME_NVM_OP_WRITE :
+					 RC_NVME_NVM_OP_READ,
+				       member_start_lba[m],
+				       (u16)(nvme_nlb - 1),
+				       (req->cmd_flags & REQ_FUA) != 0,
+				       pdu->ms_sg[m], pdu->ms_nents[m]);
+		rc_nvme_io_submit(rc_volume_members[m]->ctx.nvme.io_queues[hctx->queue_num],
+				  &cmd);
+	}
+
+	return BLK_STS_OK;
+}
+
 static blk_status_t rc_volume_queue_rq(struct blk_mq_hw_ctx *hctx,
 				       const struct blk_mq_queue_data *bd)
 {
@@ -2106,6 +2299,8 @@ static blk_status_t rc_volume_queue_rq(struct blk_mq_hw_ctx *hctx,
 	pdu->op = op;
 	pdu->sc_sct = 0;
 	pdu->nents = 0;
+	pdu->ms_active = false;
+	memset(pdu->ms_nents, 0, sizeof(pdu->ms_nents));
 	pdu->cache_entry = NULL;
 	pdu->hctx_idx = (u8)(hctx->queue_num < RC_VOLUME_MAX_HCTX ?
 			     hctx->queue_num : 0xff);
@@ -2156,6 +2351,27 @@ static blk_status_t rc_volume_queue_rq(struct blk_mq_hw_ctx *hctx,
 		blk_mq_start_request(req);
 		rc_cache_dec_inflight(pdu);
 		blk_mq_end_request(req, BLK_STS_IOERR);
+		return BLK_STS_OK;
+	}
+
+	/* Multi-stripe READ/WRITE: dispatch one NVMe cmd per affected member
+	 * instead of the 1-cmd-per-stripe split blk-mq would otherwise force.
+	 * For a 1 MiB write on a 2-member RAID0 with 256 KiB stripe, this
+	 * cuts 4 cmds → 2 cmds and halves the per-byte queue_rq /
+	 * dma_map / completion overhead. */
+	if ((op == REQ_OP_READ || op == REQ_OP_WRITE) &&
+	    rc_volume_stripe_sectors &&
+	    nr_sectors > 0 &&
+	    (pos / rc_volume_stripe_sectors) !=
+		((pos + nr_sectors - 1) / rc_volume_stripe_sectors)) {
+		blk_status_t st = rc_volume_dispatch_multi_stripe(hctx, req,
+								  pdu, pos,
+								  nr_sectors,
+								  op);
+		if (st != BLK_STS_OK) {
+			rc_cache_dec_inflight(pdu);
+			blk_mq_end_request(req, st);
+		}
 		return BLK_STS_OK;
 	}
 
@@ -3409,7 +3625,9 @@ static int rc_volume_create_disk(void)
 			.logical_block_size  = 512,
 			.physical_block_size = 512,
 			/* PRP list lets us span up to RC_VOLUME_DATA_BYTES per
-			 * request.  Caller's bvecs sum into one NVMe READ. */
+			 * request.  Caller's bvecs sum into one NVMe READ (or,
+			 * for multi-stripe requests, into one NVMe cmd per
+			 * member via rc_volume_dispatch_multi_stripe). */
 			.max_hw_sectors      = RC_VOLUME_DATA_BYTES / 512,
 			.max_segments        = RC_VOLUME_DATA_PAGES,
 			.max_segment_size    = PAGE_SIZE,
@@ -3419,10 +3637,11 @@ static int rc_volume_create_disk(void)
 			 * segment after the first is page-aligned, which is what
 			 * rc_volume_build_prp relies on. */
 			.virt_boundary_mask  = PAGE_SIZE - 1,
-			/* Requests never cross a RAID0 stripe boundary, so every
-			 * non-flush request maps to one member and one NVMe READ
-			 * or WRITE.  FLUSH is fanned out separately. */
-			.chunk_sectors       = rc_volume_stripe_sectors,
+			/* Don't force blk-mq to split at stripe boundaries — we
+			 * fan out multi-stripe requests across members ourselves
+			 * in rc_volume_dispatch_multi_stripe, which is cheaper
+			 * (1 cmd per member instead of 1 cmd per stripe). */
+			.chunk_sectors       = 0,
 			/* Advertise that the underlying controllers have a volatile
 			 * write cache and that we honour FUA — filesystems will
 			 * now route REQ_OP_FLUSH and REQ_FUA writes through. */
