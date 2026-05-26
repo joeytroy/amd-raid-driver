@@ -2384,6 +2384,12 @@ static blk_status_t rc_volume_queue_rq(struct blk_mq_hw_ctx *hctx,
 								  nr_sectors,
 								  op);
 		if (st != BLK_STS_OK) {
+			/* dispatch_multi_stripe returns errors from paths
+			 * BEFORE its internal blk_mq_start_request, so we
+			 * have to start the request before ending it —
+			 * blk-mq requires every request to be started exactly
+			 * once between queue_rq and end. */
+			blk_mq_start_request(req);
 			rc_cache_dec_inflight(pdu);
 			blk_mq_end_request(req, st);
 		}
