@@ -203,10 +203,14 @@ struct rc_volume_prefetch {
 
 static struct rc_volume_prefetch rc_volume_prefetch_state[RC_VOLUME_MAX_HCTX];
 
-static int rc_volume_prefetch_enabled = 1;
+static int rc_volume_prefetch_enabled;
 module_param_named(prefetch, rc_volume_prefetch_enabled, int, 0644);
 MODULE_PARM_DESC(prefetch,
-		 "If non-zero (default), speculatively pre-issue the next stripe on sequential reads.");
+		 "Speculatively pre-issue the next stripe on sequential reads. "
+		 "Off by default — the buffer size is hardcoded to 1 MiB which "
+		 "over-prefetches on arrays with smaller stripes (256 KiB on the "
+		 "test array) and the baseline driver already saturates the "
+		 "device.  Set to 1 to opt in.");
 
 /* ============================ Read cache ===========================
  *
@@ -271,10 +275,16 @@ static u64 rc_cache_hits;
 static u64 rc_cache_misses;
 static u64 rc_cache_evictions;
 
-static int rc_cache_entries_param = 64;
+static int rc_cache_entries_param;
 module_param_named(cache_entries, rc_cache_entries_param, int, 0444);
 MODULE_PARM_DESC(cache_entries,
-		 "Number of 1 MiB stripe cache entries (default 64 = 128 MiB on 2-member array). 0 disables.");
+		 "Number of stripe cache entries (each entry uses up to 1 MiB "
+		 "per member of DMA memory).  Off by default — measured against "
+		 "the actual stripe size, the cache hurts read throughput on "
+		 "non-repeating workloads and only the multi-member dispatch is "
+		 "responsible for the measured improvements.  Set to a non-zero "
+		 "value (e.g., 64, 128, 1100) to opt in for repeat-heavy "
+		 "workloads.");
 
 /* CIDs 0x2000..0x2FFF reserved for cache fills.  Each fill issues 2 cmds
  * (1 MiB / MDTS=512 KiB).  Layout: bit 13 = cache marker, bits 12..1 =
