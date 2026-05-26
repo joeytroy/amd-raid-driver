@@ -1499,7 +1499,7 @@ static void rc_volume_parse_logical_device(struct rc_adapter *adapter)
 
 		for (i = 0; i + 4 <= chunk_bytes; i += 4) {
 			u8 *ld;
-			u32 devtype, devices, elem_off, chunk;
+			u32 devtype, devices, elem_off, chunk, chunk_index;
 			u64 capacity;
 			int my_pos = -1;
 			u32 j;
@@ -1513,6 +1513,7 @@ static void rc_volume_parse_logical_device(struct rc_adapter *adapter)
 			devices  = get_unaligned_le32(ld + RC_LD_DEVICES_OFFSET);
 			elem_off = get_unaligned_le32(ld + RC_LD_ELEMENTOFFSET_OFFSET);
 			chunk    = get_unaligned_le32(ld + RC_LD_CHUNKSIZE_OFFSET);
+			chunk_index = get_unaligned_le32(ld + RC_LD_CHUNKINDEX_OFFSET);
 			capacity = get_unaligned_le64(ld + RC_LD_CAPACITY_OFFSET);
 
 			if (devices < 1 || devices > RC_VOLUME_MAX_MEMBERS)
@@ -1542,11 +1543,11 @@ static void rc_volume_parse_logical_device(struct rc_adapter *adapter)
 			}
 
 			rc_printk(RC_INFO,
-				  "rc_volume_parse_logical_device: %s LD@ring+%u.%u devtype=0x%04x devices=%u chunk=%u capacity=%llu my_pos=%d alloc_off=%llu alloc_sz=%llu user_off=%llu user_sz=%llu%s\n",
+				  "rc_volume_parse_logical_device: %s LD@ring+%u.%u devtype=0x%04x devices=%u chunk=%u chunk_idx=%u capacity=%llu my_pos=%d alloc_off=%llu alloc_sz=%llu user_off=%llu user_sz=%llu%s\n",
 				  pci_name(adapter->pdev),
 				  scan * RC_LD_SCAN_CHUNK_SECTORS + (i / 512),
 				  i % 512,
-				  devtype, devices, chunk,
+				  devtype, devices, chunk, chunk_index,
 				  (unsigned long long)capacity, my_pos,
 				  (unsigned long long)alloc_off,
 				  (unsigned long long)alloc_sz,
@@ -1561,6 +1562,7 @@ static void rc_volume_parse_logical_device(struct rc_adapter *adapter)
 			nvme->ld_device_type      = devtype;
 			nvme->ld_devices          = devices;
 			nvme->ld_chunk_sectors    = chunk;
+			nvme->ld_chunk_index      = chunk_index;
 			nvme->ld_capacity_sectors = capacity;
 			nvme->ld_my_position      = my_pos;
 			nvme->ld_alloc_offset     = alloc_off;
@@ -1685,27 +1687,45 @@ out:
  * Zero means "no LD seen yet". */
 static u32 rc_volume_expected_members;
 
-/* Stripe size for the assembled volume in sectors.  Sourced from
- * RC_LogicalDevice.ChunkSize when non-zero; otherwise falls back to the
- * RAID-level firmware default (512 sectors / 256 KiB for RAID0). */
-static u32 rc_volume_chunk_sectors_for(u32 devtype, u32 ld_chunk)
+/* Stripe size for the assembled volume in sectors.
+ *
+ * The on-disk RC_LogicalDevice has TWO size fields:
+ *
+ *   - field @ 0xAC (RC_LD_CHUNKSIZE_OFFSET): raw sector count.  Reads
+ *     back as 0 on AMD-RAID-created RAID0 volumes; used verbatim when
+ *     non-0.
+ *
+ *   - field @ 0x110 (RC_LD_CHUNKINDEX_OFFSET): a small index that
+ *     encodes the actual stripe size for RAID0.  Confirmed by reverse-
+ *     engineering rcraid.sys 9.3.2: FUN_140052404 and FUN_140055760
+ *     both dispatch on this value (read from in-memory LD[0xC8], which
+ *     is populated from on-disk LD[0x110]) and pick a sector count:
+ *
+ *         index   stripe
+ *         -----   ------
+ *         3       512 sectors (256 KiB)   <- our test array
+ *         2       256 sectors (128 KiB)
+ *         else    128 sectors (64 KiB)
+ *
+ *     The pattern is consistent with chunk_sectors = 64 << index for
+ *     index >= 1, which would extrapolate to 1024 sectors (512 KiB)
+ *     for index 4 and 2048 sectors (1 MiB) for index 5; the observed
+ *     Windows code only handles 2 and 3 explicitly and falls back to
+ *     64 KiB otherwise, so we mirror that to match Windows behavior
+ *     bit-for-bit on this hardware. */
+static u32 rc_volume_chunk_sectors_for(u32 devtype, u32 ld_chunk,
+				       u32 ld_chunk_index)
 {
 	if (ld_chunk)
 		return ld_chunk;
 	switch (devtype) {
 	case RC_LDT_RAID0:
-		/* The on-disk ChunkSize field at RC_LD_CHUNKSIZE_OFFSET reads
-		 * back as 0 on AMD-RAID-created RAID0 volumes, so the actual
-		 * stripe size is implied rather than stored.  Verified
-		 * empirically against a 2× Crucial T700 RAID0 carrying a
-		 * Windows install: stripe=512 sectors (256 KiB) is the only
-		 * value at which ntfs3 successfully mounts /dev/rcraid0p3 and
-		 * Windows files (explorer.exe etc.) read identically to the
-		 * Windows-side hash.  64 KiB and 128 KiB give a valid boot
-		 * sector but fail at $AttrDef; 512 KiB and 1 MiB fail earlier.
-		 * If your array uses a different stripe, override with the
-		 * stripe_sectors_override module parameter. */
-		return 512u;
+		switch (ld_chunk_index) {
+		case 3:  return 512u;
+		case 2:  return 256u;
+		case 1:
+		default: return 128u;
+		}
 	default:
 		return 0u;
 	}
@@ -1735,7 +1755,8 @@ static void rc_volume_register_member(struct rc_adapter *adapter)
 	if (have_ld) {
 		expected = nvme->ld_devices;
 		chunk_sectors = rc_volume_chunk_sectors_for(nvme->ld_device_type,
-							    nvme->ld_chunk_sectors);
+							    nvme->ld_chunk_sectors,
+							    nvme->ld_chunk_index);
 		if (!chunk_sectors) {
 			rc_printk(RC_WARN,
 				  "rc_volume_register_member: %s unknown DeviceType=0x%x with ChunkSize=0 — ignoring\n",

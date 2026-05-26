@@ -245,6 +245,7 @@ struct rc_nvme_state {
     u32            ld_device_type;      // RC_LogicalDevice.DeviceType (RC_LDT_*)
     u32            ld_devices;          // RC_LogicalDevice.Devices (member count)
     u32            ld_chunk_sectors;    // RC_LogicalDevice.ChunkSize (0 → use RAID-level default)
+    u32            ld_chunk_index;      // RC_LogicalDevice field@0x110 — RAID0 stripe encoding (1→64K, 2→128K, 3→256K, ...)
     u64            ld_capacity_sectors; // RC_LogicalDevice.Capacity (total volume sectors)
     int            ld_my_position;      // index of THIS adapter in LogicalElement array, -1 if not found
     u64            ld_alloc_offset;     // RC_LogicalElement_LE.AllocOffset (sector offset of allocated region)
@@ -598,6 +599,8 @@ struct rc_raidcore_md {
 #define RC_LD_FIRSTCOUNT_OFFSET		0x6Cu	/* u32 */
 #define RC_LD_SECONDCOUNT_OFFSET	0x70u	/* u32 */
 #define RC_LD_CHUNKSIZE_OFFSET		0xACu	/* u32 — sectors, 0 for RAID0 */
+#define RC_LD_CHUNKINDEX_OFFSET		0x110u	/* u32 — RAID0 stripe index, see
+						 * rc_volume_chunk_sectors_for() */
 #define RC_LD_ELEMENTOFFSET_OFFSET	0x04u	/* u32 — bytes from LD start to element array */
 #define RC_LD_DEVICETYPE_OFFSET		0x0Cu	/* u32 — RC_LDT_* */
 #define RC_LD_CAPACITY_OFFSET		0x50u	/* u64 — total volume sectors */
