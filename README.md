@@ -67,36 +67,139 @@ roadmap.
 
 ## What's NOT here yet
 
-- RAID levels other than RAID0 (RAID1 / 10 are roadmap; RAID5 is not).
-- SATA RAID (AHCI variants `7905 / 7916 / 7917 / 43BD`) — code paths
-  exist but are stubs.
-- Retry of transient NVMe errors.  DNR=0 commands could be
-  re-dispatched after a successful controller reset rather than
-  bubbling up as I/O errors.
-- Per-CPU I/O queues.  Single hw queue caps small-I/O IOPS today.
-- Suspend / resume hooks.
-- `rcadm`-equivalent userspace tooling (create / inspect / delete
-  arrays).  Today the array must already exist.
+The big rocks (see `IMPLEMENTATION.MD` for the full checklist):
 
-See `docs/OPEN_QUESTIONS.md` for what still needs reverse-engineering
-work, and `docs/STATUS.md` for the implementation roadmap.
+- **RAID levels other than RAID0** — RAID1 / 10 are roadmap; RAID5 is not.
+- **No partition table scan** — disk uses `GENHD_FL_NO_PART`; you have
+  to use `kpartx` to mount partitions.
+- **No DKMS / udev autobind** — every boot, the drives come up under
+  `nvme`; you re-run the unbind + insmod sequence by hand.
+- **No Secure Boot signing** — module is unsigned; SB must be off.
+- **TRIM/discard is glacial** — needs multi-member dispatch like writes.
+- **No suspend / resume** hooks.
+- **SATA RAID stubs** — AHCI variants (`7905 / 7916 / 7917 / 43BD`)
+  are claimed but not implemented.
+- **No `rcadm`-equivalent** — array must be pre-created in BIOS.
+- **Retry of transient NVMe errors** — DNR=0 commands bubble up as
+  I/O errors instead of being re-dispatched after reset.
 
-## Build and load
+See `IMPLEMENTATION.MD` for the prioritised checklist,
+`docs/OPEN_QUESTIONS.md` for remaining reverse-engineering work, and
+`docs/STATUS.md` for the implementation history.
+
+## Quick start
+
+Working assumption: BIOS is in RAID mode and you've already created
+the array in RAIDXpert. If not, see `INSTALL.md` for the one-time BIOS
+setup.
+
+### Prerequisites
+
+- **Secure Boot disabled** (or the module signed — see `INSTALL.md`).
+  Without this, `insmod` returns `Key was rejected by service`.
+- Kernel headers for the running kernel:
+  `sudo apt install build-essential linux-headers-$(uname -r)`.
+
+### 1. Build
 
 ```sh
-make
-sudo ./test_driver.sh        # loads the module, binds /dev/rcraid0 (RO)
-sudo ./bench.sh              # post-load smoke test
+sudo ./build.sh
+# produces rcraid.ko
 ```
 
-For read-write use, load with the write flag:
+### 2. Find your AMD-RAID members
 
 ```sh
-sudo modprobe -r rcraid 2>/dev/null
-sudo insmod rcraid.ko enable_writes=1
+lspci -d 1022:b000 -k
 ```
 
-Full setup and troubleshooting in `INSTALL.md`.
+You'll see one or more `[AMD] RAID Bottom Device` entries bound to
+`nvme`. Note the BDFs (e.g. `81:00.0`, `82:00.0`).
+
+**Critical**: if your OS lives on an NVMe behind the same AMD chipset,
+it will also appear as `1022:b000` (the chipset shadows every NVMe). Use
+the `Subsystem:` line to identify it (Samsung vs. Crucial vs. WD etc.)
+and **do not unbind your OS drive**.
+
+### 3. Unbind RAID members from `nvme`, then load `rcraid`
+
+```sh
+# For each member you want under rcraid (skip the OS drive):
+echo 0000:81:00.0 | sudo tee /sys/bus/pci/drivers/nvme/unbind
+echo 0000:82:00.0 | sudo tee /sys/bus/pci/drivers/nvme/unbind
+
+# Read-only mode (safest first run):
+sudo insmod ./rcraid.ko
+
+# Or read-write:
+sudo insmod ./rcraid.ko enable_writes=1
+```
+
+If your OS drive's subsystem vendor differs from the array members,
+you can also use `safe_subsys_vendor=0x<hex>` to make the driver refuse
+to bind anything whose subsystem vendor doesn't match the array — see
+`INSTALL.md`.
+
+### 4. Verify the array came up
+
+```sh
+sudo dmesg | grep -E 'rcraid|rc_volume' | tail -20
+# Look for: rc_volume_create_disk: /dev/rcraid0 up, ... (read-write)
+# And:      rc_init: Found N adapters
+
+lsblk /dev/rcraid0
+ls -l /dev/rcraid0
+```
+
+### 5. Mount it
+
+**Whole-disk filesystem** (recommended on a fresh array):
+
+```sh
+sudo mkfs.xfs -f -K -d su=256k,sw=<num_members> /dev/rcraid0
+sudo mkdir -p /mnt/rcraid0
+sudo mount -o noatime /dev/rcraid0 /mnt/rcraid0
+```
+
+> `-K` skips the discard pass — current TRIM implementation is slow.
+> Tracked in `IMPLEMENTATION.MD`.
+
+**If the array has a GPT** (Windows install, etc.) and you want to
+mount a partition: the driver currently registers the disk with
+`GENHD_FL_NO_PART`, so `/dev/rcraid0pN` won't auto-appear. Use
+`kpartx`:
+
+```sh
+sudo apt install kpartx
+sudo kpartx -av /dev/rcraid0
+ls /dev/mapper/rcraid0p*
+sudo mount /dev/mapper/rcraid0p<N> /mnt/somewhere
+```
+
+### 6. Unload
+
+```sh
+sudo umount /mnt/rcraid0           # or kpartx -d /dev/rcraid0 first
+sudo rmmod rcraid
+```
+
+After `rmmod`, the kernel won't auto-rebind the drives to `nvme` —
+they'll sit unbound until you `echo 0000:XX:00.0 > /sys/bus/pci/drivers/nvme/bind`
+or reboot.
+
+### Caveats today (read this once)
+
+- **Every reboot**: drives come up bound to `nvme`. You have to repeat
+  step 3. A persistent udev/systemd setup is on the roadmap
+  (see `IMPLEMENTATION.MD`).
+- **Secure Boot**: must be disabled, or the module signed and the cert
+  enrolled in MOK. Tracked in `IMPLEMENTATION.MD`.
+- **TRIM/discard is slow**. `mkfs.xfs` without `-K` will take hours.
+- **Partitions need `kpartx`** until partscan is implemented.
+
+Full setup, troubleshooting, and the Live-USB fallback path are in
+`INSTALL.md`. The road from here to "no manual steps" is tracked in
+`IMPLEMENTATION.MD`.
 
 ## License
 
