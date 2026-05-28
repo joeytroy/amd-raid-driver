@@ -67,6 +67,21 @@ For status of work already done, see [`docs/STATUS.md`](docs/STATUS.md).
       generator the distro uses (dracut vs initramfs-tools) and
       regenerates after the rest of the install is staged.
 
+- [x] **Live-CD install workflow** — for users coming from a blank
+      array, there needs to be a one-script path that exposes
+      `/dev/rcraid0` to the live distro's OS installer, then configures
+      the freshly-installed target to boot off the array.  No ISO
+      injection, no hosting required — works from any stock Debian /
+      Ubuntu / Fedora live CD.
+      *Touch points:* new `install-livecd.sh`.
+      *Resolved:* two-phase script — phase 1 builds + loads rcraid in
+      the live session so the installer (Ubiquity / Calamares /
+      Anaconda / debian-installer) sees `/dev/rcraid0` as an ordinary
+      disk; phase 2 (after user finishes the OS install) chroots into
+      the new rootfs and runs the equivalent of `install-dkms.sh`
+      against the target's kernel.  Mirrors DesktopECHO's
+      `raidxpert2-install` UX with our clean-room stack.
+
 - [ ] **Module signing for Secure Boot** — `insmod` fails with
       "Key was rejected by service" when SB is enabled. Ship signing
       scripts (or document MOK enrollment); for distro builds, sign
@@ -230,7 +245,8 @@ remaining items:
 2. Fast discard (fix mkfs hang)
 3. DKMS + udev autobind (so reboot doesn't break the array)
 4. Suspend / resume
-5. Boot-from-RAID via initramfs (Linux installed on the array)
+5. Boot-from-RAID — initramfs hook + live-CD installer (one-script
+   install of Linux onto the array)
 6. Module signing path
 7. RAID1 support (first redundancy level)
 8. Multi-volume support
