@@ -51,6 +51,22 @@ For status of work already done, see [`docs/STATUS.md`](docs/STATUS.md).
       naturally.  Installer auto-detects array `subsystem_vendor`
       (the vendor with ≥ 2 matching devices).
 
+- [x] **Boot-from-RAID (initramfs)** — to install Linux *on* the array
+      and have it serve as the rootfs, rcraid.ko + the udev rebind
+      glue must live inside the initramfs so they're present before
+      pivot_root.  The Windows analogue is `StartType = 0`
+      (SERVICE_BOOT_START) + `LoadOrderGroup = "SCSI miniport"` in
+      `rcbottom.inf`, which makes winload pull the driver before the
+      disk subsystem comes up.
+      *Touch points:* new `packaging/dracut/95rcraid/module-setup.sh`,
+      new `packaging/initramfs-tools/hooks/rcraid`, install-dkms.sh
+      generator detection + regen, uninstall-dkms.sh cleanup.
+      *Resolved:* dracut module + initramfs-tools hook bundle the
+      kernel module, `/usr/sbin/rcraid-bind`, `50-rcraid.rules`, and
+      `rcraid.conf` into the initramfs.  Installer detects which
+      generator the distro uses (dracut vs initramfs-tools) and
+      regenerates after the rest of the install is staged.
+
 - [ ] **Module signing for Secure Boot** — `insmod` fails with
       "Key was rejected by service" when SB is enabled. Ship signing
       scripts (or document MOK enrollment); for distro builds, sign
@@ -214,9 +230,10 @@ remaining items:
 2. Fast discard (fix mkfs hang)
 3. DKMS + udev autobind (so reboot doesn't break the array)
 4. Suspend / resume
-5. RAID1 support (first redundancy level)
+5. Boot-from-RAID via initramfs (Linux installed on the array)
 6. Module signing path
-7. Multi-volume support
-8. Hot-plug handling
+7. RAID1 support (first redundancy level)
+8. Multi-volume support
+9. Hot-plug handling
 
 Everything else can come after.

@@ -1,0 +1,26 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
+#
+# initramfs-tools hook for rcraid — Debian/Ubuntu side of the boot-from-RAID
+# story.  Runs at `update-initramfs -u` time and bundles every piece that
+# rcraid needs inside the initramfs so the rootfs on /dev/rcraid0pN is
+# mountable at pivot_root.
+
+set -e
+
+PREREQ=""
+prereqs() { echo "$PREREQ"; }
+case $1 in prereqs) prereqs; exit 0;; esac
+
+. /usr/share/initramfs-tools/hook-functions
+
+# Kernel module — pulls in rcraid.ko and runs depmod against the initramfs.
+manual_add_modules rcraid
+
+# Bind helper — gets the device from nvme to rcbottom inside initramfs.
+copy_exec /usr/sbin/rcraid-bind /usr/sbin
+
+# udev rule + modprobe drop-in.
+mkdir -p "$DESTDIR/etc/udev/rules.d" "$DESTDIR/etc/modprobe.d"
+cp /etc/udev/rules.d/50-rcraid.rules "$DESTDIR/etc/udev/rules.d/50-rcraid.rules"
+cp /etc/modprobe.d/rcraid.conf       "$DESTDIR/etc/modprobe.d/rcraid.conf"

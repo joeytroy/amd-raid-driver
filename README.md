@@ -97,7 +97,8 @@ setup.
 ### Easy path: DKMS install (auto-bind on every boot)
 
 If you want the array to come up automatically on every boot — no
-manual `unbind` / `insmod` dance, survives kernel updates — run:
+manual `unbind` / `insmod` dance, survives kernel updates, and is
+available early enough to host the **rootfs** — run:
 
 ```sh
 sudo apt install dkms
@@ -115,6 +116,11 @@ The script:
    a re-probe.
 4. Drops `/etc/modprobe.d/rcraid.conf` with `enable_writes=1` and
    `safe_subsys_vendor=...` so the array is read-write at boot.
+5. Installs an initramfs hook — dracut module on Fedora/RHEL/Arch/
+   openSUSE, initramfs-tools hook on Debian/Ubuntu — and regenerates
+   the initramfs.  This bundles `rcraid.ko` + the bind glue early
+   enough that `/dev/rcraid0pN` exists before `pivot_root`, which is
+   what makes installing Linux *onto* the array supported.
 
 Reboot and `/dev/rcraid0` (plus `/dev/rcraid0pN`) should be there
 without intervention. `sudo ./uninstall-dkms.sh` reverses everything.

@@ -152,7 +152,51 @@ udevadm control --reload-rules
 echo
 
 # ----------------------------------------------------------------------------
-# 4. Done.  Tell the user what happens next.
+# 4. Install initramfs hook so the array can serve /, and regenerate the
+#    initramfs for the running kernel.
+#
+# We support both dracut (Fedora/RHEL/Arch/openSUSE) and initramfs-tools
+# (Debian/Ubuntu).  If neither is present, the install still succeeds but
+# boot-from-RAID won't work — you can only mount the array post-boot.
+# ----------------------------------------------------------------------------
+
+INITRAMFS_GENERATOR=""
+
+if command -v dracut >/dev/null 2>&1; then
+    INITRAMFS_GENERATOR="dracut"
+    echo "==> installing dracut module 95rcraid"
+    install -d /usr/lib/dracut/modules.d/95rcraid
+    install -m 0755 \
+        "$SRC_DIR/packaging/dracut/95rcraid/module-setup.sh" \
+        /usr/lib/dracut/modules.d/95rcraid/module-setup.sh
+
+    echo "==> regenerating initramfs (dracut -f)"
+    if ! dracut -f 2>&1 | sed 's/^/    /'; then
+        echo "WARN: dracut failed — boot-from-RAID won't work until you re-run it" >&2
+    fi
+elif command -v update-initramfs >/dev/null 2>&1; then
+    INITRAMFS_GENERATOR="initramfs-tools"
+    echo "==> installing initramfs-tools hook"
+    install -d /etc/initramfs-tools/hooks
+    install -m 0755 \
+        "$SRC_DIR/packaging/initramfs-tools/hooks/rcraid" \
+        /etc/initramfs-tools/hooks/rcraid
+
+    echo "==> regenerating initramfs (update-initramfs -u)"
+    if ! update-initramfs -u 2>&1 | sed 's/^/    /'; then
+        echo "WARN: update-initramfs failed — boot-from-RAID won't work until you re-run it" >&2
+    fi
+else
+    echo "==> no initramfs generator found (dracut / update-initramfs)"
+    echo "    Skipping initramfs hook install.  The array will only be"
+    echo "    available AFTER the root filesystem mounts.  This is fine if"
+    echo "    your rootfs is NOT on rcraid; if it is, install dracut or"
+    echo "    initramfs-tools and re-run this script."
+fi
+echo
+
+# ----------------------------------------------------------------------------
+# 5. Done.  Tell the user what happens next.
 # ----------------------------------------------------------------------------
 
 cat <<EOF
@@ -166,6 +210,7 @@ What's installed:
                  (filters on subsystem_vendor=$SUBSYSTEM_VENDOR)
   modprobe conf  /etc/modprobe.d/rcraid.conf
                  (enable_writes=1, safe_subsys_vendor=$SUBSYSTEM_VENDOR)
+  initramfs      ${INITRAMFS_GENERATOR:-<none — boot-from-RAID disabled>}
 
 Next: reboot to test the auto-bind path end-to-end.  After reboot:
 
