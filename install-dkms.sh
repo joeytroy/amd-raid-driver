@@ -19,6 +19,20 @@ DKMS_SRC="/usr/src/${PKG_NAME}-${PKG_VERSION}"
 
 [ "$(id -u)" -eq 0 ] || { echo "must be root" >&2; exit 1; }
 
+# Tooling preflight — fail fast with an actionable message rather than later
+# with a silent "no devices found" or a confusing dkms error.
+for tool in lspci dkms udevadm; do
+    if ! command -v "$tool" >/dev/null 2>&1; then
+        case "$tool" in
+            lspci)   pkg="pciutils" ;;
+            dkms)    pkg="dkms" ;;
+            udevadm) pkg="systemd / udev" ;;
+        esac
+        echo "missing required tool: $tool (install $pkg)" >&2
+        exit 1
+    fi
+done
+
 echo "==> rcraid install-dkms.sh  (package: ${PKG_NAME}-${PKG_VERSION})"
 echo
 
@@ -77,8 +91,15 @@ else
         echo "  [$i] subsystem_vendor $sv → ${vendor_bdfs[$sv]# }"
         i=$((i + 1))
     done
-    read -rp "Pick one [1]: " choice
-    choice="${choice:-1}"
+    n=${#candidates[@]}
+    while :; do
+        read -rp "Pick one [1-$n, default 1]: " choice
+        choice="${choice:-1}"
+        if [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le "$n" ]; then
+            break
+        fi
+        echo "  invalid — enter a number between 1 and $n"
+    done
     SUBSYSTEM_VENDOR="${candidates[$((choice - 1))]}"
 fi
 echo
@@ -86,11 +107,6 @@ echo
 # ----------------------------------------------------------------------------
 # 2. Stage sources under /usr/src/<pkg>-<ver> and run dkms install.
 # ----------------------------------------------------------------------------
-
-if ! command -v dkms >/dev/null 2>&1; then
-    echo "dkms is not installed.  apt install dkms (or your distro's equivalent)." >&2
-    exit 1
-fi
 
 echo "==> staging sources at $DKMS_SRC"
 rm -rf "$DKMS_SRC"
