@@ -76,7 +76,6 @@ For status of work already done, see [`docs/STATUS.md`](docs/STATUS.md).
 - [x] **Suspend / resume (S3 / S4)** — `.suspend` / `.resume` PM
       callbacks at the PCI driver level. Quiesce blk-mq, save SQ/CQ
       DMA addresses, disable controller, restore on resume.
-      Untested today; will probably hang or corrupt.
       *Resolved:* `SIMPLE_DEV_PM_OPS` on `rc_bottom_driver` covers both
       S3 and S4 with one pair of hooks.  `pm_suspend_adapter` masks
       MSI vectors and clears `CC.EN`; `pm_resume_adapter` delegates

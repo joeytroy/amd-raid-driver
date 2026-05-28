@@ -4288,6 +4288,12 @@ int rc_nvme_pm_suspend_adapter(struct rc_adapter *adapter)
 		  "rc_nvme_pm_suspend_adapter: %s quiescing for S3/S4\n",
 		  pci_name(adapter->pdev));
 
+	/* Serialize against rc_nvme_reset_controller, which can run from
+	 * .timeout → rc_nvme_auto_reset_fn if a request times out mid-PM.
+	 * Both paths drive CC.EN and INTMS; without this mutex they can
+	 * race and leave the controller in an inconsistent state. */
+	mutex_lock(&nvme->admin_mutex);
+
 	WRITE_ONCE(nvme->dead, true);
 
 	/* Mask all NVMe interrupt vectors via INTMS so the controller stops
@@ -4306,14 +4312,17 @@ int rc_nvme_pm_suspend_adapter(struct rc_adapter *adapter)
 		wmb();
 	}
 	ret = rc_nvme_wait_csts(adapter, RC_NVME_CSTS_RDY, 0);
+	mutex_unlock(&nvme->admin_mutex);
+
 	if (ret) {
-		/* The host is about to lose power either way — log and let
-		 * the PM core continue.  Resume will then drive a full
-		 * reset_controller pass, which is robust against the
-		 * controller arriving in any reasonable initial state. */
+		/* Surface the failure to the PM core.  In practice the system
+		 * is about to suspend anyway, but a wedged controller is worth
+		 * flagging — resume's reset_controller will rebuild from
+		 * scratch either way. */
 		rc_printk(RC_WARN,
-			  "rc_nvme_pm_suspend_adapter: %s did not become idle in time (%d) — continuing into D3 anyway\n",
+			  "rc_nvme_pm_suspend_adapter: %s did not become idle in time (%d)\n",
 			  pci_name(adapter->pdev), ret);
+		return ret;
 	}
 	return 0;
 }

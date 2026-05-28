@@ -466,6 +466,12 @@ static void rc_bottom_remove(struct pci_dev *pdev)
  *
  * AHCI / stub members are no-op (NVMe is the only path with real I/O).
  *----------------------------------------------------------------------*/
+/* Why the NVMe-only gate: the AHCI variants (0x43BD, 0x7905, 0x7916, 0x7917)
+ * are claimed by this driver but their I/O path is a stub today.  They have
+ * an MMIO BAR but it points at AHCI registers, not NVMe ones.  Running
+ * rc_nvme_pm_* would write to RC_NVME_REG_INTMS / RC_NVME_REG_CC offsets
+ * inside the AHCI register window — scribbling random bytes into HBA state.
+ * Returning 0 here is the right no-op until those code paths exist. */
 static int rc_bottom_pm_suspend(struct device *dev)
 {
     struct pci_dev *pdev = to_pci_dev(dev);
