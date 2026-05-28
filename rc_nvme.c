@@ -4254,6 +4254,87 @@ err_irq_enabled:
 	return ret;
 }
 
+/* PM suspend for one adapter.
+ *
+ * Called from the .suspend PCI hook for each member.  Disables interrupt
+ * generation, clears CC.EN, and waits for CSTS.RDY to clear so the
+ * controller stops touching DMA buffers before the system transitions to
+ * D3 (S3) or has its RAM image written out (S4).
+ *
+ * DMA buffers (admin SQ/CQ, per-queue SQ/CQ, PRP lists) stay allocated.
+ * For S3 their RAM contents are preserved across the power transition;
+ * for S4 the hibernation snapshot captures them.  Either way, the resume
+ * path can reuse them.  We just need the controller to forget any
+ * in-flight CIDs on its side — disabling CC.EN does that.
+ *
+ * Sets nvme->dead so the upper layer fails any blk-mq dispatch that
+ * sneaks in between this call and the higher-level blk-mq freeze.
+ * Cleared again by rc_nvme_pm_resume_adapter via reset_controller. */
+int rc_nvme_pm_suspend_adapter(struct rc_adapter *adapter)
+{
+	void __iomem *base = adapter->ctx.mmio_base;
+	struct rc_nvme_state *nvme = &adapter->ctx.nvme;
+	u32 cur_cc;
+	int ret;
+
+	if (!base) {
+		rc_printk(RC_INFO,
+			  "rc_nvme_pm_suspend_adapter: %s no MMIO base — already shut down\n",
+			  pci_name(adapter->pdev));
+		return 0;
+	}
+
+	rc_printk(RC_NOTE,
+		  "rc_nvme_pm_suspend_adapter: %s quiescing for S3/S4\n",
+		  pci_name(adapter->pdev));
+
+	WRITE_ONCE(nvme->dead, true);
+
+	/* Mask all NVMe interrupt vectors via INTMS so the controller stops
+	 * generating MSI completions while we tear down.  We do NOT call
+	 * disable_irq here: enable_irq/disable_irq is refcounted, and
+	 * rc_nvme_reset_controller (which the .resume hook delegates to)
+	 * does its own paired disable_irq/enable_irq cycle.  Doubling up
+	 * here would leave the IRQ depth>0 after resume → no I/O completions
+	 * ever fire → every command times out.  The PM core's suspend_noirq
+	 * phase masks the Linux IRQ side cleanly on the host's behalf. */
+	writel(0xffffffffu, base + RC_NVME_REG_INTMS);
+
+	cur_cc = readl(base + RC_NVME_REG_CC);
+	if (cur_cc & RC_NVME_CC_EN) {
+		writel(cur_cc & ~RC_NVME_CC_EN, base + RC_NVME_REG_CC);
+		wmb();
+	}
+	ret = rc_nvme_wait_csts(adapter, RC_NVME_CSTS_RDY, 0);
+	if (ret) {
+		/* The host is about to lose power either way — log and let
+		 * the PM core continue.  Resume will then drive a full
+		 * reset_controller pass, which is robust against the
+		 * controller arriving in any reasonable initial state. */
+		rc_printk(RC_WARN,
+			  "rc_nvme_pm_suspend_adapter: %s did not become idle in time (%d) — continuing into D3 anyway\n",
+			  pci_name(adapter->pdev), ret);
+	}
+	return 0;
+}
+
+/* PM resume for one adapter.
+ *
+ * Called from the .resume PCI hook for each member after the PCI core
+ * has restored config space + put the device back in D0.  Re-enabling
+ * the controller, re-programming the admin queue, and re-creating the
+ * I/O queues is exactly what reset_controller already does, so we just
+ * delegate.  Reusing that path means the recovery code that handles a
+ * mid-operation controller wedge is the same as the code that handles
+ * S3/S4 resume — fewer codepaths to keep correct. */
+int rc_nvme_pm_resume_adapter(struct rc_adapter *adapter)
+{
+	rc_printk(RC_NOTE,
+		  "rc_nvme_pm_resume_adapter: %s reviving controller\n",
+		  pci_name(adapter->pdev));
+	return rc_nvme_reset_controller(adapter);
+}
+
 int rc_nvme_init_controller(struct rc_adapter *adapter)
 {
 	void __iomem *base = adapter->ctx.mmio_base;
