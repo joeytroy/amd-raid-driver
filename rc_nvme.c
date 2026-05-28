@@ -3744,9 +3744,16 @@ static int rc_volume_create_disk(void)
 	snprintf(rc_volume_disk->disk_name, DISK_NAME_LEN, "rcraid0");
 	rc_volume_disk->fops        = &rc_volume_bops;
 	rc_volume_disk->major       = rc_major;
-	rc_volume_disk->minors      = 1;
+	/* 256 minors per disk reserves /dev/rcraid0 + p1..p255.  Matches the
+	 * NVMe driver convention and is enough to enumerate every entry in a
+	 * GPT (the spec caps at 128). */
+	rc_volume_disk->minors      = 256;
 	rc_volume_disk->first_minor = 0;
-	rc_volume_disk->flags       = GENHD_FL_NO_PART;
+	/* No flag — let add_disk() scan the partition table at end-of-disk.
+	 * rc_volume_map_lba is pure modular arithmetic and handles any LBA in
+	 * [0, capacity), including the GPT secondary header at LBA(N-1) and the
+	 * partition array at LBA(N-33..N-2), without any tail-special-casing. */
+	rc_volume_disk->flags       = 0;
 	/* Read-only unless the operator explicitly opted in via the module
 	 * parameter.  Note the parameter is 0444 (read-only sysfs) so it
 	 * can only be set at load time — re-load to switch modes. */

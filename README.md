@@ -70,8 +70,6 @@ roadmap.
 The big rocks (see `IMPLEMENTATION.MD` for the full checklist):
 
 - **RAID levels other than RAID0** — RAID1 / 10 are roadmap; RAID5 is not.
-- **No partition table scan** — disk uses `GENHD_FL_NO_PART`; you have
-  to use `kpartx` to mount partitions.
 - **No DKMS / udev autobind** — every boot, the drives come up under
   `nvme`; you re-run the unbind + insmod sequence by hand.
 - **No Secure Boot signing** — module is unsigned; SB must be off.
@@ -164,16 +162,13 @@ sudo mount -o noatime /dev/rcraid0 /mnt/rcraid0
 > `-K` skips the discard pass — current TRIM implementation is slow.
 > Tracked in `IMPLEMENTATION.MD`.
 
-**If the array has a GPT** (Windows install, etc.) and you want to
-mount a partition: the driver currently registers the disk with
-`GENHD_FL_NO_PART`, so `/dev/rcraid0pN` won't auto-appear. Use
-`kpartx`:
+**If the array has a GPT** (Windows install, etc.) the kernel
+auto-scans on `add_disk` and partitions appear as `/dev/rcraid0p1`,
+`/dev/rcraid0p2`, … — mount directly:
 
 ```sh
-sudo apt install kpartx
-sudo kpartx -av /dev/rcraid0
-ls /dev/mapper/rcraid0p*
-sudo mount /dev/mapper/rcraid0p<N> /mnt/somewhere
+lsblk /dev/rcraid0
+sudo mount /dev/rcraid0pN /mnt/somewhere
 ```
 
 ### 6. Unload
@@ -195,7 +190,6 @@ or reboot.
 - **Secure Boot**: must be disabled, or the module signed and the cert
   enrolled in MOK. Tracked in `IMPLEMENTATION.MD`.
 - **TRIM/discard is slow**. `mkfs.xfs` without `-K` will take hours.
-- **Partitions need `kpartx`** until partscan is implemented.
 
 Full setup, troubleshooting, and the Live-USB fallback path are in
 `INSTALL.md`. The road from here to "no manual steps" is tracked in

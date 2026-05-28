@@ -12,13 +12,17 @@ For status of work already done, see [`docs/STATUS.md`](docs/STATUS.md).
 
 ## ⛔ Blockers — driver isn't usable as a daily driver without these
 
-- [ ] **Partition table scan** — disk registers with `GENHD_FL_NO_PART`
+- [x] **Partition table scan** — disk registers with `GENHD_FL_NO_PART`
       so `/dev/rcraid0p3` etc. never appear; users have to `kpartx`
       to mount partitions. Flip to standard partscan and make sure
       the GPT secondary header at end-of-disk is reachable through
       the stripe map.
       *Touch points:* `rc_volume_create_disk` (gendisk flags),
       `rc_volume_queue_rq` (last-stripe / GPT-tail addressing).
+      *Resolved:* dropped `GENHD_FL_NO_PART`, bumped `minors` to 256.
+      The stripe map needed no change — `rc_volume_map_lba` is pure
+      modular arithmetic with no end-of-disk casework, and partscan
+      round-trips a 2-partition GPT (validated on hardware).
 
 - [ ] **Fast discard / TRIM** — `mkfs.xfs` discard hangs (~70 min for
       3.6 TB), `fstrim` hangs. Current path likely issues one DSM
