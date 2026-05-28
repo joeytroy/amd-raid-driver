@@ -24,7 +24,7 @@
 # Mirrors the workflow DesktopECHO's `raidxpert2-install` offers, but using
 # our clean-room rcraid stack instead of AMD's proprietary blob.
 
-set -eu
+set -euo pipefail
 
 SRC_DIR="$(cd "$(dirname "$0")" && pwd)"
 PKG_NAME="rcraid"
@@ -333,7 +333,7 @@ cp -r "$SRC_DIR/packaging" "$TARGET/tmp/rcraid-pkg/"
 # baked at the call site — no parsing inside the chroot.
 cat > "$TARGET/tmp/rcraid-in-target.sh" <<EOF
 #!/bin/bash
-set -eu
+set -euo pipefail
 
 PKG_NAME="$PKG_NAME"
 PKG_VERSION="$PKG_VERSION"
