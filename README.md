@@ -94,10 +94,43 @@ setup.
 - Kernel headers for the running kernel:
   `sudo apt install build-essential linux-headers-$(uname -r)`.
 
+### Easiest path: install Linux *onto* the array from a live CD
+
+If you're starting from a blank array and want Linux installed on it,
+boot a stock Ubuntu / Debian / Fedora live USB and run:
+
+```sh
+sudo apt update && sudo apt install -y git    # Debian / Ubuntu
+# or:  sudo dnf install -y git                # Fedora
+git clone https://github.com/joeytroy/amd-raid-driver.git
+cd amd-raid-driver
+sudo ./install-livecd.sh
+```
+
+`install-livecd.sh` does its work in two phases:
+
+1. **Before the OS installer.** Auto-detects array members, installs
+   build tools, compiles `rcraid.ko` against the live kernel, rebinds
+   the members from `nvme` to `rcbottom`, and loads the module — so
+   `/dev/rcraid0` appears as an ordinary disk.
+2. **You launch the OS installer.** Ubiquity / Calamares / Anaconda /
+   `debian-installer` all see `/dev/rcraid0`. Pick "Custom" partitioning
+   and lay out your install on it as you would any other disk. When the
+   installer offers to reboot, **do not reboot yet** — close it and
+   return to the terminal.
+3. **After you press Enter.** The script finds your new rootfs on
+   `/dev/rcraid0pN`, chroots in, installs DKMS rcraid + the initramfs
+   hook against the *target* kernel, and tells you it's safe to reboot.
+
+This mirrors what DesktopECHO's `raidxpert2-install` offers, but using
+our clean-room rcraid — about 2.5× faster on real workloads in the
+small comparison we've done.
+
 ### Easy path: DKMS install (auto-bind on every boot)
 
-If you want the array to come up automatically on every boot — no
-manual `unbind` / `insmod` dance, survives kernel updates — run:
+If you've already got Linux installed somewhere else and just want to
+mount the array — no manual `unbind` / `insmod` dance, survives kernel
+updates, and is available early enough to host the **rootfs** — run:
 
 ```sh
 sudo apt install dkms
@@ -115,6 +148,11 @@ The script:
    a re-probe.
 4. Drops `/etc/modprobe.d/rcraid.conf` with `enable_writes=1` and
    `safe_subsys_vendor=...` so the array is read-write at boot.
+5. Installs an initramfs hook — dracut module on Fedora/RHEL/Arch/
+   openSUSE, initramfs-tools hook on Debian/Ubuntu — and regenerates
+   the initramfs.  This bundles `rcraid.ko` + the bind glue early
+   enough that `/dev/rcraid0pN` exists before `pivot_root`, which is
+   what makes installing Linux *onto* the array supported.
 
 Reboot and `/dev/rcraid0` (plus `/dev/rcraid0pN`) should be there
 without intervention. `sudo ./uninstall-dkms.sh` reverses everything.

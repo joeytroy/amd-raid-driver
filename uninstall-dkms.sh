@@ -29,6 +29,26 @@ rm -f  /usr/sbin/rcraid-bind
 rm -f  /etc/udev/rules.d/50-rcraid.rules
 rm -f  /etc/modprobe.d/rcraid.conf
 
+# Pull the initramfs hook back out and regenerate so the next boot doesn't
+# try to bring up an array we no longer have a driver for.
+if [ -d /usr/lib/dracut/modules.d/95rcraid ]; then
+    echo "==> removing dracut module 95rcraid"
+    rm -rf /usr/lib/dracut/modules.d/95rcraid
+    if command -v dracut >/dev/null 2>&1; then
+        echo "==> regenerating initramfs (dracut -f)"
+        dracut -f 2>&1 | sed 's/^/    /' || true
+    fi
+fi
+
+if [ -e /etc/initramfs-tools/hooks/rcraid ]; then
+    echo "==> removing initramfs-tools hook"
+    rm -f /etc/initramfs-tools/hooks/rcraid
+    if command -v update-initramfs >/dev/null 2>&1; then
+        echo "==> regenerating initramfs (update-initramfs -u)"
+        update-initramfs -u 2>&1 | sed 's/^/    /' || true
+    fi
+fi
+
 udevadm control --reload-rules
 
 echo "==> Uninstall complete.  Reboot to fully release drives back to nvme,"
