@@ -73,7 +73,6 @@ The big rocks (see `IMPLEMENTATION.MD` for the full checklist):
 - **No DKMS / udev autobind** — every boot, the drives come up under
   `nvme`; you re-run the unbind + insmod sequence by hand.
 - **No Secure Boot signing** — module is unsigned; SB must be off.
-- **TRIM/discard is glacial** — needs multi-member dispatch like writes.
 - **No suspend / resume** hooks.
 - **SATA RAID stubs** — AHCI variants (`7905 / 7916 / 7917 / 43BD`)
   are claimed but not implemented.
@@ -154,13 +153,10 @@ ls -l /dev/rcraid0
 **Whole-disk filesystem** (recommended on a fresh array):
 
 ```sh
-sudo mkfs.xfs -f -K -d su=256k,sw=<num_members> /dev/rcraid0
+sudo mkfs.xfs -f -d su=256k,sw=<num_members> /dev/rcraid0
 sudo mkdir -p /mnt/rcraid0
 sudo mount -o noatime /dev/rcraid0 /mnt/rcraid0
 ```
-
-> `-K` skips the discard pass — current TRIM implementation is slow.
-> Tracked in `IMPLEMENTATION.MD`.
 
 **If the array has a GPT** (Windows install, etc.) the kernel
 auto-scans on `add_disk` and partitions appear as `/dev/rcraid0p1`,
@@ -189,7 +185,6 @@ or reboot.
   (see `IMPLEMENTATION.MD`).
 - **Secure Boot**: must be disabled, or the module signed and the cert
   enrolled in MOK. Tracked in `IMPLEMENTATION.MD`.
-- **TRIM/discard is slow**. `mkfs.xfs` without `-K` will take hours.
 
 Full setup, troubleshooting, and the Live-USB fallback path are in
 `INSTALL.md`. The road from here to "no manual steps" is tracked in
