@@ -4315,13 +4315,19 @@ int rc_nvme_pm_suspend_adapter(struct rc_adapter *adapter)
 	mutex_unlock(&nvme->admin_mutex);
 
 	if (ret) {
-		/* Surface the failure to the PM core.  In practice the system
-		 * is about to suspend anyway, but a wedged controller is worth
-		 * flagging — resume's reset_controller will rebuild from
-		 * scratch either way. */
+		/* Surface the failure to the PM core, but first roll the
+		 * controller back to a usable state.  If suspend aborts the
+		 * system transition, .resume isn't guaranteed to fire for the
+		 * failing device — leaving dead=true + INTMS masked +
+		 * CC.EN=0 would brick the controller until module reload.
+		 * reset_controller is the existing recovery path; calling it
+		 * here is the same machinery we'd use from .resume, just
+		 * earlier.  Safe w.r.t. admin_mutex (already unlocked above)
+		 * and idempotent if .resume does still fire. */
 		rc_printk(RC_WARN,
-			  "rc_nvme_pm_suspend_adapter: %s did not become idle in time (%d)\n",
+			  "rc_nvme_pm_suspend_adapter: %s did not become idle in time (%d) — restoring before returning\n",
 			  pci_name(adapter->pdev), ret);
+		(void)rc_nvme_reset_controller(adapter);
 		return ret;
 	}
 	return 0;
