@@ -36,13 +36,20 @@ For status of work already done, see [`docs/STATUS.md`](docs/STATUS.md).
       `max_hw_discard_sectors` bumped 256 KiB → 1 GiB. On 2× T700 / 3.6 TiB:
       `mkfs.xfs` discard pass 70 min → 3.0 s; `fstrim` hung → 2.4 s.
 
-- [ ] **DKMS packaging + udev autobind** — every boot the T700s
+- [x] **DKMS packaging + udev autobind** — every boot the T700s
       come up bound to `nvme`; user must manually unbind + insmod.
       Need: `dkms.conf`, post-install udev rule that unbinds
       AMD-RAID members from nvme and rebinds to rcbottom, systemd
       drop-in so the array is up before fstab is consulted.
       *Touch points:* new `dkms.conf`, new `udev/50-rcraid.rules`,
       new `systemd/rcraid-bind.service`.
+      *Resolved:* `dkms.conf` + `install-dkms.sh` register the module
+      with DKMS so it rebuilds on kernel updates. udev rule + a
+      `/usr/sbin/rcraid-bind` helper move matching members to rcbottom
+      via `driver_override` + unbind + re-probe.  A systemd service
+      wasn't needed — fstab device units wait for `/dev/rcraid0pN`
+      naturally.  Installer auto-detects array `subsystem_vendor`
+      (the vendor with ≥ 2 matching devices).
 
 - [ ] **Module signing for Secure Boot** — `insmod` fails with
       "Key was rejected by service" when SB is enabled. Ship signing

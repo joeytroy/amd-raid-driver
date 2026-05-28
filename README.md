@@ -70,8 +70,6 @@ roadmap.
 The big rocks (see `IMPLEMENTATION.MD` for the full checklist):
 
 - **RAID levels other than RAID0** — RAID1 / 10 are roadmap; RAID5 is not.
-- **No DKMS / udev autobind** — every boot, the drives come up under
-  `nvme`; you re-run the unbind + insmod sequence by hand.
 - **No Secure Boot signing** — module is unsigned; SB must be off.
 - **No suspend / resume** hooks.
 - **SATA RAID stubs** — AHCI variants (`7905 / 7916 / 7917 / 43BD`)
@@ -97,14 +95,44 @@ setup.
 - Kernel headers for the running kernel:
   `sudo apt install build-essential linux-headers-$(uname -r)`.
 
-### 1. Build
+### Easy path: DKMS install (auto-bind on every boot)
+
+If you want the array to come up automatically on every boot — no
+manual `unbind` / `insmod` dance, survives kernel updates — run:
+
+```sh
+sudo apt install dkms
+sudo ./install-dkms.sh
+```
+
+The script:
+
+1. Detects which of your `1022:b000` PCI devices are array members vs.
+   your OS drive (by `subsystem_vendor`).
+2. Stages sources to `/usr/src/rcraid-<ver>/` and runs `dkms install`
+   so the module gets rebuilt on every kernel update.
+3. Drops a udev rule at `/etc/udev/rules.d/50-rcraid.rules` that pins
+   each array member to `rcbottom` via `driver_override` and triggers
+   a re-probe.
+4. Drops `/etc/modprobe.d/rcraid.conf` with `enable_writes=1` and
+   `safe_subsys_vendor=...` so the array is read-write at boot.
+
+Reboot and `/dev/rcraid0` (plus `/dev/rcraid0pN`) should be there
+without intervention. `sudo ./uninstall-dkms.sh` reverses everything.
+
+### Manual path (dev iteration / one-off)
+
+Use this if you're iterating on the driver and don't want to reinstall
+via DKMS every time.
+
+#### 1. Build
 
 ```sh
 sudo ./build.sh
 # produces rcraid.ko
 ```
 
-### 2. Find your AMD-RAID members
+#### 2. Find your AMD-RAID members
 
 ```sh
 lspci -d 1022:b000 -k
@@ -118,7 +146,7 @@ it will also appear as `1022:b000` (the chipset shadows every NVMe). Use
 the `Subsystem:` line to identify it (Samsung vs. Crucial vs. WD etc.)
 and **do not unbind your OS drive**.
 
-### 3. Unbind RAID members from `nvme`, then load `rcraid`
+#### 3. Unbind RAID members from `nvme`, then load `rcraid`
 
 ```sh
 # For each member you want under rcraid (skip the OS drive):
@@ -137,7 +165,7 @@ you can also use `safe_subsys_vendor=0x<hex>` to make the driver refuse
 to bind anything whose subsystem vendor doesn't match the array — see
 `INSTALL.md`.
 
-### 4. Verify the array came up
+#### 4. Verify the array came up
 
 ```sh
 sudo dmesg | grep -E 'rcraid|rc_volume' | tail -20
@@ -148,7 +176,7 @@ lsblk /dev/rcraid0
 ls -l /dev/rcraid0
 ```
 
-### 5. Mount it
+#### 5. Mount it
 
 **Whole-disk filesystem** (recommended on a fresh array):
 
@@ -167,10 +195,10 @@ lsblk /dev/rcraid0
 sudo mount /dev/rcraid0pN /mnt/somewhere
 ```
 
-### 6. Unload
+#### 6. Unload
 
 ```sh
-sudo umount /mnt/rcraid0           # or kpartx -d /dev/rcraid0 first
+sudo umount /mnt/rcraid0
 sudo rmmod rcraid
 ```
 
@@ -180,9 +208,8 @@ or reboot.
 
 ### Caveats today (read this once)
 
-- **Every reboot**: drives come up bound to `nvme`. You have to repeat
-  step 3. A persistent udev/systemd setup is on the roadmap
-  (see `IMPLEMENTATION.MD`).
+- **Manual path requires re-running step 3 every reboot.** The DKMS
+  install above handles this automatically.
 - **Secure Boot**: must be disabled, or the module signed and the cert
   enrolled in MOK. Tracked in `IMPLEMENTATION.MD`.
 

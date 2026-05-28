@@ -1,0 +1,36 @@
+#!/bin/sh
+# rcraid-bind <pci-bdf>
+#
+# Hand a single AMD-RAID Bottom PCI device to the rcbottom driver.
+# Invoked by udev (see /etc/udev/rules.d/50-rcraid.rules) when the kernel
+# discovers a matching device — typically very early in boot, after nvme has
+# already grabbed the namespace.
+#
+# Steps:
+#   1. Pin the device to rcbottom via driver_override so nothing else can
+#      reclaim it (including any later nvme re-probe).
+#   2. If currently bound to nvme, release it.
+#   3. Re-trigger probe so rcbottom binds.  If rcraid isn't loaded yet the
+#      probe is a no-op; modprobe rcraid is the next step and will bind then.
+#   4. Make sure the module is requested.  modprobe is idempotent — does
+#      nothing if it's already loaded.
+#
+# Designed to be safe to run multiple times for the same device.
+
+set -e
+
+dev="$1"
+[ -n "$dev" ]                              || exit 0
+[ -e "/sys/bus/pci/devices/$dev" ]         || exit 0
+
+if [ -e "/sys/bus/pci/devices/$dev/driver_override" ]; then
+    echo rcbottom > "/sys/bus/pci/devices/$dev/driver_override"
+fi
+
+if [ -e "/sys/bus/pci/drivers/nvme/$dev" ]; then
+    echo "$dev" > /sys/bus/pci/drivers/nvme/unbind 2>/dev/null || true
+fi
+
+echo "$dev" > /sys/bus/pci/drivers_probe 2>/dev/null || true
+
+modprobe rcraid 2>/dev/null || true
