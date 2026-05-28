@@ -24,13 +24,17 @@ For status of work already done, see [`docs/STATUS.md`](docs/STATUS.md).
       modular arithmetic with no end-of-disk casework, and partscan
       round-trips a 2-partition GPT (validated on hardware).
 
-- [ ] **Fast discard / TRIM** — `mkfs.xfs` discard hangs (~70 min for
+- [x] **Fast discard / TRIM** — `mkfs.xfs` discard hangs (~70 min for
       3.6 TB), `fstrim` hangs. Current path likely issues one DSM
       per stripe instead of forwarding the bio's whole discard range
       to each member as one DSM. Add a multi-member discard dispatch
       analogous to `rc_volume_dispatch_multi_stripe` for writes.
       *Touch points:* `rc_volume_queue_rq` (REQ_OP_DISCARD branch),
       new `rc_volume_dispatch_multi_stripe_discard`.
+      *Resolved:* multi-stripe discard fans one DSM per AFFECTED MEMBER
+      (each member's owned stripes form one contiguous phys extent), and
+      `max_hw_discard_sectors` bumped 256 KiB → 1 GiB. On 2× T700 / 3.6 TiB:
+      `mkfs.xfs` discard pass 70 min → 3.0 s; `fstrim` hung → 2.4 s.
 
 - [ ] **DKMS packaging + udev autobind** — every boot the T700s
       come up bound to `nvme`; user must manually unbind + insmod.

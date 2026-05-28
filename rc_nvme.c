@@ -2296,6 +2296,97 @@ static blk_status_t rc_volume_dispatch_multi_stripe(
 	return BLK_STS_OK;
 }
 
+/* Dispatch a DISCARD that spans multiple RAID0 stripes.
+ *
+ * The key observation: on RAID0, the stripes owned by member m within a
+ * logical range form ONE contiguous physical extent on m's drive.  So a
+ * multi-stripe discard becomes exactly nm one-range DSM Deallocates — never
+ * one DSM per stripe.  This is what cuts a `mkfs.xfs` discard pass from
+ * ~70 minutes (one DSM per 256 KiB stripe × 14.9M stripes) to seconds (one
+ * DSM per ~1 GiB chunk × ~3600 chunks × nm members).
+ *
+ * Per-member math is O(1) — no stripe-by-stripe walk.  For each member m we
+ * compute the first and last stripes it owns inside [start_stripe, end_stripe]
+ * and from those derive a single (slba, nlb) pair.  Partial-stripe coverage
+ * at the discard's start/end is folded into start_off / end_off.
+ */
+static blk_status_t rc_volume_dispatch_multi_stripe_discard(
+		struct blk_mq_hw_ctx *hctx, struct request *req,
+		struct rc_volume_pdu *pdu, sector_t pos, u32 nr_sectors)
+{
+	const u32 stripe = rc_volume_stripe_sectors;
+	const int nm = rc_volume_member_count;
+	const u64 start_stripe = pos / stripe;
+	const u64 end_lba = pos + (u64)nr_sectors - 1;
+	const u64 end_stripe = end_lba / stripe;
+	const u32 start_off_global = (u32)(pos - start_stripe * stripe);
+	const u32 end_off_global   = (u32)(end_lba - end_stripe * stripe);
+	u64 member_start_lba[RC_VOLUME_MAX_MEMBERS] = {0};
+	u32 member_sectors[RC_VOLUME_MAX_MEMBERS] = {0};
+	bool member_has_data[RC_VOLUME_MAX_MEMBERS] = {0};
+	int members_with_data = 0;
+	u32 tag = req->tag;
+	int m;
+
+	if (nm <= 0 || nm > RC_VOLUME_MAX_MEMBERS || !stripe)
+		return BLK_STS_IOERR;
+
+	for (m = 0; m < nm; m++) {
+		u32 start_stripe_owner = (u32)(start_stripe % (u32)nm);
+		u32 rel = ((u32)m + (u32)nm - start_stripe_owner) % (u32)nm;
+		u64 first_owned = start_stripe + rel;
+		u64 last_owned;
+		u32 count;
+		u32 m_start_off, m_end_off;
+		u64 first_phys_stripe, last_phys_stripe;
+
+		if (first_owned > end_stripe)
+			continue;
+
+		count = (u32)((end_stripe - first_owned) / (u32)nm) + 1;
+		last_owned = first_owned + (u64)(count - 1) * (u32)nm;
+
+		m_start_off = (first_owned == start_stripe) ? start_off_global : 0;
+		m_end_off   = (last_owned  == end_stripe)   ? end_off_global   : (stripe - 1);
+
+		first_phys_stripe = first_owned / (u32)nm;
+		last_phys_stripe  = last_owned  / (u32)nm;
+
+		member_start_lba[m] = first_phys_stripe * stripe + m_start_off +
+				      rc_volume_member_phys_offset[m];
+		member_sectors[m]   = (u32)((last_phys_stripe - first_phys_stripe) * stripe
+					    + m_end_off - m_start_off + 1);
+		member_has_data[m]  = true;
+		members_with_data++;
+	}
+
+	if (members_with_data == 0)
+		return BLK_STS_IOERR;
+
+	/* Discard has no DMA mapping — pdu->nents and pdu->ms_active stay zero
+	 * from queue_rq's memset, so rc_volume_unmap_request_sg no-ops on
+	 * completion.  Use member_idx=-1 + members_pending=N so the ISR's
+	 * atomic_dec_and_test completes only on the last member's DSM. */
+	pdu->member_idx = -1;
+	atomic_set(&pdu->members_pending, members_with_data);
+
+	blk_mq_start_request(req);
+	for (m = 0; m < nm; m++) {
+		struct rc_nvme_sqe cmd;
+
+		if (!member_has_data[m])
+			continue;
+
+		rc_volume_build_discard_sqe(&cmd, m, tag,
+					    member_start_lba[m],
+					    member_sectors[m]);
+		rc_nvme_io_submit(rc_volume_members[m]->ctx.nvme.io_queues[hctx->queue_num],
+				  &cmd);
+	}
+
+	return BLK_STS_OK;
+}
+
 static blk_status_t rc_volume_queue_rq(struct blk_mq_hw_ctx *hctx,
 				       const struct blk_mq_queue_data *bd)
 {
@@ -2389,6 +2480,27 @@ static blk_status_t rc_volume_queue_rq(struct blk_mq_hw_ctx *hctx,
 			 * have to start the request before ending it —
 			 * blk-mq requires every request to be started exactly
 			 * once between queue_rq and end. */
+			blk_mq_start_request(req);
+			rc_cache_dec_inflight(pdu);
+			blk_mq_end_request(req, st);
+		}
+		return BLK_STS_OK;
+	}
+
+	/* Multi-stripe DISCARD: one DSM per AFFECTED MEMBER (not per stripe).
+	 * Each member's owned stripes form a single contiguous phys extent on
+	 * its drive, so the fanout is bounded at nm regardless of how many
+	 * stripes the request covers.  Lets us advertise a much larger
+	 * max_hw_discard_sectors and turn mkfs.xfs / fstrim into a
+	 * seconds-scale operation. */
+	if (op == REQ_OP_DISCARD &&
+	    rc_volume_stripe_sectors &&
+	    nr_sectors > 0 &&
+	    (pos / rc_volume_stripe_sectors) !=
+		((pos + nr_sectors - 1) / rc_volume_stripe_sectors)) {
+		blk_status_t st = rc_volume_dispatch_multi_stripe_discard(
+				hctx, req, pdu, pos, nr_sectors);
+		if (st != BLK_STS_OK) {
 			blk_mq_start_request(req);
 			rc_cache_dec_inflight(pdu);
 			blk_mq_end_request(req, st);
@@ -3716,10 +3828,14 @@ static int rc_volume_create_disk(void)
 			 * write cache and that we honour FUA — filesystems will
 			 * now route REQ_OP_FLUSH and REQ_FUA writes through. */
 			.features            = BLK_FEAT_WRITE_CACHE | BLK_FEAT_FUA,
-			/* DISCARD via NVMe DSM Deallocate.  Each discard request
-			 * is bounded by chunk_sectors (one stripe = one member's
-			 * range), and we issue exactly one DSM range per command. */
-			.max_hw_discard_sectors  = rc_volume_stripe_sectors,
+			/* DISCARD via NVMe DSM Deallocate.  rc_volume_queue_rq
+			 * fans a single multi-stripe discard out as one DSM per
+			 * AFFECTED MEMBER (see rc_volume_dispatch_multi_stripe_discard),
+			 * so we can take requests far larger than one stripe.
+			 * 1 GiB = 2^21 sectors keeps the per-request kernel work
+			 * trivial while collapsing fstrim's ~14.9M-stripe sweep
+			 * into thousands of commands instead of millions. */
+			.max_hw_discard_sectors  = 1U << 21,
 			.discard_granularity     = 512,
 			.max_discard_segments    = 1,
 		};
