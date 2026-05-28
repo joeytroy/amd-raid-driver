@@ -738,6 +738,8 @@ int          rc_install_callbacks(struct rc_adapter *adapter, bool fast_path);
 int          rc_nvme_init_controller(struct rc_adapter *adapter);
 void         rc_nvme_cleanup_controller(struct rc_adapter *adapter);
 int          rc_nvme_reset_controller(struct rc_adapter *adapter);
+int          rc_nvme_pm_suspend_adapter(struct rc_adapter *adapter);
+int          rc_nvme_pm_resume_adapter(struct rc_adapter *adapter);
 irqreturn_t  rc_nvme_irq(struct rc_adapter *adapter);
 irqreturn_t  rc_nvme_admin_irq(int irq, void *dev_id);
 irqreturn_t  rc_nvme_io_queue_irq(int irq, void *dev_id);

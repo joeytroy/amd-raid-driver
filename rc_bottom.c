@@ -452,11 +452,58 @@ static void rc_bottom_remove(struct pci_dev *pdev)
     kfree(adapter);
 }
 
+/*----------------------------------------------------------------------
+ * Power management (S3 suspend-to-RAM and S4 hibernate).
+ *
+ * For every member the PCI core calls our .suspend with the system going
+ * down and .resume on the way back up.  We delegate to the NVMe layer to
+ * disable / re-enable the controller; the PCI core handles config-space
+ * save/restore and the D-state transition around us.
+ *
+ * The SIMPLE_DEV_PM_OPS macro maps both .suspend and .freeze (S4 snapshot
+ * phase) to our suspend handler, and .resume / .thaw / .restore to our
+ * resume handler — so the same pair covers both S3 and S4.
+ *
+ * AHCI / stub members are no-op (NVMe is the only path with real I/O).
+ *----------------------------------------------------------------------*/
+/* Why the NVMe-only gate: the AHCI variants (0x43BD, 0x7905, 0x7916, 0x7917)
+ * are claimed by this driver but their I/O path is a stub today.  They have
+ * an MMIO BAR but it points at AHCI registers, not NVMe ones.  Running
+ * rc_nvme_pm_* would write to RC_NVME_REG_INTMS / RC_NVME_REG_CC offsets
+ * inside the AHCI register window — scribbling random bytes into HBA state.
+ * Returning 0 here is the right no-op until those code paths exist. */
+static int rc_bottom_pm_suspend(struct device *dev)
+{
+    struct pci_dev *pdev = to_pci_dev(dev);
+    struct rc_adapter *adapter = pci_get_drvdata(pdev);
+
+    if (!adapter || adapter->ctx.ctrl_mode != RC_CTRL_MODE_NVME)
+        return 0;
+
+    return rc_nvme_pm_suspend_adapter(adapter);
+}
+
+static int rc_bottom_pm_resume(struct device *dev)
+{
+    struct pci_dev *pdev = to_pci_dev(dev);
+    struct rc_adapter *adapter = pci_get_drvdata(pdev);
+
+    if (!adapter || adapter->ctx.ctrl_mode != RC_CTRL_MODE_NVME)
+        return 0;
+
+    return rc_nvme_pm_resume_adapter(adapter);
+}
+
+static SIMPLE_DEV_PM_OPS(rc_bottom_pm_ops,
+                          rc_bottom_pm_suspend,
+                          rc_bottom_pm_resume);
+
 static struct pci_driver rc_bottom_driver = {
     .name = "rcbottom",
     .id_table = rc_bottom_pci_tbl,
     .probe = rc_bottom_probe,
     .remove = rc_bottom_remove,
+    .driver.pm = &rc_bottom_pm_ops,
 };
 
 int rc_bottom_init(void)

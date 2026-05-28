@@ -71,7 +71,6 @@ The big rocks (see `IMPLEMENTATION.MD` for the full checklist):
 
 - **RAID levels other than RAID0** — RAID1 / 10 are roadmap; RAID5 is not.
 - **No Secure Boot signing** — module is unsigned; SB must be off.
-- **No suspend / resume** hooks.
 - **SATA RAID stubs** — AHCI variants (`7905 / 7916 / 7917 / 43BD`)
   are claimed but not implemented.
 - **No `rcadm`-equivalent** — array must be pre-created in BIOS.
