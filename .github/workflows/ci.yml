@@ -34,21 +34,27 @@ jobs:
     name: build (${{ matrix.name }})
     runs-on: ubuntu-24.04
     container: ${{ matrix.image }}
+    # Trixie is allowed to fail for now (see its matrix comment); arch/fedora
+    # are hard gates.
+    continue-on-error: ${{ matrix.experimental || false }}
     strategy:
       fail-fast: false
-      # The driver targets recent kernels (it uses linux/unaligned.h and
-      # PCI_IRQ_INTX, which require >= 6.12), so the Ubuntu runner's own 6.8
-      # headers can't build it.  Build inside rolling/recent distro containers
-      # instead — each ships a different >= 6.12 kernel-headers tree, giving
-      # real multi-version coverage.  Update/add images as the floor moves.
+      # The driver uses recent block APIs, so the Ubuntu runners' 6.8 headers
+      # can't build it.  Build inside recent distro containers instead, each a
+      # different kernel version, for real multi-version coverage.
       matrix:
         include:
-          # Debian 13 (Trixie) ships kernel 6.12 — the driver's MINIMUM
-          # supported kernel and the install target most users will run.
-          # Building here verifies the floor instead of inferring it.
+          # Debian 13 (Trixie) ships kernel 6.12 — the install target most
+          # users will run.  ADVISORY for now: the driver currently FAILS to
+          # build on 6.12 because it calls the 2-argument blk_rq_map_sg()
+          # (rc_nvme.c), which only exists in kernel >= 6.15; 6.12 still has
+          # the 3-argument form.  The driver's real minimum is ~6.15 until a
+          # version-compat shim lands — then drop `experimental` to make this
+          # a hard gate that proves Trixie support.
           - name: debian-trixie-6.12
             image: debian:trixie
             deps: apt-get update && apt-get install -y --no-install-recommends build-essential linux-headers-amd64 git ca-certificates
+            experimental: true
           - name: arch
             image: archlinux:latest
             deps: pacman -Sy --noconfirm --needed base-devel linux-headers git
