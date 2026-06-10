@@ -43,6 +43,12 @@ jobs:
       # real multi-version coverage.  Update/add images as the floor moves.
       matrix:
         include:
+          # Debian 13 (Trixie) ships kernel 6.12 — the driver's MINIMUM
+          # supported kernel and the install target most users will run.
+          # Building here verifies the floor instead of inferring it.
+          - name: debian-trixie-6.12
+            image: debian:trixie
+            deps: apt-get update && apt-get install -y --no-install-recommends build-essential linux-headers-amd64 git
           - name: arch
             image: archlinux:latest
             deps: pacman -Sy --noconfirm --needed base-devel linux-headers git
@@ -58,12 +64,20 @@ jobs:
 
       - name: Locate kernel build tree
         run: |
-          # Arch: /usr/lib/modules/<ver>/build ; Fedora: /usr/src/kernels/<ver>
-          KDIR=$(ls -d /usr/lib/modules/*/build 2>/dev/null | sort -V | tail -1)
-          [ -d "$KDIR" ] || KDIR=$(ls -d /usr/src/kernels/* 2>/dev/null | sort -V | tail -1)
+          # Arch:   /usr/lib/modules/<ver>/build
+          # Debian: /lib/modules/<ver>/build  ->  /usr/src/linux-headers-<ver>-amd64
+          # Fedora: /usr/src/kernels/<ver>
+          KDIR=""
+          for cand in \
+            "$(ls -d /usr/lib/modules/*/build 2>/dev/null | sort -V | tail -1)" \
+            "$(ls -d /lib/modules/*/build      2>/dev/null | sort -V | tail -1)" \
+            "$(ls -d /usr/src/linux-headers-*-amd64 2>/dev/null | sort -V | tail -1)" \
+            "$(ls -d /usr/src/kernels/*        2>/dev/null | sort -V | tail -1)"; do
+            if [ -d "$cand" ]; then KDIR="$cand"; break; fi
+          done
           test -d "$KDIR" || { echo "no kernel build tree found" >&2; exit 1; }
           echo "KDIR=$KDIR" >> "$GITHUB_ENV"
-          echo "Building against: $KDIR ($(basename "$(dirname "$KDIR")" 2>/dev/null || basename "$KDIR"))"
+          echo "Building against: $KDIR"
 
       - name: Build (capture log)
         run: |
