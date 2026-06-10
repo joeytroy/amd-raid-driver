@@ -59,18 +59,22 @@ jobs:
           make KERNELDIR="$KDIR" 2>&1 | tee build.log
           test -f rcraid.ko || { echo "rcraid.ko not produced" >&2; exit 1; }
 
-      - name: Fail on compiler warnings
+      - name: Fail on compiler warnings (driver sources)
         run: |
-          # Real source warnings look like "file.c:NN:CC: warning: ...".
-          # The kbuild "compiler differs from the one used to build the
-          # kernel" and BTF/"Skipping BTF generation" notes are environmental,
-          # not code defects — exclude them.
+          # Judge only OUR sources (rc_*.c / rc_*.h), not the kernel headers:
+          # the Makefile's -Wextra makes kernel inline headers emit a flood of
+          # -Wunused-parameter we don't control.  Also ignore -Wunused-parameter
+          # in our own files — the kernel disables it tree-wide because
+          # callback/stub signatures legitimately carry unused params.  Any
+          # OTHER warning in our code (unused-variable, uninitialized, format,
+          # sign-compare, …) still fails the build.
           if grep -E ': warning:' build.log \
-               | grep -vE 'compiler differs|Skipping BTF|same the next time'; then
-            echo "::error::compiler warnings present — see above"
+               | grep -E '(^|/)rc_[a-z0-9_]+\.[ch]:' \
+               | grep -v '\[-Wunused-parameter\]'; then
+            echo "::error::compiler warnings in driver sources — see above"
             exit 1
           fi
-          echo "Build is warning-clean."
+          echo "Driver sources are warning-clean (ignoring kernel-disabled -Wunused-parameter)."
 
   # ---------------------------------------------------------------------------
   # SPDX license tag — every driver source must declare GPL-2.0-only on line 1.
