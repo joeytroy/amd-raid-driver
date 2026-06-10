@@ -48,7 +48,7 @@ jobs:
           # Building here verifies the floor instead of inferring it.
           - name: debian-trixie-6.12
             image: debian:trixie
-            deps: apt-get update && apt-get install -y --no-install-recommends build-essential linux-headers-amd64 git
+            deps: apt-get update && apt-get install -y --no-install-recommends build-essential linux-headers-amd64 git ca-certificates
           - name: arch
             image: archlinux:latest
             deps: pacman -Sy --noconfirm --needed base-devel linux-headers git
