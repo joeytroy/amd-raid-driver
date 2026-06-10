@@ -1,0 +1,148 @@
+# SPDX-License-Identifier: GPL-2.0-only
+#
+# CI gates for the rcraid out-of-tree kernel module.
+#
+# Blocking gates (a failure fails the check / blocks merge):
+#   * build      — compiles against multiple kernel versions
+#   * warnings   — the build must be warning-clean
+#   * spdx       — every C/H source carries an SPDX GPL-2.0-only tag
+#   * whitespace — no trailing whitespace / no conflict markers in the diff
+#
+# Advisory gate (reported, does NOT block — see checkpatch job comment):
+#   * checkpatch — kernel coding-style on the PR diff
+#
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+permissions:
+  contents: read
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Build the module against more than one kernel.  Using two runner images
+  # gives two distinct, reliably-available kernel header sets (so we catch
+  # in-kernel API drift that breaks out-of-tree modules) without pinning
+  # fragile exact patch versions.  Add versions here as the support matrix
+  # grows.
+  # ---------------------------------------------------------------------------
+  build:
+    name: build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ ubuntu-22.04, ubuntu-24.04 ]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build deps + kernel headers
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential linux-headers-generic
+          # Build against the newest generic headers package installed —
+          # the running runner kernel isn't relevant (we only compile, never
+          # load), so any matching headers tree works.
+          KDIR=$(ls -d /usr/src/linux-headers-*-generic 2>/dev/null | sort -V | tail -1)
+          test -n "$KDIR" || { echo "no kernel headers found" >&2; exit 1; }
+          echo "KDIR=$KDIR" >> "$GITHUB_ENV"
+          echo "Building against: $KDIR"
+
+      - name: Build (capture log)
+        run: |
+          set -o pipefail
+          make KERNELDIR="$KDIR" 2>&1 | tee build.log
+          test -f rcraid.ko || { echo "rcraid.ko not produced" >&2; exit 1; }
+
+      - name: Fail on compiler warnings
+        run: |
+          # Real source warnings look like "file.c:NN:CC: warning: ...".
+          # The kbuild "compiler differs from the one used to build the
+          # kernel" and BTF/"Skipping BTF generation" notes are environmental,
+          # not code defects — exclude them.
+          if grep -E ': warning:' build.log \
+               | grep -vE 'compiler differs|Skipping BTF|same the next time'; then
+            echo "::error::compiler warnings present — see above"
+            exit 1
+          fi
+          echo "Build is warning-clean."
+
+  # ---------------------------------------------------------------------------
+  # SPDX license tag — every driver source must declare GPL-2.0-only on line 1.
+  # ---------------------------------------------------------------------------
+  spdx:
+    name: spdx-license
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check SPDX headers
+        run: |
+          rc=0
+          for f in rc_*.c rc_*.h; do
+            if ! head -1 "$f" | grep -q 'SPDX-License-Identifier: GPL-2.0-only'; then
+              echo "::error file=$f::missing 'SPDX-License-Identifier: GPL-2.0-only' on line 1"
+              rc=1
+            fi
+          done
+          [ "$rc" -eq 0 ] && echo "All sources carry the SPDX GPL-2.0-only tag."
+          exit $rc
+
+  # ---------------------------------------------------------------------------
+  # Whitespace / conflict-marker hygiene on the changed lines.
+  # ---------------------------------------------------------------------------
+  whitespace:
+    name: whitespace
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: git diff --check
+        run: |
+          BASE="${{ github.event.pull_request.base.sha }}"
+          if [ -z "$BASE" ]; then BASE="$(git rev-parse HEAD~1 2>/dev/null || git rev-parse HEAD)"; fi
+          echo "Checking $BASE..HEAD for trailing whitespace + conflict markers"
+          # Exclude generated reverse-engineering dumps and vendor binaries —
+          # those are reference artifacts, not source we author.
+          git diff --check "$BASE" HEAD -- \
+            ':(exclude)docs/ghidra_output/**' \
+            ':(exclude)drivers/windows/**'
+
+  # ---------------------------------------------------------------------------
+  # checkpatch — ADVISORY for now (continue-on-error).  Five source files
+  # currently use 4-space indentation instead of kernel tabs, so a strict
+  # blocking checkpatch would fail until the tree is normalized.  Once the
+  # tree is converted to tab indentation, remove `continue-on-error: true`
+  # below to make new style violations block merges.
+  # ---------------------------------------------------------------------------
+  checkpatch:
+    name: checkpatch (advisory)
+    runs-on: ubuntu-24.04
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Fetch checkpatch.pl
+        run: |
+          base=https://raw.githubusercontent.com/torvalds/linux/master/scripts
+          mkdir -p scripts-cp
+          for f in checkpatch.pl const_structs.checkpatch spelling.txt; do
+            curl -fsSL "$base/$f" -o "scripts-cp/$f" || true
+          done
+          chmod +x scripts-cp/checkpatch.pl
+      - name: Run checkpatch on the diff
+        run: |
+          BASE="${{ github.event.pull_request.base.sha }}"
+          if [ -z "$BASE" ]; then BASE="$(git rev-parse HEAD~1 2>/dev/null || git rev-parse HEAD)"; fi
+          # Only lint the driver sources we author, not generated RE dumps.
+          git diff "$BASE" HEAD -- 'rc_*.c' 'rc_*.h' 'Makefile' > pr.diff
+          if [ ! -s pr.diff ]; then echo "No source changes to check."; exit 0; fi
+          perl scripts-cp/checkpatch.pl --no-tree --no-signoff \
+            --ignore FILE_PATH_CHANGES \
+            pr.diff || true
