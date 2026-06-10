@@ -31,27 +31,39 @@ jobs:
   # grows.
   # ---------------------------------------------------------------------------
   build:
-    name: build (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
+    name: build (${{ matrix.name }})
+    runs-on: ubuntu-24.04
+    container: ${{ matrix.image }}
     strategy:
       fail-fast: false
+      # The driver targets recent kernels (it uses linux/unaligned.h and
+      # PCI_IRQ_INTX, which require >= 6.12), so the Ubuntu runner's own 6.8
+      # headers can't build it.  Build inside rolling/recent distro containers
+      # instead — each ships a different >= 6.12 kernel-headers tree, giving
+      # real multi-version coverage.  Update/add images as the floor moves.
       matrix:
-        os: [ ubuntu-22.04, ubuntu-24.04 ]
+        include:
+          - name: arch
+            image: archlinux:latest
+            deps: pacman -Sy --noconfirm --needed base-devel linux-headers git
+          - name: fedora
+            image: fedora:latest
+            deps: dnf -y install kernel-devel gcc make git findutils diffutils
     steps:
+      # git must exist before actions/checkout runs.
+      - name: Install toolchain + kernel headers
+        run: ${{ matrix.deps }}
+
       - uses: actions/checkout@v4
 
-      - name: Install build deps + kernel headers
+      - name: Locate kernel build tree
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            build-essential linux-headers-generic
-          # Build against the newest generic headers package installed —
-          # the running runner kernel isn't relevant (we only compile, never
-          # load), so any matching headers tree works.
-          KDIR=$(ls -d /usr/src/linux-headers-*-generic 2>/dev/null | sort -V | tail -1)
-          test -n "$KDIR" || { echo "no kernel headers found" >&2; exit 1; }
+          # Arch: /usr/lib/modules/<ver>/build ; Fedora: /usr/src/kernels/<ver>
+          KDIR=$(ls -d /usr/lib/modules/*/build 2>/dev/null | sort -V | tail -1)
+          [ -d "$KDIR" ] || KDIR=$(ls -d /usr/src/kernels/* 2>/dev/null | sort -V | tail -1)
+          test -d "$KDIR" || { echo "no kernel build tree found" >&2; exit 1; }
           echo "KDIR=$KDIR" >> "$GITHUB_ENV"
-          echo "Building against: $KDIR"
+          echo "Building against: $KDIR ($(basename "$(dirname "$KDIR")" 2>/dev/null || basename "$KDIR"))"
 
       - name: Build (capture log)
         run: |
