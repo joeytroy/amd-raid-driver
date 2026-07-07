@@ -71,6 +71,14 @@ jobs:
             `gh pr comment`) saying what you reviewed and that it looks
             clean — a silent pass is indistinguishable from a review
             that never ran.
+          # claude-code-action runs Claude in an automation sandbox that
+          # denies side-effecting tools by default.  Without this allowlist
+          # the reviewer completes its analysis but every attempt to publish
+          # is blocked (permission_denials in the run log, "No buffered inline
+          # comments"), so the review is invisible.  Allow exactly the tools
+          # it needs to post: gh pr comment/view/diff and the inline-comment
+          # MCP tool.
           claude_args: |
             --model claude-sonnet-5
             --max-turns 40
+            --allowedTools "Bash(gh pr comment:*),Bash(gh pr view:*),Bash(gh pr diff:*),mcp__github_inline_comment__create_inline_comment"
