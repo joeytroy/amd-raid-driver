@@ -482,13 +482,18 @@ if [ -z "${ESP_DEV:-}" ] || [ ! -d "$ESP_MNT/EFI" ]; then
     echo "    If the box won't boot, confirm the installer created an EFI"
     echo "    System Partition on /dev/rcraid0 and populated \\EFI."
 else
-    # 1) Removable-media fallback loader.
+    # 1) Removable-media fallback loader.  Discover the vendor shim/grub, but
+    #    skip any candidate inside one of our own EFI/BOOT.rcraid-{orig,bak}
+    #    backup dirs from a previous run — those sort before real vendor dirs
+    #    (e.g. fedora/) under the EFI/*/ glob and would otherwise be picked as
+    #    the loader to install.
     boot_src=""
     for cand in \
         "$ESP_MNT/EFI/ubuntu/shimx64.efi" \
         "$ESP_MNT/EFI/ubuntu/grubx64.efi" \
         "$ESP_MNT"/EFI/*/shimx64.efi \
         "$ESP_MNT"/EFI/*/grubx64.efi; do
+        case "$cand" in *"/BOOT.rcraid-"*) continue ;; esac
         [ -f "$cand" ] && { boot_src="$cand"; break; }
     done
     if [ -n "$boot_src" ]; then
