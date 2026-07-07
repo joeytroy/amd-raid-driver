@@ -493,24 +493,37 @@ else
     done
     if [ -n "$boot_src" ]; then
         vendor_dir=$(dirname "$boot_src")
-        mkdir -p "$ESP_MNT/EFI/BOOT"
+        BOOT_DIR="$ESP_MNT/EFI/BOOT"
+        mkdir -p "$BOOT_DIR"
         # \EFI\BOOT\BOOTX64.EFI is the firmware-wide removable-media fallback
         # and may already belong to another OS on a shared ESP (e.g. Windows'
-        # own fallback loader on a dual-boot box).  Preserve whatever is there
-        # before we overwrite it, so it can be restored.  Guard on the backup
-        # not already existing so re-runs keep the true original, not our copy.
-        if [ -f "$ESP_MNT/EFI/BOOT/BOOTX64.EFI" ] && \
-           [ ! -e "$ESP_MNT/EFI/BOOT/BOOTX64.EFI.rcraid-orig" ]; then
-            cp -f "$ESP_MNT/EFI/BOOT/BOOTX64.EFI" \
-                  "$ESP_MNT/EFI/BOOT/BOOTX64.EFI.rcraid-orig"
-            echo "    preserved existing BOOTX64.EFI -> BOOTX64.EFI.rcraid-orig"
+        # own fallback loader on a dual-boot box).  Preserve a genuinely
+        # pre-existing loader once, so it can be restored.
+        #
+        # The idempotency key is the .rcraid-managed sentinel we drop below,
+        # NOT "does .rcraid-orig exist yet".  Keying on the backup would break
+        # the reinstall / multi-distro-on-the-array workflow this installer is
+        # built for: a second run would find our OWN prior shim at BOOTX64.EFI
+        # and preserve it as "the original", masking (and permanently losing) a
+        # real foreign loader that predated the first run.  The sentinel marks
+        # the slot as ours, so only a BOOTX64.EFI that predates ANY run of this
+        # script is ever backed up.
+        if [ -f "$BOOT_DIR/BOOTX64.EFI" ] && [ ! -e "$BOOT_DIR/.rcraid-managed" ]; then
+            cp -f "$BOOT_DIR/BOOTX64.EFI" "$BOOT_DIR/BOOTX64.EFI.rcraid-orig"
+            echo "    preserved pre-rcraid BOOTX64.EFI -> BOOTX64.EFI.rcraid-orig"
         fi
         # Copy the whole loader chain (shim + grub + MOK manager) so that
         # shim, once running as BOOTX64.EFI, still finds grubx64.efi beside
         # it.  Ubuntu's grub has an embedded prefix pointing at \EFI\ubuntu,
         # so it reads its real config from there regardless of where it ran.
-        cp -f "$vendor_dir"/*.efi "$ESP_MNT/EFI/BOOT/" 2>/dev/null || true
-        cp -f "$boot_src" "$ESP_MNT/EFI/BOOT/BOOTX64.EFI"
+        cp -f "$vendor_dir"/*.efi "$BOOT_DIR/" 2>/dev/null || true
+        cp -f "$boot_src" "$BOOT_DIR/BOOTX64.EFI"
+        # Mark the slot as rcraid-managed so future runs don't mistake our own
+        # shim for a foreign original.
+        printf '%s\n' \
+            "BOOTX64.EFI in this directory is installed by rcraid install-livecd.sh." \
+            "If BOOTX64.EFI.rcraid-orig exists, it is the pre-rcraid fallback loader." \
+            > "$BOOT_DIR/.rcraid-managed"
         echo "    fallback loader installed: EFI/BOOT/BOOTX64.EFI ($(basename "$boot_src"))"
     else
         echo "    WARN: no shim/grub .efi under $ESP_MNT/EFI — install may be incomplete" >&2
