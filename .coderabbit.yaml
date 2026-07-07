@@ -1,0 +1,8 @@
+# Disable CodeRabbit automatic PR reviews.  The CI gates in
+# .github/workflows/ci.yml (build, warnings, SPDX, whitespace, checkpatch)
+# are the review bar for this repo.
+reviews:
+  auto_review:
+    enabled: false
+chat:
+  auto_reply: false
