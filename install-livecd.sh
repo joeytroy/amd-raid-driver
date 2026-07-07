@@ -507,27 +507,47 @@ else
 
     # 2) Best-effort labelled NVRAM entry.
     if [ -d /sys/firmware/efi/efivars ] && command -v efibootmgr >/dev/null 2>&1; then
-        esp_partnum="${ESP_DEV##*p}"
+        # Derive BOTH the disk and the partition number from the ESP device
+        # itself.  $ESP_DEV comes from the target's fstab /boot/efi entry, which
+        # is not guaranteed to live on /dev/rcraid0 — so hardcoding -d
+        # /dev/rcraid0 could point efibootmgr at the wrong disk.  lsblk
+        # PKNAME/PARTN handle any naming scheme; fall back to parsing the
+        # rcraid `pN` suffix if those columns are unavailable (older lsblk).
+        esp_disk="" esp_partnum=""
+        if pk=$(lsblk -nro PKNAME "$ESP_DEV" 2>/dev/null | awk 'NF{print; exit}'); then
+            [ -n "$pk" ] && esp_disk="/dev/$pk"
+        fi
+        if pn=$(lsblk -nro PARTN "$ESP_DEV" 2>/dev/null | awk 'NF{print; exit}'); then
+            esp_partnum="$pn"
+        fi
+        if [ -z "$esp_disk" ] || [ -z "$esp_partnum" ]; then
+            case "$ESP_DEV" in
+                *p[0-9]*) esp_disk="${ESP_DEV%p*}"; esp_partnum="${ESP_DEV##*p}" ;;
+            esac
+        fi
         [[ "$esp_partnum" =~ ^[0-9]+$ ]] || esp_partnum=""
+
         if [ -f "$ESP_MNT/EFI/ubuntu/shimx64.efi" ]; then
             loader='\EFI\ubuntu\shimx64.efi'
         else
             loader='\EFI\BOOT\BOOTX64.EFI'
         fi
-        if [ -n "$esp_partnum" ]; then
+        if [ -n "$esp_disk" ] && [ -b "$esp_disk" ] && [ -n "$esp_partnum" ]; then
             # Drop our own stale duplicates from earlier runs so re-running
             # doesn't pile up identical entries.
             while read -r bootnum; do
                 [ -n "$bootnum" ] && efibootmgr -b "$bootnum" -B >/dev/null 2>&1 || true
             done < <(efibootmgr 2>/dev/null | sed -n 's/^Boot\([0-9A-Fa-f]\{4\}\).* rcraid (Kubuntu)$/\1/p')
-            if efibootmgr -c -d /dev/rcraid0 -p "$esp_partnum" \
+            if efibootmgr -c -d "$esp_disk" -p "$esp_partnum" \
                  -L "rcraid (Kubuntu)" -l "$loader" >/dev/null 2>&1; then
-                echo "    NVRAM entry created: 'rcraid (Kubuntu)' -> $loader"
+                echo "    NVRAM entry created: 'rcraid (Kubuntu)' -> $esp_disk p$esp_partnum $loader"
             else
-                echo "    efibootmgr wouldn't write an NVRAM entry (array device path"
-                echo "    not resolvable from the RAID node) — the BOOTX64.EFI fallback"
-                echo "    above will still boot the array."
+                echo "    efibootmgr wouldn't write an NVRAM entry (device path not"
+                echo "    resolvable) — the BOOTX64.EFI fallback above will still boot."
             fi
+        else
+            echo "    couldn't resolve the ESP disk/partition from $ESP_DEV — skipping"
+            echo "    the NVRAM entry; the BOOTX64.EFI fallback above will still boot."
         fi
     else
         echo "    live session not UEFI-booted (or efibootmgr absent) — skipping the"
