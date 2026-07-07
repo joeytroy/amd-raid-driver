@@ -41,6 +41,9 @@ jobs:
       - uses: anthropics/claude-code-action@v1
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          # TEMP: diagnostic — expose the full SDK transcript so we can see
+          # exactly which tool calls the sandbox denies.  Revert once fixed.
+          show_full_output: true
           prompt: |
             Review this pull request. This repo is a clean-room Linux kernel
             block driver (rcraid) for AMD RaidXpert2 NVMe RAID arrays, so
