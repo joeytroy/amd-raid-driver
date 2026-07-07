@@ -494,36 +494,54 @@ else
     if [ -n "$boot_src" ]; then
         vendor_dir=$(dirname "$boot_src")
         BOOT_DIR="$ESP_MNT/EFI/BOOT"
+        cur="$BOOT_DIR/BOOTX64.EFI"
+        sentinel="$BOOT_DIR/.rcraid-managed"
         mkdir -p "$BOOT_DIR"
         # \EFI\BOOT\BOOTX64.EFI is the firmware-wide removable-media fallback
         # and may already belong to another OS on a shared ESP (e.g. Windows'
-        # own fallback loader on a dual-boot box).  Preserve a genuinely
-        # pre-existing loader once, so it can be restored.
+        # own fallback loader on a dual-boot box).  Preserve any loader we did
+        # not write before overwriting it, so it can be restored.
         #
-        # The idempotency key is the .rcraid-managed sentinel we drop below,
-        # NOT "does .rcraid-orig exist yet".  Keying on the backup would break
-        # the reinstall / multi-distro-on-the-array workflow this installer is
-        # built for: a second run would find our OWN prior shim at BOOTX64.EFI
-        # and preserve it as "the original", masking (and permanently losing) a
-        # real foreign loader that predated the first run.  The sentinel marks
-        # the slot as ours, so only a BOOTX64.EFI that predates ANY run of this
-        # script is ever backed up.
-        if [ -f "$BOOT_DIR/BOOTX64.EFI" ] && [ ! -e "$BOOT_DIR/.rcraid-managed" ]; then
-            cp -f "$BOOT_DIR/BOOTX64.EFI" "$BOOT_DIR/BOOTX64.EFI.rcraid-orig"
-            echo "    preserved pre-rcraid BOOTX64.EFI -> BOOTX64.EFI.rcraid-orig"
+        # Deciding "did we write the current file?" cannot key on the sentinel
+        # alone: another OS's installer/repair can overwrite BOOTX64.EFI on a
+        # shared ESP without touching our sentinel, so a later run would
+        # silently clobber that new foreign loader.  Instead record the hash of
+        # what we install (in the sentinel) and treat the current file as
+        # foreign whenever it does NOT match that hash (or the sentinel is
+        # absent).  This also keeps the reinstall / multi-distro-on-the-array
+        # workflow correct: an unchanged loader we wrote last time still
+        # matches, so we don't re-preserve our own shim as "the original".
+        foreign=0
+        if [ -f "$cur" ]; then
+            cur_hash=$(sha256sum "$cur" | awk '{print $1}')
+            if [ -f "$sentinel" ]; then
+                [ "$cur_hash" = "$(cat "$sentinel" 2>/dev/null)" ] || foreign=1
+            else
+                foreign=1
+            fi
+        fi
+        if [ "$foreign" = 1 ]; then
+            # Keep the first displaced loader as .rcraid-orig; preserve any
+            # later, distinct foreign loader under a hash-suffixed name so
+            # nothing is ever clobbered or lost.
+            dest="$BOOT_DIR/BOOTX64.EFI.rcraid-orig"
+            [ -e "$dest" ] && dest="$BOOT_DIR/BOOTX64.EFI.rcraid-bak.${cur_hash:0:12}"
+            if [ ! -e "$dest" ]; then
+                cp -f "$cur" "$dest"
+                echo "    preserved foreign BOOTX64.EFI -> $(basename "$dest")"
+            fi
         fi
         # Copy the whole loader chain (shim + grub + MOK manager) so that
         # shim, once running as BOOTX64.EFI, still finds grubx64.efi beside
         # it.  Ubuntu's grub has an embedded prefix pointing at \EFI\ubuntu,
         # so it reads its real config from there regardless of where it ran.
+        # Only BOOTX64.EFI (the name firmware auto-boots) is treated as a
+        # contended slot; the vendor-named files are ours.
         cp -f "$vendor_dir"/*.efi "$BOOT_DIR/" 2>/dev/null || true
-        cp -f "$boot_src" "$BOOT_DIR/BOOTX64.EFI"
-        # Mark the slot as rcraid-managed so future runs don't mistake our own
-        # shim for a foreign original.
-        printf '%s\n' \
-            "BOOTX64.EFI in this directory is installed by rcraid install-livecd.sh." \
-            "If BOOTX64.EFI.rcraid-orig exists, it is the pre-rcraid fallback loader." \
-            > "$BOOT_DIR/.rcraid-managed"
+        cp -f "$boot_src" "$cur"
+        # Record the hash of exactly what we wrote so a future run can tell our
+        # own loader from a foreign overwrite.
+        sha256sum "$cur" | awk '{print $1}' > "$sentinel"
         echo "    fallback loader installed: EFI/BOOT/BOOTX64.EFI ($(basename "$boot_src"))"
     else
         echo "    WARN: no shim/grub .efi under $ESP_MNT/EFI — install may be incomplete" >&2
