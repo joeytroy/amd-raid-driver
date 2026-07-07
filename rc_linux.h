@@ -66,6 +66,12 @@ static inline int scsi_add_host(struct Scsi_Host *host, struct device *dev) { re
 #define RC_DRIVER_DESCRIPTION        "AMD RAID Controller for Linux"
 #define RC_DRIVER_BUILD              "9.3.2-00039"
 
+// Source revision, normally injected by the Makefile (git describe, or the
+// .rcraid_rev file in DKMS/live-CD staged trees).
+#ifndef RC_DRIVER_BUILD_REV
+#define RC_DRIVER_BUILD_REV          "unknown"
+#endif
+
 // Maximum adapters and targets (AMD Official Specifications)
 #define RC_MAX_ADAPTERS              11  // Max Controller Count per AMD spec
 #define RC_MAX_NVME_DEVICES          10  // Max NVMe devices per AMD spec

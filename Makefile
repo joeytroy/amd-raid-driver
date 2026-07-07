@@ -21,6 +21,19 @@ EXTRA_CFLAGS += -Wall -Wextra
 EXTRA_CFLAGS += -Wno-error
 EXTRA_CFLAGS += -DRC_DEBUG_LEVEL=$(RC_DEBUG_LEVEL)
 
+# Build revision baked into the load banner and modinfo, so a loaded module
+# can always be matched to the exact source it was built from (a stale build
+# on the test box once cost a debugging round).  Resolution order:
+#   1. .rcraid_rev in the source dir — written by install-dkms.sh /
+#      install-livecd.sh when they stage sources outside the git tree
+#   2. git describe — building straight from a checkout
+#   3. "unknown"
+# $(src) is set when kbuild re-reads this file as the module makefile;
+# it's empty for the outer make invocation, where "." is the source dir.
+RCRAID_SRC := $(if $(src),$(src),.)
+RCRAID_REV := $(shell cat $(RCRAID_SRC)/.rcraid_rev 2>/dev/null || git -C $(RCRAID_SRC) describe --always --dirty 2>/dev/null || echo unknown)
+EXTRA_CFLAGS += -DRC_DRIVER_BUILD_REV=\"$(RCRAID_REV)\"
+
 # Build targets
 all:
 	@echo "Attempting to build with current kernel..."

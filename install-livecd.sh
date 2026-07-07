@@ -324,6 +324,15 @@ cp -r \
     "$SRC_DIR"/rc_*.c \
     "$SRC_DIR"/rc_*.h \
     "$TARGET_SRC/"
+# Bake the source revision into the staged tree — it has no .git, so the
+# Makefile reads .rcraid_rev to stamp the module banner and modinfo.
+if rev=$(git -C "$SRC_DIR" describe --always --dirty 2>/dev/null); then
+    echo "$rev" > "$TARGET_SRC/.rcraid_rev"
+elif [ -f "$SRC_DIR/.rcraid_rev" ]; then
+    # Live sessions often run from an unpacked tarball (no .git); a
+    # pre-baked .rcraid_rev travels with it.
+    cp "$SRC_DIR/.rcraid_rev" "$TARGET_SRC/.rcraid_rev"
+fi
 # packaging/ needs to be reachable for the in-target script.
 mkdir -p "$TARGET/tmp/rcraid-pkg"
 cp -r "$SRC_DIR/packaging" "$TARGET/tmp/rcraid-pkg/"
