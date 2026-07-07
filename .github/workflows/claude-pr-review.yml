@@ -7,8 +7,11 @@
 # Uses `pull_request` (not pull_request_target) so no elevated token or
 # secrets are exposed to untrusted code.
 #
-# Requires the ANTHROPIC_API_KEY repository secret
-# (Settings -> Secrets and variables -> Actions).
+# Auth: CLAUDE_CODE_OAUTH_TOKEN repository secret — a subscription token
+# minted with `claude setup-token` (Claude Pro/Max account), so reviews
+# bill against the subscription, not a pay-as-you-go API key.  To rotate:
+#   claude setup-token | tail -1 | gh secret set CLAUDE_CODE_OAUTH_TOKEN
+# Note: review runs draw from the subscription's rate limits.
 
 name: Claude PR Review
 
@@ -34,7 +37,7 @@ jobs:
 
       - uses: anthropics/claude-code-action@v1
         with:
-          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           prompt: |
             Review this pull request. This repo is a clean-room Linux kernel
             block driver (rcraid) for AMD RaidXpert2 NVMe RAID arrays, so
