@@ -538,37 +538,47 @@ else
                 foreign=1
             fi
         fi
+        # If the current fallback is foreign, a successful backup is a hard
+        # precondition for overwriting the slot: if we can't preserve it, leave
+        # everything in place and rely on the NVRAM entry below rather than
+        # silently clobbering a loader we couldn't save.
+        may_write=1
         if [ "$foreign" = 1 ]; then
+            may_write=0
             # Preserve the ENTIRE existing EFI/BOOT chain, not just BOOTX64.EFI:
             # a foreign shim depends on its sibling grubx64.efi/mmx64.efi, which
-            # the vendor copy below would otherwise clobber — leaving the backup
-            # unbootable.  Keep the first displaced chain as EFI/BOOT.rcraid-orig
-            # and any later, distinct one under a hash-suffixed name so nothing
-            # is ever clobbered or lost.
+            # the vendor copy below would otherwise clobber.  First displaced
+            # chain -> EFI/BOOT.rcraid-orig; later ones get a guaranteed-unique
+            # name so no prior backup is ever overwritten, even when the hash
+            # was unavailable (empty suffix).
             dest="$ESP_MNT/EFI/BOOT.rcraid-orig"
             [ -e "$dest" ] && dest="$ESP_MNT/EFI/BOOT.rcraid-bak.${cur_hash:0:12}"
-            if [ ! -e "$dest" ]; then
-                if cp -r "$BOOT_DIR" "$dest" 2>/dev/null; then
-                    echo "    preserved foreign EFI/BOOT loader chain -> $(basename "$dest")"
-                else
-                    echo "    WARN: couldn't back up existing EFI/BOOT — leaving it in place" >&2
-                fi
+            _n=0
+            while [ -e "$dest" ]; do
+                _n=$((_n + 1)); dest="$ESP_MNT/EFI/BOOT.rcraid-bak.${cur_hash:0:12}.$_n"
+            done
+            if cp -r "$BOOT_DIR" "$dest" 2>/dev/null; then
+                may_write=1
+                echo "    preserved foreign EFI/BOOT loader chain -> $(basename "$dest")"
+            else
+                echo "    WARN: couldn't back up foreign EFI/BOOT — leaving it in place" >&2
+                echo "    and NOT overwriting BOOTX64.EFI; relying on the NVRAM entry." >&2
             fi
         fi
-        # Copy the whole loader chain (shim + grub + MOK manager) so that
-        # shim, once running as BOOTX64.EFI, still finds grubx64.efi beside
-        # it.  Ubuntu's grub has an embedded prefix pointing at \EFI\ubuntu,
-        # so it reads its real config from there regardless of where it ran.
-        # Only BOOTX64.EFI (the name firmware auto-boots) is treated as a
-        # contended slot; the vendor-named files are ours.
-        cp -f "$vendor_dir"/*.efi "$BOOT_DIR/" 2>/dev/null || true
-        if cp -f "$boot_src" "$cur" 2>/dev/null; then
-            # Record the hash of exactly what we wrote so a future run can tell
-            # our own loader from a foreign overwrite.
-            sha256sum "$cur" 2>/dev/null | awk '{print $1}' > "$sentinel" 2>/dev/null || true
-            echo "    fallback loader installed: EFI/BOOT/BOOTX64.EFI ($(basename "$boot_src"))"
-        else
-            echo "    WARN: couldn't install EFI/BOOT/BOOTX64.EFI fallback loader" >&2
+        if [ "$may_write" = 1 ]; then
+            # Copy the whole loader chain (shim + grub + MOK manager) so shim,
+            # once running as BOOTX64.EFI, still finds grubx64.efi beside it.
+            # Ubuntu's grub has an embedded prefix pointing at \EFI\ubuntu, so
+            # it reads its real config from there regardless of where it ran.
+            cp -f "$vendor_dir"/*.efi "$BOOT_DIR/" 2>/dev/null || true
+            if cp -f "$boot_src" "$cur" 2>/dev/null; then
+                # Record the hash of exactly what we wrote so a future run can
+                # tell our own loader from a foreign overwrite.
+                sha256sum "$cur" 2>/dev/null | awk '{print $1}' > "$sentinel" 2>/dev/null || true
+                echo "    fallback loader installed: EFI/BOOT/BOOTX64.EFI ($(basename "$boot_src"))"
+            else
+                echo "    WARN: couldn't install EFI/BOOT/BOOTX64.EFI fallback loader" >&2
+            fi
         fi
     else
         echo "    WARN: no shim/grub .efi under $ESP_MNT/EFI — install may be incomplete" >&2
@@ -610,12 +620,14 @@ else
         # so the firmware boot menu isn't misleading on Fedora/Debian installs.
         nvram_label="rcraid (${target_os:-linux})"
         if [ -n "$esp_disk" ] && [ -b "$esp_disk" ] && [ -n "$esp_partnum" ]; then
-            # Drop our own stale duplicates from earlier runs so re-running
-            # doesn't pile up entries — match any prior "rcraid (...)" label,
-            # not just this run's distro.
+            # Drop only OUR prior entries for THIS distro so re-running doesn't
+            # pile up duplicates.  Match the EXACT label — a wildcard would also
+            # delete a sibling distro's own "rcraid (<other>)" entry on a
+            # multi-distro array.  target_os is an os-release ID, so it carries
+            # no regex metacharacters worth escaping here.
             while read -r bootnum; do
                 [ -n "$bootnum" ] && efibootmgr -b "$bootnum" -B >/dev/null 2>&1 || true
-            done < <(efibootmgr 2>/dev/null | sed -n 's/^Boot\([0-9A-Fa-f]\{4\}\).* rcraid (.*)$/\1/p')
+            done < <(efibootmgr 2>/dev/null | sed -n "s/^Boot\([0-9A-Fa-f]\{4\}\).* ${nvram_label}\$/\1/p")
             if efibootmgr -c -d "$esp_disk" -p "$esp_partnum" \
                  -L "$nvram_label" -l "$loader" >/dev/null 2>&1; then
                 echo "    NVRAM entry created: '$nvram_label' -> $esp_disk p$esp_partnum $loader"
