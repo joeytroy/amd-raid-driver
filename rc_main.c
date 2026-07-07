@@ -29,6 +29,7 @@ MODULE_PARM_DESC(debug_level, "Debug level (0=debug, 1=info, 2=note, 3=warn, 4=e
 MODULE_AUTHOR("Joey Troy and contributors");
 MODULE_DESCRIPTION(RC_DRIVER_DESCRIPTION);
 MODULE_VERSION(RC_DRIVER_VERSION);
+MODULE_INFO(build_rev, RC_DRIVER_BUILD_REV);
 MODULE_LICENSE("GPL v2");
 
 // Module initialization
@@ -36,7 +37,8 @@ static int __init rc_init(void)
 {
     int err;
     
-    rc_printk(RC_NOTE, "rc_init: AMD RAID Driver version %s\n", RC_DRIVER_VERSION);
+    rc_printk(RC_NOTE, "rc_init: AMD RAID Driver version %s (build %s)\n",
+              RC_DRIVER_VERSION, RC_DRIVER_BUILD_REV);
     rc_printk(RC_NOTE, "rc_init: Based on Windows driver architecture\n");
     
     // Register block major

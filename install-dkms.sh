@@ -118,6 +118,12 @@ cp -r \
     "$SRC_DIR"/rc_*.h \
     "$DKMS_SRC/"
 
+# Bake the source revision into the staged tree — it has no .git, so the
+# Makefile reads .rcraid_rev to stamp the module banner and modinfo.
+if rev=$(git -C "$SRC_DIR" describe --always --dirty 2>/dev/null); then
+    echo "$rev" > "$DKMS_SRC/.rcraid_rev"
+fi
+
 echo "==> dkms add"
 dkms add -m "$PKG_NAME" -v "$PKG_VERSION" 2>&1 | sed 's/^/    /'
 
