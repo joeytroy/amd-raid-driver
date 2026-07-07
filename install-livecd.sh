@@ -494,6 +494,17 @@ else
     if [ -n "$boot_src" ]; then
         vendor_dir=$(dirname "$boot_src")
         mkdir -p "$ESP_MNT/EFI/BOOT"
+        # \EFI\BOOT\BOOTX64.EFI is the firmware-wide removable-media fallback
+        # and may already belong to another OS on a shared ESP (e.g. Windows'
+        # own fallback loader on a dual-boot box).  Preserve whatever is there
+        # before we overwrite it, so it can be restored.  Guard on the backup
+        # not already existing so re-runs keep the true original, not our copy.
+        if [ -f "$ESP_MNT/EFI/BOOT/BOOTX64.EFI" ] && \
+           [ ! -e "$ESP_MNT/EFI/BOOT/BOOTX64.EFI.rcraid-orig" ]; then
+            cp -f "$ESP_MNT/EFI/BOOT/BOOTX64.EFI" \
+                  "$ESP_MNT/EFI/BOOT/BOOTX64.EFI.rcraid-orig"
+            echo "    preserved existing BOOTX64.EFI -> BOOTX64.EFI.rcraid-orig"
+        fi
         # Copy the whole loader chain (shim + grub + MOK manager) so that
         # shim, once running as BOOTX64.EFI, still finds grubx64.efi beside
         # it.  Ubuntu's grub has an embedded prefix pointing at \EFI\ubuntu,
@@ -527,8 +538,13 @@ else
         fi
         [[ "$esp_partnum" =~ ^[0-9]+$ ]] || esp_partnum=""
 
-        if [ -f "$ESP_MNT/EFI/ubuntu/shimx64.efi" ]; then
-            loader='\EFI\ubuntu\shimx64.efi'
+        # Point the NVRAM entry at the loader we actually resolved above, so
+        # it's correct for ubuntu/fedora/debian vendor dirs alike, converting
+        # the ESP-relative path to the backslash form efibootmgr expects.
+        # Fall back to the removable-media loader if nothing specific matched.
+        if [ -n "$boot_src" ]; then
+            loader="${boot_src#"$ESP_MNT"}"   # e.g. /EFI/ubuntu/shimx64.efi
+            loader="${loader//\//\\}"          # -> \EFI\ubuntu\shimx64.efi
         else
             loader='\EFI\BOOT\BOOTX64.EFI'
         fi
