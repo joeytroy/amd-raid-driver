@@ -73,4 +73,4 @@ jobs:
             that never ran.
           claude_args: |
             --model claude-sonnet-5
-            --max-turns 12
+            --max-turns 40
