@@ -66,6 +66,11 @@ jobs:
             Include severity (critical/major/minor) and a suggested fix
             where possible. Report real issues only — do not pad the
             review with style nits or restate the diff.
+
+            If you find no issues, post one brief PR comment (via
+            `gh pr comment`) saying what you reviewed and that it looks
+            clean — a silent pass is indistinguishable from a review
+            that never ran.
           claude_args: |
             --model claude-sonnet-5
             --max-turns 12
