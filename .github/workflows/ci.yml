@@ -34,6 +34,13 @@ jobs:
     name: build (${{ matrix.name }})
     runs-on: ubuntu-24.04
     container: ${{ matrix.image }}
+    # Force bash for every run step.  These jobs execute inside distro
+    # containers, and on Ubuntu/Debian /bin/sh is dash — which aborts on the
+    # `set -o pipefail` bashism in the build step ("Illegal option -o
+    # pipefail").  Fedora/Arch map /bin/sh to bash so they passed, masking it.
+    defaults:
+      run:
+        shell: bash
     strategy:
       fail-fast: false
       # The driver uses recent block APIs, so the Ubuntu runners' 6.8 headers
