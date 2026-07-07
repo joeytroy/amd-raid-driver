@@ -524,7 +524,12 @@ else
                [ -n "$cur_hash" ]; then
                 if [ -f "$sentinel" ]; then
                     [ "$cur_hash" = "$(cat "$sentinel" 2>/dev/null)" ] || foreign=1
-                else
+                elif ! cmp -s "$cur" "$boot_src"; then
+                    # No sentinel yet (first run): treat the existing loader as
+                    # foreign only if it is NOT already byte-identical to the
+                    # one we're about to install — the OS installer commonly
+                    # drops its own removable-fallback copy of the same shim
+                    # here, and that isn't worth "preserving" as an original.
                     foreign=1
                 fi
             else
@@ -534,16 +539,19 @@ else
             fi
         fi
         if [ "$foreign" = 1 ]; then
-            # Keep the first displaced loader as .rcraid-orig; preserve any
-            # later, distinct foreign loader under a hash-suffixed name so
-            # nothing is ever clobbered or lost.
-            dest="$BOOT_DIR/BOOTX64.EFI.rcraid-orig"
-            [ -e "$dest" ] && dest="$BOOT_DIR/BOOTX64.EFI.rcraid-bak.${cur_hash:0:12}"
+            # Preserve the ENTIRE existing EFI/BOOT chain, not just BOOTX64.EFI:
+            # a foreign shim depends on its sibling grubx64.efi/mmx64.efi, which
+            # the vendor copy below would otherwise clobber — leaving the backup
+            # unbootable.  Keep the first displaced chain as EFI/BOOT.rcraid-orig
+            # and any later, distinct one under a hash-suffixed name so nothing
+            # is ever clobbered or lost.
+            dest="$ESP_MNT/EFI/BOOT.rcraid-orig"
+            [ -e "$dest" ] && dest="$ESP_MNT/EFI/BOOT.rcraid-bak.${cur_hash:0:12}"
             if [ ! -e "$dest" ]; then
-                if cp -f "$cur" "$dest" 2>/dev/null; then
-                    echo "    preserved foreign BOOTX64.EFI -> $(basename "$dest")"
+                if cp -r "$BOOT_DIR" "$dest" 2>/dev/null; then
+                    echo "    preserved foreign EFI/BOOT loader chain -> $(basename "$dest")"
                 else
-                    echo "    WARN: couldn't back up existing BOOTX64.EFI — leaving it in place" >&2
+                    echo "    WARN: couldn't back up existing EFI/BOOT — leaving it in place" >&2
                 fi
             fi
         fi
@@ -598,15 +606,19 @@ else
         else
             loader='\EFI\BOOT\BOOTX64.EFI'
         fi
+        # Label the entry with the actual target distro, not a hardcoded name,
+        # so the firmware boot menu isn't misleading on Fedora/Debian installs.
+        nvram_label="rcraid (${target_os:-linux})"
         if [ -n "$esp_disk" ] && [ -b "$esp_disk" ] && [ -n "$esp_partnum" ]; then
             # Drop our own stale duplicates from earlier runs so re-running
-            # doesn't pile up identical entries.
+            # doesn't pile up entries — match any prior "rcraid (...)" label,
+            # not just this run's distro.
             while read -r bootnum; do
                 [ -n "$bootnum" ] && efibootmgr -b "$bootnum" -B >/dev/null 2>&1 || true
-            done < <(efibootmgr 2>/dev/null | sed -n 's/^Boot\([0-9A-Fa-f]\{4\}\).* rcraid (Kubuntu)$/\1/p')
+            done < <(efibootmgr 2>/dev/null | sed -n 's/^Boot\([0-9A-Fa-f]\{4\}\).* rcraid (.*)$/\1/p')
             if efibootmgr -c -d "$esp_disk" -p "$esp_partnum" \
-                 -L "rcraid (Kubuntu)" -l "$loader" >/dev/null 2>&1; then
-                echo "    NVRAM entry created: 'rcraid (Kubuntu)' -> $esp_disk p$esp_partnum $loader"
+                 -L "$nvram_label" -l "$loader" >/dev/null 2>&1; then
+                echo "    NVRAM entry created: '$nvram_label' -> $esp_disk p$esp_partnum $loader"
             else
                 echo "    efibootmgr wouldn't write an NVRAM entry (device path not"
                 echo "    resolvable) — the BOOTX64.EFI fallback above will still boot."
