@@ -53,7 +53,7 @@ echo
 # Phase 1 — build + load into the live session
 # ----------------------------------------------------------------------------
 
-echo "==> [1/8] installing live-session build dependencies"
+echo "==> [1/6] installing live-session build dependencies"
 case "$FAMILY" in
     debian)
         export DEBIAN_FRONTEND=noninteractive
@@ -75,7 +75,7 @@ echo
 # downstream NVMe as 1022:b000, including the live USB stick on some boards,
 # so we filter by subsys vendor).  Heuristic: pick the vendor with >= 2
 # devices; if there's a tie, ask the user.
-echo "==> [2/8] detecting array members"
+echo "==> [2/6] detecting array members"
 declare -A vendor_count
 declare -A vendor_bdfs
 while read -r bdf; do
@@ -129,13 +129,13 @@ echo "    members: $MEMBER_BDFS"
 echo "    subsystem_vendor: $SUBSYSTEM_VENDOR"
 echo
 
-echo "==> [3/8] building rcraid.ko against live kernel $(uname -r)"
+echo "==> [3/6] building rcraid.ko against live kernel $(uname -r)"
 make -C "$SRC_DIR" clean >/dev/null 2>&1 || true
 make -C "$SRC_DIR" all 2>&1 | sed 's/^/    /'
 [ -f "$SRC_DIR/rcraid.ko" ] || { echo "build failed" >&2; exit 1; }
 echo
 
-echo "==> [4/8] loading rcraid into the live session"
+echo "==> [4/6] loading rcraid into the live session"
 # Inline rebind — same logic as packaging/sbin/rcraid-bind, but that helper
 # isn't installed yet.  Pin each member to rcbottom, drop nvme's claim if
 # present, kick a re-probe.  rcraid.ko load comes after so it has somewhere
@@ -214,38 +214,7 @@ read -rp "Press Enter once the OS installer is FINISHED (Ctrl-C to abort): " _
 # ----------------------------------------------------------------------------
 
 echo
-echo "==> [5/8] releasing any leftover installer mounts on /dev/rcraid0"
-# Graphical installers (Calamares/Ubiquity) usually leave the freshly
-# installed system mounted — e.g. /dev/rcraid0p2 on /tmp/calamares-root-XXXX
-# with /boot/efi and the API filesystems bind-mounted beneath it.  Those
-# stale mounts make our own `mount` of the same partitions fail with EBUSY
-# and leave the chroot half-populated.  Clear them, deepest mount first, so
-# nested submounts unwind cleanly.  A few passes handle mounts freed only
-# once their parent is gone.
-_released=0
-for _pass in 1 2 3; do
-    mapfile -t _mps < <(
-        for _part in /dev/rcraid0 /dev/rcraid0p*; do
-            [ -b "$_part" ] || continue
-            findmnt -nro TARGET --source "$_part" 2>/dev/null || true
-        done | awk 'NF { print length, $0 }' | sort -rn | cut -d" " -f2-
-    )
-    [ "${#_mps[@]}" -gt 0 ] || break
-    for _mp in "${_mps[@]}"; do
-        [ -n "$_mp" ] || continue
-        echo "    unmounting $_mp"
-        umount -R "$_mp" 2>/dev/null || umount -l "$_mp" 2>/dev/null || true
-        _released=1
-    done
-done
-if [ "$_released" = 1 ]; then
-    echo "    cleared installer leftovers"
-else
-    echo "    none found"
-fi
-echo
-
-echo "==> [6/8] locating the target rootfs on /dev/rcraid0"
+echo "==> [5/6] locating the target rootfs on /dev/rcraid0"
 
 # Probe each partition read-only and find the one that looks like a Linux root
 # (has /etc/os-release or /usr/lib/os-release).  Skip swap, EFI, etc.
@@ -294,7 +263,6 @@ mount "$TARGET_PART" "$TARGET"
 
 trap 'umount -R "$TARGET" 2>/dev/null || true' EXIT
 
-ESP_DEV=""
 for sub in /boot /boot/efi; do
     fs_line=$(awk -v sub="$sub" '$2==sub && $1 !~ /^#/ {print; exit}' "$TARGET/etc/fstab" 2>/dev/null || true)
     [ -n "$fs_line" ] || continue
@@ -308,7 +276,6 @@ for sub in /boot /boot/efi; do
     if [ -n "$fs_dev" ] && [ -b "$fs_dev" ]; then
         echo "    mounting $sub from $fs_dev"
         mount "$fs_dev" "$TARGET$sub"
-        if [ "$sub" = /boot/efi ]; then ESP_DEV="$fs_dev"; fi
     fi
 done
 
@@ -333,7 +300,7 @@ fi
 echo
 
 # Stage rcraid sources into the target and run the in-target install.
-echo "==> [7/8] installing rcraid into the target system"
+echo "==> [6/6] installing rcraid into the target system"
 
 # Pick the kernel in the target that we'll build for.  Live and target kernels
 # can differ (e.g. Ubuntu 24.04 live boots HWE while the installed system uses
@@ -440,123 +407,6 @@ rm -rf "$TARGET/tmp/rcraid-pkg" "$TARGET/tmp/rcraid-in-target.sh"
 
 echo
 
-# ----------------------------------------------------------------------------
-# [8/8] Make the array actually selectable at boot.
-#
-# The graphical installers' own efibootmgr call is frequently lost: the
-# firmware reaches the array through its RAIDXpert2 UEFI driver, whose EFI
-# device path doesn't match what the installer computed from the Linux RAID
-# node — so a fresh install can leave NO usable boot entry at all (the "only
-# Windows shows in BIOS" symptom).  Two independent safety nets, with the ESP
-# still mounted at $TARGET/boot/efi from the fstab step above:
-#
-#   1. \EFI\BOOT\BOOTX64.EFI — the removable-media fallback that every UEFI
-#      firmware boots off any visible ESP with no NVRAM entry required.  This
-#      is what makes the array boot regardless of the device-path mismatch.
-#   2. A labelled efibootmgr NVRAM entry — best-effort, for a named item in
-#      the firmware boot menu; skipped cleanly when the live session isn't
-#      UEFI-booted or the firmware refuses the write.
-# ----------------------------------------------------------------------------
-echo "==> [8/8] ensuring a UEFI boot entry for the array"
-ESP_MNT="$TARGET/boot/efi"
-
-# If the target fstab didn't hand us the ESP, find it by GPT type GUID and
-# mount it ourselves (the trap's `umount -R $TARGET` releases it either way).
-if [ -z "${ESP_DEV:-}" ]; then
-    for _p in /dev/rcraid0p*; do
-        [ -b "$_p" ] || continue
-        if [ "$(blkid -o value -s PARTTYPE "$_p" 2>/dev/null || true)" = \
-             "c12a7328-f81f-11d2-ba4b-00a0c93ec93b" ]; then
-            ESP_DEV="$_p"
-            break
-        fi
-    done
-    if [ -n "${ESP_DEV:-}" ] && ! mountpoint -q "$ESP_MNT" 2>/dev/null; then
-        mkdir -p "$ESP_MNT"
-        mount "$ESP_DEV" "$ESP_MNT" 2>/dev/null || true
-    fi
-fi
-
-if [ -z "${ESP_DEV:-}" ] || [ ! -d "$ESP_MNT/EFI" ]; then
-    echo "    no ESP with an EFI/ directory found — skipping."
-    echo "    If the box won't boot, confirm the installer created an EFI"
-    echo "    System Partition on /dev/rcraid0 and populated \\EFI."
-else
-    # 1) Removable-media fallback loader.
-    boot_src=""
-    for cand in \
-        "$ESP_MNT/EFI/ubuntu/shimx64.efi" \
-        "$ESP_MNT/EFI/ubuntu/grubx64.efi" \
-        "$ESP_MNT"/EFI/*/shimx64.efi \
-        "$ESP_MNT"/EFI/*/grubx64.efi; do
-        [ -f "$cand" ] && { boot_src="$cand"; break; }
-    done
-    if [ -n "$boot_src" ]; then
-        vendor_dir=$(dirname "$boot_src")
-        mkdir -p "$ESP_MNT/EFI/BOOT"
-        # Copy the whole loader chain (shim + grub + MOK manager) so that
-        # shim, once running as BOOTX64.EFI, still finds grubx64.efi beside
-        # it.  Ubuntu's grub has an embedded prefix pointing at \EFI\ubuntu,
-        # so it reads its real config from there regardless of where it ran.
-        cp -f "$vendor_dir"/*.efi "$ESP_MNT/EFI/BOOT/" 2>/dev/null || true
-        cp -f "$boot_src" "$ESP_MNT/EFI/BOOT/BOOTX64.EFI"
-        echo "    fallback loader installed: EFI/BOOT/BOOTX64.EFI ($(basename "$boot_src"))"
-    else
-        echo "    WARN: no shim/grub .efi under $ESP_MNT/EFI — install may be incomplete" >&2
-    fi
-
-    # 2) Best-effort labelled NVRAM entry.
-    if [ -d /sys/firmware/efi/efivars ] && command -v efibootmgr >/dev/null 2>&1; then
-        # Derive BOTH the disk and the partition number from the ESP device
-        # itself.  $ESP_DEV comes from the target's fstab /boot/efi entry, which
-        # is not guaranteed to live on /dev/rcraid0 — so hardcoding -d
-        # /dev/rcraid0 could point efibootmgr at the wrong disk.  lsblk
-        # PKNAME/PARTN handle any naming scheme; fall back to parsing the
-        # rcraid `pN` suffix if those columns are unavailable (older lsblk).
-        esp_disk="" esp_partnum=""
-        if pk=$(lsblk -nro PKNAME "$ESP_DEV" 2>/dev/null | awk 'NF{print; exit}'); then
-            [ -n "$pk" ] && esp_disk="/dev/$pk"
-        fi
-        if pn=$(lsblk -nro PARTN "$ESP_DEV" 2>/dev/null | awk 'NF{print; exit}'); then
-            esp_partnum="$pn"
-        fi
-        if [ -z "$esp_disk" ] || [ -z "$esp_partnum" ]; then
-            case "$ESP_DEV" in
-                *p[0-9]*) esp_disk="${ESP_DEV%p*}"; esp_partnum="${ESP_DEV##*p}" ;;
-            esac
-        fi
-        [[ "$esp_partnum" =~ ^[0-9]+$ ]] || esp_partnum=""
-
-        if [ -f "$ESP_MNT/EFI/ubuntu/shimx64.efi" ]; then
-            loader='\EFI\ubuntu\shimx64.efi'
-        else
-            loader='\EFI\BOOT\BOOTX64.EFI'
-        fi
-        if [ -n "$esp_disk" ] && [ -b "$esp_disk" ] && [ -n "$esp_partnum" ]; then
-            # Drop our own stale duplicates from earlier runs so re-running
-            # doesn't pile up identical entries.
-            while read -r bootnum; do
-                [ -n "$bootnum" ] && efibootmgr -b "$bootnum" -B >/dev/null 2>&1 || true
-            done < <(efibootmgr 2>/dev/null | sed -n 's/^Boot\([0-9A-Fa-f]\{4\}\).* rcraid (Kubuntu)$/\1/p')
-            if efibootmgr -c -d "$esp_disk" -p "$esp_partnum" \
-                 -L "rcraid (Kubuntu)" -l "$loader" >/dev/null 2>&1; then
-                echo "    NVRAM entry created: 'rcraid (Kubuntu)' -> $esp_disk p$esp_partnum $loader"
-            else
-                echo "    efibootmgr wouldn't write an NVRAM entry (device path not"
-                echo "    resolvable) — the BOOTX64.EFI fallback above will still boot."
-            fi
-        else
-            echo "    couldn't resolve the ESP disk/partition from $ESP_DEV — skipping"
-            echo "    the NVRAM entry; the BOOTX64.EFI fallback above will still boot."
-        fi
-    else
-        echo "    live session not UEFI-booted (or efibootmgr absent) — skipping the"
-        echo "    NVRAM entry; the EFI/BOOT/BOOTX64.EFI fallback will boot the array."
-    fi
-fi
-
-echo
-
 # Best-effort unmount.  trap will catch anything we miss.
 umount -R "$TARGET" 2>/dev/null || true
 trap - EXIT
@@ -568,9 +418,6 @@ cat <<EOF
   /dev/rcraid0pN is configured to boot off the AMD-RAID array.
   rcraid is installed via DKMS so it rebuilds on kernel updates.
   An initramfs hook makes the array available before pivot_root.
-  A UEFI boot entry + \EFI\BOOT\BOOTX64.EFI fallback were installed
-  so the firmware can find the array even if the installer's own
-  boot entry didn't stick.
 
   You can now reboot:
 

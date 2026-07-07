@@ -5,12 +5,6 @@ arrays. Initially targets the TRX50 chipset's NVMe RAID Bottom
 controller (PCI `1022:B000`); SATA and additional NVMe variants are
 on the roadmap.
 
-## Support This Project
-
-If you find this project helpful, please consider supporting its development:
-
-[![PayPal](https://img.shields.io/badge/Donate-PayPal-blue.svg)](https://www.paypal.com/paypalme/joeytroynm)
-
 ## What works today
 
 - PCI `1022:B000` (NVMe RAID Bottom) end to end: controller bring-up,
@@ -40,15 +34,9 @@ If you find this project helpful, please consider supporting its development:
   directly via `dma_map_sg` + PRP enumeration — no bounce buffer, no
   memcpy on either side.  Drops ~33 MiB of pinned per-tag buffers vs
   the prior path.
-- **Boot-from-RAID validated end to end:** Kubuntu 24.04 (HWE kernel
-  6.17) installed onto and booting from a 2-member Crucial T700
-  RAID0 array (256 KiB stripe) via `install-livecd.sh` — rootfs on
-  `/dev/rcraid0pN`, with DKMS auto-rebuild and initramfs auto-bind
-  bringing the array up before `pivot_root`.
-- Throughput on that array: ~19.3 GB/s read / ~8.6 GB/s write
-  (KDiskMark, parallel queues); single-stream `dd` on the dev box is
-  ~6.7 GB/s @ `bs=1M`. Writes trail reads because multi-stripe write
-  fan-out is currently disabled for correctness (see below).
+- Bench throughput on a 2-member Crucial T700 RAID0 dev box:
+  ~2.1 GB/s @ `bs=64K`, ~6.7 GB/s @ `bs=1M`, ~11.9 GB/s aggregate
+  across 8 concurrent readers.
 
 See `docs/STATUS.md` for the full state and the next-steps list.
 
@@ -88,13 +76,6 @@ The big rocks (see `IMPLEMENTATION.MD` for the full checklist):
 - **No `rcadm`-equivalent** — array must be pre-created in BIOS.
 - **Retry of transient NVMe errors** — DNR=0 commands bubble up as
   I/O errors instead of being re-dispatched after reset.
-- **Multi-stripe write fan-out disabled** — a write spanning a stripe
-  boundary is split and issued per member serially (the
-  `chunk_sectors = stripe` safety fix) after a data-corruption bug was
-  found in the parallel fan-out path on fragmented buffered writeback.
-  Correct, but caps large sequential write throughput; a safe
-  re-enable (bvec coalescing + NVMe PRP page-alignment guard, gated on
-  the write-path torture test) is roadmap.
 
 See `IMPLEMENTATION.MD` for the prioritised checklist,
 `docs/OPEN_QUESTIONS.md` for remaining reverse-engineering work, and
@@ -110,10 +91,6 @@ setup.
 
 - **Secure Boot disabled** (or the module signed — see `INSTALL.md`).
   Without this, `insmod` returns `Key was rejected by service`.
-- **Kernel ≥ 6.15.** The driver calls the 2-argument
-  `blk_rq_map_sg()` introduced in 6.15, so older kernels won't build.
-  On Ubuntu 24.04 that means the HWE stack (`linux-generic-hwe-24.04`,
-  6.17+); the 6.8 GA kernel is too old.
 - Kernel headers for the running kernel:
   `sudo apt install build-essential linux-headers-$(uname -r)`.
 
