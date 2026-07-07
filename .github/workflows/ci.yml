@@ -55,6 +55,16 @@ jobs:
           - name: arch
             image: archlinux:latest
             deps: pacman -Sy --noconfirm --needed base-devel linux-headers git
+          # Ubuntu 24.04 + HWE kernel headers — the RAID box's actual target
+          # (Kubuntu 24.04 runs the linux-generic-hwe-24.04 stack, 6.17 as of
+          # 24.04.4 and rolling to 6.20/7.0 in Aug 2026).  This job is the
+          # early warning before DKMS on the box hits new-kernel API drift.
+          - name: ubuntu-hwe
+            image: ubuntu:24.04
+            deps: >-
+              apt-get update &&
+              DEBIAN_FRONTEND=noninteractive apt-get install -y
+              build-essential linux-headers-generic-hwe-24.04 git
     steps:
       # git must exist before actions/checkout runs.
       - name: Install toolchain + kernel headers
@@ -66,11 +76,13 @@ jobs:
         run: |
           # Arch:   /usr/lib/modules/<ver>/build
           # Debian: /lib/modules/<ver>/build  ->  /usr/src/linux-headers-<ver>-amd64
+          # Ubuntu: /lib/modules/<ver>/build  ->  /usr/src/linux-headers-<ver>-generic
           # Fedora: /usr/src/kernels/<ver>
           KDIR=""
           for cand in \
             "$(ls -d /usr/lib/modules/*/build 2>/dev/null | sort -V | tail -1)" \
             "$(ls -d /lib/modules/*/build      2>/dev/null | sort -V | tail -1)" \
+            "$(ls -d /usr/src/linux-headers-*-generic 2>/dev/null | sort -V | tail -1)" \
             "$(ls -d /usr/src/linux-headers-*-amd64 2>/dev/null | sort -V | tail -1)" \
             "$(ls -d /usr/src/kernels/*        2>/dev/null | sort -V | tail -1)"; do
             if [ -d "$cand" ]; then KDIR="$cand"; break; fi
