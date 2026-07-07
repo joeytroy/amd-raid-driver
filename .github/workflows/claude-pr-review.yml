@@ -41,10 +41,15 @@ jobs:
       - uses: anthropics/claude-code-action@v1
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-          # TEMP: diagnostic — expose the full SDK transcript so we can see
-          # exactly which tool calls the sandbox denies.  Revert once fixed.
-          show_full_output: true
           prompt: |
+            You are reviewing PR #${{ github.event.pull_request.number }}
+            in this repository.  The checkout is a detached merge commit,
+            so `gh` cannot infer the PR number — always pass it explicitly
+            (e.g. `gh pr diff ${{ github.event.pull_request.number }}`,
+            `gh pr comment ${{ github.event.pull_request.number }} --body ...`).
+            Do NOT run `gh pr list`, `gh api`, or `gh search` to discover it;
+            those are not permitted and the number is already given above.
+
             Review this pull request. This repo is a clean-room Linux kernel
             block driver (rcraid) for AMD RaidXpert2 NVMe RAID arrays, so
             review with kernel-driver standards in mind:
@@ -70,10 +75,10 @@ jobs:
             where possible. Report real issues only — do not pad the
             review with style nits or restate the diff.
 
-            If you find no issues, post one brief PR comment (via
-            `gh pr comment`) saying what you reviewed and that it looks
-            clean — a silent pass is indistinguishable from a review
-            that never ran.
+            If you find no issues, post one brief PR comment with
+            `gh pr comment ${{ github.event.pull_request.number }} --body ...`
+            saying what you reviewed and that it looks clean — a silent
+            pass is indistinguishable from a review that never ran.
           # --allowedTools REPLACES the action's default allowlist, it does
           # not extend it.  So this list must cover BOTH what the reviewer
           # needs to read the change (Read/Grep/Glob, git/gh inspection) AND
