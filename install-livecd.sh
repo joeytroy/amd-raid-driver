@@ -472,7 +472,7 @@ if [ -z "${ESP_DEV:-}" ]; then
         fi
     done
     if [ -n "${ESP_DEV:-}" ] && ! mountpoint -q "$ESP_MNT" 2>/dev/null; then
-        mkdir -p "$ESP_MNT"
+        mkdir -p "$ESP_MNT" 2>/dev/null || true
         mount "$ESP_DEV" "$ESP_MNT" 2>/dev/null || true
     fi
 fi
@@ -496,7 +496,7 @@ else
         BOOT_DIR="$ESP_MNT/EFI/BOOT"
         cur="$BOOT_DIR/BOOTX64.EFI"
         sentinel="$BOOT_DIR/.rcraid-managed"
-        mkdir -p "$BOOT_DIR"
+        mkdir -p "$BOOT_DIR" 2>/dev/null || true
         # \EFI\BOOT\BOOTX64.EFI is the firmware-wide removable-media fallback
         # and may already belong to another OS on a shared ESP (e.g. Windows'
         # own fallback loader on a dual-boot box).  Preserve any loader we did
@@ -511,12 +511,25 @@ else
         # absent).  This also keeps the reinstall / multi-distro-on-the-array
         # workflow correct: an unchanged loader we wrote last time still
         # matches, so we don't re-preserve our own shim as "the original".
+        # Everything below is best-effort: the fallback loader is belt-and-
+        # suspenders (boot-from-RAID also works via DKMS + initramfs), so a
+        # transient I/O error here — plausible against a degraded/rebuilding
+        # array member — must WARN and press on, never abort the installer via
+        # set -e before the NVRAM step and the final summary.
         foreign=0
         if [ -f "$cur" ]; then
-            cur_hash=$(sha256sum "$cur" | awk '{print $1}')
-            if [ -f "$sentinel" ]; then
-                [ "$cur_hash" = "$(cat "$sentinel" 2>/dev/null)" ] || foreign=1
+            # If we can't hash the current loader, treat it as foreign so we
+            # err on the side of preserving it.
+            if cur_hash=$(sha256sum "$cur" 2>/dev/null | awk '{print $1}') && \
+               [ -n "$cur_hash" ]; then
+                if [ -f "$sentinel" ]; then
+                    [ "$cur_hash" = "$(cat "$sentinel" 2>/dev/null)" ] || foreign=1
+                else
+                    foreign=1
+                fi
             else
+                echo "    WARN: couldn't hash existing BOOTX64.EFI — treating as foreign" >&2
+                cur_hash=""
                 foreign=1
             fi
         fi
@@ -527,8 +540,11 @@ else
             dest="$BOOT_DIR/BOOTX64.EFI.rcraid-orig"
             [ -e "$dest" ] && dest="$BOOT_DIR/BOOTX64.EFI.rcraid-bak.${cur_hash:0:12}"
             if [ ! -e "$dest" ]; then
-                cp -f "$cur" "$dest"
-                echo "    preserved foreign BOOTX64.EFI -> $(basename "$dest")"
+                if cp -f "$cur" "$dest" 2>/dev/null; then
+                    echo "    preserved foreign BOOTX64.EFI -> $(basename "$dest")"
+                else
+                    echo "    WARN: couldn't back up existing BOOTX64.EFI — leaving it in place" >&2
+                fi
             fi
         fi
         # Copy the whole loader chain (shim + grub + MOK manager) so that
@@ -538,11 +554,14 @@ else
         # Only BOOTX64.EFI (the name firmware auto-boots) is treated as a
         # contended slot; the vendor-named files are ours.
         cp -f "$vendor_dir"/*.efi "$BOOT_DIR/" 2>/dev/null || true
-        cp -f "$boot_src" "$cur"
-        # Record the hash of exactly what we wrote so a future run can tell our
-        # own loader from a foreign overwrite.
-        sha256sum "$cur" | awk '{print $1}' > "$sentinel"
-        echo "    fallback loader installed: EFI/BOOT/BOOTX64.EFI ($(basename "$boot_src"))"
+        if cp -f "$boot_src" "$cur" 2>/dev/null; then
+            # Record the hash of exactly what we wrote so a future run can tell
+            # our own loader from a foreign overwrite.
+            sha256sum "$cur" 2>/dev/null | awk '{print $1}' > "$sentinel" 2>/dev/null || true
+            echo "    fallback loader installed: EFI/BOOT/BOOTX64.EFI ($(basename "$boot_src"))"
+        else
+            echo "    WARN: couldn't install EFI/BOOT/BOOTX64.EFI fallback loader" >&2
+        fi
     else
         echo "    WARN: no shim/grub .efi under $ESP_MNT/EFI — install may be incomplete" >&2
     fi
