@@ -1,0 +1,65 @@
+# Claude (Sonnet) automated PR review.
+#
+# Runs on every PR opened or updated by the repo owner or collaborators.
+# Fork PRs and external contributors are deliberately excluded: this is a
+# public repo, and the job spends Anthropic API credits — the
+# author_association guard keeps drive-by PRs from triggering it.
+# Uses `pull_request` (not pull_request_target) so no elevated token or
+# secrets are exposed to untrusted code.
+#
+# Requires the ANTHROPIC_API_KEY repository secret
+# (Settings -> Secrets and variables -> Actions).
+
+name: Claude PR Review
+
+permissions:
+  contents: read
+  pull-requests: write
+
+on:
+  pull_request:
+    types: [opened, synchronize]
+
+jobs:
+  review:
+    if: |
+      github.event.pull_request.author_association == 'OWNER' ||
+      github.event.pull_request.author_association == 'COLLABORATOR' ||
+      github.event.pull_request.author_association == 'MEMBER'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: anthropics/claude-code-action@v1
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          prompt: |
+            Review this pull request. This repo is a clean-room Linux kernel
+            block driver (rcraid) for AMD RaidXpert2 NVMe RAID arrays, so
+            review with kernel-driver standards in mind:
+
+            - Correctness in the I/O path: blk-mq request lifecycle
+              (start/end exactly once), scatterlist sizing and DMA
+              map/unmap pairing, NVMe PRP page-alignment rules, stripe
+              arithmetic, integer overflow on sector/byte math.
+            - Concurrency: locking around shared state, ISR vs process
+              context, per-hctx vs global resources, completion races.
+            - Error paths: every failure path must unwind (unmap, free,
+              end request) and LOG — silent BLK_STS_IOERR returns have
+              bitten this project before.
+            - Assumptions that only hold for page-aligned direct I/O but
+              break on fragmented buffered writeback (512-byte buffer-head
+              bvecs) — this exact class of bug caused data-path failures
+              in the past (see PR #10).
+            - For shell scripts: safety of destructive operations, unset
+              variable handling, quoting.
+
+            Post findings as inline comments on the specific lines.
+            Include severity (critical/major/minor) and a suggested fix
+            where possible. Report real issues only — do not pad the
+            review with style nits or restate the diff.
+          claude_args: |
+            --model claude-sonnet-5
+            --max-turns 12
