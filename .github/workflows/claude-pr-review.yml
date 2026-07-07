@@ -18,6 +18,8 @@ name: Claude PR Review
 permissions:
   contents: read
   pull-requests: write
+  # Required by claude-code-action's OAuth-token auth (OIDC exchange).
+  id-token: write
 
 on:
   pull_request:
