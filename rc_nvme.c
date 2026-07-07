@@ -523,8 +523,15 @@ irqreturn_t rc_nvme_io_queue_irq(int irq, void *dev_id)
 			if (req) {
 				u16 sc = (status >> 1) & 0x7fff;
 				pdu = blk_mq_rq_to_pdu(req);
-				if (sc)
+				if (sc) {
 					pdu->sc_sct = sc;
+					rc_printk(RC_ERROR,
+						  "rc_nvme_io_queue_irq: %s qid=%u CID=%u op=%u pos=%llu len=%u failed SC/SCT=0x%04x\n",
+						  pci_name(adapter->pdev), q->qid,
+						  cid, pdu->op,
+						  (u64)blk_rq_pos(req),
+						  blk_rq_sectors(req), sc);
+				}
 				if (atomic_dec_and_test(&pdu->members_pending)) {
 					/* Try to defer to local batch; fall back
 					 * to the softirq path if the batch is full. */
@@ -2168,8 +2175,12 @@ static blk_status_t rc_volume_dispatch_multi_stripe(
 	int members_with_data = 0;
 	int m;
 
-	if (nm <= 0 || nm > RC_VOLUME_MAX_MEMBERS || !stripe)
+	if (nm <= 0 || nm > RC_VOLUME_MAX_MEMBERS || !stripe) {
+		rc_printk(RC_ERROR,
+			  "rc_volume_dispatch_multi_stripe: bad volume state (members=%d stripe=%u) — pos=%llu len=%u rejected\n",
+			  nm, stripe, (u64)pos, nr_sectors);
 		return BLK_STS_IOERR;
+	}
 
 	for (m = 0; m < nm; m++)
 		sg_init_table(pdu->ms_sg[m], RC_VOLUME_MS_PAGES_PER_MEMBER);
@@ -2194,18 +2205,34 @@ static blk_status_t rc_volume_dispatch_multi_stripe(
 			u32 chunk_bytes = chunk_sectors * 512u;
 			int mbr = (int)(stripe_idx % nm);
 
-			if (chunk_bytes == 0 || chunk_bytes > seg_remaining)
+			if (chunk_bytes == 0 || chunk_bytes > seg_remaining) {
+				rc_printk(RC_ERROR,
+					  "rc_volume_dispatch_multi_stripe: bvec split error (chunk_bytes=%u seg_remaining=%u bv_len=%u) — pos=%llu len=%u rejected\n",
+					  chunk_bytes, seg_remaining, bv.bv_len,
+					  (u64)pos, nr_sectors);
 				return BLK_STS_IOERR;
-			if (sg_used[mbr] >= RC_VOLUME_MS_PAGES_PER_MEMBER)
+			}
+			if (sg_used[mbr] >= RC_VOLUME_MS_PAGES_PER_MEMBER) {
+				rc_printk(RC_ERROR,
+					  "rc_volume_dispatch_multi_stripe: member %d sg overflow (>%u entries) — pos=%llu len=%u rejected\n",
+					  mbr, RC_VOLUME_MS_PAGES_PER_MEMBER,
+					  (u64)pos, nr_sectors);
 				return BLK_STS_IOERR;
+			}
 
 			if (!member_has_data[mbr]) {
 				u64 phys_lba;
 				int phys_member;
 				rc_volume_map_lba(cur_lba, &phys_member,
 						  &phys_lba);
-				if (phys_member != mbr)
+				if (phys_member != mbr) {
+					rc_printk(RC_ERROR,
+						  "rc_volume_dispatch_multi_stripe: member mismatch (map_lba=%d stripe_mod=%d cur_lba=%llu) — pos=%llu len=%u rejected\n",
+						  phys_member, mbr,
+						  (u64)cur_lba, (u64)pos,
+						  nr_sectors);
 					return BLK_STS_IOERR;
+				}
 				member_start_lba[mbr] = phys_lba;
 				member_has_data[mbr] = true;
 				members_with_data++;
@@ -2223,8 +2250,12 @@ static blk_status_t rc_volume_dispatch_multi_stripe(
 		}
 	}
 
-	if (members_with_data < 2)
+	if (members_with_data < 2) {
+		rc_printk(RC_ERROR,
+			  "rc_volume_dispatch_multi_stripe: only %d member with data — pos=%llu len=%u rejected\n",
+			  members_with_data, (u64)pos, nr_sectors);
 		return BLK_STS_IOERR;	/* shouldn't reach here for single-member */
+	}
 
 	/* Mark each member's sg array as the active subset. */
 	for (m = 0; m < nm; m++) {
@@ -2248,6 +2279,9 @@ static blk_status_t rc_volume_dispatch_multi_stripe(
 		mapped = dma_map_sg(dma_dev, pdu->ms_sg[m], sg_used[m],
 				    rc_volume_dma_dir(op));
 		if (mapped == 0) {
+			rc_printk(RC_ERROR,
+				  "rc_volume_dispatch_multi_stripe: dma_map_sg failed (member %d, %u entries) — pos=%llu len=%u rejected\n",
+				  m, sg_used[m], (u64)pos, nr_sectors);
 			/* Unwind: undo previously mapped members. */
 			pdu->ms_nents[m] = 0;
 			for (--m; m >= 0; m--) {
@@ -2444,6 +2478,8 @@ static blk_status_t rc_volume_queue_rq(struct blk_mq_hw_ctx *hctx,
 	}
 
 	if (op != REQ_OP_READ && op != REQ_OP_WRITE && op != REQ_OP_DISCARD) {
+		rc_printk(RC_ERROR,
+			  "rc_volume_queue_rq: unsupported op=%u rejected\n", op);
 		blk_mq_start_request(req);
 		rc_cache_dec_inflight(pdu);
 		blk_mq_end_request(req, BLK_STS_IOERR);
@@ -2454,6 +2490,11 @@ static blk_status_t rc_volume_queue_rq(struct blk_mq_hw_ctx *hctx,
 	    pos + nr_sectors > get_capacity(rc_volume_disk) ||
 	    (op != REQ_OP_DISCARD &&
 	     nr_sectors > (RC_VOLUME_DATA_BYTES / 512))) {
+		rc_printk(RC_ERROR,
+			  "rc_volume_queue_rq: op=%u pos=%llu len=%u out of bounds (capacity=%llu max_io=%lu) rejected\n",
+			  op, (u64)pos, nr_sectors,
+			  (u64)get_capacity(rc_volume_disk),
+			  RC_VOLUME_DATA_BYTES / 512);
 		blk_mq_start_request(req);
 		rc_cache_dec_inflight(pdu);
 		blk_mq_end_request(req, BLK_STS_IOERR);
@@ -3819,11 +3860,20 @@ static int rc_volume_create_disk(void)
 			 * segment after the first is page-aligned, which is what
 			 * rc_volume_build_prp relies on. */
 			.virt_boundary_mask  = PAGE_SIZE - 1,
-			/* Don't force blk-mq to split at stripe boundaries — we
-			 * fan out multi-stripe requests across members ourselves
-			 * in rc_volume_dispatch_multi_stripe, which is cheaper
-			 * (1 cmd per member instead of 1 cmd per stripe). */
-			.chunk_sectors       = 0,
+			/* Split READ/WRITE at stripe boundaries so each request
+			 * maps to exactly one member.  The multi-stripe fan-out
+			 * (rc_volume_dispatch_multi_stripe) is disabled for now:
+			 * it builds one sg entry per raw bvec (overflowing the
+			 * 128-entry per-member arrays on buffer-head writeback,
+			 * which sends 512-byte bvecs), and slicing one bio's data
+			 * stream across members violates NVMe PRP page-alignment
+			 * unless the buffer happens to be page-aligned at every
+			 * stripe boundary.  Discards are unaffected — blk-mq
+			 * splits them by max_hw_discard_sectors, not
+			 * chunk_sectors, so the one-DSM-per-member fan-out in
+			 * rc_volume_dispatch_multi_stripe_discard still sees
+			 * multi-stripe requests. */
+			.chunk_sectors       = rc_volume_stripe_sectors,
 			/* Advertise that the underlying controllers have a volatile
 			 * write cache and that we honour FUA — filesystems will
 			 * now route REQ_OP_FLUSH and REQ_FUA writes through. */
