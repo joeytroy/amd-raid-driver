@@ -1558,6 +1558,18 @@ static void rc_volume_parse_logical_device(struct rc_adapter *adapter)
 			chunk_index = get_unaligned_le32(ld + RC_LD_CHUNKINDEX_OFFSET);
 			capacity = get_unaligned_le64(ld + RC_LD_CAPACITY_OFFSET);
 
+			/* Diagnostic cross-check.  Reverse-engineering rcraid.sys
+			 * 9.3.2 (docs/RCRAID_GEOMETRY_RE.md) shows the Windows
+			 * driver uses SECONDCOUNT (+0x70), not DEVICES (+0x68),
+			 * as the RAID0 member count in its stripe math and its
+			 * "RAID0 needs >= 2 members" check (FUN_1400121d0).  The
+			 * two are equal for a plain N-disk RAID0, so we still key
+			 * assembly off DEVICES (proven correct on this hardware)
+			 * — but log SECONDCOUNT so any mismatch on an exotic
+			 * layout is visible instead of silently mis-counted. */
+			u32 second_count =
+				get_unaligned_le32(ld + RC_LD_SECONDCOUNT_OFFSET);
+
 			if (devices < 1 || devices > RC_VOLUME_MAX_MEMBERS)
 				continue;
 			if ((u64)i + elem_off +
@@ -1585,11 +1597,11 @@ static void rc_volume_parse_logical_device(struct rc_adapter *adapter)
 			}
 
 			rc_printk(RC_INFO,
-				  "rc_volume_parse_logical_device: %s LD@ring+%u.%u devtype=0x%04x devices=%u chunk=%u chunk_idx=%u capacity=%llu my_pos=%d alloc_off=%llu alloc_sz=%llu user_off=%llu user_sz=%llu%s\n",
+				  "rc_volume_parse_logical_device: %s LD@ring+%u.%u devtype=0x%04x devices=%u second_count=%u chunk=%u chunk_idx=%u capacity=%llu my_pos=%d alloc_off=%llu alloc_sz=%llu user_off=%llu user_sz=%llu%s\n",
 				  pci_name(adapter->pdev),
 				  scan * RC_LD_SCAN_CHUNK_SECTORS + (i / 512),
 				  i % 512,
-				  devtype, devices, chunk, chunk_index,
+				  devtype, devices, second_count, chunk, chunk_index,
 				  (unsigned long long)capacity, my_pos,
 				  (unsigned long long)alloc_off,
 				  (unsigned long long)alloc_sz,
@@ -1738,10 +1750,11 @@ static u32 rc_volume_expected_members;
  *     non-0.
  *
  *   - field @ 0x110 (RC_LD_CHUNKINDEX_OFFSET): a small index that
- *     encodes the actual stripe size for RAID0.  Confirmed by reverse-
- *     engineering rcraid.sys 9.3.2: FUN_140052404 and FUN_140055760
- *     both dispatch on this value (read from in-memory LD[0xC8], which
- *     is populated from on-disk LD[0x110]) and pick a sector count:
+ *     encodes the actual stripe size for RAID0.  VERIFIED against
+ *     rcraid.sys 9.3.2 (see docs/RCRAID_GEOMETRY_RE.md): FUN_1400121d0
+ *     dispatches on this value (read from in-memory LD[0xC8], populated
+ *     from on-disk LD[0x110] by the field copier FUN_140018444) and
+ *     picks a sector count:
  *
  *         index   stripe
  *         -----   ------
@@ -1749,12 +1762,16 @@ static u32 rc_volume_expected_members;
  *         2       256 sectors (128 KiB)
  *         else    128 sectors (64 KiB)
  *
- *     The pattern is consistent with chunk_sectors = 64 << index for
- *     index >= 1, which would extrapolate to 1024 sectors (512 KiB)
- *     for index 4 and 2048 sectors (1 MiB) for index 5; the observed
- *     Windows code only handles 2 and 3 explicitly and falls back to
- *     64 KiB otherwise, so we mirror that to match Windows behavior
- *     bit-for-bit on this hardware. */
+ *     Two subtleties confirmed by the RE, not guessed:
+ *       - FUN_140018444 forces chunk_index = 1 when the on-disk field
+ *         is 0, so 0 and 1 both mean 64 KiB.
+ *       - Windows handles ONLY 2 and 3 explicitly; every other value
+ *         (including >= 4) falls to 64 KiB.  So the "64 << index"
+ *         extrapolation is NOT what Windows does — an index >= 4 is an
+ *         encoding neither driver understands.  We keep the 64 KiB
+ *         best-effort here so the array is still READABLE, but the
+ *         caller marks such geometry untrusted so the write-veto forces
+ *         read-only (a wrong stripe size would corrupt on write). */
 static u32 rc_volume_chunk_sectors_for(u32 devtype, u32 ld_chunk,
 				       u32 ld_chunk_index)
 {
@@ -1804,6 +1821,20 @@ static void rc_volume_register_member(struct rc_adapter *adapter)
 				  "rc_volume_register_member: %s unknown DeviceType=0x%x with ChunkSize=0 — ignoring\n",
 				  pci_name(adapter->pdev), nvme->ld_device_type);
 			goto out;
+		}
+		/* Fail closed on an unrecognized RAID0 stripe encoding.  When
+		 * ChunkSize is 0 the stripe comes from chunk_index, and the
+		 * reference parser (rcraid.sys 9.3.2 FUN_1400121d0) only maps
+		 * 2 and 3; anything >= 4 falls to a 64 KiB guess that would be
+		 * WRONG for a real 512 KiB / 1 MiB stripe and corrupt the array
+		 * on write.  Keep 64 KiB so reads still work, but distrust the
+		 * geometry so create_disk forces read-only. */
+		if (nvme->ld_device_type == RC_LDT_RAID0 &&
+		    nvme->ld_chunk_sectors == 0 && nvme->ld_chunk_index > 3) {
+			rc_printk(RC_WARN,
+				  "rc_volume_register_member: %s RAID0 chunk_index=%u not understood (only 0..3 map to a known stripe) — geometry UNTRUSTED, writes will be vetoed\n",
+				  pci_name(adapter->pdev), nvme->ld_chunk_index);
+			rc_volume_geometry_trusted = false;
 		}
 	} else {
 		expected = RC_VOLUME_EXPECTED_MEMBERS;
