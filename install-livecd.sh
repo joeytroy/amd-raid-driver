@@ -590,14 +590,27 @@ else
                 done
             fi
             if [ -e "$dest" ]; then
-                # This exact chain is already preserved — nothing to copy.
+                # A COMPLETE copy already exists — the atomic rename below only
+                # publishes $dest after a full cp, so its mere presence means a
+                # good backup.  Nothing to do.
                 may_write=1
-            elif cp -r "$BOOT_DIR" "$dest" 2>/dev/null; then
-                may_write=1
-                echo "    preserved existing EFI/BOOT loader chain -> $(basename "$dest")"
             else
-                echo "    WARN: couldn't back up existing EFI/BOOT — leaving it in place" >&2
-                echo "    and NOT overwriting BOOTX64.EFI; relying on the NVRAM entry." >&2
+                # Copy to a temp path, then atomically rename into place.  An
+                # interrupted cp (power loss, I/O error on a degraded member)
+                # then leaves only the temp — never a partial copy under $dest
+                # that a later run would mistake for a complete backup and skip,
+                # silently losing the displaced loader.
+                _tmp="$ESP_MNT/EFI/BOOT.rcraid-partial"
+                rm -rf "$_tmp" 2>/dev/null || true
+                if cp -r "$BOOT_DIR" "$_tmp" 2>/dev/null && \
+                   mv "$_tmp" "$dest" 2>/dev/null; then
+                    may_write=1
+                    echo "    preserved existing EFI/BOOT loader chain -> $(basename "$dest")"
+                else
+                    rm -rf "$_tmp" 2>/dev/null || true
+                    echo "    WARN: couldn't back up existing EFI/BOOT — leaving it in place" >&2
+                    echo "    and NOT overwriting BOOTX64.EFI; relying on the NVRAM entry." >&2
+                fi
             fi
         fi
         if [ "$may_write" = 1 ]; then
