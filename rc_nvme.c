@@ -55,6 +55,14 @@ static struct rc_adapter *rc_volume_members[RC_VOLUME_MAX_MEMBERS];
 static u64 rc_volume_member_phys_offset[RC_VOLUME_MAX_MEMBERS];
 static int rc_volume_member_count;
 static u32 rc_volume_stripe_sectors;
+/* Geometry-trust flag.  True only while every member was placed from the
+ * deterministic on-disk Logical Device (ld_my_position + LD-derived stripe).
+ * Cleared if any member falls back to the legacy BDF-sorted guess, where the
+ * member order and phys offsets are inferred, not read from disk.  A volume
+ * assembled on the guessed geometry must never be written to (a wrong member
+ * order silently corrupts the array), so this vetoes writes at create_disk
+ * time regardless of the enable_writes opt-in. */
+static bool rc_volume_geometry_trusted = true;
 static DEFINE_MUTEX(rc_volume_lock);
 
 /* Conservatively hard-code expected member count = 2 (the user's RAID0).
@@ -1854,7 +1862,10 @@ static void rc_volume_register_member(struct rc_adapter *adapter)
 		rc_volume_member_phys_offset[pos] = nvme->ld_userdata_offset;
 		rc_volume_member_count++;
 	} else {
-		/* Legacy BDF-sorted insertion. */
+		/* Legacy BDF-sorted insertion.  The member order and phys
+		 * offsets here are a guess (no on-disk LD to read them from),
+		 * so the assembled geometry can't be trusted for writes. */
+		rc_volume_geometry_trusted = false;
 		for (pos = 0; pos < rc_volume_member_count; pos++) {
 			if (rc_volume_bdf_cmp(adapter, rc_volume_members[pos]) < 0)
 				break;
@@ -3922,12 +3933,26 @@ static int rc_volume_create_disk(void)
 	rc_volume_disk->flags       = 0;
 	/* Read-only unless the operator explicitly opted in via the module
 	 * parameter.  Note the parameter is 0444 (read-only sysfs) so it
-	 * can only be set at load time — re-load to switch modes. */
-	if (!rc_volume_enable_writes)
+	 * can only be set at load time — re-load to switch modes.
+	 *
+	 * Additionally veto writes when the geometry is untrusted: if any
+	 * member was placed by the legacy BDF-sorted guess rather than the
+	 * on-disk LD, the member order / phys offsets are inferred and a
+	 * write could land on the wrong drive and corrupt the array.  This
+	 * gate is purely additive — it can only force read-only, never grant
+	 * writes the operator didn't request. */
+	if (!rc_volume_enable_writes || !rc_volume_geometry_trusted)
 		set_disk_ro(rc_volume_disk, 1);
+	if (rc_volume_enable_writes && !rc_volume_geometry_trusted)
+		rc_printk(RC_WARN,
+			  "rc_volume_create_disk: enable_writes=1 but geometry is UNTRUSTED (a member was assembled via the legacy BDF fallback, not the on-disk LD) — forcing READ-ONLY to avoid corrupting a mis-assembled array. Restore LD parsing (or set stripe_sectors_override and verify reads) before enabling writes.\n");
 	rc_printk(RC_NOTE,
 		  "rc_volume_create_disk: writes %s\n",
-		  rc_volume_enable_writes ? "ENABLED" : "disabled (load with enable_writes=1 to allow)");
+		  (rc_volume_enable_writes && rc_volume_geometry_trusted) ?
+			"ENABLED" :
+		  !rc_volume_enable_writes ?
+			"disabled (load with enable_writes=1 to allow)" :
+			"disabled (geometry untrusted — see warning above)");
 
 	ret = add_disk(rc_volume_disk);
 	if (ret)
@@ -3938,7 +3963,8 @@ static int rc_volume_create_disk(void)
 		  rc_volume_disk->disk_name,
 		  (unsigned long long)total_sectors,
 		  (unsigned long long)(total_sectors >> 11),
-		  rc_volume_enable_writes ? "read-write" : "read-only");
+		  (rc_volume_enable_writes && rc_volume_geometry_trusted) ?
+			"read-write" : "read-only");
 	return 0;
 
 err_put_disk:
