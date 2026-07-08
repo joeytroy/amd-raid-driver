@@ -539,7 +539,20 @@ else
         # overwrite Ubuntu's fallback with no preservation.  Treating a vendor
         # mismatch as displaced routes it through the backup path instead.
         our_vendor=$(basename "$vendor_dir")
+        # Two distinct cases for the loader currently occupying the slot:
+        #   foreign=1        — a loader we did NOT write (a real other-OS loader,
+        #                      or one an external agent wrote over ours).  Nowhere
+        #                      else to recover it from, so preserve before we
+        #                      overwrite.
+        #   displaced_ours=1 — OUR OWN loader from a previous run for a DIFFERENT
+        #                      distro (the multi-distro switch): the hash still
+        #                      matches the sentinel, only the vendor differs.
+        #                      That distro still boots from its own EFI/<vendor>
+        #                      loader and NVRAM entry, so it's recoverable — WARN
+        #                      but do NOT back it up.  Backing every switch up is
+        #                      what let the .rcraid-bak dirs accumulate unbounded.
         foreign=0
+        displaced_ours=0
         if [ -f "$cur" ]; then
             # If we can't hash the current loader, treat it as foreign so we
             # err on the side of preserving it.
@@ -548,9 +561,10 @@ else
                 if [ -f "$sentinel" ]; then
                     read -r rec_hash rec_vendor < "$sentinel" 2>/dev/null || \
                         { rec_hash=""; rec_vendor=""; }
-                    if [ "$cur_hash" != "$rec_hash" ] || \
-                       [ "$rec_vendor" != "$our_vendor" ]; then
-                        foreign=1
+                    if [ "$cur_hash" != "$rec_hash" ]; then
+                        foreign=1          # changed out from under us
+                    elif [ "$rec_vendor" != "$our_vendor" ]; then
+                        displaced_ours=1   # our own loader, switching distros
                     fi
                 elif ! cmp -s "$cur" "$boot_src"; then
                     # No sentinel yet (first run): treat the existing loader as
@@ -612,6 +626,13 @@ else
                     echo "    and NOT overwriting BOOTX64.EFI; relying on the NVRAM entry." >&2
                 fi
             fi
+        elif [ "$displaced_ours" = 1 ]; then
+            # Our own prior fallback for a different distro — recoverable, so we
+            # overwrite without a backup (that is what keeps backups bounded),
+            # but say so rather than clobber silently.
+            echo "    note: replacing this array's own ${rec_vendor:-previous} fallback"
+            echo "    loader with ${our_vendor} — the former still boots via its own"
+            echo "    EFI/${rec_vendor:-<vendor>} loader and NVRAM entry."
         fi
         if [ "$may_write" = 1 ]; then
             # Copy the whole loader chain (shim + grub + MOK manager) so shim,
