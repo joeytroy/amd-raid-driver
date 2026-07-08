@@ -1558,15 +1558,15 @@ static void rc_volume_parse_logical_device(struct rc_adapter *adapter)
 			chunk_index = get_unaligned_le32(ld + RC_LD_CHUNKINDEX_OFFSET);
 			capacity = get_unaligned_le64(ld + RC_LD_CAPACITY_OFFSET);
 
-			/* Diagnostic cross-check.  Reverse-engineering rcraid.sys
-			 * 9.3.2 (docs/RCRAID_GEOMETRY_RE.md) shows the Windows
-			 * driver uses SECONDCOUNT (+0x70), not DEVICES (+0x68),
-			 * as the RAID0 member count in its stripe math and its
-			 * "RAID0 needs >= 2 members" check (FUN_1400121d0).  The
-			 * two are equal for a plain N-disk RAID0, so we still key
-			 * assembly off DEVICES (proven correct on this hardware)
-			 * — but log SECONDCOUNT so any mismatch on an exotic
-			 * layout is visible instead of silently mis-counted. */
+			/* Diagnostic.  An earlier reading of rcraid.sys 9.3.2
+			 * guessed SECONDCOUNT (+0x70) might be the authoritative
+			 * RAID0 member count instead of DEVICES (+0x68).
+			 * On-hardware boot logging DISPROVED that: on a healthy
+			 * 2-member RAID0 this array reports DEVICES=2 and
+			 * SECONDCOUNT=1.  So DEVICES is the member count (what we
+			 * key assembly off — correct), and SECONDCOUNT is some
+			 * other field.  Keep logging it purely for forensics.
+			 * See docs/RCRAID_GEOMETRY_RE.md. */
 			u32 second_count =
 				get_unaligned_le32(ld + RC_LD_SECONDCOUNT_OFFSET);
 

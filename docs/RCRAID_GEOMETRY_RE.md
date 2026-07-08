@@ -8,8 +8,8 @@ bit-for-bit", "this is a guess at member position") with confirmed fact.
 
 **Bottom line:** the Linux driver's RAID0 geometry parsing is **correct** — the
 chunk-size mapping, the key struct offsets, and the RAID-level magic all match
-the Windows binary. One field (member count) has a naming/offset question worth
-verifying. Details below.
+the Windows binary. The one field that looked uncertain (member count) was
+settled on hardware: `0x68` (DEVICES) is correct. Details below.
 
 ## Methodology
 
@@ -57,9 +57,9 @@ From `FUN_140018444` (`param_2` = on-disk packet, `param_1` = in-memory LD):
 | DeviceType | `+0x0C` | `RC_LD_DEVICETYPE_OFFSET 0x0C` | ✅ |
 | element-array offset | `+0x04` | `RC_LD_ELEMENTOFFSET_OFFSET 0x04` | ✅ |
 | Capacity (u64) | `+0x50` | `RC_LD_CAPACITY_OFFSET 0x50` | ✅ |
-| DEVICES | `+0x68` | `RC_LD_DEVICES_OFFSET 0x68` | ⚠️ see below |
+| DEVICES (member count) | `+0x68` | `RC_LD_DEVICES_OFFSET 0x68` | ✅ **confirmed on hw** (=2) |
 | (FirstCount) | `+0x6C` | `RC_LD_FIRSTCOUNT_OFFSET 0x6C` | ✅ copied to in-mem `[0x2d]` |
-| (SecondCount) | `+0x70` | `RC_LD_SECONDCOUNT_OFFSET 0x70` | ⚠️ see below |
+| (SecondCount) | `+0x70` | `RC_LD_SECONDCOUNT_OFFSET 0x70` | ℹ️ =1 on a 2-member RAID0 — NOT the member count |
 | PacketSize | `+0x90` | `RC_LD_PACKETSIZE_OFFSET 0x90` | ✅ (`piVar13[0x24]` sanity-check) |
 | ChunkSize (u32, sectors; 0 for RAID0) | `+0xAC` | `RC_LD_CHUNKSIZE_OFFSET 0xAC` | ✅ |
 | chunk_index (u32) | `+0x110` | `RC_LD_CHUNKINDEX_OFFSET 0x110` | ✅ |
@@ -123,16 +123,19 @@ the I/O handler pair (stored at in-mem `+0x158` / `+0x168`):
 - ChunkSize `0xAC`, chunk_index `0x110`, chunk_index default 0→1.
 - chunk_index → stripe size mapping (3→256K, 2→128K, else→64K).
 
-**Open question — member count field (`0x68` vs `0x70`):**
+**RESOLVED — member count is `0x68` (DEVICES), not `0x70`:**
 `FUN_140018444` copies three adjacent counts — on-disk `0x68`→in-mem `[0x2c]`,
-`0x6C`→`[0x2d]`, `0x70`→`[0x2e]`. The Linux driver treats `0x68` (`DEVICES`) as
-the member count. The Windows striping calc `FUN_1400121d0` uses in-mem `[0x2e]`
-(← on-disk `0x70`, which Linux names `SECONDCOUNT`). For a plain 2-disk RAID0
-these are equal (and the workstation array assembles correctly with 2/2 members),
-so this is **not** a live bug here — but the authoritative member/element count
-for exotic layouts (RAID10, spanned, RAID5 with parity) should be confirmed
-before relying on it. Recommend RE'ing the element-count/validation path
-(`RC_ValidateLogicalElement` @ `0x140023554`) to settle which field governs.
+`0x6C`→`[0x2d]`, `0x70`→`[0x2e]`. A static reading of the striping calc
+`FUN_1400121d0` (which uses in-mem `[0x2e]` ← on-disk `0x70`) *suggested* `0x70`
+might be the authoritative member count. **On-hardware boot logging disproved
+that:** on this healthy 2-member RAID0 the on-disk LD reports **`devices` (0x68)
+= 2** and **`second_count` (0x70) = 1**. So `0x68` is the member count (the Linux
+driver is correct), and `0x70` is some other field — the `[0x2e]`/`+0xb8` static
+interpretation was mistaken. This is a good example of empirical validation
+catching a plausible-but-wrong decompiler inference: the driver logs `0x70` but
+was deliberately NOT switched to key off it — which would have mis-counted the
+array as 1 member and broken assembly. The driver keeps logging `second_count`
+for forensics on exotic layouts.
 
 **Latent gap (not affecting this box):**
 Neither this Windows version nor the Linux driver handles `chunk_index ≥ 4`; both
@@ -145,9 +148,11 @@ does **not** catch this, because the LD parses fine — only the stripe size is
 wrong. Worth a guard: treat an unrecognized chunk_index as untrusted.
 
 ## Follow-ups
-- [ ] Update `rc_nvme.c` / `rc_linux.h` comments: cite `FUN_1400121d0` /
-      `FUN_140018444` and drop the "guess"/"mirror" hedging for the confirmed items.
-- [ ] Settle the `0x68` vs `0x70` member-count question via the element-validation path.
-- [ ] Consider flagging `chunk_index` values other than {0,1,2,3} as untrusted
+- [x] Update `rc_nvme.c` comments: cite `FUN_1400121d0` / `FUN_140018444`, drop
+      the "guess"/"mirror" hedging for the confirmed items. (commit `10239e8`)
+- [x] Settle the `0x68` vs `0x70` member-count question — RESOLVED on hardware:
+      `0x68` (DEVICES)=2 is the count; `0x70` (SECONDCOUNT)=1 is not. Driver logs
+      both; keys off `0x68`.
+- [x] Flag `chunk_index` values other than {0,1,2,3} as untrusted
       (fail closed) rather than silently using 64 KiB.
 - [ ] If a 9.3.3 `rcraid.sys` becomes available, diff its chunk_index mapping.
