@@ -482,14 +482,20 @@ if [ -z "${ESP_DEV:-}" ] || [ ! -d "$ESP_MNT/EFI" ]; then
     echo "    If the box won't boot, confirm the installer created an EFI"
     echo "    System Partition on /dev/rcraid0 and populated \\EFI."
 else
-    # 1) Removable-media fallback loader.  Discover the VENDOR loader
-    #    (EFI/ubuntu, EFI/fedora, …).  Skip both our own generic EFI/BOOT
-    #    fallback copy and any EFI/BOOT.rcraid-{orig,bak} backup dir: all of
-    #    those sort before real vendor dirs under the EFI/*/ glob, so a rerun
-    #    would otherwise rediscover and reinstall our previously-copied
-    #    (possibly stale) shim/grub instead of the vendor's current one.
+    # 1) Removable-media fallback loader.  Discover the VENDOR loader, and
+    #    prefer the TARGET distro's own dir (EFI/$target_os) first.  This
+    #    matters on a shared ESP that already carries another OS's loader: the
+    #    NVRAM entry below is labelled for $target_os and its -l path comes from
+    #    the same boot_src, so if discovery picked, say, EFI/ubuntu while we're
+    #    installing Fedora, the "rcraid (fedora)" entry would actually boot
+    #    Ubuntu's shim.  EFI/ubuntu stays as a fallback (Mint et al. ship their
+    #    loader there), then the generic glob.  Skip our own EFI/BOOT fallback
+    #    copy and any EFI/BOOT.rcraid-{orig,bak} backup dir: those sort before
+    #    real vendor dirs under the EFI/*/ glob and would otherwise be picked.
     boot_src=""
     for cand in \
+        "$ESP_MNT/EFI/$target_os/shimx64.efi" \
+        "$ESP_MNT/EFI/$target_os/grubx64.efi" \
         "$ESP_MNT/EFI/ubuntu/shimx64.efi" \
         "$ESP_MNT/EFI/ubuntu/grubx64.efi" \
         "$ESP_MNT"/EFI/*/shimx64.efi \
