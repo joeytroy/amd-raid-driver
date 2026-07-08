@@ -530,6 +530,15 @@ else
         # transient I/O error here — plausible against a degraded/rebuilding
         # array member — must WARN and press on, never abort the installer via
         # set -e before the NVRAM step and the final summary.
+        # The sentinel binds the installed loader to BOTH its content hash and
+        # the vendor dir it came from ("<hash> <vendor>").  The vendor half
+        # matters for the multi-distro-on-the-array workflow: install Ubuntu,
+        # then Fedora on the same ESP.  BOOTX64.EFI still holds Ubuntu's shim
+        # (unchanged, so the hash alone still matches), but we're now installing
+        # Fedora's — a hash-only check would call it "ours/unchanged" and
+        # overwrite Ubuntu's fallback with no preservation.  Treating a vendor
+        # mismatch as displaced routes it through the backup path instead.
+        our_vendor=$(basename "$vendor_dir")
         foreign=0
         if [ -f "$cur" ]; then
             # If we can't hash the current loader, treat it as foreign so we
@@ -537,7 +546,12 @@ else
             if cur_hash=$(sha256sum "$cur" 2>/dev/null | awk '{print $1}') && \
                [ -n "$cur_hash" ]; then
                 if [ -f "$sentinel" ]; then
-                    [ "$cur_hash" = "$(cat "$sentinel" 2>/dev/null)" ] || foreign=1
+                    read -r rec_hash rec_vendor < "$sentinel" 2>/dev/null || \
+                        { rec_hash=""; rec_vendor=""; }
+                    if [ "$cur_hash" != "$rec_hash" ] || \
+                       [ "$rec_vendor" != "$our_vendor" ]; then
+                        foreign=1
+                    fi
                 elif ! cmp -s "$cur" "$boot_src"; then
                     # No sentinel yet (first run): treat the existing loader as
                     # foreign only if it is NOT already byte-identical to the
@@ -573,7 +587,7 @@ else
             done
             if cp -r "$BOOT_DIR" "$dest" 2>/dev/null; then
                 may_write=1
-                echo "    preserved foreign EFI/BOOT loader chain -> $(basename "$dest")"
+                echo "    preserved existing EFI/BOOT loader chain -> $(basename "$dest")"
             else
                 echo "    WARN: couldn't back up foreign EFI/BOOT — leaving it in place" >&2
                 echo "    and NOT overwriting BOOTX64.EFI; relying on the NVRAM entry." >&2
@@ -586,9 +600,11 @@ else
             # it reads its real config from there regardless of where it ran.
             cp -f "$vendor_dir"/*.efi "$BOOT_DIR/" 2>/dev/null || true
             if cp -f "$boot_src" "$cur" 2>/dev/null; then
-                # Record the hash of exactly what we wrote so a future run can
-                # tell our own loader from a foreign overwrite.
-                sha256sum "$cur" 2>/dev/null | awk '{print $1}' > "$sentinel" 2>/dev/null || true
+                # Record "<hash> <vendor>" so a future run can tell our own
+                # loader from a foreign overwrite AND detect a distro switch.
+                printf '%s %s\n' \
+                    "$(sha256sum "$cur" 2>/dev/null | awk '{print $1}')" "$our_vendor" \
+                    > "$sentinel" 2>/dev/null || true
                 echo "    fallback loader installed: EFI/BOOT/BOOTX64.EFI ($(basename "$boot_src"))"
             else
                 echo "    WARN: couldn't install EFI/BOOT/BOOTX64.EFI fallback loader" >&2
