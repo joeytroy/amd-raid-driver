@@ -630,9 +630,18 @@ else
         else
             loader='\EFI\BOOT\BOOTX64.EFI'
         fi
-        # Label the entry with the actual target distro, not a hardcoded name,
-        # so the firmware boot menu isn't misleading on Fedora/Debian installs.
-        nvram_label="rcraid (${target_os:-linux})"
+        # Label the entry after the loader we ACTUALLY resolved, so the label
+        # and the -l path (and the BOOTX64.EFI fallback) can never disagree by
+        # construction — both come from $boot_src.  boot_src discovery already
+        # prefers EFI/$target_os, so this is normally the target distro; if it
+        # had to fall back to another vendor dir, the label honestly reflects
+        # what will boot.  With no vendor loader at all, fall back to the
+        # target distro name for the generic BOOTX64.EFI entry.
+        if [ -n "$boot_src" ]; then
+            nvram_label="rcraid ($(basename "$(dirname "$boot_src")"))"
+        else
+            nvram_label="rcraid (${target_os:-linux})"
+        fi
         if [ -n "$esp_disk" ] && [ -b "$esp_disk" ] && [ -n "$esp_partnum" ]; then
             # Drop only OUR prior entries for THIS distro so re-running doesn't
             # pile up duplicates.  Compare the label as a LITERAL string (not a
