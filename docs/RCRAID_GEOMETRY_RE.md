@@ -141,11 +141,27 @@ for forensics on exotic layouts.
 Neither this Windows version nor the Linux driver handles `chunk_index ≥ 4`; both
 silently fall back to 64 KiB. If a newer RAIDXpert2 / firmware ever creates an
 array with a 512 KiB or 1 MiB stripe encoded as index 4/5, **both** drivers would
-mis-map it and corrupt data on write. The 9.3.3 `rcraid.sys` is **not** in the
-tree (only `rcbottom.sys`/`rccfg.sys` are), so whether 9.3.3 extended the mapping
-is unverified. The geometry-trust write-veto (see `WORKSTATION_SESSION.md` §5)
-does **not** catch this, because the LD parses fine — only the stripe size is
-wrong. Worth a guard: treat an unrecognized chunk_index as untrusted.
+mis-map it and corrupt data on write. **9.3.3-00291 does NOT extend the
+mapping** (verified — see below), so the gap is inherent to AMD's encoding, not a
+version quirk. The dedicated fail-closed guard (mark unrecognized chunk_index
+untrusted) now covers it; the geometry-trust write-veto alone would not, since
+the LD parses fine and only the stripe size is wrong.
+
+## Cross-version check: 9.3.3-00291
+
+The 9.3.3 `rcraid.sys` (now vendored at
+`drivers/windows/trx50/9.3.3-00291/rcraid/`) was run through the same pipeline.
+The binary **differs** from 9.3.2 (SHA256 `3f241608…` vs `f0a6fc8b…`, +2,952
+bytes — an earlier repo note wrongly called them byte-identical), but the
+**geometry parsing is unchanged**:
+- chunk_index ladder identical (`==3`→`0x200`, `==2`→`0x100`, else→`0x80`;
+  same `0x12/0x11/0x10` exponent form; **no** index ≥ 4 case).
+- same in-memory chunk field `[0x32]` ← on-disk `+0x110`; ChunkSize `+0xAC`.
+- RAID-level magics all present (`0x1BF6/7/A/B` = RAID0/1/5/10), consistent
+  with 9.3.3's advertised RAID 0/1/10 (+RAID5 on Threadripper) support.
+
+So all `rcraid` geometry conclusions here hold for 9.3.3 — because the code is
+unchanged, not because the binary is.
 
 ## Follow-ups
 - [x] Update `rc_nvme.c` comments: cite `FUN_1400121d0` / `FUN_140018444`, drop
@@ -155,4 +171,5 @@ wrong. Worth a guard: treat an unrecognized chunk_index as untrusted.
       both; keys off `0x68`.
 - [x] Flag `chunk_index` values other than {0,1,2,3} as untrusted
       (fail closed) rather than silently using 64 KiB.
-- [ ] If a 9.3.3 `rcraid.sys` becomes available, diff its chunk_index mapping.
+- [x] Diff a 9.3.3 `rcraid.sys` — DONE: binary differs but geometry is
+      unchanged (see "Cross-version check" above); 9.3.3 binary vendored.
