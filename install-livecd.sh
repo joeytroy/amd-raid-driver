@@ -482,18 +482,21 @@ if [ -z "${ESP_DEV:-}" ] || [ ! -d "$ESP_MNT/EFI" ]; then
     echo "    If the box won't boot, confirm the installer created an EFI"
     echo "    System Partition on /dev/rcraid0 and populated \\EFI."
 else
-    # 1) Removable-media fallback loader.  Discover the vendor shim/grub, but
-    #    skip any candidate inside one of our own EFI/BOOT.rcraid-{orig,bak}
-    #    backup dirs from a previous run — those sort before real vendor dirs
-    #    (e.g. fedora/) under the EFI/*/ glob and would otherwise be picked as
-    #    the loader to install.
+    # 1) Removable-media fallback loader.  Discover the VENDOR loader
+    #    (EFI/ubuntu, EFI/fedora, …).  Skip both our own generic EFI/BOOT
+    #    fallback copy and any EFI/BOOT.rcraid-{orig,bak} backup dir: all of
+    #    those sort before real vendor dirs under the EFI/*/ glob, so a rerun
+    #    would otherwise rediscover and reinstall our previously-copied
+    #    (possibly stale) shim/grub instead of the vendor's current one.
     boot_src=""
     for cand in \
         "$ESP_MNT/EFI/ubuntu/shimx64.efi" \
         "$ESP_MNT/EFI/ubuntu/grubx64.efi" \
         "$ESP_MNT"/EFI/*/shimx64.efi \
         "$ESP_MNT"/EFI/*/grubx64.efi; do
-        case "$cand" in *"/BOOT.rcraid-"*) continue ;; esac
+        case "$cand" in
+            *"/EFI/BOOT/"*|*"/BOOT.rcraid-"*) continue ;;
+        esac
         [ -f "$cand" ] && { boot_src="$cand"; break; }
     done
     if [ -n "$boot_src" ]; then
@@ -626,13 +629,21 @@ else
         nvram_label="rcraid (${target_os:-linux})"
         if [ -n "$esp_disk" ] && [ -b "$esp_disk" ] && [ -n "$esp_partnum" ]; then
             # Drop only OUR prior entries for THIS distro so re-running doesn't
-            # pile up duplicates.  Match the EXACT label — a wildcard would also
-            # delete a sibling distro's own "rcraid (<other>)" entry on a
-            # multi-distro array.  target_os is an os-release ID, so it carries
-            # no regex metacharacters worth escaping here.
-            while read -r bootnum; do
-                [ -n "$bootnum" ] && efibootmgr -b "$bootnum" -B >/dev/null 2>&1 || true
-            done < <(efibootmgr 2>/dev/null | sed -n "s/^Boot\([0-9A-Fa-f]\{4\}\).* ${nvram_label}\$/\1/p")
+            # pile up duplicates.  Compare the label as a LITERAL string (not a
+            # regex): matching the exact label avoids deleting a sibling
+            # distro's "rcraid (<other>)" entry, and a literal compare avoids an
+            # os-release ID with regex metacharacters (e.g. a '.') widening it.
+            # efibootmgr (no -v) prints "BootXXXX* <label>"; split off the tag
+            # and compare the remainder.
+            while read -r _tag _rest; do
+                case "$_tag" in
+                    Boot[0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f]*) ;;
+                    *) continue ;;
+                esac
+                [ "$_rest" = "$nvram_label" ] || continue
+                _bn="${_tag#Boot}"; _bn="${_bn%\*}"
+                efibootmgr -b "$_bn" -B >/dev/null 2>&1 || true
+            done < <(efibootmgr 2>/dev/null)
             if efibootmgr -c -d "$esp_disk" -p "$esp_partnum" \
                  -L "$nvram_label" -l "$loader" >/dev/null 2>&1; then
                 echo "    NVRAM entry created: '$nvram_label' -> $esp_disk p$esp_partnum $loader"
