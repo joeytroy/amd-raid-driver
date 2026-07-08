@@ -573,23 +573,30 @@ else
         may_write=1
         if [ "$foreign" = 1 ]; then
             may_write=0
-            # Preserve the ENTIRE existing EFI/BOOT chain, not just BOOTX64.EFI:
-            # a foreign shim depends on its sibling grubx64.efi/mmx64.efi, which
-            # the vendor copy below would otherwise clobber.  First displaced
-            # chain -> EFI/BOOT.rcraid-orig; later ones get a guaranteed-unique
-            # name so no prior backup is ever overwritten, even when the hash
-            # was unavailable (empty suffix).
-            dest="$ESP_MNT/EFI/BOOT.rcraid-orig"
-            [ -e "$dest" ] && dest="$ESP_MNT/EFI/BOOT.rcraid-bak.${cur_hash:0:12}"
-            _n=0
-            while [ -e "$dest" ]; do
-                _n=$((_n + 1)); dest="$ESP_MNT/EFI/BOOT.rcraid-bak.${cur_hash:0:12}.$_n"
-            done
-            if cp -r "$BOOT_DIR" "$dest" 2>/dev/null; then
+            # Preserve the ENTIRE existing EFI/BOOT chain (shim + sibling
+            # grubx64.efi/mmx64.efi, which the vendor copy below would clobber)
+            # before overwriting.  Name the backup by the loader's content hash
+            # so re-displacing the SAME chain on a later run is an idempotent
+            # no-op instead of piling up .1/.2 duplicates.  When the hash is
+            # unavailable we can't dedup blind, so fall back to a unique name
+            # and err toward preserving.
+            if [ -n "$cur_hash" ]; then
+                dest="$ESP_MNT/EFI/BOOT.rcraid-bak.${cur_hash:0:12}"
+            else
+                dest="$ESP_MNT/EFI/BOOT.rcraid-bak.unknown"
+                _n=0
+                while [ -e "$dest" ]; do
+                    _n=$((_n + 1)); dest="$ESP_MNT/EFI/BOOT.rcraid-bak.unknown.$_n"
+                done
+            fi
+            if [ -e "$dest" ]; then
+                # This exact chain is already preserved — nothing to copy.
+                may_write=1
+            elif cp -r "$BOOT_DIR" "$dest" 2>/dev/null; then
                 may_write=1
                 echo "    preserved existing EFI/BOOT loader chain -> $(basename "$dest")"
             else
-                echo "    WARN: couldn't back up foreign EFI/BOOT — leaving it in place" >&2
+                echo "    WARN: couldn't back up existing EFI/BOOT — leaving it in place" >&2
                 echo "    and NOT overwriting BOOTX64.EFI; relying on the NVRAM entry." >&2
             fi
         fi
