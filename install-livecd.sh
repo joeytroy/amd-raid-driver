@@ -472,7 +472,7 @@ if [ -z "${ESP_DEV:-}" ]; then
         fi
     done
     if [ -n "${ESP_DEV:-}" ] && ! mountpoint -q "$ESP_MNT" 2>/dev/null; then
-        mkdir -p "$ESP_MNT"
+        mkdir -p "$ESP_MNT" 2>/dev/null || true
         mount "$ESP_DEV" "$ESP_MNT" 2>/dev/null || true
     fi
 fi
@@ -482,25 +482,175 @@ if [ -z "${ESP_DEV:-}" ] || [ ! -d "$ESP_MNT/EFI" ]; then
     echo "    If the box won't boot, confirm the installer created an EFI"
     echo "    System Partition on /dev/rcraid0 and populated \\EFI."
 else
-    # 1) Removable-media fallback loader.
+    # 1) Removable-media fallback loader.  Discover the VENDOR loader, and
+    #    prefer the TARGET distro's own dir (EFI/$target_os) first.  This
+    #    matters on a shared ESP that already carries another OS's loader: the
+    #    NVRAM entry below is labelled for $target_os and its -l path comes from
+    #    the same boot_src, so if discovery picked, say, EFI/ubuntu while we're
+    #    installing Fedora, the "rcraid (fedora)" entry would actually boot
+    #    Ubuntu's shim.  EFI/ubuntu stays as a fallback (Mint et al. ship their
+    #    loader there), then the generic glob.  Skip our own EFI/BOOT fallback
+    #    copy and any EFI/BOOT.rcraid-{orig,bak} backup dir: those sort before
+    #    real vendor dirs under the EFI/*/ glob and would otherwise be picked.
     boot_src=""
     for cand in \
+        "$ESP_MNT/EFI/$target_os/shimx64.efi" \
+        "$ESP_MNT/EFI/$target_os/grubx64.efi" \
         "$ESP_MNT/EFI/ubuntu/shimx64.efi" \
         "$ESP_MNT/EFI/ubuntu/grubx64.efi" \
         "$ESP_MNT"/EFI/*/shimx64.efi \
         "$ESP_MNT"/EFI/*/grubx64.efi; do
+        case "$cand" in
+            *"/EFI/BOOT/"*|*"/BOOT.rcraid-"*) continue ;;
+        esac
         [ -f "$cand" ] && { boot_src="$cand"; break; }
     done
     if [ -n "$boot_src" ]; then
         vendor_dir=$(dirname "$boot_src")
-        mkdir -p "$ESP_MNT/EFI/BOOT"
-        # Copy the whole loader chain (shim + grub + MOK manager) so that
-        # shim, once running as BOOTX64.EFI, still finds grubx64.efi beside
-        # it.  Ubuntu's grub has an embedded prefix pointing at \EFI\ubuntu,
-        # so it reads its real config from there regardless of where it ran.
-        cp -f "$vendor_dir"/*.efi "$ESP_MNT/EFI/BOOT/" 2>/dev/null || true
-        cp -f "$boot_src" "$ESP_MNT/EFI/BOOT/BOOTX64.EFI"
-        echo "    fallback loader installed: EFI/BOOT/BOOTX64.EFI ($(basename "$boot_src"))"
+        BOOT_DIR="$ESP_MNT/EFI/BOOT"
+        cur="$BOOT_DIR/BOOTX64.EFI"
+        sentinel="$BOOT_DIR/.rcraid-managed"
+        mkdir -p "$BOOT_DIR" 2>/dev/null || true
+        # \EFI\BOOT\BOOTX64.EFI is the firmware-wide removable-media fallback
+        # and may already belong to another OS on a shared ESP (e.g. Windows'
+        # own fallback loader on a dual-boot box).  Preserve any loader we did
+        # not write before overwriting it, so it can be restored.
+        #
+        # Deciding "did we write the current file?" cannot key on the sentinel
+        # alone: another OS's installer/repair can overwrite BOOTX64.EFI on a
+        # shared ESP without touching our sentinel, so a later run would
+        # silently clobber that new foreign loader.  Instead record the hash of
+        # what we install (in the sentinel) and treat the current file as
+        # foreign whenever it does NOT match that hash (or the sentinel is
+        # absent).  This also keeps the reinstall / multi-distro-on-the-array
+        # workflow correct: an unchanged loader we wrote last time still
+        # matches, so we don't re-preserve our own shim as "the original".
+        # Everything below is best-effort: the fallback loader is belt-and-
+        # suspenders (boot-from-RAID also works via DKMS + initramfs), so a
+        # transient I/O error here — plausible against a degraded/rebuilding
+        # array member — must WARN and press on, never abort the installer via
+        # set -e before the NVRAM step and the final summary.
+        # The sentinel binds the installed loader to BOTH its content hash and
+        # the vendor dir it came from ("<hash> <vendor>").  The vendor half
+        # matters for the multi-distro-on-the-array workflow: install Ubuntu,
+        # then Fedora on the same ESP.  BOOTX64.EFI still holds Ubuntu's shim
+        # (unchanged, so the hash alone still matches), but we're now installing
+        # Fedora's — a hash-only check would call it "ours/unchanged" and
+        # overwrite Ubuntu's fallback with no preservation.  Treating a vendor
+        # mismatch as displaced routes it through the backup path instead.
+        our_vendor=$(basename "$vendor_dir")
+        # Two distinct cases for the loader currently occupying the slot:
+        #   foreign=1        — a loader we did NOT write (a real other-OS loader,
+        #                      or one an external agent wrote over ours).  Nowhere
+        #                      else to recover it from, so preserve before we
+        #                      overwrite.
+        #   displaced_ours=1 — OUR OWN loader from a previous run for a DIFFERENT
+        #                      distro (the multi-distro switch): the hash still
+        #                      matches the sentinel, only the vendor differs.
+        #                      That distro still boots from its own EFI/<vendor>
+        #                      loader and NVRAM entry, so it's recoverable — WARN
+        #                      but do NOT back it up.  Backing every switch up is
+        #                      what let the .rcraid-bak dirs accumulate unbounded.
+        foreign=0
+        displaced_ours=0
+        if [ -f "$cur" ]; then
+            # If we can't hash the current loader, treat it as foreign so we
+            # err on the side of preserving it.
+            if cur_hash=$(sha256sum "$cur" 2>/dev/null | awk '{print $1}') && \
+               [ -n "$cur_hash" ]; then
+                if [ -f "$sentinel" ]; then
+                    read -r rec_hash rec_vendor < "$sentinel" 2>/dev/null || \
+                        { rec_hash=""; rec_vendor=""; }
+                    if [ "$cur_hash" != "$rec_hash" ]; then
+                        foreign=1          # changed out from under us
+                    elif [ "$rec_vendor" != "$our_vendor" ]; then
+                        displaced_ours=1   # our own loader, switching distros
+                    fi
+                elif ! cmp -s "$cur" "$boot_src"; then
+                    # No sentinel yet (first run): treat the existing loader as
+                    # foreign only if it is NOT already byte-identical to the
+                    # one we're about to install — the OS installer commonly
+                    # drops its own removable-fallback copy of the same shim
+                    # here, and that isn't worth "preserving" as an original.
+                    foreign=1
+                fi
+            else
+                echo "    WARN: couldn't hash existing BOOTX64.EFI — treating as foreign" >&2
+                cur_hash=""
+                foreign=1
+            fi
+        fi
+        # If the current fallback is foreign, a successful backup is a hard
+        # precondition for overwriting the slot: if we can't preserve it, leave
+        # everything in place and rely on the NVRAM entry below rather than
+        # silently clobbering a loader we couldn't save.
+        may_write=1
+        if [ "$foreign" = 1 ]; then
+            may_write=0
+            # Preserve the ENTIRE existing EFI/BOOT chain (shim + sibling
+            # grubx64.efi/mmx64.efi, which the vendor copy below would clobber)
+            # before overwriting.  Name the backup by the loader's content hash
+            # so re-displacing the SAME chain on a later run is an idempotent
+            # no-op instead of piling up .1/.2 duplicates.  When the hash is
+            # unavailable we can't dedup blind, so fall back to a unique name
+            # and err toward preserving.
+            if [ -n "$cur_hash" ]; then
+                dest="$ESP_MNT/EFI/BOOT.rcraid-bak.${cur_hash:0:12}"
+            else
+                dest="$ESP_MNT/EFI/BOOT.rcraid-bak.unknown"
+                _n=0
+                while [ -e "$dest" ]; do
+                    _n=$((_n + 1)); dest="$ESP_MNT/EFI/BOOT.rcraid-bak.unknown.$_n"
+                done
+            fi
+            if [ -e "$dest" ]; then
+                # A COMPLETE copy already exists — the atomic rename below only
+                # publishes $dest after a full cp, so its mere presence means a
+                # good backup.  Nothing to do.
+                may_write=1
+            else
+                # Copy to a temp path, then atomically rename into place.  An
+                # interrupted cp (power loss, I/O error on a degraded member)
+                # then leaves only the temp — never a partial copy under $dest
+                # that a later run would mistake for a complete backup and skip,
+                # silently losing the displaced loader.
+                _tmp="$ESP_MNT/EFI/BOOT.rcraid-partial"
+                rm -rf "$_tmp" 2>/dev/null || true
+                if cp -r "$BOOT_DIR" "$_tmp" 2>/dev/null && \
+                   mv "$_tmp" "$dest" 2>/dev/null; then
+                    may_write=1
+                    echo "    preserved existing EFI/BOOT loader chain -> $(basename "$dest")"
+                else
+                    rm -rf "$_tmp" 2>/dev/null || true
+                    echo "    WARN: couldn't back up existing EFI/BOOT — leaving it in place" >&2
+                    echo "    and NOT overwriting BOOTX64.EFI; relying on the NVRAM entry." >&2
+                fi
+            fi
+        elif [ "$displaced_ours" = 1 ]; then
+            # Our own prior fallback for a different distro — recoverable, so we
+            # overwrite without a backup (that is what keeps backups bounded),
+            # but say so rather than clobber silently.
+            echo "    note: replacing this array's own ${rec_vendor:-previous} fallback"
+            echo "    loader with ${our_vendor} — the former still boots via its own"
+            echo "    EFI/${rec_vendor:-<vendor>} loader and NVRAM entry."
+        fi
+        if [ "$may_write" = 1 ]; then
+            # Copy the whole loader chain (shim + grub + MOK manager) so shim,
+            # once running as BOOTX64.EFI, still finds grubx64.efi beside it.
+            # Ubuntu's grub has an embedded prefix pointing at \EFI\ubuntu, so
+            # it reads its real config from there regardless of where it ran.
+            cp -f "$vendor_dir"/*.efi "$BOOT_DIR/" 2>/dev/null || true
+            if cp -f "$boot_src" "$cur" 2>/dev/null; then
+                # Record "<hash> <vendor>" so a future run can tell our own
+                # loader from a foreign overwrite AND detect a distro switch.
+                printf '%s %s\n' \
+                    "$(sha256sum "$cur" 2>/dev/null | awk '{print $1}')" "$our_vendor" \
+                    > "$sentinel" 2>/dev/null || true
+                echo "    fallback loader installed: EFI/BOOT/BOOTX64.EFI ($(basename "$boot_src"))"
+            else
+                echo "    WARN: couldn't install EFI/BOOT/BOOTX64.EFI fallback loader" >&2
+            fi
+        fi
     else
         echo "    WARN: no shim/grub .efi under $ESP_MNT/EFI — install may be incomplete" >&2
     fi
@@ -527,20 +677,48 @@ else
         fi
         [[ "$esp_partnum" =~ ^[0-9]+$ ]] || esp_partnum=""
 
-        if [ -f "$ESP_MNT/EFI/ubuntu/shimx64.efi" ]; then
-            loader='\EFI\ubuntu\shimx64.efi'
+        # Point the NVRAM entry at the loader we actually resolved above, so
+        # it's correct for ubuntu/fedora/debian vendor dirs alike, converting
+        # the ESP-relative path to the backslash form efibootmgr expects.
+        # Fall back to the removable-media loader if nothing specific matched.
+        if [ -n "$boot_src" ]; then
+            loader="${boot_src#"$ESP_MNT"}"   # e.g. /EFI/ubuntu/shimx64.efi
+            loader="${loader//\//\\}"          # -> \EFI\ubuntu\shimx64.efi
         else
             loader='\EFI\BOOT\BOOTX64.EFI'
         fi
+        # Label the entry after the loader we ACTUALLY resolved, so the label
+        # and the -l path (and the BOOTX64.EFI fallback) can never disagree by
+        # construction — both come from $boot_src.  boot_src discovery already
+        # prefers EFI/$target_os, so this is normally the target distro; if it
+        # had to fall back to another vendor dir, the label honestly reflects
+        # what will boot.  With no vendor loader at all, fall back to the
+        # target distro name for the generic BOOTX64.EFI entry.
+        if [ -n "$boot_src" ]; then
+            nvram_label="rcraid ($(basename "$(dirname "$boot_src")"))"
+        else
+            nvram_label="rcraid (${target_os:-linux})"
+        fi
         if [ -n "$esp_disk" ] && [ -b "$esp_disk" ] && [ -n "$esp_partnum" ]; then
-            # Drop our own stale duplicates from earlier runs so re-running
-            # doesn't pile up identical entries.
-            while read -r bootnum; do
-                [ -n "$bootnum" ] && efibootmgr -b "$bootnum" -B >/dev/null 2>&1 || true
-            done < <(efibootmgr 2>/dev/null | sed -n 's/^Boot\([0-9A-Fa-f]\{4\}\).* rcraid (Kubuntu)$/\1/p')
+            # Drop only OUR prior entries for THIS distro so re-running doesn't
+            # pile up duplicates.  Compare the label as a LITERAL string (not a
+            # regex): matching the exact label avoids deleting a sibling
+            # distro's "rcraid (<other>)" entry, and a literal compare avoids an
+            # os-release ID with regex metacharacters (e.g. a '.') widening it.
+            # efibootmgr (no -v) prints "BootXXXX* <label>"; split off the tag
+            # and compare the remainder.
+            while read -r _tag _rest; do
+                case "$_tag" in
+                    Boot[0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f]*) ;;
+                    *) continue ;;
+                esac
+                [ "$_rest" = "$nvram_label" ] || continue
+                _bn="${_tag#Boot}"; _bn="${_bn%\*}"
+                efibootmgr -b "$_bn" -B >/dev/null 2>&1 || true
+            done < <(efibootmgr 2>/dev/null)
             if efibootmgr -c -d "$esp_disk" -p "$esp_partnum" \
-                 -L "rcraid (Kubuntu)" -l "$loader" >/dev/null 2>&1; then
-                echo "    NVRAM entry created: 'rcraid (Kubuntu)' -> $esp_disk p$esp_partnum $loader"
+                 -L "$nvram_label" -l "$loader" >/dev/null 2>&1; then
+                echo "    NVRAM entry created: '$nvram_label' -> $esp_disk p$esp_partnum $loader"
             else
                 echo "    efibootmgr wouldn't write an NVRAM entry (device path not"
                 echo "    resolvable) — the BOOTX64.EFI fallback above will still boot."
