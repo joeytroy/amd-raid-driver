@@ -20,8 +20,19 @@ completion registers at all.
 
 ## CVE-2024-21962 status
 
-- `rcraid.sys` is **byte-identical** between 9.3.2-00255 and 9.3.3-00291
-  (SHA256 match). All prior `rcraid` analysis is valid for the patched build.
+- `rcraid.sys` is **NOT** byte-identical between 9.3.2-00255 and 9.3.3-00291
+  — CORRECTED 2026-07-07 once the actual 9.3.3 binary was obtained (it was
+  not in the tree when this note was first written, so byte-identity was
+  assumed). Ground truth:
+    - 9.3.2-00255: SHA256 `f0a6fc8b…`, 560,576 bytes
+    - 9.3.3-00291: SHA256 `3f241608…`, 563,528 bytes (+2,952 bytes)
+  However, the **geometry parsing is functionally identical** — verified by
+  re-running the Ghidra pipeline on the 9.3.3 binary (see
+  `RCRAID_GEOMETRY_RE.md`): same chunk_index→stripe ladder (3→256K, 2→128K,
+  else→64K, no index ≥ 4), same on-disk offsets (DeviceType 0x0C, ChunkSize
+  0xAC, chunk_index 0x110), same RAID-level magics (0x1BF6/7/A/B =
+  RAID0/1/5/10). So prior `rcraid` geometry analysis IS valid for 9.3.3 —
+  because the relevant code is unchanged, not because the binary is.
 - `rccfg.sys` shrank by 600 bytes — the CVE fix lives here (config IOCTL
   surface, "improper input validation"). Not relevant to the Linux port.
 - `rcbottom.sys` grew by 1968 bytes — small, likely localized bounds checks.
