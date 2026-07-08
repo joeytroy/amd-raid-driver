@@ -75,10 +75,18 @@ jobs:
             where possible. Report real issues only — do not pad the
             review with style nits or restate the diff.
 
-            If you find no issues, post one brief PR comment with
-            `gh pr comment ${{ github.event.pull_request.number }} --body ...`
-            saying what you reviewed and that it looks clean — a silent
-            pass is indistinguishable from a review that never ran.
+            MANDATORY FINAL STEP — do this as the very last thing, in
+            every case, before you finish: post exactly one summary PR
+            comment with
+            `gh pr comment ${{ github.event.pull_request.number }} --body "..."`.
+            State what you reviewed and then EITHER a short list of the
+            issues you filed as inline comments, OR — if you found nothing
+            — that it looks clean and is good to merge. Do NOT end the
+            review without posting this summary comment: a run that posts
+            nothing is indistinguishable from a review that never ran, and
+            a clean pass with no comment cannot be told apart from a
+            failure. If a tool call is denied, do not retry it in a loop —
+            skip it and proceed to this summary.
           # --allowedTools REPLACES the action's default allowlist, it does
           # not extend it.  So this list must cover BOTH what the reviewer
           # needs to read the change (Read/Grep/Glob, git/gh inspection) AND
