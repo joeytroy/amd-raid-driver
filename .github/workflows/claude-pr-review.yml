@@ -86,7 +86,14 @@ jobs:
           # inline-comment MCP tool for line findings).  Omit the read tools
           # and the reviewer silently fails — permission_denials in the run
           # log, "No buffered inline comments", nothing posted.
+          #
+          # The read-only shell inspection tools (cat/sed/awk/grep/head/tail/
+          # ls/wc/find/shellcheck/git blame) are included because a thorough
+          # review reaches for them; without them the agent burns its turn
+          # budget on denials and never posts its verdict — even a clean pass.
+          # All are read-only; the guard above still restricts this job to
+          # OWNER/COLLABORATOR/MEMBER PRs on a non-elevated token.
           claude_args: |
             --model claude-sonnet-5
             --max-turns 40
-            --allowedTools "Read,Grep,Glob,Bash(gh pr view:*),Bash(gh pr diff:*),Bash(gh pr comment:*),Bash(git diff:*),Bash(git log:*),Bash(git show:*),mcp__github_inline_comment__create_inline_comment"
+            --allowedTools "Read,Grep,Glob,Bash(gh pr view:*),Bash(gh pr diff:*),Bash(gh pr comment:*),Bash(git diff:*),Bash(git log:*),Bash(git show:*),Bash(git blame:*),Bash(cat:*),Bash(sed:*),Bash(awk:*),Bash(grep:*),Bash(rg:*),Bash(head:*),Bash(tail:*),Bash(ls:*),Bash(wc:*),Bash(find:*),Bash(shellcheck:*),mcp__github_inline_comment__create_inline_comment"
