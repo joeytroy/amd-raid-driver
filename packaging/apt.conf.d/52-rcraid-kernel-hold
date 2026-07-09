@@ -1,0 +1,21 @@
+// rcraid backs the root filesystem via an out-of-tree DKMS module. An
+// unattended kernel update that changed a kernel API rcraid uses could fail
+// to (re)build the module, leaving the new kernel's initramfs without rcraid
+// and the machine unbootable — with no operator watching.
+//
+// This drop-in keeps kernel packages OUT of unattended-upgrades so kernel
+// changes are always deliberate. APT merges Package-Blacklist entries from
+// every apt.conf.d file, so this appends to (does not replace) the stock
+// 50unattended-upgrades list, and survives that package being upgraded.
+//
+// After you DELIBERATELY update a kernel, run scripts/verify-boot-safety.sh
+// and keep a known-good fallback kernel installed before rebooting.
+//
+// To go back to automatic kernel updates, remove this file.
+Unattended-Upgrade::Package-Blacklist {
+    "linux-image-";
+    "linux-headers-";
+    "linux-modules-";
+    "linux-generic";
+    "linux-lowlatency";
+};
