@@ -1,318 +1,266 @@
-# rcraid — AMD-RAID Linux driver
+# rcraid — AMD-RAID driver for Linux
+[![Donate via PayPal](https://img.shields.io/badge/Donate-PayPal-blue.svg)](https://www.paypal.com/paypalme/joeytroynm)
 
-A clean-room Linux kernel module for AMD-RAID NVMe and SATA RAID
-arrays. Initially targets the TRX50 chipset's NVMe RAID Bottom
-controller (PCI `1022:B000`); SATA and additional NVMe variants are
-on the roadmap.
+A clean-room Linux kernel module that lets you read and write your
+**AMD-RAID NVMe arrays** natively — no Windows, no proprietary blob.
 
-## Support This Project
+If your motherboard is in RAID mode and you built an array in RAIDXpert,
+`rcraid` assembles it into an ordinary block device at `/dev/rcraid0`
+that you can partition, format, mount, and even **boot Linux from**.
 
-If you find this project helpful, please consider supporting its development:
+> ⚠️ **Read the [safety notes](#safety-first) before loading the driver.**
+> The AMD chipset makes *every* NVMe look like the same PCI device, so
+> the driver has guardrails to keep it off your OS disk — but you must
+> point it at the right drives.
 
-[![PayPal](https://img.shields.io/badge/Donate-PayPal-blue.svg)](https://www.paypal.com/paypalme/joeytroynm)
+---
+
+## Is my hardware supported?
+
+**Yes, if you have an AMD-RAID NVMe array** on any recent AMD platform —
+Ryzen 7000+, Ryzen AI 300 / AI Max, Threadripper 7000 / 9000 (TRX50 /
+WRX90), or the X870 / B850 / X670 / B650 chipsets. They all present the
+NVMe RAID controller as PCI `1022:B000`, which is fully implemented here.
+
+| PCI ID | Controller | Status |
+|--------|-----------|--------|
+| `1022:B000` | NVMe RAID Bottom (TRX50, WRX90, X870/X670, B850/B650, …) | ✅ **RAID0 read/write, boot-from-array validated** |
+| `1022:43BD` `7905` `7916` `7917` | SATA RAID (Promontory / older) | ⚙️ Claimed but stubbed — not yet implemented |
+
+**RAID level:** RAID0 works today. RAID1 / RAID10 are on the roadmap.
+RAID5 is not planned (AMD only supports it on 3rd-gen Threadripper).
+
+---
 
 ## What works today
 
-- PCI `1022:B000` (NVMe RAID Bottom) end to end: controller bring-up,
-  admin + I/O queues, NVMe Identify, RAID0 volume assembly from
-  on-disk metadata, blk-mq read/write at `/dev/rcraid0`.
-- Member count, per-member position, and volume capacity all parsed
-  from the on-disk `RC_LogicalDevice` record — no hardcoding.
-- Interrupt-driven async completion: MSI ISR walks the CQ and routes
-  each CQE to `blk_mq_complete_request`; queue depth 32; no polling
-  on the dispatch path.
-- `REQ_OP_FLUSH` (NVMe FLUSH 0x00, fanned out to every member) and
-  `REQ_FUA` (CDW12.FUA passthrough) — filesystems can fsync safely.
-- `REQ_OP_DISCARD` via NVMe DSM Deallocate (0x09), split at the
-  stripe boundary so each request lands on one member.
-- Writes gated behind `enable_writes=1` module parameter (off by
-  default for safety; load with the param to allow).
-- `safe_subsys_vendor` module parameter to keep `rcraid` off the OS
-  drive — the AMD chipset shadows every NVMe as `1022:b000`, so this
-  filter is what prevents the driver from claiming the boot SSD.
-- Error handling + timeouts: blk-mq `.timeout` at 30 s, per-adapter
-  `dead` flag, ISR CSTS canary, best-effort NVMe Abort, tagset drain
-  of in-flight requests when a controller dies, automatic controller
-  reset on first timeout per death episode, and manual reset via
-  `echo 1 > /sys/bus/pci/devices/<bdf>/rcraid/reset` as the fallback
-  when auto-reset itself fails.  See `docs/ERROR_HANDLING.md`.
-- Scatterlist-native DMA: hardware reads/writes the bio's user pages
-  directly via `dma_map_sg` + PRP enumeration — no bounce buffer, no
-  memcpy on either side.  Drops ~33 MiB of pinned per-tag buffers vs
-  the prior path.
-- **Boot-from-RAID validated end to end:** Kubuntu 24.04 (HWE kernel
-  6.17) installed onto and booting from a 2-member Crucial T700
-  RAID0 array (256 KiB stripe) via `install-livecd.sh` — rootfs on
-  `/dev/rcraid0pN`, with DKMS auto-rebuild and initramfs auto-bind
-  bringing the array up before `pivot_root`.
-- Throughput on that array: ~19.3 GB/s read / ~8.6 GB/s write
-  (KDiskMark, parallel queues); single-stream `dd` on the dev box is
-  ~6.7 GB/s @ `bs=1M`. Writes trail reads because multi-stripe write
-  fan-out is currently disabled for correctness (see below).
+- **RAID0 volumes, read *and* write** at `/dev/rcraid0` — member count,
+  member order, stripe size, and capacity are all read from the on-disk
+  RAIDXpert metadata. Nothing is hardcoded.
+- **Boot Linux from the array.** Validated end to end: Kubuntu 24.04
+  (HWE kernel 6.17) installed onto and booting from a 2× Crucial T700
+  RAID0 array, with DKMS rebuilds and an initramfs hook that brings the
+  array up before `pivot_root`.
+- **Filesystem-safe.** FLUSH, FUA, and DISCARD/TRIM are all wired up, so
+  `fsync`, journaling, and `fstrim` behave correctly.
+- **Fast — and symmetric.** ~19.7 GB/s read / ~18.7 GB/s write on that
+  2-drive array (KDiskMark 3.3.0, SEQ1M Q8T1). Interrupt-driven async completion
+  with a scatterlist-native DMA path — the hardware reads and writes your
+  pages directly, no bounce buffers or memcpy.
+- **Resilient.** 30 s command timeouts, controller health tracking,
+  best-effort NVMe Abort, and automatic controller reset on the first
+  timeout — with a manual sysfs reset as a fallback.
 
-See `docs/STATUS.md` for the full state and the next-steps list.
+Writes are **off by the module's default** (`enable_writes=1` to opt in) —
+the `install-livecd.sh` and DKMS installers turn writes on for you; the
+read-only default only applies to a bare manual `insmod`.
 
-## Hardware support
+<p align="center">
+  <img src="image/kdiskmark.png" width="480" alt="KDiskMark on /dev/rcraid0: 19,730 MB/s read, 18,715 MB/s write (SEQ1M Q8T1)"><br>
+  <sub><em>KDiskMark 3.3.0 on <code>/dev/rcraid0</code> — RAID0 across two Crucial T700 NVMe SSDs (PCIe 5.0) on a TRX50 motherboard.</em></sub>
+</p>
 
-The driver claims the same five PCI IDs as AMD's Windows
-`rcbottom.sys`, covering both the NVMe and the older SATA RAID
-controllers AMD has shipped:
+---
 
-| PCI ID | Variant | Status here |
-|--------|---------|-------------|
-| `1022:B000` | NVMe RAID Bottom (TRX50, WRX90, X870E/X870, B850/B840, X670E/X670, etc.) | **Fully implemented, RAID0 R/W validated.** |
-| `1022:43BD` | Promontory SATA RAID | Claimed; AHCI path is stub. |
-| `1022:7905` | Older SATA RAID | Claimed; AHCI path is stub. |
-| `1022:7916` | Older SATA RAID | Claimed; AHCI path is stub. |
-| `1022:7917` | X570S-era SATA RAID | Claimed; AHCI path is stub. |
+## Safety first
 
-These IDs cover every CPU/chipset in AMD's published support matrix
-for `rcraid` — Ryzen 7000+ desktop, Ryzen AI 300 / AI Max 300,
-Threadripper 7000 / 9000 (TRX50 / WRX90), and the X870/B850/X670/B650
-consumer chipsets.  The platform variety is in firmware, not in
-distinct PCI devices.
+Two things protect your data and your OS install. Understand both:
 
-RAID-level coverage matches AMD: RAID 0, 1, 10 are target features
-for any of the above; RAID 5 is only supported by AMD on the 3rd Gen
-Threadripper (TRX40 / Castle Peak) and is not currently on our
-roadmap.
+1. **The driver is read-only unless writes are enabled with
+   `enable_writes=1`.** The install scripts enable writes for you; a bare
+   manual `insmod` stays read-only. On the manual path, do your first run
+   read-only and confirm the array assembles correctly before enabling
+   writes.
 
-## What's NOT here yet
+2. **Your OS drive can masquerade as an array member.** The AMD chipset
+   shadows every NVMe as PCI `1022:b000`, including your boot SSD. The
+   driver refuses to touch a disk whose `subsystem_vendor` doesn't match
+   the array (the `safe_subsys_vendor` parameter), and the install
+   scripts set this for you — but if you bind drives by hand, **never
+   unbind your OS drive.** Identify members by their `Subsystem:` line
+   (Crucial vs. Samsung vs. WD, etc.).
 
-The big rocks (see `IMPLEMENTATION.MD` for the full checklist):
+Also note: the module is **unsigned**, so **Secure Boot must be off**
+(or you sign the module yourself and enrol the key — see `INSTALL.md`).
 
-- **RAID levels other than RAID0** — RAID1 / 10 are roadmap; RAID5 is not.
-- **No Secure Boot signing** — module is unsigned; SB must be off.
-- **SATA RAID stubs** — AHCI variants (`7905 / 7916 / 7917 / 43BD`)
-  are claimed but not implemented.
-- **No `rcadm`-equivalent** — array must be pre-created in BIOS.
-- **Retry of transient NVMe errors** — DNR=0 commands bubble up as
-  I/O errors instead of being re-dispatched after reset.
-- **Multi-stripe write fan-out disabled** — a write spanning a stripe
-  boundary is split and issued per member serially (the
-  `chunk_sectors = stripe` safety fix) after a data-corruption bug was
-  found in the parallel fan-out path on fragmented buffered writeback.
-  Correct, but caps large sequential write throughput; a safe
-  re-enable (bvec coalescing + NVMe PRP page-alignment guard, gated on
-  the write-path torture test) is roadmap.
-
-See `IMPLEMENTATION.MD` for the prioritised checklist,
-`docs/OPEN_QUESTIONS.md` for remaining reverse-engineering work, and
-`docs/STATUS.md` for the implementation history.
+---
 
 ## Quick start
 
-Working assumption: BIOS is in RAID mode and you've already created
-the array in RAIDXpert. If not, see `INSTALL.md` for the one-time BIOS
-setup.
+**Prerequisites**
+- BIOS in RAID mode, array already created in RAIDXpert (see `INSTALL.md`
+  for the one-time BIOS setup).
+- Secure Boot disabled.
+- Kernel **≥ 6.15** (on Ubuntu 24.04 that means the HWE stack, 6.17+ —
+  the 6.8 GA kernel is too old).
+- `sudo apt install build-essential linux-headers-$(uname -r)`
 
-### Prerequisites
+Pick the path that matches what you're doing:
 
-- **Secure Boot disabled** (or the module signed — see `INSTALL.md`).
-  Without this, `insmod` returns `Key was rejected by service`.
-- **Kernel ≥ 6.15.** The driver calls the 2-argument
-  `blk_rq_map_sg()` introduced in 6.15, so older kernels won't build.
-  On Ubuntu 24.04 that means the HWE stack (`linux-generic-hwe-24.04`,
-  6.17+); the 6.8 GA kernel is too old.
-- Kernel headers for the running kernel:
-  `sudo apt install build-essential linux-headers-$(uname -r)`.
+### 🅐 Install Linux *onto* the array (from a live USB)
 
-### Easiest path: install Linux *onto* the array from a live CD
+This is the recommended path for a fresh array. `install-livecd.sh` runs
+in two phases around the normal OS installer — you don't reboot until the
+very end. Full walkthrough:
 
-If you're starting from a blank array and want Linux installed on it,
-boot a stock Ubuntu / Debian / Fedora live USB and run:
+**1. Boot the live USB and enter the live desktop.**
+Flash a stock Ubuntu / Kubuntu / Debian / Fedora ISO, boot it, and choose
+**Try** (the live session) — *not* Install yet. Connect to the network.
+
+**2. Build and load the driver.**
 
 ```sh
-sudo apt update && sudo apt install -y git    # Debian / Ubuntu
-# or:  sudo dnf install -y git                # Fedora
+sudo apt install -y git          # or: sudo dnf install -y git
 git clone https://github.com/joeytroy/amd-raid-driver.git
 cd amd-raid-driver
 sudo ./install-livecd.sh
 ```
 
-`install-livecd.sh` does its work in two phases:
+The script installs build tools, compiles the module against the live
+kernel, auto-detects your array members, binds them, and loads `rcraid`.
+When it prints that **`/dev/rcraid0` is up**, it pauses and waits for you.
 
-1. **Before the OS installer.** Auto-detects array members, installs
-   build tools, compiles `rcraid.ko` against the live kernel, rebinds
-   the members from `nvme` to `rcbottom`, and loads the module — so
-   `/dev/rcraid0` appears as an ordinary disk.
-2. **You launch the OS installer.** Ubiquity / Calamares / Anaconda /
-   `debian-installer` all see `/dev/rcraid0`. Pick "Custom" partitioning
-   and lay out your install on it as you would any other disk. When the
-   installer offers to reboot, **do not reboot yet** — close it and
-   return to the terminal.
-3. **After you press Enter.** The script finds your new rootfs on
-   `/dev/rcraid0pN`, chroots in, installs DKMS rcraid + the initramfs
-   hook against the *target* kernel, and tells you it's safe to reboot.
+**3. Run the OS installer — leave this terminal open.**
+Launch the distro's installer from the live desktop (*Install Kubuntu*,
+etc.) and:
 
-This mirrors what DesktopECHO's `raidxpert2-install` offers, but using
-our clean-room rcraid — about 2.5× faster on real workloads in the
-small comparison we've done.
+- ✅ **Tick "Download updates while installing."** Keep the machine online
+  for the whole run — in our testing this is what keeps the installer from
+  restarting the session and dropping the loaded driver (and the array)
+  partway through the install.
+- Point the install at **`/dev/rcraid0`**. The simplest option is
+  **"Erase disk and install"** with `/dev/rcraid0` selected as the target
+  — the installer auto-partitions it and phase 2 picks up the result. (Use
+  Manual/Custom instead only if you want a specific layout.) Just make sure
+  the disk you erase is `/dev/rcraid0`, **not** your OS drive or the live
+  USB.
+- Let it finish, but when it offers to reboot, **do *not* reboot.** Close
+  the installer and return to the terminal.
 
-### Easy path: DKMS install (auto-bind on every boot)
+**4. Press Enter to finish.**
+Back in the terminal, press Enter. Phase 2 finds your new rootfs on
+`/dev/rcraid0pN`, chroots in, installs DKMS + the initramfs hook against
+the *target* kernel, and writes a UEFI boot entry (plus an
+`\EFI\BOOT\BOOTX64.EFI` fallback, since installer-created entries often
+don't stick on RAIDXpert firmware).
 
-If you've already got Linux installed somewhere else and just want to
-mount the array — no manual `unbind` / `insmod` dance, survives kernel
-updates, and is available early enough to host the **rootfs** — run:
+**5. Reboot.** `sudo reboot` — the system now boots from the array on its
+own. If the first boot misbehaves, hit `e` in GRUB and add
+`rd.driver.blacklist=nvme` to prove the rcraid path, then revert.
+
+### 🅑 Mount an array from an existing Linux install (DKMS, persistent)
+
+Survives kernel updates and comes up automatically at every boot:
 
 ```sh
 sudo apt install dkms
 sudo ./install-dkms.sh
 ```
 
-The script:
+It detects your array members (vs. your OS drive), installs the module
+via DKMS, pins the members to the driver with a udev rule, enables writes
+by default, and adds an initramfs hook. Reboot and `/dev/rcraid0` (plus
+any `/dev/rcraid0pN` partitions) is just there. `sudo ./uninstall-dkms.sh`
+reverses all of it.
 
-1. Detects which of your `1022:b000` PCI devices are array members vs.
-   your OS drive (by `subsystem_vendor`).
-2. Stages sources to `/usr/src/rcraid-<ver>/` and runs `dkms install`
-   so the module gets rebuilt on every kernel update.
-3. Drops a udev rule at `/etc/udev/rules.d/50-rcraid.rules` that pins
-   each array member to `rcbottom` via `driver_override` and triggers
-   a re-probe.
-4. Drops `/etc/modprobe.d/rcraid.conf` with `enable_writes=1` and
-   `safe_subsys_vendor=...` so the array is read-write at boot.
-5. Installs an initramfs hook — dracut module on Fedora/RHEL/Arch/
-   openSUSE, initramfs-tools hook on Debian/Ubuntu — and regenerates
-   the initramfs.  This bundles `rcraid.ko` + the bind glue early
-   enough that `/dev/rcraid0pN` exists before `pivot_root`, which is
-   what makes installing Linux *onto* the array supported.
+### 🅒 Build and load by hand (dev iteration / one-off)
 
-Reboot and `/dev/rcraid0` (plus `/dev/rcraid0pN`) should be there
-without intervention. `sudo ./uninstall-dkms.sh` reverses everything.
-
-### Manual path (dev iteration / one-off)
-
-Use this if you're iterating on the driver and don't want to reinstall
-via DKMS every time.
-
-#### 1. Build
+<details>
+<summary>Manual unbind / insmod steps</summary>
 
 ```sh
-sudo ./build.sh
-# produces rcraid.ko
-```
+sudo ./build.sh                        # produces rcraid.ko
 
-#### 2. Find your AMD-RAID members
+lspci -d 1022:b000 -k                   # find your members' BDFs
+                                        # ⚠️ do NOT include your OS drive
 
-```sh
-lspci -d 1022:b000 -k
-```
-
-You'll see one or more `[AMD] RAID Bottom Device` entries bound to
-`nvme`. Note the BDFs (e.g. `81:00.0`, `82:00.0`).
-
-**Critical**: if your OS lives on an NVMe behind the same AMD chipset,
-it will also appear as `1022:b000` (the chipset shadows every NVMe). Use
-the `Subsystem:` line to identify it (Samsung vs. Crucial vs. WD etc.)
-and **do not unbind your OS drive**.
-
-#### 3. Unbind RAID members from `nvme`, then load `rcraid`
-
-```sh
-# For each member you want under rcraid (skip the OS drive):
+# Unbind each array member from nvme:
 echo 0000:81:00.0 | sudo tee /sys/bus/pci/drivers/nvme/unbind
 echo 0000:82:00.0 | sudo tee /sys/bus/pci/drivers/nvme/unbind
 
-# Read-only mode (safest first run):
-sudo insmod ./rcraid.ko
+sudo insmod ./rcraid.ko                 # read-only (safest first run)
+sudo insmod ./rcraid.ko enable_writes=1 # read-write
 
-# Or read-write:
-sudo insmod ./rcraid.ko enable_writes=1
-```
-
-If your OS drive's subsystem vendor differs from the array members,
-you can also use `safe_subsys_vendor=0x<hex>` to make the driver refuse
-to bind anything whose subsystem vendor doesn't match the array — see
-`INSTALL.md`.
-
-#### 4. Verify the array came up
-
-```sh
+# Confirm it came up:
 sudo dmesg | grep -E 'rcraid|rc_volume' | tail -20
-# Look for: rc_volume_create_disk: /dev/rcraid0 up, ... (read-write)
-# And:      rc_init: Found N adapters
-
 lsblk /dev/rcraid0
-ls -l /dev/rcraid0
 ```
 
-#### 5. Mount it
-
-**Whole-disk filesystem** (recommended on a fresh array):
+Then format/mount as any disk, e.g. a fresh whole-disk XFS:
 
 ```sh
 sudo mkfs.xfs -f -d su=256k,sw=<num_members> /dev/rcraid0
-sudo mkdir -p /mnt/rcraid0
 sudo mount -o noatime /dev/rcraid0 /mnt/rcraid0
 ```
 
-**If the array has a GPT** (Windows install, etc.) the kernel
-auto-scans on `add_disk` and partitions appear as `/dev/rcraid0p1`,
-`/dev/rcraid0p2`, … — mount directly:
+Unload with `sudo umount … && sudo rmmod rcraid`. Note the manual path
+must be repeated every reboot (path 🅑 automates it), and after `rmmod`
+the drives stay unbound until you rebind them to `nvme` or reboot.
 
-```sh
-lsblk /dev/rcraid0
-sudo mount /dev/rcraid0pN /mnt/somewhere
-```
+</details>
 
-#### 6. Unload
+Full setup, troubleshooting, and the Secure-Boot / signing details are in
+**[`INSTALL.md`](INSTALL.md)**.
 
-```sh
-sudo umount /mnt/rcraid0
-sudo rmmod rcraid
-```
+---
 
-After `rmmod`, the kernel won't auto-rebind the drives to `nvme` —
-they'll sit unbound until you `echo 0000:XX:00.0 > /sys/bus/pci/drivers/nvme/bind`
-or reboot.
+## Not yet supported
 
-### Caveats today (read this once)
+- **RAID1 / RAID10** — roadmap. **RAID5** — not planned.
+- **SATA RAID** — the `43BD / 7905 / 7916 / 7917` controllers are claimed
+  but the AHCI path is a stub.
+- **No array management** — create/modify the array in BIOS/RAIDXpert.
+- **No Secure Boot signing** out of the box.
 
-- **Manual path requires re-running step 3 every reboot.** The DKMS
-  install above handles this automatically.
-- **Secure Boot**: must be disabled, or the module signed and the cert
-  enrolled in MOK. Tracked in `IMPLEMENTATION.MD`.
+The prioritized checklist lives in
+[`docs/IMPLEMENTATION.MD`](docs/IMPLEMENTATION.MD).
 
-Full setup, troubleshooting, and the Live-USB fallback path are in
-`INSTALL.md`. The road from here to "no manual steps" is tracked in
-`IMPLEMENTATION.MD`.
+---
 
-## License
+## For developers
 
-This driver is licensed under **GPL-2.0-only**. See `LICENSE` for the
-full text and `RE_METHODOLOGY.md` for the clean-room reverse-engineering
-process and legal record.
+This is a clean-room driver reverse-engineered from AMD's publicly
+distributed Windows binaries under DMCA §1201(f) interoperability
+protections — **no AMD source code is used**. Contributions welcome:
+open a PR, add yourself to the contributor list, and sign off your
+commits (`git commit -s`). The long-term goal is mainline kernel
+inclusion.
 
-The PCI ID table, on-disk metadata layouts, and protocol-level
-behaviour are derived from analysis of AMD's publicly distributed
-Windows drivers (`rcbottom.sys`, `rcraid.sys`, `rccfg.sys`) under
-DMCA §1201(f) interoperability protections. No AMD source code is
-incorporated into this driver.
+| Doc | What's in it |
+|-----|--------------|
+| [`docs/STATUS.md`](docs/STATUS.md) | Implementation history — how each piece was built |
+| [`docs/IMPLEMENTATION.MD`](docs/IMPLEMENTATION.MD) | Prioritized checklist toward a daily-driver release |
+| [`docs/ERROR_HANDLING.md`](docs/ERROR_HANDLING.md) | Timeout / reset / dead-controller design |
+| [`docs/OPEN_QUESTIONS.md`](docs/OPEN_QUESTIONS.md) | Remaining reverse-engineering unknowns |
+| [`RE_METHODOLOGY.md`](RE_METHODOLOGY.md) | Clean-room process and legal record |
 
-## Repository layout
+**Repository layout**
 
 | Path | What's there |
 |------|--------------|
-| `rc_*.c`, `rc_*.h` | The Linux driver. SPDX `GPL-2.0-only`. |
-| `Makefile`, `build.sh`, `test_driver.sh`, `bench.sh`, `unload.sh` | Build + test helpers. |
-| `docs/` | Status, open questions, Ghidra findings, decompiled extracts. |
-| `drivers/windows/trx50/` | AMD Windows binaries (.sys / .inf / .cat) used as primary RE input. |
-| `drivers/reference/` | Third-party reference material kept under its own licenses; not compiled into the driver. |
-| `scripts/ghidra/` | Headless-Ghidra scripts used to extract the structure information that informs the driver. |
+| `rc_*.c`, `rc_*.h` | The driver (SPDX `GPL-2.0-only`) |
+| `Makefile`, `build.sh`, `test_driver.sh`, `bench.sh`, `unload.sh` | Build + test helpers |
+| `docs/` | Status, open questions, Ghidra findings, decompiled extracts |
+| `drivers/windows/trx50/` | AMD Windows binaries used as RE input |
+| `drivers/reference/` | Third-party reference material (own licenses; not compiled in) |
+| `scripts/ghidra/` | Headless-Ghidra extraction scripts |
 
-## Maintainership
+---
 
-Maintained by Joey Troy (`@joeytroy`). Long-term goal is mainline
-Linux kernel inclusion. Contributions welcome via pull request;
-please add yourself to the contributor list and sign off your commits
-(`git commit -s`).
+## License
 
-## A note for AMD
+**GPL-2.0-only** — see [`LICENSE`](LICENSE). Maintained by Joey Troy
+(`@joeytroy`).
 
-This project is an interoperability driver for hardware AMD has sold,
-so Linux owners of that hardware can access their data. It does not
-redistribute AMD's binaries beyond what is necessary for the
-development team's reference, and we do not link against AMD's
-proprietary core. We would be happy to coordinate with AMD on
-documentation, hardware references, or any concerns — please open
-an issue.
+The PCI IDs, on-disk metadata layouts, and protocol behaviour are derived
+from analysis of AMD's publicly distributed Windows drivers
+(`rcbottom.sys`, `rcraid.sys`, `rccfg.sys`) under DMCA §1201(f). No AMD
+source is incorporated.
+
+### A note for AMD
+
+This is an interoperability driver for hardware you sold, so Linux owners
+can access their own data. It doesn't redistribute your binaries beyond
+what the dev team needs as reference, and it doesn't link against your
+proprietary core. We'd be glad to coordinate on documentation or hardware
+references — please open an issue.
