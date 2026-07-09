@@ -179,6 +179,13 @@ struct rc_nvme_io_queue {
     // (pci_irq_vector(pdev, qid)).  -1 if not registered.
     int            irq_vector;
 
+    // True when this queue's CQ interrupt vector (IV) is 0 — the admin
+    // vector — because the platform granted no dedicated I/O vectors
+    // (MSI/INTx single-vector fallback).  No request_irq of our own
+    // (irq_vector stays -1); rc_nvme_irq drains this queue's CQ from the
+    // vector-0 handler instead.
+    bool           shares_admin_vector;
+
     // Guards sq_tail + cq_head + cq_phase against submitter/ISR race.
     spinlock_t     lock;
 
@@ -417,6 +424,13 @@ struct rc_adapter {
     // Interrupt wiring
     enum rc_irq_mode irq_mode;
     int irq_vector;
+    // Total IRQ vectors pci_alloc_irq_vectors_affinity actually granted
+    // (admin + I/O).  The usable I/O queue count is capped at
+    // nr_irq_vectors - 1 (vector 0 is admin): each I/O CQ is bound to
+    // its own vector, and binding to a vector that was never allocated
+    // fails queue creation outright instead of degrading.  1 on the
+    // MSI/INTx single-vector fallback (I/O then shares vector 0).
+    int nr_irq_vectors;
 
     // Device-extension state mirrors
     struct rc_dev_context ctx;

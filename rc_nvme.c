@@ -604,12 +604,28 @@ irqreturn_t rc_nvme_io_queue_irq(int irq, void *dev_id)
 	return IRQ_HANDLED;
 }
 
-/* Back-compat shim: rc_hw_interrupt_handler still calls rc_nvme_irq for
- * the admin vector when ctrl_mode == NVMe.  The I/O vectors get
- * rc_nvme_io_queue_irq registered directly by rc_nvme_create_io_queues. */
+/* Vector-0 handler body: rc_hw_interrupt_handler calls this when
+ * ctrl_mode == NVMe.  Always services the admin CQ; additionally drains
+ * any I/O queue whose CQ is bound to the admin vector (IV=0) because the
+ * platform granted no dedicated I/O vectors (MSI/INTx single-vector
+ * fallback).  Queues with their own MSI-X vector get
+ * rc_nvme_io_queue_irq registered directly and are skipped here. */
 irqreturn_t rc_nvme_irq(struct rc_adapter *adapter)
 {
-	return rc_nvme_admin_irq(0, adapter);
+	struct rc_nvme_state *nvme = &adapter->ctx.nvme;
+	irqreturn_t ret;
+	u16 i;
+
+	ret = rc_nvme_admin_irq(0, adapter);
+
+	for (i = 0; i < RC_NVME_IO_QUEUE_TARGET; i++) {
+		struct rc_nvme_io_queue *q = nvme->io_queues[i];
+
+		if (q && q->shares_admin_vector &&
+		    rc_nvme_io_queue_irq(0, q) == IRQ_HANDLED)
+			ret = IRQ_HANDLED;
+	}
+	return ret;
 }
 
 /* Cheap dead-controller probe usable from process context (timeout callback).
@@ -1114,7 +1130,11 @@ static int rc_nvme_enable_write_cache(struct rc_adapter *adapter)
 /* Allocate one I/O queue pair: DMA-coherent SQ + CQ, wire it up via
  * Create I/O CQ + Create I/O SQ admin commands, register its MSI-X
  * vector with rc_nvme_io_queue_irq.  qid = 1-based.  vec_index is the
- * MSI-X vector slot (also 1-based — vector 0 is admin). */
+ * MSI-X vector slot (1-based — vector 0 is admin), EXCEPT on the
+ * single-vector MSI/INTx fallback where vec_index 0 is passed: the CQ
+ * is then bound to the admin vector and no IRQ of our own is
+ * registered — rc_nvme_irq drains this queue from the vector-0 handler
+ * (which rc_bottom already owns) instead. */
 static int rc_nvme_create_one_io_queue(struct rc_adapter *adapter,
 				       u16 qid, u16 vec_index)
 {
@@ -1194,29 +1214,37 @@ static int rc_nvme_create_one_io_queue(struct rc_adapter *adapter,
 
 	/* Wire the per-queue ISR.  The pci_irq_vector call resolves the
 	 * MSI-X slot to a Linux IRQ number; the kernel will route this
-	 * vector's interrupts to rc_nvme_io_queue_irq with `q` as dev_id. */
-	q->irq_vector = pci_irq_vector(adapter->pdev, vec_index);
-	if (q->irq_vector < 0) {
-		ret = q->irq_vector;
-		rc_printk(RC_ERROR,
-			  "rc_nvme_create_one_io_queue: %s qid=%u pci_irq_vector(%u) failed (%d)\n",
-			  pci_name(adapter->pdev), qid, vec_index, ret);
-		goto err_delete_sq;
-	}
-	ret = request_irq(q->irq_vector, rc_nvme_io_queue_irq, 0,
-			  "rcraid-ioq", q);
-	if (ret) {
-		rc_printk(RC_ERROR,
-			  "rc_nvme_create_one_io_queue: %s qid=%u request_irq(%d) failed (%d)\n",
-			  pci_name(adapter->pdev), qid, q->irq_vector, ret);
-		q->irq_vector = -1;
-		goto err_delete_sq;
+	 * vector's interrupts to rc_nvme_io_queue_irq with `q` as dev_id.
+	 * vec_index 0 = single-vector fallback: the admin vector's handler
+	 * (rc_hw_interrupt_handler → rc_nvme_irq) already covers vector 0
+	 * and drains shared queues, so no request_irq of our own. */
+	if (vec_index == 0) {
+		q->shares_admin_vector = true;
+	} else {
+		q->irq_vector = pci_irq_vector(adapter->pdev, vec_index);
+		if (q->irq_vector < 0) {
+			ret = q->irq_vector;
+			rc_printk(RC_ERROR,
+				  "rc_nvme_create_one_io_queue: %s qid=%u pci_irq_vector(%u) failed (%d)\n",
+				  pci_name(adapter->pdev), qid, vec_index, ret);
+			goto err_delete_sq;
+		}
+		ret = request_irq(q->irq_vector, rc_nvme_io_queue_irq, 0,
+				  "rcraid-ioq", q);
+		if (ret) {
+			rc_printk(RC_ERROR,
+				  "rc_nvme_create_one_io_queue: %s qid=%u request_irq(%d) failed (%d)\n",
+				  pci_name(adapter->pdev), qid, q->irq_vector, ret);
+			q->irq_vector = -1;
+			goto err_delete_sq;
+		}
 	}
 
 	nvme->io_queues[qid - 1] = q;
 	rc_printk(RC_NOTE,
-		  "rc_nvme_create_one_io_queue: %s qid=%u up — SQ/CQ depth=%u IV=%u IRQ=%d\n",
-		  pci_name(adapter->pdev), qid, depth, vec_index, q->irq_vector);
+		  "rc_nvme_create_one_io_queue: %s qid=%u up — SQ/CQ depth=%u IV=%u IRQ=%d%s\n",
+		  pci_name(adapter->pdev), qid, depth, vec_index, q->irq_vector,
+		  q->shares_admin_vector ? " (shared with admin)" : "");
 	return 0;
 
 err_delete_sq:
@@ -1277,12 +1305,39 @@ static void rc_nvme_destroy_one_io_queue(struct rc_adapter *adapter,
 	kfree(q);
 }
 
+/* How many I/O queues this adapter can actually drive: the controller's
+ * grant is capped by dedicated I/O IRQ vectors (nr_irq_vectors - 1; each
+ * queue's CQ gets its own vector), by online CPUs (more queues than CPUs
+ * buys nothing — blk-mq maps hctxs per-CPU), and by the static Windows-
+ * matching target of 4.  Mirrors the documented Windows behavior of
+ * min(MSI vectors - 1, 4) (docs/REVERSE_ENGINEERING.md).  Returns 0 to
+ * mean "no dedicated vectors — use 1 queue sharing the admin vector". */
+static u16 rc_nvme_usable_io_queues(struct rc_adapter *adapter, u16 wanted)
+{
+	int io_vecs = adapter->nr_irq_vectors - 1;
+	u32 cpus = num_online_cpus();
+
+	if (io_vecs < 1)
+		return 0;
+	if (wanted > (u16)io_vecs)
+		wanted = (u16)io_vecs;
+	if (cpus >= 1 && wanted > (u16)cpus)
+		wanted = (u16)cpus;
+	if (wanted < 1)
+		wanted = 1;
+	if (wanted > RC_NVME_IO_QUEUE_TARGET)
+		wanted = RC_NVME_IO_QUEUE_TARGET;
+	return wanted;
+}
+
 /* Allocate nvme->nr_io_queues queue pairs.  qid = i+1, vec_index = i+1
- * (vector 0 is reserved for admin).  On partial failure, rolls back
- * everything created so far. */
+ * (vector 0 is reserved for admin), or vec_index = 0 for every queue on
+ * the single-vector fallback.  On partial failure, rolls back everything
+ * created so far. */
 static int rc_nvme_create_io_queues(struct rc_adapter *adapter)
 {
 	struct rc_nvme_state *nvme = &adapter->ctx.nvme;
+	u16 usable;
 	u16 i;
 	int ret;
 
@@ -1290,6 +1345,25 @@ static int rc_nvme_create_io_queues(struct rc_adapter *adapter)
 		nvme->nr_io_queues = 1;
 	if (nvme->nr_io_queues > RC_NVME_IO_QUEUE_TARGET)
 		nvme->nr_io_queues = RC_NVME_IO_QUEUE_TARGET;
+
+	/* Never bind a CQ to an IRQ vector that was never allocated — that
+	 * used to fail queue creation and roll back to ZERO I/O queues on
+	 * vector-constrained hosts instead of degrading gracefully. */
+	usable = rc_nvme_usable_io_queues(adapter, nvme->nr_io_queues);
+	if (usable == 0) {
+		rc_printk(RC_WARN,
+			  "rc_nvme_create_io_queues: %s no dedicated I/O IRQ vectors (%d total) — 1 I/O queue sharing the admin vector\n",
+			  pci_name(adapter->pdev), adapter->nr_irq_vectors);
+		nvme->nr_io_queues = 1;
+		return rc_nvme_create_one_io_queue(adapter, 1, 0);
+	}
+	if (usable < nvme->nr_io_queues) {
+		rc_printk(RC_NOTE,
+			  "rc_nvme_create_io_queues: %s clamping %u granted I/O queues to %u (irq_vectors=%d, cpus=%u)\n",
+			  pci_name(adapter->pdev), nvme->nr_io_queues, usable,
+			  adapter->nr_irq_vectors, num_online_cpus());
+		nvme->nr_io_queues = usable;
+	}
 
 	for (i = 0; i < nvme->nr_io_queues; i++) {
 		ret = rc_nvme_create_one_io_queue(adapter, i + 1, i + 1);
@@ -4451,7 +4525,11 @@ int rc_nvme_reset_controller(struct rc_adapter *adapter)
 		cmd.opc   = RC_NVME_ADMIN_OP_CREATE_IO_CQ;
 		cmd.prp1  = cpu_to_le64(q->cq_dma);
 		cmd.cdw10 = cpu_to_le32(((u32)(q->cq_depth - 1) << 16) | q->qid);
-		cmd.cdw11 = cpu_to_le32(((u32)q->qid << 16) | 0x3u);
+		/* IV mirrors original creation: vec_index == qid for queues
+		 * with a dedicated MSI-X vector, 0 for the single-vector
+		 * fallback (shared with admin). */
+		cmd.cdw11 = cpu_to_le32(((u32)(q->shares_admin_vector ?
+					       0 : q->qid) << 16) | 0x3u);
 		ret = __rc_nvme_admin_cmd_locked(adapter, &cmd, NULL);
 		if (ret) {
 			rc_printk(RC_ERROR,
@@ -4722,10 +4800,21 @@ int rc_nvme_init_controller(struct rc_adapter *adapter)
 			  ret);
 
 	/* Tell the controller how many I/O queue pairs we plan to use.  Per
-	 * NVMe spec this must happen before Create I/O CQ/SQ.  Step 2 of
-	 * the multi-queue work just requests RC_NVME_IO_QUEUE_TARGET and
-	 * stores the granted count; step 3 will create that many queues. */
-	ret = rc_nvme_set_num_queues(adapter, RC_NVME_IO_QUEUE_TARGET);
+	 * NVMe spec this must happen before Create I/O CQ/SQ.  Request only
+	 * what we can actually drive — min(IRQ vectors - 1, online CPUs,
+	 * RC_NVME_IO_QUEUE_TARGET), the documented Windows-matching cap —
+	 * rather than the raw target: on a vector-constrained host asking
+	 * for 4 and then binding CQs to nonexistent vectors used to roll
+	 * back to zero I/O queues.  A 0 return means no dedicated vectors
+	 * at all; still ask for 1 queue (it will share the admin vector). */
+	{
+		u16 want = rc_nvme_usable_io_queues(adapter,
+						    RC_NVME_IO_QUEUE_TARGET);
+
+		if (want == 0)
+			want = 1;
+		ret = rc_nvme_set_num_queues(adapter, want);
+	}
 	if (ret) {
 		rc_printk(RC_WARN,
 			  "rc_nvme_init_controller: Set Features Number of Queues failed (%d) — falling back to 1 I/O queue\n",
@@ -4739,11 +4828,15 @@ int rc_nvme_init_controller(struct rc_adapter *adapter)
 	 * bring-up of the root-fs adapter. */
 	(void)rc_nvme_enable_write_cache(adapter);
 
-	/* One I/O queue pair so the upper layer can submit NVM commands.
-	 * Step 3 will replace this with a loop creating nvme->nr_io_queues
-	 * pairs, each with its own MSI-X vector. */
+	/* Create nvme->nr_io_queues queue pairs, each with its own MSI-X
+	 * vector (or one pair sharing the admin vector on the single-vector
+	 * fallback), so the upper layer can submit NVM commands. */
 	ret = rc_nvme_create_io_queues(adapter);
 	if (ret) {
+		/* All queues were rolled back — zero the advertised count so
+		 * nothing downstream (volume nr_hw_queues, sync I/O helpers)
+		 * trusts a count whose io_queues[] slots are NULL. */
+		nvme->nr_io_queues = 0;
 		rc_printk(RC_WARN,
 			  "rc_nvme_init_controller: I/O queue creation failed (%d) — admin still works\n",
 			  ret);
