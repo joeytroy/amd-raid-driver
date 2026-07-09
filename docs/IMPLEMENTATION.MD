@@ -6,7 +6,7 @@ release. Grouped by priority: blockers first, then features, then polish.
 Check items off as PRs land. Each item should resolve to a PR (or a
 documented "won't fix" with reasoning).
 
-For status of work already done, see [`docs/STATUS.md`](docs/STATUS.md).
+For status of work already done, see [`STATUS.md`](STATUS.md).
 
 ---
 
@@ -251,7 +251,7 @@ honestly.
 
 ## 🤔 Open reverse-engineering questions
 
-See [`docs/OPEN_QUESTIONS.md`](docs/OPEN_QUESTIONS.md). Most relevant
+See [`OPEN_QUESTIONS.md`](OPEN_QUESTIONS.md). Most relevant
 remaining items:
 
 - [ ] `rcraid.sys` completion ISR (`FUN_14000d2b8`) — never decompiled.
