@@ -54,8 +54,9 @@ If you do rebuild:
 - [ ] Only then reboot. If it fails to come up, boot the live USB and restore
       `initrd.img-<ver>.good`.
 
-> Note: the write-perf fix (multi-stripe write fan-out, §5) is **not yet in the
-> code**, so a reinstall will not change throughput.
+> Note: the multi-stripe write fan-out (§5) **is already in the code** as of
+> PR #10, so the driver on current `main` already has it — a reinstall does not
+> add it (it was merged before this checklist was written).
 
 ## 3. Validate the live-CD installer fixes (PRs #24, #26)
 
@@ -81,9 +82,44 @@ cannot run against the live array. Decide a scratch target first:
 
 Then run the test against that target only.
 
-## 5. Multi-stripe write fan-out rewrite
+## 5. Multi-stripe write fan-out — DONE (PR #10)
 
-The one real remaining **code** change. A write spanning a stripe boundary is
-currently disabled (why writes trail reads). The fix fans a spanning write out
-into per-member I/Os. Needs the hardware to test against — do it after §4 has a
-scratch target so it can be exercised safely.
+**Already implemented and merged** — this checklist's claim that it was "not yet
+in the code" was stale (PR #10, `241b787`, landed hours before this doc). A
+stripe-spanning READ/WRITE is fanned out into one NVMe command per member by
+`rc_volume_dispatch_multi_stripe()` in `rc_nvme.c`; `REQ_OP_WRITE` is handled,
+not disabled. Writes are gated behind the `enable_writes` module parameter
+(default `0` → disk comes up read-only); load with `enable_writes=1` for
+read-write. The workstation box runs with `enable_writes=1`.
+
+Follow-ups (status as of 2026-07-07):
+
+- [x] **Measure it — done, with a correction.** BEWARE compressible test data:
+      this array's storage stack compresses writes, so fio with its default
+      (low-entropy) buffers reports ~15–18 GiB/s writes — **not real**. With
+      *incompressible* data (`--buffer_compress_percentage=0`, as KDiskMark
+      uses) the honest numbers are:
+      - Sequential **read** ~18–19 GB/s (Q8); ~10 GB/s (Q1).
+      - Sequential **write** ~8.6 GiB/s (**9 GB/s**) — matches KDiskMark's
+        8559 MB/s.
+      So writes run ~45% of reads. That is normal NVMe write<read media
+      asymmetry, **not** a driver defect. The fan-out still works: ~9 GB/s is
+      ~2× a single drive, i.e. both RAID0 members write in parallel. PR #10's
+      win is *command efficiency* (2 NVMe cmds/spanning-IO instead of 4), not
+      making NAND writes as fast as reads. **Always bench this array with
+      incompressible data.**
+- [x] **`enable_writes` default — decided: KEEP read-only default.** Flipping
+      it removes a safety interlock and buys nothing (installs already set
+      `enable_writes=1` via `/etc/modprobe.d/rcraid.conf`). The write-safety
+      improvement was folded into the geometry veto below instead.
+- [x] **Stripe/member auto-detection hardening — VALIDATED on hardware.**
+      Branch `harden-geometry-write-veto`: when any member is assembled via the
+      untrusted legacy BDF fallback (LD parse failed), the volume is forced
+      **read-only even with `enable_writes=1`**, so a guessed member order can't
+      corrupt the array. Purely additive (can only force read-only). Installed
+      via `install-dkms.sh` and rebooted 2026-07-07: new module (srcversion
+      `41C1D5B…`) booted, both members took the trusted LD path, dmesg logged
+      `writes ENABLED / read-write` with no `UNTRUSTED` warning, and an
+      O_DIRECT write+read test passed. The veto is compiled in and runs each
+      boot but correctly stays silent on this box's trusted geometry.
+      Still uncommitted on the branch — commit + PR pending.

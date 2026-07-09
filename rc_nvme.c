@@ -55,6 +55,16 @@ static struct rc_adapter *rc_volume_members[RC_VOLUME_MAX_MEMBERS];
 static u64 rc_volume_member_phys_offset[RC_VOLUME_MAX_MEMBERS];
 static int rc_volume_member_count;
 static u32 rc_volume_stripe_sectors;
+/* Geometry-trust reason.  NULL while every member was placed from the
+ * deterministic on-disk Logical Device (ld_my_position + LD-derived stripe).
+ * Set to a human-readable cause by whichever site revokes trust.  The two
+ * triggers — a legacy BDF fallback (LD parse failed) and an unrecognized
+ * RAID0 chunk_index (LD parsed fine) — have DIFFERENT root causes and
+ * remedies, so the reason is recorded here instead of hard-coded at the
+ * message site.  A non-NULL reason vetoes writes at create_disk time
+ * regardless of the enable_writes opt-in (a wrong member order or stripe
+ * size silently corrupts the array on write). */
+static const char *rc_volume_geometry_untrust_reason;
 static DEFINE_MUTEX(rc_volume_lock);
 
 /* Conservatively hard-code expected member count = 2 (the user's RAID0).
@@ -1550,6 +1560,18 @@ static void rc_volume_parse_logical_device(struct rc_adapter *adapter)
 			chunk_index = get_unaligned_le32(ld + RC_LD_CHUNKINDEX_OFFSET);
 			capacity = get_unaligned_le64(ld + RC_LD_CAPACITY_OFFSET);
 
+			/* Diagnostic.  An earlier reading of rcraid.sys 9.3.2
+			 * guessed SECONDCOUNT (+0x70) might be the authoritative
+			 * RAID0 member count instead of DEVICES (+0x68).
+			 * On-hardware boot logging DISPROVED that: on a healthy
+			 * 2-member RAID0 this array reports DEVICES=2 and
+			 * SECONDCOUNT=1.  So DEVICES is the member count (what we
+			 * key assembly off — correct), and SECONDCOUNT is some
+			 * other field.  Keep logging it purely for forensics.
+			 * See docs/RCRAID_GEOMETRY_RE.md. */
+			u32 second_count =
+				get_unaligned_le32(ld + RC_LD_SECONDCOUNT_OFFSET);
+
 			if (devices < 1 || devices > RC_VOLUME_MAX_MEMBERS)
 				continue;
 			if ((u64)i + elem_off +
@@ -1577,11 +1599,11 @@ static void rc_volume_parse_logical_device(struct rc_adapter *adapter)
 			}
 
 			rc_printk(RC_INFO,
-				  "rc_volume_parse_logical_device: %s LD@ring+%u.%u devtype=0x%04x devices=%u chunk=%u chunk_idx=%u capacity=%llu my_pos=%d alloc_off=%llu alloc_sz=%llu user_off=%llu user_sz=%llu%s\n",
+				  "rc_volume_parse_logical_device: %s LD@ring+%u.%u devtype=0x%04x devices=%u second_count=%u chunk=%u chunk_idx=%u capacity=%llu my_pos=%d alloc_off=%llu alloc_sz=%llu user_off=%llu user_sz=%llu%s\n",
 				  pci_name(adapter->pdev),
 				  scan * RC_LD_SCAN_CHUNK_SECTORS + (i / 512),
 				  i % 512,
-				  devtype, devices, chunk, chunk_index,
+				  devtype, devices, second_count, chunk, chunk_index,
 				  (unsigned long long)capacity, my_pos,
 				  (unsigned long long)alloc_off,
 				  (unsigned long long)alloc_sz,
@@ -1730,10 +1752,11 @@ static u32 rc_volume_expected_members;
  *     non-0.
  *
  *   - field @ 0x110 (RC_LD_CHUNKINDEX_OFFSET): a small index that
- *     encodes the actual stripe size for RAID0.  Confirmed by reverse-
- *     engineering rcraid.sys 9.3.2: FUN_140052404 and FUN_140055760
- *     both dispatch on this value (read from in-memory LD[0xC8], which
- *     is populated from on-disk LD[0x110]) and pick a sector count:
+ *     encodes the actual stripe size for RAID0.  VERIFIED against
+ *     rcraid.sys 9.3.2 (see docs/RCRAID_GEOMETRY_RE.md): FUN_1400121d0
+ *     dispatches on this value (read from in-memory LD[0xC8], populated
+ *     from on-disk LD[0x110] by the field copier FUN_140018444) and
+ *     picks a sector count:
  *
  *         index   stripe
  *         -----   ------
@@ -1741,12 +1764,16 @@ static u32 rc_volume_expected_members;
  *         2       256 sectors (128 KiB)
  *         else    128 sectors (64 KiB)
  *
- *     The pattern is consistent with chunk_sectors = 64 << index for
- *     index >= 1, which would extrapolate to 1024 sectors (512 KiB)
- *     for index 4 and 2048 sectors (1 MiB) for index 5; the observed
- *     Windows code only handles 2 and 3 explicitly and falls back to
- *     64 KiB otherwise, so we mirror that to match Windows behavior
- *     bit-for-bit on this hardware. */
+ *     Two subtleties confirmed by the RE, not guessed:
+ *       - FUN_140018444 forces chunk_index = 1 when the on-disk field
+ *         is 0, so 0 and 1 both mean 64 KiB.
+ *       - Windows handles ONLY 2 and 3 explicitly; every other value
+ *         (including >= 4) falls to 64 KiB.  So the "64 << index"
+ *         extrapolation is NOT what Windows does — an index >= 4 is an
+ *         encoding neither driver understands.  We keep the 64 KiB
+ *         best-effort here so the array is still READABLE, but the
+ *         caller marks such geometry untrusted so the write-veto forces
+ *         read-only (a wrong stripe size would corrupt on write). */
 static u32 rc_volume_chunk_sectors_for(u32 devtype, u32 ld_chunk,
 				       u32 ld_chunk_index)
 {
@@ -1796,6 +1823,21 @@ static void rc_volume_register_member(struct rc_adapter *adapter)
 				  "rc_volume_register_member: %s unknown DeviceType=0x%x with ChunkSize=0 — ignoring\n",
 				  pci_name(adapter->pdev), nvme->ld_device_type);
 			goto out;
+		}
+		/* Fail closed on an unrecognized RAID0 stripe encoding.  When
+		 * ChunkSize is 0 the stripe comes from chunk_index, and the
+		 * reference parser (rcraid.sys 9.3.2 FUN_1400121d0) only maps
+		 * 2 and 3; anything >= 4 falls to a 64 KiB guess that would be
+		 * WRONG for a real 512 KiB / 1 MiB stripe and corrupt the array
+		 * on write.  Keep 64 KiB so reads still work, but distrust the
+		 * geometry so create_disk forces read-only. */
+		if (nvme->ld_device_type == RC_LDT_RAID0 &&
+		    nvme->ld_chunk_sectors == 0 && nvme->ld_chunk_index > 3) {
+			rc_printk(RC_WARN,
+				  "rc_volume_register_member: %s RAID0 chunk_index=%u not understood (only 0..3 map to a known stripe) — geometry UNTRUSTED, writes will be vetoed\n",
+				  pci_name(adapter->pdev), nvme->ld_chunk_index);
+			rc_volume_geometry_untrust_reason =
+				"the on-disk RAID0 chunk_index is not one this driver maps to a stripe size (see the earlier chunk_index warning) — an on-disk encoding this driver doesn't recognize, not a parse failure";
 		}
 	} else {
 		expected = RC_VOLUME_EXPECTED_MEMBERS;
@@ -1854,7 +1896,11 @@ static void rc_volume_register_member(struct rc_adapter *adapter)
 		rc_volume_member_phys_offset[pos] = nvme->ld_userdata_offset;
 		rc_volume_member_count++;
 	} else {
-		/* Legacy BDF-sorted insertion. */
+		/* Legacy BDF-sorted insertion.  The member order and phys
+		 * offsets here are a guess (no on-disk LD to read them from),
+		 * so the assembled geometry can't be trusted for writes. */
+		rc_volume_geometry_untrust_reason =
+			"a member was assembled via the legacy BDF fallback, not the on-disk LD, so member order/offsets are inferred — restore LD parsing (or set stripe_sectors_override and verify reads) before enabling writes";
 		for (pos = 0; pos < rc_volume_member_count; pos++) {
 			if (rc_volume_bdf_cmp(adapter, rc_volume_members[pos]) < 0)
 				break;
@@ -3922,12 +3968,38 @@ static int rc_volume_create_disk(void)
 	rc_volume_disk->flags       = 0;
 	/* Read-only unless the operator explicitly opted in via the module
 	 * parameter.  Note the parameter is 0444 (read-only sysfs) so it
-	 * can only be set at load time — re-load to switch modes. */
-	if (!rc_volume_enable_writes)
-		set_disk_ro(rc_volume_disk, 1);
-	rc_printk(RC_NOTE,
-		  "rc_volume_create_disk: writes %s\n",
-		  rc_volume_enable_writes ? "ENABLED" : "disabled (load with enable_writes=1 to allow)");
+	 * can only be set at load time — re-load to switch modes.
+	 *
+	 * Additionally veto writes when the geometry is untrusted.  Two
+	 * distinct triggers can revoke trust (legacy BDF fallback, or an
+	 * unrecognized RAID0 chunk_index), each with its own cause and remedy
+	 * recorded in rc_volume_geometry_untrust_reason.  The gate is purely
+	 * additive — it can only force read-only, never grant writes the
+	 * operator didn't request — and the untrusted reason is surfaced
+	 * UNCONDITIONALLY (not only when enable_writes=1), so an operator
+	 * running the default enable_writes=0 learns, on the box that hit it,
+	 * why a later enable_writes=1 reload will still come up read-only. */
+	{
+		bool geom_trusted = (rc_volume_geometry_untrust_reason == NULL);
+
+		if (!rc_volume_enable_writes || !geom_trusted)
+			set_disk_ro(rc_volume_disk, 1);
+
+		if (!geom_trusted && rc_volume_enable_writes)
+			rc_printk(RC_WARN,
+				  "rc_volume_create_disk: enable_writes=1 but geometry is UNTRUSTED: %s — forcing READ-ONLY to avoid corrupting a mis-assembled array\n",
+				  rc_volume_geometry_untrust_reason);
+		else if (!geom_trusted)
+			rc_printk(RC_WARN,
+				  "rc_volume_create_disk: geometry is UNTRUSTED: %s — volume is READ-ONLY; loading with enable_writes=1 will NOT help until this is resolved\n",
+				  rc_volume_geometry_untrust_reason);
+		else if (!rc_volume_enable_writes)
+			rc_printk(RC_NOTE,
+				  "rc_volume_create_disk: writes disabled (load with enable_writes=1 to allow)\n");
+		else
+			rc_printk(RC_NOTE,
+				  "rc_volume_create_disk: writes ENABLED\n");
+	}
 
 	ret = add_disk(rc_volume_disk);
 	if (ret)
@@ -3938,7 +4010,9 @@ static int rc_volume_create_disk(void)
 		  rc_volume_disk->disk_name,
 		  (unsigned long long)total_sectors,
 		  (unsigned long long)(total_sectors >> 11),
-		  rc_volume_enable_writes ? "read-write" : "read-only");
+		  (rc_volume_enable_writes &&
+		   rc_volume_geometry_untrust_reason == NULL) ?
+			"read-write" : "read-only");
 	return 0;
 
 err_put_disk:
