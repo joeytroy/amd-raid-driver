@@ -82,17 +82,23 @@ for img in /boot/vmlinuz-*; do
     # 5. Informational: is the on-disk module signed (matters under Secure Boot)?
     if [ -n "$ko" ]; then
         # modinfo needs a .ko-suffixed path to recognise the file as a module.
-        tmpd="$(mktemp -d)"; tmp="$tmpd/rcraid.ko"
-        case "$ko" in
-            *.zst) zstd -dc "$ko" 2>/dev/null > "$tmp" ;;
-            *)     cp "$ko" "$tmp" ;;
-        esac
-        signer="$(modinfo "$tmp" 2>/dev/null | sed -n 's/^signer:[[:space:]]*//p')"
-        rm -rf "$tmpd"
+        # Decompress by suffix (distros use zstd/xz/gzip, or none).
+        signer=""
+        if tmpd="$(mktemp -d 2>/dev/null)"; then
+            tmp="$tmpd/rcraid.ko"
+            case "$ko" in
+                *.zst) zstd -dc "$ko" 2>/dev/null > "$tmp" ;;
+                *.xz)  xz   -dc "$ko" 2>/dev/null > "$tmp" ;;
+                *.gz)  gzip -dc "$ko" 2>/dev/null > "$tmp" ;;
+                *)     cp "$ko" "$tmp" 2>/dev/null ;;
+            esac
+            signer="$(modinfo "$tmp" 2>/dev/null | sed -n 's/^signer:[[:space:]]*//p')"
+            rm -rf "$tmpd"
+        fi
         if [ -n "$signer" ]; then
             echo "   [info] signed by: $signer"
         else
-            echo "   [info] unsigned (fine unless Secure Boot is enforced)"
+            echo "   [info] unsigned or signer unreadable (fine unless Secure Boot is enforced)"
         fi
     fi
 
