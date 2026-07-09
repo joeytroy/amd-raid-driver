@@ -127,9 +127,15 @@ static int rc_bottom_map_bars(struct rc_adapter *adapter)
 
     /* For device ID 0xb000 (NVMe RAID Bottom), MMIO is in BAR0 */
     /* For device ID 0x43bd (Promontory), MMIO is in BAR5 */
-    if (adapter->device_id == 0xb000) {
+    /* Any other NVMe-class function also uses BAR0 — the NVMe spec puts
+     * the controller registers there (MLBAR/MUBAR), and rc_classify_device
+     * already routes class 0x0108 to the NVMe path.  This is what lets the
+     * QEMU test rig bind virtual NVMe controllers (1b36:0010) at runtime
+     * via new_id — see scripts/qemu-test/. */
+    if (adapter->device_id == 0xb000 ||
+        (adapter->pdev->class >> 8) == 0x0108) {
         if (!ctx->bar[0].virt) {
-            rc_printk(RC_ERROR, "rc_bottom: BAR0 missing for NVMe RAID Bottom device\n");
+            rc_printk(RC_ERROR, "rc_bottom: BAR0 missing for NVMe-class device\n");
             return -ENODEV;
         }
         ctx->mmio_base = ctx->bar[0].virt;
