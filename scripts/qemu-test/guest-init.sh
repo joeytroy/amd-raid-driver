@@ -41,15 +41,29 @@ done
 # Bind every NVMe-class PCI function to rcbottom.  new_id entries die
 # with the module, so the reload cycle below calls this again.
 bind_nvme_functions() {
-    bound=0
+    found=0
     for d in /sys/bus/pci/devices/*; do
         [ "$(cat "$d/class")" = "0x010802" ] || continue
         v=$(cat "$d/vendor"); dev=$(cat "$d/device")
-        # Duplicate IDs EEXIST on the second write; that's fine.
+        # Duplicate IDs EEXIST on the second write; that's fine — actual
+        # bind success is verified by the driver-symlink check below.
         echo "${v#0x} ${dev#0x}" > /sys/bus/pci/drivers/rcbottom/new_id 2>/dev/null
-        bound=$((bound + 1))
+        found=$((found + 1))
     done
-    [ "$bound" -ge 2 ] || fail "found $bound NVMe functions, need >= 2"
+    [ "$found" -ge 2 ] || fail "found $found NVMe functions, need >= 2"
+
+    # new_id probes synchronously, so the driver symlink tells us whether
+    # each function really bound (a failed probe or rejected new_id write
+    # would otherwise surface only as a vague rcraid0 timeout later).
+    bound=0
+    for d in /sys/bus/pci/devices/*; do
+        [ "$(cat "$d/class")" = "0x010802" ] || continue
+        case "$(readlink "$d/driver" 2>/dev/null)" in
+            */rcbottom) bound=$((bound + 1)) ;;
+            *) echo "rcraid-test: WARNING: $(basename "$d") did not bind to rcbottom" ;;
+        esac
+    done
+    [ "$bound" -ge 2 ] || fail "only $bound of $found NVMe functions bound to rcbottom"
 }
 
 echo "rcraid-test: loading rcraid.ko"
