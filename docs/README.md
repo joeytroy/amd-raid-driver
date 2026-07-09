@@ -8,7 +8,7 @@ Linux port of the AMD-RAID Windows driver, targeting the TRX50 chipset's
 | Doc | What's in it |
 |---|---|
 | **[STATUS.md](STATUS.md)** | Where the port stands today, the dated implementation log of how each piece was built, and the error-handling / reset design. |
-| **[IMPLEMENTATION.MD](IMPLEMENTATION.MD)** | Prioritized checklist toward a daily-driver release — blockers, missing features, polish, performance. |
+| **[IMPLEMENTATION.MD](IMPLEMENTATION.MD)** | Prioritized checklist toward a daily-driver release — blockers, missing features, polish, performance — plus the enterprise-gap roadmap beyond that. |
 | **[REVERSE_ENGINEERING.md](REVERSE_ENGINEERING.md)** | Authoritative RE reference: what the Windows driver actually does (AHCI-vs-nvme.c split, queue/geometry layout, debunked theories), the 9.3.2-vs-9.3.3 delta, and open questions. |
 | **[archive/](archive/)** | Historical docs, including the 2024 analysis that predates the corrected findings. **Contains debunked claims** — see `archive/README.md` first. |
 

@@ -2,6 +2,8 @@
 
 Tracks what's left between the current driver and a daily-driver-quality
 release. Grouped by priority: blockers first, then features, then polish.
+Beyond daily-driver, the [Enterprise gaps](#-enterprise-gaps--beyond-daily-driver)
+section tracks what an enterprise-grade release adds on top.
 
 Check items off as PRs land. Each item should resolve to a PR (or a
 documented "won't fix" with reasoning).
@@ -87,6 +89,13 @@ For status of work already done, see [`STATUS.md`](STATUS.md).
       scripts (or document MOK enrollment); for distro builds, sign
       with the kernel's ephemeral key.
       *Touch points:* new `scripts/sign-module.sh`, INSTALL.md.
+      *Narrowed 2026-07:* on shim distros (Ubuntu/Fedora) DKMS already
+      signs the module with the shim MOK key automatically (verified:
+      `dkms build` runs kmodsign with `/var/lib/shim-signed/mok/MOK.priv`),
+      so a user who has enrolled a MOK gets Secure Boot for free. What's
+      left is documentation (MOK enrollment walkthrough in INSTALL.md,
+      including the `mokutil --import` reboot dance) and the manual-build
+      path (`build.sh` output is unsigned).
 
 - [ ] **Writes enabled by default (with safety latch)** —
       `enable_writes=1` opt-in is a packaging nightmare. Default to
@@ -122,10 +131,15 @@ For status of work already done, see [`STATUS.md`](STATUS.md).
       degraded (no-op for RAID0 = volume fails), drain pending I/O
       with `BLK_STS_IOERR`.
 
-- [ ] **FUA / Flush / barrier semantics** — Flush command exists;
+- [x] **FUA / Flush / barrier semantics** — Flush command exists;
       FUA bit on write SQEs is not set even when bio has REQ_FUA.
       Databases / filesystems expecting durability see ack-before-
       durable. Wire `cmd_flags & REQ_FUA` → SQE DW12 bit 30.
+      *Resolved:* `REQ_OP_FLUSH` fans out NVMe FLUSH to every member;
+      `REQ_FUA` sets CDW12 bit 30 on the write SQE; queue limits
+      advertise `BLK_FEAT_WRITE_CACHE | BLK_FEAT_FUA`. Verified on
+      hardware (`write_cache: write back`, `fua: 1`, IRQs on both
+      members for `dd conv=fsync`). See STATUS.md "FLUSH + FUA support".
 
 - [ ] **SMART pass-through / drive health** — `nvme` userspace tool
       can't see the drives. Add a passthrough ioctl (NVME_IOCTL_ADMIN_CMD)
@@ -195,6 +209,92 @@ For status of work already done, see [`STATUS.md`](STATUS.md).
       `GHIDRA_FINDINGS_2026` / `RCRAID_GEOMETRY_RE` /
       `WINDOWS_MULTIQUEUE_FINDINGS` / `OPEN_QUESTIONS` folded into
       REVERSE_ENGINEERING; `WORKSTATION_SESSION` moved to `archive/`.
+
+---
+
+## 🏢 Enterprise gaps — beyond daily-driver
+
+What separates a daily-driver release from something a company could
+deploy and support. Several checklist items above are enterprise table
+stakes too — **RAID1/10**, **hot-plug / drive-failure handling**,
+**rebuild**, **SMART pass-through**, **multi-volume**, and **kernel test
+suite integration** — the redundancy trio (RAID1 + failure handling +
+rebuild) being the definition of the category. The items below are what
+*isn't* tracked anywhere else.
+
+### Data integrity
+
+- [ ] **Scrub / patrol reads** — background pass that reads every
+      stripe and surfaces latent sector errors before a rebuild trips
+      over them. RAID0 version is detection-only (report via uevent +
+      log); becomes repair once RAID1 exists. Progress/last-run in
+      sysfs or debugfs.
+
+- [ ] **Retry policy for transient errors** — DNR=0 completions are
+      retryable per spec but we end the request with `BLK_STS_IOERR`
+      today. Re-dispatch after controller reset; bounded retries with
+      backoff. (Already flagged in STATUS.md "Limits"; tracked here
+      because enterprise workloads hit transient SCs that desktops
+      never see.)
+
+- [ ] **End-to-end protection statement (T10 PI/DIF)** — likely
+      *won't* be supported (consumer NVMe members, 512e LBA format);
+      the enterprise-relevant deliverable is a documented position, not
+      code.
+
+### Management & monitoring plane
+
+- [ ] **Array state observability** — status queryable by a tool, not
+      dmesg: volume state (online/dead/resetting), per-member health,
+      reset/latch state. Start with sysfs attrs; grow into a
+      `rcraidctl` CLI. Windows parity here is RAIDXpert2.
+
+- [ ] **Event notification** — emit uevents on state transitions
+      (member dead, auto-reset attempted/failed, volume offline) so
+      monitoring stacks (node_exporter, collectd, udev rules) can
+      alert without scraping logs. Structured, ratelimit-safe log
+      lines with stable prefixes for the same reason.
+
+### Validation & support
+
+- [ ] **Tested-configuration support matrix** — everything is
+      currently validated on one config: TRX50 + 2× Crucial T700 +
+      one Ubuntu kernel line. Document what's tested vs. best-effort
+      (kernels, distros, drive models, member counts ≥ 3), and grow
+      the matrix deliberately. The AHCI variants are already flagged
+      best-effort; the NVMe path has the same single-config exposure,
+      just undocumented.
+
+- [ ] **Power-fail / crash-safety validation** — the design is right
+      (members' volatile write cache + honest FLUSH/FUA), but nothing
+      documents torture evidence: power cut mid-write → journal
+      recovery → data verification, repeated. Scripted harness +
+      results write-up. Related: formalize the "no write-back driver
+      cache without power-loss protection" position (currently a
+      side-note in the Performance section) into a short data-durability
+      statement.
+
+### Operations & lifecycle
+
+- [ ] **Operator runbook** — STATUS.md's error-handling design is
+      engineering docs; operators need: what to do when the volume
+      goes offline, interpreting the auto-reset latch, safe driver
+      upgrade procedure (install-dkms.sh re-run + reboot), rollback
+      when a DKMS rebuild fails on a new kernel, drive replacement
+      (once rebuild exists).
+
+- [ ] **Security & release lifecycle policy** — how vulnerabilities
+      in the Linux driver get reported and fixed, which releases get
+      fixes, changelog / release-notes discipline (the VERSION file
+      is the start). The repo tracks the Windows-side CVE-2024-21962;
+      the Linux driver needs its own policy.
+
+- [ ] **Legal read on RE'd metadata (deployment, not just upstream)** —
+      the existing "License / upstream review" polish item covers LKML
+      submission; enterprise adoption additionally needs a written
+      opinion on whether companies can legally *deploy* a driver built
+      on a reverse-engineered metadata layout. Bigger than one
+      checkbox; deserves its own doc once counsel weighs in.
 
 ---
 
@@ -270,15 +370,27 @@ remaining items:
 
 ## Suggested next-PR order
 
-1. Partition table scan (fastest unblock for daily use)
-2. Fast discard (fix mkfs hang)
-3. DKMS + udev autobind (so reboot doesn't break the array)
-4. Suspend / resume
-5. Boot-from-RAID — initramfs hook + live-CD installer (one-script
-   install of Linux onto the array)
-6. Module signing path
-7. RAID1 support (first redundancy level)
-8. Multi-volume support
-9. Hot-plug handling
+The original daily-driver sequence (partition scan, fast discard,
+DKMS/udev, suspend/resume, boot-from-RAID) has shipped. Current order,
+aimed at the enterprise bar:
+
+1. **RAID1 support** — first redundancy level; unlocks everything in
+   the enterprise category. Needs a second test array (can't reformat
+   the dev box's rootfs RAID0), or a loopback/qemu harness first.
+2. **Hot-plug / drive-failure handling** — degraded-mode semantics;
+   pairs with RAID1 (for RAID0 it just means failing the volume
+   cleanly instead of oopsing).
+3. **Rebuild** — background resync kthread + progress reporting;
+   completes the redundancy trio.
+4. **Array state observability + uevents** — sysfs status attrs and
+   state-transition events; cheap once the degraded-state machinery
+   from (2) exists.
+5. **SMART pass-through** — per-member health visibility.
+6. **Kernel test suite integration** — blktests/xfstests in CI so the
+   redundancy work above stays regression-backed.
+7. **Secure Boot documentation** (MOK enrollment; the DKMS/shim path
+   already signs) and **writes-enabled-by-default latch**.
+8. **Multi-volume support**, then the remaining enterprise doc items
+   (support matrix, runbook, durability statement) alongside.
 
 Everything else can come after.
