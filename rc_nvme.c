@@ -133,9 +133,29 @@ static struct blk_mq_tag_set rc_volume_tagset;
 /* blk-mq tag pool size per hctx.  Matches Windows per-queue SQ depth.
  * Total in-flight requests = nr_hw_queues × this. */
 #define RC_VOLUME_QUEUE_DEPTH	256
+/* Max hardware queues (hctx) the volume exposes.  nr_hw_queues is the min
+ * of every member's granted NVMe I/O queues, capped at
+ * RC_NVME_IO_QUEUE_TARGET=4 in practice, but sized to 8 here as a ceiling.
+ * Used to dimension every per-hctx array below. */
+#define RC_VOLUME_MAX_HCTX		8u
 
-static __le64     *rc_volume_prp_va[RC_VOLUME_MAX_MEMBERS][RC_VOLUME_QUEUE_DEPTH];
-static dma_addr_t  rc_volume_prp_pa[RC_VOLUME_MAX_MEMBERS][RC_VOLUME_QUEUE_DEPTH];
+/* Per-tag PRP-list / DSM-range scratch buffers.
+ *
+ * DIMENSIONED BY [hctx][member][tag] — the hctx index is essential, NOT
+ * optional.  blk-mq tags (req->tag) are unique only WITHIN a hardware
+ * queue: on an nr_hw_queues>1 volume the same tag value is live
+ * simultaneously on every hctx (total in-flight = nr_hw_queues ×
+ * RC_VOLUME_QUEUE_DEPTH, per the comment above).  Two concurrent requests
+ * on different hctx that draw the same tag route to different NVMe queues
+ * (io_queues[hctx->queue_num]) but would share one [member][tag] buffer if
+ * the hctx dimension were dropped — each stomping the other's PRP list.
+ * The victim command then DMAs to the other request's pages (silent
+ * corruption) or to stale/unmapped IOVAs (AMD-Vi IO_PAGE_FAULT → EIO).
+ * That only bites transfers > 2 pages (≤2 pages use PRP1/PRP2 directly and
+ * never touch this pool) under multi-queue concurrency — which is why
+ * synchronous dd passes and deep-queue fio O_DIRECT fails. */
+static __le64     *rc_volume_prp_va[RC_VOLUME_MAX_HCTX][RC_VOLUME_MAX_MEMBERS][RC_VOLUME_QUEUE_DEPTH];
+static dma_addr_t  rc_volume_prp_pa[RC_VOLUME_MAX_HCTX][RC_VOLUME_MAX_MEMBERS][RC_VOLUME_QUEUE_DEPTH];
 
 /* Sequential read prefetch.
  *
@@ -167,7 +187,6 @@ static dma_addr_t  rc_volume_prp_pa[RC_VOLUME_MAX_MEMBERS][RC_VOLUME_QUEUE_DEPTH
 #define RC_VOLUME_PREFETCH_SECTORS	(RC_VOLUME_PREFETCH_BYTES / 512u)
 #define RC_VOLUME_PREFETCH_PAGES	(RC_VOLUME_PREFETCH_BYTES / PAGE_SIZE)
 #define RC_VOLUME_PREFETCH_CID_BASE	0x100u
-#define RC_VOLUME_MAX_HCTX		8u
 #define RC_VOLUME_PREFETCH_SLOTS	2u
 
 enum rc_prefetch_state {
@@ -2099,11 +2118,12 @@ static void rc_volume_unmap_request_sg(struct rc_volume_pdu *pdu)
  * For >2 pages, PRP2 is replaced with the address of the per-tag PRP
  * list buffer (filled in along the way).  Two-page transfers use PRP2
  * directly.  Single-page transfers leave PRP2 zero. */
-static void rc_volume_build_prp(struct rc_nvme_sqe *cmd, int member_idx, u32 tag,
+static void rc_volume_build_prp(struct rc_nvme_sqe *cmd, unsigned int hctx_idx,
+				int member_idx, u32 tag,
 				struct scatterlist *sgl, int nents)
 {
-	__le64 *prp_list      = rc_volume_prp_va[member_idx][tag];
-	dma_addr_t prp_list_pa = rc_volume_prp_pa[member_idx][tag];
+	__le64 *prp_list      = rc_volume_prp_va[hctx_idx][member_idx][tag];
+	dma_addr_t prp_list_pa = rc_volume_prp_pa[hctx_idx][member_idx][tag];
 	struct scatterlist *sg;
 	unsigned int n_pages = 0;
 	int i;
@@ -2150,7 +2170,8 @@ static void rc_volume_build_prp(struct rc_nvme_sqe *cmd, int member_idx, u32 tag
  * request has REQ_FUA set.  Caller has already dma_map_sg'd the bvecs
  * into pdu->sg / pdu->nents; rc_volume_build_prp enumerates those pages
  * into PRP1/PRP2 (and the per-tag PRP list if > 2 pages). */
-static void rc_volume_build_io_sqe(struct rc_nvme_sqe *cmd, int member_idx,
+static void rc_volume_build_io_sqe(struct rc_nvme_sqe *cmd, unsigned int hctx_idx,
+				   int member_idx,
 				   u32 tag, u8 opc, u64 slba, u16 nlb_zbased,
 				   bool fua, struct scatterlist *sgl, int nents)
 {
@@ -2167,7 +2188,7 @@ static void rc_volume_build_io_sqe(struct rc_nvme_sqe *cmd, int member_idx,
 	cmd->cdw11 = cpu_to_le32((u32)(slba >> 32));
 	cmd->cdw12 = cpu_to_le32(cdw12);
 
-	rc_volume_build_prp(cmd, member_idx, tag, sgl, nents);
+	rc_volume_build_prp(cmd, hctx_idx, member_idx, tag, sgl, nents);
 }
 
 /* Build an NVMe FLUSH SQE for one member.  No data, no PRPs, just opcode +
@@ -2187,11 +2208,12 @@ static void rc_volume_build_flush_sqe(struct rc_nvme_sqe *cmd, u32 tag)
  * list, so the buffer is free for the range list).  Range count = 1 (the
  * blk-mq split at chunk_sectors keeps each discard request to one stripe,
  * which maps to one member). */
-static void rc_volume_build_discard_sqe(struct rc_nvme_sqe *cmd, int member_idx,
+static void rc_volume_build_discard_sqe(struct rc_nvme_sqe *cmd, unsigned int hctx_idx,
+					int member_idx,
 					u32 tag, u64 slba, u32 nlb)
 {
 	struct rc_nvme_dsm_range *range = (struct rc_nvme_dsm_range *)
-					   rc_volume_prp_va[member_idx][tag];
+					   rc_volume_prp_va[hctx_idx][member_idx][tag];
 
 	range->context_attrs = cpu_to_le32(0);
 	range->nlb           = cpu_to_le32(nlb);
@@ -2201,7 +2223,7 @@ static void rc_volume_build_discard_sqe(struct rc_nvme_sqe *cmd, int member_idx,
 	cmd->opc   = RC_NVME_NVM_OP_DSM;
 	cmd->cid   = cpu_to_le16((u16)tag);
 	cmd->nsid  = cpu_to_le32(1);
-	cmd->prp1  = cpu_to_le64(rc_volume_prp_pa[member_idx][tag]);
+	cmd->prp1  = cpu_to_le64(rc_volume_prp_pa[hctx_idx][member_idx][tag]);
 	cmd->cdw10 = cpu_to_le32(0);              /* NR = 0 means 1 range */
 	cmd->cdw11 = cpu_to_le32(RC_NVME_DSM_AD); /* Deallocate */
 }
@@ -2422,7 +2444,7 @@ static blk_status_t rc_volume_dispatch_multi_stripe(
 		if (!pdu->ms_nents[m])
 			continue;
 
-		rc_volume_build_io_sqe(&cmd, m, tag,
+		rc_volume_build_io_sqe(&cmd, hctx->queue_num, m, tag,
 				       op == REQ_OP_WRITE ?
 					 RC_NVME_NVM_OP_WRITE :
 					 RC_NVME_NVM_OP_READ,
@@ -2518,7 +2540,7 @@ static blk_status_t rc_volume_dispatch_multi_stripe_discard(
 		if (!member_has_data[m])
 			continue;
 
-		rc_volume_build_discard_sqe(&cmd, m, tag,
+		rc_volume_build_discard_sqe(&cmd, hctx->queue_num, m, tag,
 					    member_start_lba[m],
 					    member_sectors[m]);
 		rc_nvme_io_submit(rc_volume_members[m]->ctx.nvme.io_queues[hctx->queue_num],
@@ -2877,7 +2899,7 @@ static blk_status_t rc_volume_queue_rq(struct blk_mq_hw_ctx *hctx,
 	atomic_set(&pdu->members_pending, 1);
 
 	if (op == REQ_OP_DISCARD) {
-		rc_volume_build_discard_sqe(&cmd, member_idx, tag,
+		rc_volume_build_discard_sqe(&cmd, hctx->queue_num, member_idx, tag,
 					    phys_lba, nr_sectors);
 		blk_mq_start_request(req);
 		rc_nvme_io_submit(rc_volume_members[member_idx]->ctx.nvme.io_queues[hctx->queue_num],
@@ -2895,7 +2917,7 @@ static blk_status_t rc_volume_queue_rq(struct blk_mq_hw_ctx *hctx,
 		return BLK_STS_OK;
 	}
 
-	rc_volume_build_io_sqe(&cmd, member_idx, tag,
+	rc_volume_build_io_sqe(&cmd, hctx->queue_num, member_idx, tag,
 			       op == REQ_OP_WRITE ? RC_NVME_NVM_OP_WRITE
 						  : RC_NVME_NVM_OP_READ,
 			       phys_lba, (u16)(nr_sectors - 1),
@@ -3882,44 +3904,54 @@ static int rc_volume_create_disk(void)
 	struct rc_adapter *m0 = rc_volume_members[0];
 	u64 total_sectors;
 	int i, ret;
-
-	/* Per-tag, per-member PRP-list buffer (PAGE_SIZE each).  Tag = NVMe
-	 * CID; the same tag may route to different members on different
-	 * requests, so each member needs its own pool.  Data buffers no
-	 * longer exist here — hardware DMAs directly to the bio's pages via
-	 * dma_map_sg in rc_volume_queue_rq. */
-	for (i = 0; i < rc_volume_member_count; i++) {
-		struct device *dev = &rc_volume_members[i]->pdev->dev;
-		u32 t;
-
-		for (t = 0; t < RC_VOLUME_QUEUE_DEPTH; t++) {
-			rc_volume_prp_va[i][t] =
-				dma_alloc_coherent(dev, PAGE_SIZE,
-						   &rc_volume_prp_pa[i][t],
-						   GFP_KERNEL);
-			if (!rc_volume_prp_va[i][t]) {
-				ret = -ENOMEM;
-				goto err_free_dma;
-			}
-		}
-	}
+	u32 nr_hw, h;
 
 	/* nr_hw_queues = min(member->nr_io_queues) across all members.  Each
 	 * hctx i routes to io_queues[i] on every member, so we can't ask
 	 * blk-mq for more hctxs than the smallest member supports.  All
 	 * T700s grant 128 (we cap at RC_NVME_IO_QUEUE_TARGET=4) so this
 	 * just resolves to 4 in practice, but the min is a future-proofing
-	 * safety net. */
-	{
-		u32 nr_hw = m0->ctx.nvme.nr_io_queues;
-		for (i = 1; i < rc_volume_member_count; i++) {
-			u32 m = rc_volume_members[i]->ctx.nvme.nr_io_queues;
-			if (m < nr_hw)
-				nr_hw = m;
-		}
-		if (nr_hw == 0)
-			nr_hw = 1;
+	 * safety net.  Computed up front because it dimensions the PRP pool
+	 * allocated just below.  Clamped to RC_VOLUME_MAX_HCTX so the [hctx]
+	 * index into that pool (and every other per-hctx array) is always in
+	 * bounds. */
+	nr_hw = m0->ctx.nvme.nr_io_queues;
+	for (i = 1; i < rc_volume_member_count; i++) {
+		u32 m = rc_volume_members[i]->ctx.nvme.nr_io_queues;
+		if (m < nr_hw)
+			nr_hw = m;
+	}
+	if (nr_hw == 0)
+		nr_hw = 1;
+	if (nr_hw > RC_VOLUME_MAX_HCTX)
+		nr_hw = RC_VOLUME_MAX_HCTX;
 
+	/* Per-hctx, per-member, per-tag PRP-list / DSM buffer (PAGE_SIZE each).
+	 * The hctx dimension is mandatory — req->tag is unique only within a
+	 * single hctx, so two concurrent commands on different queues that draw
+	 * the same tag must not share a buffer (see the pool declaration near
+	 * the top of this file for the full corruption rationale).  Only the
+	 * live nr_hw × member_count × queue_depth subset is allocated; the rest
+	 * stay NULL and are skipped by the free paths. */
+	for (h = 0; h < nr_hw; h++) {
+		for (i = 0; i < rc_volume_member_count; i++) {
+			struct device *dev = &rc_volume_members[i]->pdev->dev;
+			u32 t;
+
+			for (t = 0; t < RC_VOLUME_QUEUE_DEPTH; t++) {
+				rc_volume_prp_va[h][i][t] =
+					dma_alloc_coherent(dev, PAGE_SIZE,
+							   &rc_volume_prp_pa[h][i][t],
+							   GFP_KERNEL);
+				if (!rc_volume_prp_va[h][i][t]) {
+					ret = -ENOMEM;
+					goto err_free_dma;
+				}
+			}
+		}
+	}
+
+	{
 		memset(&rc_volume_tagset, 0, sizeof(rc_volume_tagset));
 		rc_volume_tagset.ops          = &rc_volume_mq_ops;
 		rc_volume_tagset.nr_hw_queues = nr_hw;
@@ -4108,12 +4140,15 @@ err_free_dma:
 		struct device *dev = &rc_volume_members[i]->pdev->dev;
 		u32 t;
 
-		for (t = 0; t < RC_VOLUME_QUEUE_DEPTH; t++) {
-			if (rc_volume_prp_va[i][t]) {
-				dma_free_coherent(dev, PAGE_SIZE,
-						  rc_volume_prp_va[i][t],
-						  rc_volume_prp_pa[i][t]);
-				rc_volume_prp_va[i][t] = NULL;
+		for (h = 0; h < RC_VOLUME_MAX_HCTX; h++) {
+			for (t = 0; t < RC_VOLUME_QUEUE_DEPTH; t++) {
+				if (rc_volume_prp_va[h][i][t]) {
+					dma_free_coherent(dev, PAGE_SIZE,
+							  rc_volume_prp_va[h][i][t],
+							  rc_volume_prp_pa[h][i][t]);
+					rc_volume_prp_va[h][i][t] = NULL;
+					rc_volume_prp_pa[h][i][t] = 0;
+				}
 			}
 		}
 	}
@@ -4137,15 +4172,17 @@ void rc_volume_teardown(void)
 	for (i = 0; i < RC_VOLUME_MAX_MEMBERS; i++) {
 		if (rc_volume_members[i]) {
 			struct device *dev = &rc_volume_members[i]->pdev->dev;
-			u32 t;
+			u32 t, h;
 
-			for (t = 0; t < RC_VOLUME_QUEUE_DEPTH; t++) {
-				if (rc_volume_prp_va[i][t]) {
-					dma_free_coherent(dev, PAGE_SIZE,
-							  rc_volume_prp_va[i][t],
-							  rc_volume_prp_pa[i][t]);
-					rc_volume_prp_va[i][t] = NULL;
-					rc_volume_prp_pa[i][t] = 0;
+			for (h = 0; h < RC_VOLUME_MAX_HCTX; h++) {
+				for (t = 0; t < RC_VOLUME_QUEUE_DEPTH; t++) {
+					if (rc_volume_prp_va[h][i][t]) {
+						dma_free_coherent(dev, PAGE_SIZE,
+								  rc_volume_prp_va[h][i][t],
+								  rc_volume_prp_pa[h][i][t]);
+						rc_volume_prp_va[h][i][t] = NULL;
+						rc_volume_prp_pa[h][i][t] = 0;
+					}
 				}
 			}
 		}
