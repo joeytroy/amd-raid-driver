@@ -215,6 +215,13 @@ Full setup, troubleshooting, and the Secure-Boot / signing details are in
   I/O error (`BLK_STS_IOERR`) even when the drive reports it as retryable
   (DNR=0); it isn't re-dispatched. Controller-level failures still trigger
   the automatic reset described above.
+- **Single-request multi-stripe fan-out is intentionally disabled** —
+  requests are split at stripe boundaries (`chunk_sectors`), so each NVMe
+  command targets exactly one member. Parallelism across members comes from
+  many requests in flight at once (which is what the numbers above measure),
+  not from one request fanning out. The fan-out path is wired up but
+  unreachable by design — see
+  [`docs/IMPLEMENTATION.MD`](docs/IMPLEMENTATION.MD).
 
 The prioritized checklist lives in
 [`docs/IMPLEMENTATION.MD`](docs/IMPLEMENTATION.MD).
