@@ -211,6 +211,10 @@ Full setup, troubleshooting, and the Secure-Boot / signing details are in
   but the AHCI path is a stub.
 - **No array management** — create/modify the array in BIOS/RAIDXpert.
 - **No Secure Boot signing** out of the box.
+- **No retry of transient NVMe errors** — a failed command surfaces as an
+  I/O error (`BLK_STS_IOERR`) even when the drive reports it as retryable
+  (DNR=0); it isn't re-dispatched. Controller-level failures still trigger
+  the automatic reset described above.
 
 The prioritized checklist lives in
 [`docs/IMPLEMENTATION.MD`](docs/IMPLEMENTATION.MD).
