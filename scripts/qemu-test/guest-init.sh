@@ -1,10 +1,11 @@
 #!/bin/sh
 # /init for the rcraid QEMU test VM (busybox initramfs).
 #
-# Loads rcraid.ko, binds every NVMe-class PCI function to rcbottom via
-# sysfs new_id (QEMU's virtual NVMe is 1b36:0010 — not in the module's ID
-# table, but rc_classify_device() routes any class 0x0108 device to the
-# NVMe path), waits for /dev/rcraid0, verifies its size against the
+# Loads rcraid.ko with allow_foreign_nvme=1, binds every NVMe-class PCI
+# function to rcbottom via sysfs new_id (QEMU's virtual NVMe is 1b36:0010
+# — not in the module's ID table; the opt-in lets the driver accept
+# non-B000 NVMe-class functions), waits for /dev/rcraid0, verifies its
+# size against the
 # expected_sectors= kernel arg, then round-trips data through the volume
 # with the page cache dropped between write and read.
 #
@@ -67,7 +68,7 @@ bind_nvme_functions() {
 }
 
 echo "rcraid-test: loading rcraid.ko"
-insmod /rcraid.ko enable_writes=1 || fail "insmod rcraid.ko"
+insmod /rcraid.ko enable_writes=1 allow_foreign_nvme=1 || fail "insmod rcraid.ko"
 
 echo "rcraid-test: binding NVMe-class PCI functions to rcbottom"
 bind_nvme_functions
@@ -109,7 +110,7 @@ got=$(dd if=/dev/rcraid0 bs=1M skip=33 count=4 2>/dev/null | md5sum | cut -d' ' 
 
 echo "rcraid-test: reload cycle (metadata must still validate)"
 rmmod rcraid || fail "rmmod"
-insmod /rcraid.ko enable_writes=1 || fail "re-insmod"
+insmod /rcraid.ko enable_writes=1 allow_foreign_nvme=1 || fail "re-insmod"
 bind_nvme_functions
 i=0
 while [ ! -b /dev/rcraid0 ]; do

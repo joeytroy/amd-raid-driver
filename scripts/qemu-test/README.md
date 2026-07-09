@@ -31,10 +31,13 @@ Design notes:
 - **No competing driver.** The guest kernel's `nvme` driver is a module
   we simply don't ship, so the virtual controllers stay unbound until
   `new_id` hands them to rcbottom.
-- **No driver test hooks.** QEMU's NVMe (`1b36:0010`) reaches the normal
-  probe path: `rc_classify_device` routes any PCI class `0x0108`
-  function to the NVMe code, and BAR selection accepts NVMe-class
-  functions (controller registers are in BAR0 per spec).
+- **One explicit opt-in, no hidden hooks.** QEMU's NVMe (`1b36:0010`)
+  reaches the normal probe path: `rc_classify_device` routes any PCI
+  class `0x0108` function to the NVMe code, and BAR selection accepts
+  non-B000 NVMe-class functions **only** under `allow_foreign_nvme=1`
+  (the guest init passes it). Default-off on purpose — the NVMe
+  bring-up resets the controller it touches, so an accidental `new_id`
+  bind of an unrelated drive must fail at BAR mapping instead.
 - **Same geometry as hardware.** QEMU reports MDTS=7 / MPSMIN=0 /
   VWC=1 — identical to the Crucial T700s — so PRP-list sizing and the
   write-cache path are exercised realistically.
