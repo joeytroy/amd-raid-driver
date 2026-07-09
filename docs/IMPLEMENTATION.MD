@@ -208,7 +208,10 @@ Current measured (`fio --direct=1` sustained 15 s, 2× Crucial T700,
 (Spec ceilings are 2× the per-drive T700 2 TB figures: 12.4 GB/s read /
 11.8 GB/s write each. An earlier revision of this table showed 8.9 GB/s
 write — that was measured before the driver enabled each member's
-volatile write cache at init; it is not a current limit.)
+volatile write cache at init; it is not a current limit. The README
+quotes 19.7 read / 18.7 write from KDiskMark 3.3.0 on the same array;
+the ~1 GB/s write-side gap vs this table is KDiskMark harness overhead,
+not the driver — raw `fio` measures the two directions identical.)
 
 Windows CDM's headline 22 GB/s sequential write is a benchmark artifact
 (CDM uses tiny test sizes that fit in the drive's SLC cache). For real
