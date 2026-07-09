@@ -36,6 +36,18 @@ MODULE_PARM_DESC(safe_subsys_vendor,
                  "If non-zero, only bind to PCI devices whose subsystem_vendor matches this u16. "
                  "Use to keep rcraid off the OS drive on chipsets that expose every NVMe as 1022:b000.");
 
+/* Opt-in for driving NVMe controllers that are NOT the known AMD RAID
+ * Bottom device (0xb000) — e.g. QEMU's 1b36:0010 in the test rig, bound
+ * at runtime via sysfs new_id.  Default OFF: rc_nvme_init_controller()
+ * resets whatever it touches (CC.EN=0), so an accidental new_id bind of
+ * an unrelated NVMe drive must fail at BAR mapping, not get its
+ * controller torn down.  See scripts/qemu-test/. */
+static bool rc_allow_foreign_nvme;
+module_param_named(allow_foreign_nvme, rc_allow_foreign_nvme, bool, 0444);
+MODULE_PARM_DESC(allow_foreign_nvme,
+                 "Allow driving NVMe-class (0x0108) controllers other than the AMD RAID Bottom "
+                 "device (1022:b000). TEST RIGS ONLY: the NVMe bring-up resets the controller.");
+
 /*----------------------------------------------------------------------
  * PCI identity table.  Mirrors the five entries in AMD's
  * Windows rcbottom.inf (9.3.2/9.3.3): four SATA-RAID device IDs
@@ -125,20 +137,20 @@ static int rc_bottom_map_bars(struct rc_adapter *adapter)
                   bar->virt);
     }
 
-    /* For device ID 0xb000 (NVMe RAID Bottom), MMIO is in BAR0 */
-    /* For device ID 0x43bd (Promontory), MMIO is in BAR5 */
-    if (adapter->device_id == 0xb000) {
-        if (!ctx->bar[0].virt) {
-            rc_printk(RC_ERROR, "rc_bottom: BAR0 missing for NVMe RAID Bottom device\n");
-            return -ENODEV;
-        }
-        ctx->mmio_base = ctx->bar[0].virt;
-        ctx->mmio_len = ctx->bar[0].len;
-        ctx->mmio_phys = ctx->bar[0].phys;
-        rc_printk(RC_INFO, "rc_bottom: Using BAR0 for NVMe RAID Bottom (phys=0x%llx len=0x%llx)\n",
-                  (unsigned long long)ctx->mmio_phys, (unsigned long long)ctx->mmio_len);
-    } else if (adapter->device_id == 0x43bd) {
-    if (!ctx->bar[5].virt) {
+    /* For device ID 0x43bd (Promontory), MMIO is in BAR5.  Checked FIRST
+     * so the precedence matches rc_classify_device() (explicit device-ID
+     * matches win over the class fallback) and the two functions can
+     * never disagree about a device's code path.
+     *
+     * BAR0 (where the NVMe spec puts the controller registers) is used
+     * for 0xb000 (NVMe RAID Bottom, class 0x010802) and — ONLY behind
+     * the allow_foreign_nvme opt-in — any other NVMe-class function,
+     * e.g. the QEMU test rig's virtual controllers (1b36:0010, bound at
+     * runtime via new_id; see scripts/qemu-test/).  Without the opt-in,
+     * unknown IDs fail here, BEFORE rc_nvme_init_controller() can reset
+     * (CC.EN=0) a controller that isn't ours. */
+    if (adapter->device_id == 0x43bd) {
+        if (!ctx->bar[5].virt) {
             rc_printk(RC_ERROR, "rc_bottom: BAR5 missing for Promontory device\n");
             return -ENODEV;
         }
@@ -146,6 +158,22 @@ static int rc_bottom_map_bars(struct rc_adapter *adapter)
         ctx->mmio_len = ctx->bar[5].len;
         ctx->mmio_phys = ctx->bar[5].phys;
         rc_printk(RC_INFO, "rc_bottom: Using BAR5 for Promontory device (phys=0x%llx len=0x%llx)\n",
+                  (unsigned long long)ctx->mmio_phys, (unsigned long long)ctx->mmio_len);
+    } else if (adapter->device_id == 0xb000 ||
+               (rc_allow_foreign_nvme &&
+                (adapter->pdev->class >> 8) == 0x0108)) {
+        if (adapter->device_id != 0xb000)
+            rc_printk(RC_WARN,
+                      "rc_bottom: allow_foreign_nvme — driving non-AMD NVMe controller %04x:%04x, its NVMe state WILL be reset\n",
+                      adapter->pdev->vendor, adapter->pdev->device);
+        if (!ctx->bar[0].virt) {
+            rc_printk(RC_ERROR, "rc_bottom: BAR0 missing for NVMe-class device\n");
+            return -ENODEV;
+        }
+        ctx->mmio_base = ctx->bar[0].virt;
+        ctx->mmio_len = ctx->bar[0].len;
+        ctx->mmio_phys = ctx->bar[0].phys;
+        rc_printk(RC_INFO, "rc_bottom: Using BAR0 for NVMe RAID Bottom (phys=0x%llx len=0x%llx)\n",
                   (unsigned long long)ctx->mmio_phys, (unsigned long long)ctx->mmio_len);
     } else {
         rc_printk(RC_ERROR, "rc_bottom: Unknown device ID 0x%04x\n", adapter->device_id);
