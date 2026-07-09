@@ -4,7 +4,7 @@
 > box.  Controller bring-up, admin + I/O queues, NVMe Identify,
 > RAID0 volume assembly from on-disk metadata, blk-mq read and write
 > (writes gated behind `enable_writes=1`).  See `docs/STATUS.md` for
-> the full picture, `docs/GHIDRA_FINDINGS_2026.md` for the
+> the full picture, `docs/REVERSE_ENGINEERING.md` for the
 > reverse-engineering background, and `RE_METHODOLOGY.md` at the
 > repository root for the license and legal record.
 
@@ -215,7 +215,8 @@ device ID is something else, it's not currently supported.
 
 That means we wrote the right registers but they didn't stick — likely
 the controller needs a vendor-specific config write before MMIO comes
-up. See `docs/OPEN_QUESTIONS.md` item 6 and 7. Capture the full dmesg
+up. See the low-priority open questions (BAR discovery, vendor PCI
+config writes) in `docs/REVERSE_ENGINEERING.md`. Capture the full dmesg
 and paste it into a new development session.
 
 ### "I just want to compare against the working Windows driver"

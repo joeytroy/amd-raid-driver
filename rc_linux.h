@@ -140,7 +140,7 @@ struct rc_doorbell_state {
 
 // Controller mode — selects the init/dispatch path.
 // Mirrors the Windows AMD driver's split between ahci.c (iVar7==1) and
-// nvme.c (iVar7==2). See docs/GHIDRA_FINDINGS_2026.md.
+// nvme.c (iVar7==2). See docs/REVERSE_ENGINEERING.md.
 enum rc_ctrl_mode {
     RC_CTRL_MODE_UNKNOWN = 0,
     RC_CTRL_MODE_AHCI    = 1,   // DEV_7905/7916/7917/43BD (CC_0104)
@@ -150,7 +150,7 @@ enum rc_ctrl_mode {
 
 /* Target number of I/O queue pairs to request at init via Set Features
  * Number of Queues.  Matches Windows rcbottom.sys's hardcoded cap (see
- * docs/WINDOWS_MULTIQUEUE_FINDINGS.md).  Controller may grant fewer;
+ * docs/REVERSE_ENGINEERING.md).  Controller may grant fewer;
  * the granted count lands in nvme->nr_io_queues.  Step 3a creates this
  * many queue pairs (with their own MSI-X vectors); step 3b connects
  * them to blk-mq via per-CPU hctx mapping. */
@@ -534,7 +534,7 @@ struct rc_nvme_dsm_range {
 } __packed;
 
 /* Per-queue SQ/CQ depth.  Matches Windows rcbottom.sys's per-queue
- * size of 256 (see docs/WINDOWS_MULTIQUEUE_FINDINGS.md).  Clamped
+ * size of 256 (see docs/REVERSE_ENGINEERING.md).  Clamped
  * against CAP.MQES at queue-create time.  With nr_hw_queues=4 this
  * gives 1024 total outstanding NVMe commands per controller. */
 #define RC_NVME_IO_QUEUE_DEPTH		256
@@ -552,7 +552,7 @@ struct rc_nvme_dsm_range {
  * to be the correct stripe size in sectors.  The SDK calls this field
  * `ConfigRingSize` (size of the config ring at ConfigRingOffset).  The
  * real per-volume stripe lives in RC_LogicalDevice.ChunkSize on disk,
- * which we don't yet parse — see docs/OPEN_QUESTIONS.md. */
+ * which we don't yet parse — see docs/REVERSE_ENGINEERING.md. */
 #define RC_RAIDCORE_LBA			0x5000ULL
 #define RC_RAIDCORE_BYTES		512u
 #define RC_RAIDCORE_PAYLOAD_BYTES	0x1F8u	/* 504 = 0x200 - 8 */
@@ -599,7 +599,7 @@ struct rc_raidcore_md {
  * Lives in the config ring (LBA = RC_MetaData.config_ring_lba + N), tagged
  * by the leading u32 == RC_DST_LOGICAL_DEVICE (0x25BD).  ChunkSize at +0xAC
  * is observed to be 0 for RAID0 — the firmware uses a hardcoded default of
- * 2048 sectors (1 MiB) for that RAID level.  See docs/OPEN_QUESTIONS.md.
+ * 2048 sectors (1 MiB) for that RAID level.  See docs/REVERSE_ENGINEERING.md.
  *
  * We declare only the fields the driver consumes; the trailing reserved
  * area is implicit. */

@@ -186,10 +186,15 @@ For status of work already done, see [`STATUS.md`](STATUS.md).
       we'd need `drivers/block/rcraid/Kconfig` + `Makefile` slotting,
       and adjustments for the in-tree style.
 
-- [ ] **Doc consolidation** — `docs/` has STATUS.md, OPEN_QUESTIONS.md,
-      GHIDRA_FINDINGS_2026.md, ERROR_HANDLING.md plus archives.
-      Consolidate the active ones into one "Developer Guide" and
-      move the rest to `docs/archive/`.
+- [x] **Doc consolidation** — `docs/` had 9 active files with heavy
+      overlap. *Resolved:* consolidated to four — `STATUS.md` (state +
+      impl log + error-handling design), `IMPLEMENTATION.MD` (this
+      checklist), `REVERSE_ENGINEERING.md` (all RE findings: Ghidra
+      analysis, rcraid geometry, multi-queue, open questions), and
+      `README.md` (index). `ERROR_HANDLING.md` folded into STATUS;
+      `GHIDRA_FINDINGS_2026` / `RCRAID_GEOMETRY_RE` /
+      `WINDOWS_MULTIQUEUE_FINDINGS` / `OPEN_QUESTIONS` folded into
+      REVERSE_ENGINEERING; `WORKSTATION_SESSION` moved to `archive/`.
 
 ---
 
@@ -251,7 +256,8 @@ honestly.
 
 ## 🤔 Open reverse-engineering questions
 
-See [`OPEN_QUESTIONS.md`](OPEN_QUESTIONS.md). Most relevant
+See the "Open questions" section of
+[`REVERSE_ENGINEERING.md`](REVERSE_ENGINEERING.md). Most relevant
 remaining items:
 
 - [ ] `rcraid.sys` completion ISR (`FUN_14000d2b8`) — never decompiled.
