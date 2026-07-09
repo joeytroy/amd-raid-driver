@@ -10,11 +10,12 @@
 #
 # Requires root.  Run from the repo root.
 
-set -eu
+set -euo pipefail
 
 SRC_DIR="$(cd "$(dirname "$0")" && pwd)"
 PKG_NAME="rcraid"
 PKG_VERSION="$(awk -F'"' '/^PACKAGE_VERSION=/ {print $2}' "$SRC_DIR/dkms.conf")"
+DRIVER_VERSION="$(cat "$SRC_DIR/VERSION")"
 DKMS_SRC="/usr/src/${PKG_NAME}-${PKG_VERSION}"
 
 [ "$(id -u)" -eq 0 ] || { echo "must be root" >&2; exit 1; }
@@ -33,7 +34,7 @@ for tool in lspci dkms udevadm; do
     fi
 done
 
-echo "==> rcraid install-dkms.sh  (package: ${PKG_NAME}-${PKG_VERSION})"
+echo "==> rcraid install-dkms.sh  (driver ${DRIVER_VERSION}, dkms package ${PKG_NAME}-${PKG_VERSION})"
 echo
 
 # ----------------------------------------------------------------------------
@@ -125,14 +126,23 @@ if rev=$(git -C "$SRC_DIR" describe --always --dirty 2>/dev/null); then
     echo "$rev" > "$DKMS_SRC/.rcraid_rev"
 fi
 
-echo "==> dkms add"
-dkms add -m "$PKG_NAME" -v "$PKG_VERSION" 2>&1 | sed 's/^/    /'
+# The dkms package version (from dkms.conf) stays fixed across driver updates
+# (the driver version lives in VERSION), so a re-run of this script must not
+# assume a clean slate: skip `add` if the package is already registered, and
+# force build/install so dkms rebuilds from the freshly staged sources instead
+# of silently keeping the previously installed module.
+if [ -n "$(dkms status -m "$PKG_NAME" -v "$PKG_VERSION" 2>/dev/null)" ]; then
+    echo "==> dkms add (skipped — ${PKG_NAME}/${PKG_VERSION} already registered)"
+else
+    echo "==> dkms add"
+    dkms add -m "$PKG_NAME" -v "$PKG_VERSION" 2>&1 | sed 's/^/    /'
+fi
 
 echo "==> dkms build"
-dkms build -m "$PKG_NAME" -v "$PKG_VERSION" 2>&1 | sed 's/^/    /'
+dkms build -m "$PKG_NAME" -v "$PKG_VERSION" --force 2>&1 | sed 's/^/    /'
 
 echo "==> dkms install"
-dkms install -m "$PKG_NAME" -v "$PKG_VERSION" 2>&1 | sed 's/^/    /'
+dkms install -m "$PKG_NAME" -v "$PKG_VERSION" --force 2>&1 | sed 's/^/    /'
 echo
 
 # ----------------------------------------------------------------------------
@@ -205,6 +215,15 @@ echo
 # ----------------------------------------------------------------------------
 # 5. Done.  Tell the user what happens next.
 # ----------------------------------------------------------------------------
+
+if grep -q '^rcraid ' /proc/modules; then
+    cat <<EOF
+NOTE: rcraid is currently loaded, so the running module is still the old
+build.  The freshly installed module (and the regenerated initramfs) take
+effect on the next reboot.
+
+EOF
+fi
 
 cat <<EOF
 ==> Install complete.
