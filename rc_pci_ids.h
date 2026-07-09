@@ -51,9 +51,10 @@
 #define RC_DIPM_DISABLE              0x00000000
 #define RC_HMB_POLICY_DEFAULT        0x00000002
 
-/* MSI: 9.3.2 limited to 5 vectors; 9.3.3 raised to 16.  We currently
- * request 1 (single-interrupt polling); revisit when we add
- * interrupt-driven completion. */
+/* MSI: 9.3.2's INF limited to 5 vectors; 9.3.3 raised to 16.  We request
+ * RC_NVME_IO_QUEUE_TARGET + 1 = 5 (1 admin + 4 I/O queues, the Windows
+ * hard cap) in rc_bottom_setup_interrupts — within both limits, so
+ * nothing changes across releases unless the queue target is raised. */
 #define RC_MSI_SUPPORTED             1
 #define RC_MSI_MESSAGE_LIMIT_9_3_2   5
 #define RC_MSI_MESSAGE_LIMIT_9_3_3   16
