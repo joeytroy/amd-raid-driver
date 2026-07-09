@@ -33,12 +33,13 @@ if [ -z "$KERNELDIR" ]; then
     exit 1
 fi
 
-# Set environment variables
+# Set environment variables.  KCFLAGS is the supported way to append
+# compiler flags from the environment; modern kbuild ignores EXTRA_CFLAGS.
 export KERNELDIR
-export EXTRA_CFLAGS="-Wall -Wextra -Wno-error -Wno-unused-variable -Wno-unused-function -Wno-missing-field-initializers"
+export KCFLAGS="-Wno-error -Wno-unused-variable -Wno-unused-function -Wno-missing-field-initializers"
 
 echo "Building with kernel directory: $KERNELDIR"
-echo "Extra CFLAGS: $EXTRA_CFLAGS"
+echo "Extra CFLAGS (KCFLAGS): $KCFLAGS"
 
 # Build the module
 echo "Building AMD RAID driver..."
@@ -52,7 +53,7 @@ else
     echo "Build failed. Trying alternative approach..."
     
     # Try with minimal flags
-    export EXTRA_CFLAGS="-Wno-error -Wno-unused-variable -Wno-unused-function -Wno-missing-field-initializers -Wno-unused-but-set-variable"
+    export KCFLAGS="-Wno-error -Wno-unused-variable -Wno-unused-function -Wno-missing-field-initializers -Wno-unused-but-set-variable"
     make -C "$KERNELDIR" M="$(pwd)" modules
     
     if [ $? -eq 0 ]; then

@@ -60,11 +60,19 @@ static inline int scsi_add_host(struct Scsi_Host *host, struct device *dev) { re
 
 #include "rc_pci_ids.h"
 
-// Driver Information
+// Driver Information.
+// The version tracks the AMD Windows release whose behavior this port
+// matches.  It lives in the VERSION file at the repo root and is
+// injected by the Makefile — when a new AMD release has been torn down
+// with Ghidra and verified (see docs/REVERSE_ENGINEERING.md "Version
+// delta"), bump VERSION, not this header.  The #ifndef fallback exists
+// only for builds outside the normal kbuild flow and must simply match
+// the current VERSION.
 #define RC_DRIVER_NAME               "rcraid"
-#define RC_DRIVER_VERSION            "9.3.2.00255"
+#ifndef RC_DRIVER_VERSION
+#define RC_DRIVER_VERSION            "9.3.3.00291"
+#endif
 #define RC_DRIVER_DESCRIPTION        "AMD RAID Controller for Linux"
-#define RC_DRIVER_BUILD              "9.3.2-00039"
 
 // Source revision, normally injected by the Makefile (git describe, or the
 // .rcraid_rev file in DKMS/live-CD staged trees).

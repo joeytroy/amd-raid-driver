@@ -16,8 +16,11 @@ disagrees with this file, this file wins.
 Tooling: **Ghidra 12.1** headless (scripts in `scripts/ghidra/`) plus PyGhidra
 for targeted decompiles. Raw extracts live under `docs/ghidra_output/`
 (`rcbottom_9.3.2/`, `rcbottom_9.3.3/`, `rcraid_9.3.2/`). The Linux driver's
-version string `RC_DRIVER_VERSION "9.3.2.00255"` is the exact-match anchor for
-the geometry work.
+version string comes from the single-line `VERSION` file at the repo root
+(injected by the Makefile) and names the AMD Windows release whose behavior
+the port matches — currently `9.3.3.00291`. The geometry ground truth was
+established on 9.3.2-00255 and re-verified on 9.3.3-00291 (see "Version
+delta" below).
 
 ---
 
@@ -42,6 +45,21 @@ is functionally identical between versions** — verified by re-running the
 pipeline on 9.3.3 (see "rcraid geometry" below). So 9.3.3 is a maintenance /
 security release, not a feature release, for the NVMe RAID0 path this port
 targets.
+
+### Tracking a new AMD release
+
+When AMD ships a new Windows RAID driver (e.g. a future 9.3.4):
+
+1. Extract the new `rcraid.sys` / `rcbottom.sys` / `rccfg.sys` into
+   `drivers/windows/trx50/<version>/`.
+2. Re-run the Ghidra pipeline on them ("Reproducing the analysis" below) and
+   string/symbol-diff against the previous release, focusing on the geometry
+   parser and the NVMe queue-init path.
+3. Update this section with the findings; port any data-path change the diff
+   surfaces.
+4. Bump the single-line `VERSION` file at the repo root to the new release
+   (e.g. `9.3.4.00xxx`) — the Makefile injects it into the module banner and
+   `modinfo`; no code change is needed for the version itself.
 
 ---
 

@@ -17,9 +17,12 @@ rcraid-objs := \
 KERNELDIR ?= /lib/modules/$(shell uname -r)/build
 
 # Compiler flags
-EXTRA_CFLAGS += -Wall -Wextra
-EXTRA_CFLAGS += -Wno-error
-EXTRA_CFLAGS += -DRC_DEBUG_LEVEL=$(RC_DEBUG_LEVEL)
+# Compiler flags.  ccflags-y, NOT the old EXTRA_CFLAGS: kbuild dropped
+# EXTRA_CFLAGS support (it is absent from scripts/Makefile.lib on 6.x),
+# so anything added through it silently never reaches the compiler —
+# which is exactly how the build-rev stamp below was broken for a while.
+ccflags-y += -Wall -Wextra
+ccflags-y += -Wno-error
 
 # Build revision baked into the load banner and modinfo, so a loaded module
 # can always be matched to the exact source it was built from (a stale build
@@ -32,7 +35,18 @@ EXTRA_CFLAGS += -DRC_DEBUG_LEVEL=$(RC_DEBUG_LEVEL)
 # it's empty for the outer make invocation, where "." is the source dir.
 RCRAID_SRC := $(if $(src),$(src),.)
 RCRAID_REV := $(shell cat $(RCRAID_SRC)/.rcraid_rev 2>/dev/null || git -C $(RCRAID_SRC) describe --always --dirty 2>/dev/null || echo unknown)
-EXTRA_CFLAGS += -DRC_DRIVER_BUILD_REV=\"$(RCRAID_REV)\"
+ccflags-y += -DRC_DRIVER_BUILD_REV=\"$(RCRAID_REV)\"
+
+# Driver version = the AMD Windows release this port's behavior matches,
+# read from the single-line VERSION file at the repo root.  When a new AMD
+# release has been torn down with Ghidra and verified against the port
+# (docs/REVERSE_ENGINEERING.md "Version delta"), bump VERSION — no code
+# change needed.  Falls back to the rc_linux.h default if the file is
+# missing (e.g. a hand-copied source dir).
+RCRAID_VERSION := $(firstword $(shell cat $(RCRAID_SRC)/VERSION 2>/dev/null))
+ifneq ($(RCRAID_VERSION),)
+ccflags-y += -DRC_DRIVER_VERSION=\"$(RCRAID_VERSION)\"
+endif
 
 # Build targets
 all:
@@ -47,12 +61,14 @@ clean:
 	@rm -rf .tmp_versions
 	@echo "Clean completed"
 
-# Simple build target that ignores missing files
+# Lenient build target: extra warnings suppressed via KCFLAGS (the
+# supported way to append flags from outside kbuild; EXTRA_CFLAGS on the
+# command line is ignored by modern kernels).
 simple:
 	@echo "Building with minimal requirements..."
-	@$(MAKE) -C $(KERNELDIR) M=$(PWD) modules EXTRA_CFLAGS="$(EXTRA_CFLAGS) -Wno-error -Wno-unused-variable -Wno-unused-function -Wno-missing-field-initializers" || \
+	@$(MAKE) -C $(KERNELDIR) M=$(PWD) modules KCFLAGS="-Wno-error -Wno-unused-variable -Wno-unused-function -Wno-missing-field-initializers" || \
 	(echo "Trying with older kernel..." && \
-	 find /usr/src -name "linux-source-*" -type d | head -1 | xargs -I {} sh -c 'if [ -d "{}/build" ]; then echo "Using: {}"; $(MAKE) -C {}/build M=$(PWD) modules EXTRA_CFLAGS="$(EXTRA_CFLAGS) -Wno-error -Wno-unused-variable -Wno-unused-function -Wno-missing-field-initializers"; else echo "No kernel found"; exit 1; fi')
+	 find /usr/src -name "linux-source-*" -type d | head -1 | xargs -I {} sh -c 'if [ -d "{}/build" ]; then echo "Using: {}"; $(MAKE) -C {}/build M=$(PWD) modules KCFLAGS="-Wno-error -Wno-unused-variable -Wno-unused-function -Wno-missing-field-initializers"; else echo "No kernel found"; exit 1; fi')
 
 install:
 	$(MAKE) -C $(KERNELDIR) M=$(PWD) modules_install

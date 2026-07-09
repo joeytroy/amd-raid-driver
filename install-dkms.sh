@@ -114,6 +114,7 @@ mkdir -p "$DKMS_SRC"
 cp -r \
     "$SRC_DIR"/Makefile \
     "$SRC_DIR"/dkms.conf \
+    "$SRC_DIR"/VERSION \
     "$SRC_DIR"/rc_*.c \
     "$SRC_DIR"/rc_*.h \
     "$DKMS_SRC/"
