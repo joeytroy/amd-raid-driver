@@ -70,7 +70,7 @@ MODULE_DEVICE_TABLE(pci, rc_bottom_pci_tbl);
 
 static void rc_bottom_init_bar_templates(struct rc_adapter *adapter)
 {
-    /* Windows service slot +0x1B8 writes static doorbell templates.
+    /* Windows service slot +0x188 writes static doorbell templates.
      * Our port just caches BAR metadata for rcbottom -> rccfg -> rcraid.
      * This is now handled in rc_bottom_map_bars() based on device ID.
      */
@@ -233,6 +233,12 @@ static int rc_bottom_setup_interrupts(struct rc_adapter *adapter)
         return ret < 0 ? ret : -ENODEV;
     }
 
+    /* Remember how many vectors we actually got: the NVMe layer caps its
+     * I/O queue count at nr_irq_vectors - 1 so it never binds a CQ to a
+     * vector that doesn't exist (which would fail queue creation and
+     * roll back to zero I/O queues instead of degrading). */
+    adapter->nr_irq_vectors = ret;
+
     if (pdev->msix_enabled) {
         adapter->irq_mode = RC_IRQ_MODE_MSIX;
         adapter->irq_vector = pci_irq_vector(pdev, 0);
@@ -241,12 +247,12 @@ static int rc_bottom_setup_interrupts(struct rc_adapter *adapter)
     } else if (pdev->msi_enabled) {
         adapter->irq_mode = RC_IRQ_MODE_MSI;
         adapter->irq_vector = pci_irq_vector(pdev, 0);
-        rc_printk(RC_INFO, "rc_bottom: MSI vector %d assigned (no MSI-X — multi-queue will share vector 0)\n",
-                  adapter->irq_vector);
+        rc_printk(RC_INFO, "rc_bottom: MSI with %d vector(s) (no MSI-X%s)\n",
+                  ret, ret == 1 ? " — I/O will share vector 0" : "");
     } else {
         adapter->irq_mode = RC_IRQ_MODE_LEGACY;
         adapter->irq_vector = pci_irq_vector(pdev, 0);
-        rc_printk(RC_WARN, "rc_bottom: falling back to legacy IRQ %d\n",
+        rc_printk(RC_WARN, "rc_bottom: falling back to legacy IRQ %d (I/O will share it)\n",
                   adapter->irq_vector);
     }
     return 0;
@@ -308,6 +314,7 @@ static struct rc_adapter *rc_bottom_alloc_adapter(struct pci_dev *pdev)
     adapter->hmb_policy = RC_HMB_POLICY_DEFAULT;
     adapter->irq_mode = RC_IRQ_MODE_NONE;
     adapter->irq_vector = -1;
+    adapter->nr_irq_vectors = 0;
     INIT_LIST_HEAD(&adapter->list_node);
 
     adapter->hw.owner = adapter;

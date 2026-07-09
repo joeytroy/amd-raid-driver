@@ -150,8 +150,15 @@ Two distinct sequences exist:
 - **Re-arm** (`FUN_14000924c`): order **1, 2, 3, 4**, signature without the
   extra arg; runs after init.
 
-The Linux `rc_activate_doorbells()` implements the 1-4-2-3 init order, which is
-correct. Re-arm is not required to get the device responsive initially.
+Neither sequence is implemented in the Linux port, and none is needed: the
+1-4-2-3 ordering belongs to the AHCI/StorPort `+0x188` template model, and the
+NVMe path (`0xB000`) rings standard per-queue SQ/CQ doorbells at
+`BAR0 + 0x1000 + (2*qid + dir) * (4 << CAP.DSTRD)` instead
+(`rc_nvme_ring_sq_doorbell` in `rc_nvme.c`).  An earlier revision of this
+section claimed a Linux `rc_activate_doorbells()` implemented the 1-4-2-3
+order — no such function ever existed; the only related helper,
+`rc_bottom_init_bar_templates()`, is deliberately a no-op.  Revisit only if
+the AHCI path is ever built.
 
 ---
 
@@ -207,9 +214,13 @@ count caps at `min(num_online_cpus, MSI-X vectors − 1, 4)` — on the dev box
 
 Deliberate differences from Windows: no static cmd-tracking buffer (blk-mq
 tagset does that — 256 tags × N queues × `sizeof(pdu)`, each request carries a
-per-hctx PRP-list buffer); `scatterlist`-native DMA; and the software design
-follows Linux `nvme-core` patterns since the on-the-wire NVMe protocol is
-spec-defined — the Windows RE only fixed the *queue count/depth* target.
+per-hctx PRP-list buffer); `scatterlist`-native DMA; **CQ depth 256, not
+Windows' 1024** (the CQ is sized equal to the SQ — with at most 256 commands
+outstanding per queue a 256-entry CQ can never overflow, so the 4× headroom
+Windows allocates buys nothing; this follows Linux `nvme-core` convention);
+and the software design follows Linux `nvme-core` patterns since the
+on-the-wire NVMe protocol is spec-defined — the Windows RE only fixed the
+*queue count/depth* target.
 
 > The per-hctx dimension on the PRP-list pool matters: `req->tag` is unique
 > only within one hctx, so two concurrent commands on different queues can draw
