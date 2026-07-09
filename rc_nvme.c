@@ -887,6 +887,7 @@ static int rc_nvme_identify_controller(struct rc_adapter *adapter)
 		u32 nn    = le32_to_cpup((const __le32 *)(b + RC_NVME_ID_CTRL_NN));
 		u8  mdts  = b[RC_NVME_ID_CTRL_MDTS];
 		u8  mpsmin = (u8)((nvme->cap >> 48) & 0xf);
+		u8  vwc   = b[RC_NVME_ID_CTRL_VWC];
 		char sn[21], mn[41], fr[9];
 
 		rc_nvme_ascii_field(b + RC_NVME_ID_CTRL_SN, 20, sn);
@@ -896,11 +897,12 @@ static int rc_nvme_identify_controller(struct rc_adapter *adapter)
 		nvme->mdts = mdts;
 		nvme->max_transfer_bytes = mdts ?
 			(1u << mdts) * (1u << (12 + mpsmin)) : 0;
+		nvme->vwc_present = (vwc & 1) ? 1 : 0;
 
 		rc_printk(RC_NOTE,
-			  "rc_nvme_identify_controller: VID=0x%04x SSVID=0x%04x SN='%s' MN='%s' FR='%s' NN=%u MDTS=%u MPSMIN=%u max_xfer=%u B\n",
+			  "rc_nvme_identify_controller: VID=0x%04x SSVID=0x%04x SN='%s' MN='%s' FR='%s' NN=%u MDTS=%u MPSMIN=%u max_xfer=%u B VWC=%u\n",
 			  vid, ssvid, sn, mn, fr, nn,
-			  mdts, mpsmin, nvme->max_transfer_bytes);
+			  mdts, mpsmin, nvme->max_transfer_bytes, nvme->vwc_present);
 	}
 
 out:
@@ -1027,6 +1029,65 @@ static int rc_nvme_set_num_queues(struct rc_adapter *adapter, u16 requested)
 
 	mutex_lock(&nvme->admin_mutex);
 	ret = __rc_nvme_set_num_queues_locked(adapter, requested);
+	mutex_unlock(&nvme->admin_mutex);
+	return ret;
+}
+
+/* Explicitly enable the controller's volatile write cache via Set Features
+ * Volatile Write Cache (FID 0x06, CDW11.WCE=1).  Caller must hold admin_mutex.
+ *
+ * Why do this rather than inherit whatever the drive powered up with: NVMe
+ * leaves the power-on WCE state implementation-defined, and a Controller Level
+ * Reset can revert it.  The volume advertises BLK_FEAT_WRITE_CACHE to the block
+ * layer, so we want the underlying members to actually be in write-back mode —
+ * otherwise sequential writes fall off a cliff (write-through commits every LBA
+ * to NAND before completing).  Setting it here makes the state deterministic on
+ * every bring-up and after every auto-reset.
+ *
+ * NON-FATAL by contract: a controller with no write cache (Identify VWC bit
+ * clear) or one that rejects the feature just keeps whatever state it had.  The
+ * caller must NOT treat a failure as fatal — this driver backs the root fs, and
+ * refusing to bring the adapter up over a cache-mode nicety would make the box
+ * unbootable. */
+static int __rc_nvme_enable_write_cache_locked(struct rc_adapter *adapter)
+{
+	struct rc_nvme_state *nvme = &adapter->ctx.nvme;
+	struct rc_nvme_sqe cmd = {};
+	int ret;
+
+	if (!nvme->vwc_present) {
+		rc_printk(RC_NOTE,
+			  "rc_nvme_enable_write_cache: %s no volatile write cache present (VWC=0) — leaving cache mode untouched\n",
+			  pci_name(adapter->pdev));
+		return 0;
+	}
+
+	cmd.opc   = RC_NVME_ADMIN_OP_SET_FEATURES;
+	cmd.cdw10 = cpu_to_le32(RC_NVME_FID_VOLATILE_WRITE_CACHE);
+	cmd.cdw11 = cpu_to_le32(1);	/* WCE = 1 (enable write-back) */
+
+	ret = __rc_nvme_admin_cmd_locked(adapter, &cmd, NULL);
+	if (ret) {
+		rc_printk(RC_WARN,
+			  "rc_nvme_enable_write_cache: %s Set Features WCE=1 failed (%d) — continuing with inherited cache state\n",
+			  pci_name(adapter->pdev), ret);
+		return ret;
+	}
+
+	rc_printk(RC_NOTE,
+		  "rc_nvme_enable_write_cache: %s volatile write cache ENABLED (WCE=1)\n",
+		  pci_name(adapter->pdev));
+	return 0;
+}
+
+/* admin_mutex-taking wrapper for the init (non-reset) bring-up path. */
+static int rc_nvme_enable_write_cache(struct rc_adapter *adapter)
+{
+	struct rc_nvme_state *nvme = &adapter->ctx.nvme;
+	int ret;
+
+	mutex_lock(&nvme->admin_mutex);
+	ret = __rc_nvme_enable_write_cache_locked(adapter);
 	mutex_unlock(&nvme->admin_mutex);
 	return ret;
 }
@@ -2507,7 +2568,18 @@ static blk_status_t rc_volume_queue_rq(struct blk_mq_hw_ctx *hctx,
 	/* FLUSH fans out to every member: set the pending counter to the
 	 * member count, build a single FLUSH SQE template (CID=tag, no
 	 * data), and submit it on every member's I/O SQ.  Each member's
-	 * ISR atomically decrements; the last one calls blk_mq_complete. */
+	 * ISR atomically decrements; the last one calls blk_mq_complete.
+	 *
+	 * DATA-INTEGRITY INVARIANT — do NOT "optimize" this to flush only a
+	 * subset of members (e.g. skip members with no writes since the last
+	 * flush, or short-circuit an "empty" flush).  A RAID0 stripe is spread
+	 * across every member, so a REQ_OP_FLUSH must not complete until EVERY
+	 * member has committed its volatile cache.  Any dirty-tracking scheme
+	 * races the write submission path; getting it wrong ACKs an fsync while
+	 * a member still holds unflushed data, silently corrupting the (root!)
+	 * filesystem on power loss.  The fan-out already runs in parallel and
+	 * completes on the last ack — that is the correct and optimal shape.
+	 * fsync cost is NVMe flush latency (physics), not a driver defect. */
 	if (op == REQ_OP_FLUSH) {
 		atomic_set(&pdu->members_pending, rc_volume_member_count);
 		pdu->member_idx = -1;
@@ -3907,18 +3979,29 @@ static int rc_volume_create_disk(void)
 			 * rc_volume_build_prp relies on. */
 			.virt_boundary_mask  = PAGE_SIZE - 1,
 			/* Split READ/WRITE at stripe boundaries so each request
-			 * maps to exactly one member.  The multi-stripe fan-out
-			 * (rc_volume_dispatch_multi_stripe) is disabled for now:
-			 * it builds one sg entry per raw bvec (overflowing the
-			 * 128-entry per-member arrays on buffer-head writeback,
-			 * which sends 512-byte bvecs), and slicing one bio's data
-			 * stream across members violates NVMe PRP page-alignment
-			 * unless the buffer happens to be page-aligned at every
-			 * stripe boundary.  Discards are unaffected — blk-mq
-			 * splits them by max_hw_discard_sectors, not
-			 * chunk_sectors, so the one-DSM-per-member fan-out in
+			 * maps to exactly one member.  blk-mq guarantees no
+			 * request crosses a chunk_sectors-aligned boundary, so
+			 * every READ/WRITE that reaches rc_volume_queue_rq is
+			 * single-member and takes the single-stripe path.
+			 *
+			 * NOTE: rc_volume_dispatch_multi_stripe IS wired up in
+			 * rc_volume_queue_rq (its bvec walk splits at stripe
+			 * boundaries into per-member sg arrays and honours the
+			 * virt_boundary_mask above, so the old PRP-alignment /
+			 * sg-overflow problems no longer apply).  But with
+			 * chunk_sectors set to the stripe size that fan-out is
+			 * currently UNREACHABLE for READ/WRITE — no request ever
+			 * spans two stripes.  It's retained (not deleted) as the
+			 * ready path for a future change that raises chunk_sectors
+			 * to fold a multi-stripe request into one NVMe cmd per
+			 * member.  Not worth enabling today: 256 KiB single-member
+			 * commands already saturate the members (~18-20 GB/s R/W).
+			 *
+			 * Discards are unaffected — blk-mq splits them by
+			 * max_hw_discard_sectors, not chunk_sectors, so the
+			 * one-DSM-per-member fan-out in
 			 * rc_volume_dispatch_multi_stripe_discard still sees
-			 * multi-stripe requests. */
+			 * genuinely multi-stripe requests. */
 			.chunk_sectors       = rc_volume_stripe_sectors,
 			/* Advertise that the underlying controllers have a volatile
 			 * write cache and that we honour FUA — filesystems will
@@ -4314,6 +4397,11 @@ int rc_nvme_reset_controller(struct rc_adapter *adapter)
 		goto err_irq_enabled;
 	}
 
+	/* Re-assert write-back cache mode: a Controller Level Reset can revert
+	 * WCE to its power-on default.  Non-fatal — never fail the reset over
+	 * cache mode (admin_mutex is held for the whole reset sequence). */
+	(void)__rc_nvme_enable_write_cache_locked(adapter);
+
 	/* Re-issue Create I/O CQ + Create I/O SQ for every existing queue.
 	 * DMA buffers and IRQ vectors are still ours; we just need to tell
 	 * the controller about them again. */
@@ -4607,6 +4695,12 @@ int rc_nvme_init_controller(struct rc_adapter *adapter)
 			  ret);
 		nvme->nr_io_queues = 1;
 	}
+
+	/* Put the member into a deterministic write-back cache state rather
+	 * than inheriting the power-on/Windows-left setting.  Non-fatal (see
+	 * __rc_nvme_enable_write_cache_locked): a failure here must not block
+	 * bring-up of the root-fs adapter. */
+	(void)rc_nvme_enable_write_cache(adapter);
 
 	/* One I/O queue pair so the upper layer can submit NVM commands.
 	 * Step 3 will replace this with a loop creating nvme->nr_io_queues

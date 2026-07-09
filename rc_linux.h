@@ -215,6 +215,7 @@ struct rc_nvme_state {
     u8             timeout_500ms;     // CAP.TO * 500 ms = boot timeout
     u8             mdts;              // Identify Controller MDTS (0 = unlimited)
     u32            max_transfer_bytes;// derived from MDTS + CAP.MPSMIN (0 if unlimited)
+    u8             vwc_present;       // Identify Controller VWC bit0: 1 = controller has a volatile write cache
 
     // Namespace 1 (per Identify NS); populated only after identify_namespace.
     u32            ns1_lba_bytes;     // LBA size in bytes (e.g. 512 or 4096)
@@ -513,6 +514,7 @@ void rc_config_cleanup(void);
 #define RC_NVME_ADMIN_OP_SET_FEATURES	0x09
 
 /* Feature IDs for Set Features (CDW10[7:0]). */
+#define RC_NVME_FID_VOLATILE_WRITE_CACHE 0x06	/* CDW11 bit0 = WCE */
 #define RC_NVME_FID_NUMBER_OF_QUEUES	0x07
 
 /* NVM I/O opcodes (NVMe 1.4 §6) */
@@ -637,6 +639,7 @@ struct rc_raidcore_md {
 #define RC_NVME_ID_CTRL_FR		64	/* 8 bytes ASCII, space-padded */
 #define RC_NVME_ID_CTRL_MDTS		77	/* u8, max xfer = (2^MDTS) * CAP.MPSMIN pages */
 #define RC_NVME_ID_CTRL_NN		516	/* u32, number of namespaces */
+#define RC_NVME_ID_CTRL_VWC		525	/* u8, bit0 = volatile write cache present */
 
 /* Field offsets within the Identify Namespace response (NVMe 1.4 §5.15.2.1). */
 #define RC_NVME_ID_NS_NSZE		0	/* u64, namespace size in LBAs */
