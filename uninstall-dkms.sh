@@ -1,7 +1,7 @@
 #!/bin/bash
 # Remove rcraid DKMS module, udev rule, helper script, and modprobe drop-in.
 
-set -eu
+set -euo pipefail
 
 SRC_DIR="$(cd "$(dirname "$0")" && pwd)"
 PKG_NAME="rcraid"
@@ -11,7 +11,7 @@ PKG_VERSION="$(awk -F'"' '/^PACKAGE_VERSION=/ {print $2}' "$SRC_DIR/dkms.conf")"
 
 echo "==> rcraid uninstall-dkms.sh  (package: ${PKG_NAME}-${PKG_VERSION})"
 
-if lsmod | grep -q '^rcraid'; then
+if grep -q '^rcraid ' /proc/modules; then
     echo "==> unloading rcraid"
     rmmod rcraid || {
         echo "rmmod failed.  Unmount /dev/rcraid0 and try again." >&2
@@ -19,7 +19,7 @@ if lsmod | grep -q '^rcraid'; then
     }
 fi
 
-if dkms status -m "$PKG_NAME" -v "$PKG_VERSION" 2>/dev/null | grep -q "$PKG_NAME"; then
+if [ -n "$(dkms status -m "$PKG_NAME" -v "$PKG_VERSION" 2>/dev/null)" ]; then
     echo "==> dkms remove"
     dkms remove -m "$PKG_NAME" -v "$PKG_VERSION" --all 2>&1 | sed 's/^/    /'
 fi
