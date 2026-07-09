@@ -18,7 +18,7 @@
  * NVMe controller boot sequence (kept inline as documentation)
  *
  * For DEV_B000 (and any other CC_0108 device) the Windows AMD driver takes
- * its nvme.c code path, not the ahci.c one. See docs/GHIDRA_FINDINGS_2026.md.
+ * its nvme.c code path, not the ahci.c one. See docs/REVERSE_ENGINEERING.md.
  * This file implements the standard NVMe 1.4 controller boot sequence:
  *
  *   1. Read CAP, snapshot MQES / DSTRD / TO.
@@ -1648,7 +1648,7 @@ static void rc_volume_parse_logical_device(struct rc_adapter *adapter)
 			 * SECONDCOUNT=1.  So DEVICES is the member count (what we
 			 * key assembly off — correct), and SECONDCOUNT is some
 			 * other field.  Keep logging it purely for forensics.
-			 * See docs/RCRAID_GEOMETRY_RE.md. */
+			 * See docs/REVERSE_ENGINEERING.md. */
 			u32 second_count =
 				get_unaligned_le32(ld + RC_LD_SECONDCOUNT_OFFSET);
 
@@ -1833,7 +1833,7 @@ static u32 rc_volume_expected_members;
  *
  *   - field @ 0x110 (RC_LD_CHUNKINDEX_OFFSET): a small index that
  *     encodes the actual stripe size for RAID0.  VERIFIED against
- *     rcraid.sys 9.3.2 (see docs/RCRAID_GEOMETRY_RE.md): FUN_1400121d0
+ *     rcraid.sys 9.3.2 (see docs/REVERSE_ENGINEERING.md): FUN_1400121d0
  *     dispatches on this value (read from in-memory LD[0xC8], populated
  *     from on-disk LD[0x110] by the field copier FUN_140018444) and
  *     picks a sector count:

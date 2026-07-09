@@ -4,6 +4,36 @@ Current focus: **PCI 1022:B000 only** (TRX50 NVMe RAID Bottom). The AHCI
 variants (`7905 / 7916 / 7917 / 43BD`) are not on the target hardware and
 are best-effort/untested.
 
+## Current state (2026-07)
+
+The driver is a working daily-driver for **NVMe RAID0**: it boots Linux from
+the array as rootfs, reads and writes at ~19.7 GB/s symmetric, and survives
+kernel updates via DKMS. What's live today:
+
+- **NVMe RAID0**, geometry auto-detected from on-disk RAIDCore metadata
+  (member count, order, stripe size — nothing hardcoded).
+- **Reads and writes** (`enable_writes=1`; installers set it). Writes stage
+  through scatterlist-native DMA — no bounce buffers.
+- **4 I/O queues × depth 256** per controller (blk-mq `nr_hw_queues=4`,
+  1024 outstanding), MSI-X, fully interrupt-driven async completion. Each
+  hctx has its own PRP-list pool (per-tag-per-member-per-hctx).
+- **FLUSH, FUA, DISCARD/TRIM** wired up; volatile write cache enabled on each
+  member at init.
+- **Error handling**: 30 s timeout, per-adapter dead-flag, best-effort NVMe
+  Abort, tagset drain, and automatic controller reset (manual sysfs reset as
+  fallback). See "Error handling and reset (design)" below.
+- **Boot-from-RAID** via dracut / initramfs-tools hooks; DKMS + udev autobind;
+  live-CD install workflow; suspend/resume (S3/S4).
+
+Not yet: RAID1/10/5, hot-plug/rebuild, SMART pass-through, multi-volume,
+Secure Boot signing out of the box, array creation from Linux. The prioritized
+roadmap is in [`IMPLEMENTATION.MD`](IMPLEMENTATION.MD); the RE ground truth is
+in [`REVERSE_ENGINEERING.md`](REVERSE_ENGINEERING.md).
+
+The sections below are the dated implementation log — how each piece was built,
+kept for forensics. Where an early "Not started" / "Next steps" note has since
+been implemented, it's marked.
+
 ## Where we are
 
 ### Done — NVMe controller and admin path
@@ -236,7 +266,8 @@ collide with teardown.
 
 Behaviour change worth flagging: one stuck command takes the volume
 offline until either the operator runs the sysfs reset or the module
-is reloaded.  Full design notes in [`ERROR_HANDLING.md`](ERROR_HANDLING.md).
+is reloaded.  Full design notes in the "Error handling and reset
+(design)" section at the end of this document.
 
 ### Scatterlist-native DMA
 
@@ -294,22 +325,19 @@ without operator intervention.  `cancel_work_sync` runs first in
 `rc_nvme_cleanup_controller` so an in-flight auto-reset can't race
 admin/MMIO teardown at module unload.
 
-### Not started
+### Since done (this section was the mid-2025 backlog)
 
-- **Interrupt-driven completion**. We poll, which costs a kworker
-  thread per outstanding request.
-- **Multiple I/O queues** (per-CPU). Currently one queue per controller,
-  single hardware queue for the gendisk.
-- **Write support**. Risky until member ordering and stripe-mapping is
-  proven against a non-empty array. Adding NVMe WRITE (opcode `0x01`)
-  is mechanically simple; gating it behind a module parameter is the
-  right path.
-- **Member position field**. Decompiling `RC_UpdateMetaData` confirmed
-  the per-member 512 B block does *not* carry a position/index. The
-  Windows driver must reconstruct ordering from controller-level state
-  or BIOS config. We currently fall back to PCI BDF ordering with the
-  `reverse_member_order` override.
-- **Member count field**. Same story. Hardcoded `2` until decoded.
+The four items below were open when this log was first written; all have
+since shipped and are described in the sections above:
+
+- **Interrupt-driven completion** — done (Stage 1 + Stage 2 async above).
+- **Multiple I/O queues (per-CPU)** — done: 4 hctx, `nr_hw_queues=4`,
+  `blk_mq_pci_map_queues`, per-hctx PRP pool.
+- **Write support** — done behind `enable_writes=1`, scatterlist DMA.
+- **Member position / member count** — done: both are read from the on-disk
+  `RC_LogicalDevice` config-ring record (`Devices` at `+0x68`, element-array
+  membership for position), replacing the hardcoded `2` and the PCI-BDF
+  ordering heuristic. `reverse_member_order` remains as an escape hatch.
 
 ## How to validate the current state
 
@@ -318,49 +346,255 @@ sudo ./build.sh
 sudo ./test_driver.sh
 ```
 
-Expected dmesg highlights for DEV_B000:
+Expected dmesg highlights for DEV_B000 (current build — writes on via the
+installers, 4 I/O queues, depth 256):
 
 ```
 rc_nvme_init_controller: CAP=0x080000203c01ffff MQES=65536 ...
-rc_nvme_init_controller: ready — admin SQ depth=32 CQ depth=32, doorbell stride=0
-rc_nvme_identify_controller: VID=0xc0a9 SSVID=0xc0a9 SN='...' MN='CT2000T700SSD3' FR='PACR5103' NN=1
-rc_nvme_identify_namespace: nsid=1 NSZE=3907029168 ... LBA=512 B ... => 1907729 MiB
-rc_nvme_create_io_queues: qid=1 up — SQ depth=64 CQ depth=64
-rc_nvme_read_validate_metadata: RAIDCore v0x00030000 stripe=2048 sectors (1024 KiB) ...
+rc_nvme_identify_controller: ... MN='CT2000T700SSD3' ... MDTS=7 ... VWC=1
+rc_nvme_enable_write_cache: 0000:81:00.0 volatile write cache ENABLED (WCE=1)
+rc_nvme_identify_namespace: nsid=1 NSZE=3907029168 ... LBA=512 B ...
+rc_nvme_create_io_queues: 4 I/O queues up — SQ depth=256 CQ depth=1024
 rc_volume_register_member: 0000:81:00.0 registered at pos 0 (1/2)
 rc_volume_register_member: 0000:82:00.0 registered at pos 1 (2/2)
-rc_volume_create_disk: /dev/rcraid0 up, 7814058336 sectors (3815458 MiB, read-only)
+rc_volume_create_disk: blk-mq nr_hw_queues=4 (queue_depth=256 → 1024 total outstanding)
+rc_volume_create_disk: /dev/rcraid0 up, 7811850240 sectors (3814380 MiB, read-write)
 ```
 
-Then `lsblk /dev/rcraid0` shows a 3.6 TiB read-only disk, and
-`dd if=/dev/rcraid0 bs=64K count=N` reads through the assembled volume.
+Then `lsblk /dev/rcraid0` shows a 3.6 TiB disk. Sustained `fio --direct=1`
+SEQ1M Q8T1 measures **~19.7 GB/s read and ~19.7 GB/s write** on the 2× T700
+array (see the perf table in [`IMPLEMENTATION.MD`](IMPLEMENTATION.MD)).
 
-`bench.sh` after a successful load now reports ~760 MB/s @ `bs=4K`
-rising to ~1.1 GB/s @ `bs=64K`, and confirms the RAIDCore magic at
-logical sector 40960 (member 0, phys 0x5000).  Larger blocks scale
-much further now that one NVMe READ carries up to 512 KiB:
-~3.6 GB/s @ `bs=512K`, ~4.4 GB/s @ `bs=1M`, ~4.7 GB/s @ `bs=4M`.
-
-For writes, load the module with `enable_writes=1`:
+Writes are enabled by the installers; a bare manual `insmod` is read-only
+unless loaded with `enable_writes=1`:
 
 ```sh
 sudo modprobe -r rcraid && sudo insmod rcraid.ko enable_writes=1
 ```
 
-`/dev/rcraid0` then accepts writes (lsblk's `RO` column reads 0) and
-routes them through NVMe WRITE (opcode 0x01) at the per-member
-position derived from the on-disk LD record.
-
 ## Next implementation steps (in order)
 
-1. **Interrupt-driven completion** for both admin and I/O queues.
-   Currently polls with `usleep_range`; dispatch holds a kworker per
-   outstanding I/O. MSI vectors are already registered.
-2. **Per-CPU I/O queues** to improve concurrency.
-3. **Multiple-volume / non-RAID0 support** — the LD parser already
-   handles other `RC_LDT_*` device types in principle; the stripe
-   mapping and elsewhere need RAID-level-specific paths.
-4. **SATA RAID path** — claim 1022:7905 / 0x43BD / 0x7916 / 0x7917 in
-   MODULE_DEVICE_TABLE is already in place; the AHCI bring-up needs
-   to be implemented (rewrite from rcbottom.sys, not from the old
-   deleted scaffolding).
+The original bring-up backlog (interrupt-driven completion, per-CPU queues) is
+done — see "Since done" above. What remains, in rough priority:
+
+1. **Non-RAID0 support (RAID1 first, then RAID10)** — the LD parser already
+   recognises other `RC_LDT_*` device types; the stripe mapping and dispatch
+   need RAID-level-specific paths. See [`IMPLEMENTATION.MD`](IMPLEMENTATION.MD).
+2. **Multi-volume support** — one gendisk per LD instead of a single
+   `/dev/rcraid0`.
+3. **Hot-plug / drive-failure handling** — clean member teardown + drain.
+4. **SATA RAID (AHCI) path** — the `1022:7905 / 43BD / 7916 / 7917`
+   MODULE_DEVICE_TABLE claims are in place; the AHCI bring-up must be
+   implemented fresh from `rcbottom.sys` (not the old deleted scaffolding).
+
+---
+
+## Error handling and reset (design)
+
+How the I/O path detects, contains, and reports failures. This all lives in
+`rc_nvme.c`; this section explains the *why* so a reader can navigate the code
+without reverse-engineering the design from individual functions. (The
+implementation-log entries above — "Error handling and timeouts", "Controller
+reset (manual)", "Automatic reset on timeout" — are the summary; this is the
+full design.)
+
+What's implemented: a 30 s blk-mq timeout callback; a per-adapter `dead` flag
+with three set paths; best-effort NVMe Abort on stuck commands; tagset-wide
+drain of in-flight requests when an adapter dies; decoded SC/SCT/DNR/More in
+failure logs; and manual + automatic controller reset. Still open (see "Limits"
+at the end): retry of transient (DNR=0) errors, and recovery for the sync
+init-time helpers.
+
+### Adapter health states
+
+Every adapter is either **alive** or **dead**. The flag lives in
+`adapter->ctx.nvme.dead` (`rc_linux.h:struct rc_nvme_state`). It starts zero
+(kzalloc), and — absent a reset — transitions to `true` once and is read with
+`READ_ONCE` / written with `WRITE_ONCE`. (A successful controller reset clears
+it back to false; see below.)
+
+Three transitions to dead:
+
+1. **`rc_nvme_irq` health canary.** Every ISR entry reads `CSTS` first. If
+   `CSTS == 0xffffffff` (hot-unplug / PCI vanished) or `CSTS.CFS` (controller
+   fatal status) is set, the CQ contents are no longer trustworthy. The flag is
+   set, both wait queues are woken so sync-init helpers return promptly, and the
+   ISR returns without touching the CQ. Hardirq-safe — no sleeping, no work
+   scheduling; the next `.timeout` handles cleanup.
+2. **`rc_nvme_check_dead` from `.timeout`.** Process-context probe that re-reads
+   CSTS with the same predicates, used by `rc_volume_timeout` to decide whether
+   a stuck request is just slow or actually unreachable.
+3. **`rc_volume_timeout` after a "stuck" command.** Even if CSTS still reads
+   sane, an unresponsive command means we cannot safely recycle its CID (see
+   "CID-recycle hazard"); the handler flags the adapter dead as part of its
+   response, which then triggers auto-reset.
+
+### I/O path participants
+
+Five functions cooperate, each with one job:
+
+| Function | Context | Job |
+|---|---|---|
+| `rc_volume_queue_rq` | submitter | Fast-fail if `rc_volume_any_member_dead()` before touching the SQ. |
+| `rc_nvme_irq` | hardirq | CSTS canary first, then walk the CQ and `blk_mq_complete_request` per CID. |
+| `rc_volume_complete` | softirq | Decode `pdu->sc_sct`; log SCT/SC/DNR/More for real failures, "controller dead" for the sentinel; end with `BLK_STS_IOERR` or (READ memcpy first) `BLK_STS_OK`. |
+| `rc_volume_timeout` | workqueue | The recovery decision tree (below). |
+| `rc_volume_drain_dead` | workqueue | Walk `blk_mq_tagset_busy_iter`, complete every in-flight request that touched a dead adapter with the sentinel SC. |
+
+### Timeout flow
+
+Triggered when a request's CQE hasn't landed within 30 s. Returns
+`BLK_EH_DONE` in every path — blk-mq will not retry; the driver has taken
+responsibility for ending the request.
+
+```
+.timeout(req)
+ │
+ ├── blk_mq_request_completed(req)?      ─yes→ BLK_EH_DONE  (ISR raced and won)
+ │
+ ├── rc_nvme_check_dead(involved members)?
+ │   yes ────────────────────────────────→ drain_dead() → end(IOERR) → BLK_EH_DONE
+ │   no
+ │
+ ├── issue rc_nvme_abort() to involved members  (best effort)
+ ├── blk_mq_request_completed(req)?      ─yes→ BLK_EH_DONE  (abort completed it)
+ │
+ └── WRITE_ONCE(involved.dead = true)
+     → drain_dead() → end(TIMEOUT) → schedule auto-reset → BLK_EH_DONE
+```
+
+"Involved members": R/W/DISCARD → just `pdu->member_idx` (stripe-mapped at
+submit); FLUSH → all members (fan-out, can't complete unless every member
+ACKs). The `blk_mq_request_completed` re-check after Abort matters: the Abort
+may have caused the controller to post the original CQE (SC = "Aborted by
+Request"), so the ISR may have run during the abort and we mustn't end the same
+tag twice.
+
+### CID-recycle hazard
+
+This is the core reason `.timeout` is so aggressive about flagging adapters
+dead. When `blk_mq_end_request(req, BLK_STS_TIMEOUT)` returns, blk-mq frees the
+request and the tag (the integer that became `CID` in the SQE) is eligible for
+reuse. If the controller later posts a CQE for that CID — late but real — the
+ISR's `blk_mq_tag_to_rq(tags, cid)` looks up whatever request now holds the
+tag, possibly an unrelated I/O. For a READ the ISR would memcpy the per-tag DMA
+buffer (data for the *original* LBA) into the new request's bvecs — **silent
+data corruption**. Without a reset path the only safe option is to stop
+dispatching to that controller and drain in-flight requests. A real reset
+recovers the CID space cleanly (CC.EN=0 → re-enable resets the CID counters),
+letting the volume keep serving — which is why auto-reset exists.
+
+### Drain protocol
+
+`rc_volume_drain_dead` is the cleanup pass, called from `.timeout` only (the
+ISR is hardirq and can't run it):
+
+1. Build `dead_mask` — one bit per dead member.
+2. If zero, no-op.
+3. `blk_mq_tagset_busy_iter` runs `rc_volume_drain_iter` for every in-flight
+   request.
+4. Each request: "would it need a dead member to complete?" (FLUSH: any dead
+   member; R/W/DISCARD: `member_idx ∈ dead_mask`).
+5. If yes and not already completed, set `pdu->sc_sct = RC_VOLUME_SC_DEAD` and
+   `blk_mq_complete_request`.
+
+`blk_mq_complete_request` is atomic against the ISR's competing call — only one
+wins the state-machine transition, so a naturally-arriving CQE during iteration
+completes safely and drain becomes a no-op for that request.
+
+### Sentinel SC
+
+`RC_VOLUME_SC_DEAD` (`0x7fff`) distinguishes "we killed this because the
+controller is dead" from a real NVMe error. `pdu->sc_sct` is `CQE.status >> 1`:
+bit 14 = DNR, bit 13 = More, bits 10:8 = SCT, bits 7:0 = SC. `0x7fff` sets
+every bit (DNR=1, More=1, SCT=7, SC=0xff) — a combination a spec-compliant
+controller never posts for a real command, so it's reliably distinct.
+`rc_volume_complete` checks for it first and prints "controller dead".
+
+### admin_mutex
+
+`rc_nvme_admin_cmd` is serialized by a per-adapter `nvme.admin_mutex`, held
+across SQE write, doorbell ring, CQE wait, and CQ-head advance. Before async,
+the admin queue was only used single-threaded at init; now `.timeout` can issue
+an Abort from a workqueue while teardown or another timeout touches the same
+queue. CID stays hardcoded to `0` — only one admin command is in flight at a
+time, guaranteed by the mutex. The split between `__rc_nvme_admin_cmd_locked`
+and `rc_nvme_admin_cmd` lets reset hold the mutex across its Create I/O CQ/SQ
+commands without deadlocking.
+
+### Controller reset (manual + automatic)
+
+`rc_nvme_reset_controller(adapter)` is the recovery path out of `dead`.
+Operators trigger it via the per-adapter sysfs attribute:
+
+```
+echo 1 | sudo tee /sys/bus/pci/devices/0000:81:00.0/rcraid/reset
+```
+
+Returns 0 on success or `-errno` (`-EIO` if the controller refused to come
+ready, `-ENOTSUPP` for non-NVMe adapters, `-EINVAL` for input other than `1`).
+Sequence under `admin_mutex`:
+
+```
+1. WRITE_ONCE(dead = true)      (idempotent)
+2. blk_mq_quiesce_queue         no new .queue_rq
+3. rc_volume_drain_dead         fail in-flight; their CIDs are about to be wiped
+4. disable_irq                  let in-flight ISR finish before register writes
+5. INTMS=~0, CC.EN=0, wait CSTS.RDY=0
+6. memset SQ/CQ buffers; reset tail/head/phase
+7. Reprogram AQA/ASQ/ACQ, CC.EN=1, wait CSTS.RDY=1
+8. INTMC=~0, enable_irq
+9. Create I/O CQ + Create I/O SQ on the existing DMA buffers
+10. WRITE_ONCE(dead = false)
+11. blk_mq_unquiesce_queue      new I/O resumes
+```
+
+Any failure between 5 and 9 returns `-EIO` with `dead` still set; module reload
+becomes the only recovery. The reset deliberately does **not** re-issue
+Identify (CAP/MDTS/namespace shouldn't change on the same silicon),
+re-allocate DMA buffers (handles persist across CC.EN=0; the controller just
+needs them re-bound via Create I/O CQ/SQ), or touch the gendisk/tagset.
+
+`.timeout` schedules this automatically for each adapter it flags dead, via one
+`work_struct` per adapter plus an `auto_reset_disabled` latch. Policy is **one
+attempt per death episode**: `schedule_work`'s "already queued" check coalesces
+multiple `.timeout` invocations; a successful reset clears both `dead` and the
+latch (so a fresh death hours later gets its own attempt); a failed reset
+latches `auto_reset_disabled` and further timeouts only drain — the operator's
+manual sysfs reset clears the latch on success. This avoids the thrash mode
+(fried silicon → 30 s timeout → 50 ms reset → timeout → …) while self-healing a
+single hung command or transient fault without intervention.
+`cancel_work_sync(&nvme->auto_reset_work)` runs first in
+`rc_nvme_cleanup_controller` so an in-flight auto-reset can't race teardown.
+
+### Limits (still open)
+
+- **Retry on transient SCs.** Distinguish DNR=0 (retryable) from DNR=1 and
+  re-dispatch rather than ending the request. Belongs on top of reset (a
+  recovered controller is the right place to retry). *This is the caveat the
+  README lists under "Not yet supported."*
+- **Abort path for sync init helpers.** `rc_nvme_admin_cmd` and
+  `rc_nvme_io_cmd_sync` time out at 2 s and surface `-ETIMEDOUT`; no caller
+  needs to soldier on past that yet, so no recovery code exists for them.
+
+### Behaviour for users
+
+- **Before**: a stuck command wedged its tag forever with a ratelimited
+  warning; no recovery short of reboot.
+- **After**: stuck commands time out at 30 s and trigger an automatic reset.
+  The offending request still fails with `BLK_STS_TIMEOUT`, but the controller
+  is back ~50 ms later and subsequent I/O succeeds. If the auto-reset itself
+  fails, the controller stays dead and `echo 1 > .../rcraid/reset` is the manual
+  escape hatch.
+
+If the volume goes offline unexpectedly, check `dmesg` for:
+
+```
+rcraid: rc_nvme_irq: 0000:..:.. controller dead (CSTS=0x........) — failing in-flight I/O
+rcraid: rc_volume_timeout: tag=N op=M: member dead — draining in-flight
+rcraid: rc_volume_timeout: tag=N op=M: issuing NVMe Abort
+```
+
+The first is the ISR catching CSTS.CFS or a hot-unplug; the second is
+`.timeout` finding a dead controller; the third is the "still looks alive but
+this command is hung" path.

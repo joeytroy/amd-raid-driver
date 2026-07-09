@@ -3,7 +3,7 @@
 Historical documentation kept for reference. **None of this is the
 current state of the port.** See `docs/README.md` for live documentation.
 
-## `legacy_2024/` — superseded by GHIDRA_FINDINGS_2026
+## `legacy_2024/` — superseded by REVERSE_ENGINEERING.md
 
 The three documents in `legacy_2024/` (`TECHNICAL_REFERENCE.md`,
 `IMPLEMENTATION_STATUS.md`, `GHIDRA_ANALYSIS_NEEDED.md`) were the primary
@@ -21,9 +21,12 @@ analysis docs through 2024. They contain significant amounts of
 
 The function-level analysis of `rcraid.sys` (command submission,
 completion callbacks, queue dispatchers) is still largely valid since
-that binary is byte-identical between 9.3.2 and 9.3.3.
+that binary's data-path/geometry code is functionally unchanged between
+9.3.2 and 9.3.3 (the binaries are **not** byte-identical — 9.3.3 grew
++2,952 bytes — but the relevant code is the same; see the version-delta
+section of `REVERSE_ENGINEERING.md`).
 
-For the corrected picture, read **`docs/GHIDRA_FINDINGS_2026.md`** at
+For the corrected picture, read **`docs/REVERSE_ENGINEERING.md`** at
 the top level.
 
 ## Older standalone files

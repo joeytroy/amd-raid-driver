@@ -12,7 +12,7 @@
  * information is just sitting in pdev->device and pdev->class, so there
  * is no need to recreate the WDF class-bind dance (service +0x418).
  *
- * See docs/GHIDRA_FINDINGS_2026.md for the full reasoning.
+ * See docs/REVERSE_ENGINEERING.md for the full reasoning.
  *
  * Original work, independently authored from clean-room reverse
  * engineering of the AMD-RAID Windows driver binaries under DMCA

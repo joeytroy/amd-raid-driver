@@ -239,10 +239,9 @@ inclusion.
 
 | Doc | What's in it |
 |-----|--------------|
-| [`docs/STATUS.md`](docs/STATUS.md) | Implementation history — how each piece was built |
+| [`docs/STATUS.md`](docs/STATUS.md) | Current state, implementation history, and the timeout / reset / dead-controller design |
 | [`docs/IMPLEMENTATION.MD`](docs/IMPLEMENTATION.MD) | Prioritized checklist toward a daily-driver release |
-| [`docs/ERROR_HANDLING.md`](docs/ERROR_HANDLING.md) | Timeout / reset / dead-controller design |
-| [`docs/OPEN_QUESTIONS.md`](docs/OPEN_QUESTIONS.md) | Remaining reverse-engineering unknowns |
+| [`docs/REVERSE_ENGINEERING.md`](docs/REVERSE_ENGINEERING.md) | RE reference — Windows-driver findings, geometry, and remaining unknowns |
 | [`RE_METHODOLOGY.md`](RE_METHODOLOGY.md) | Clean-room process and legal record |
 
 **Repository layout**

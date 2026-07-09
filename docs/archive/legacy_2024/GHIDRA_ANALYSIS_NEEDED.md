@@ -10,7 +10,7 @@
 >   WDF/KMDF version-bind function pointer, not a firmware accessor.
 > - Hunting for `FUN_14002ce29` — outside the binary; does not exist.
 >
-> Current Ghidra TODOs live in **`docs/OPEN_QUESTIONS.md`** at the repo
+> Current Ghidra TODOs live in **`docs/REVERSE_ENGINEERING.md`** at the repo
 > top level. Keep this archived file only as a record of what we used
 > to think.
 

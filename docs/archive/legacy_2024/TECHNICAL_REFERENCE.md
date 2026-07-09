@@ -11,7 +11,7 @@
 > - `FUN_14002ce29` is outside `rcbottom.sys` and does not exist in
 >   the binary.
 >
-> See **`docs/GHIDRA_FINDINGS_2026.md`** at the repo top level for the
+> See **`docs/REVERSE_ENGINEERING.md`** at the repo top level for the
 > corrected picture. The `rcraid.sys` analysis below is mostly still
 > valid (that binary is byte-identical between 9.3.2 and 9.3.3); the
 > `rcbottom.sys` analysis needs to be read against the 2026 findings.

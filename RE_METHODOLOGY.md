@@ -133,8 +133,8 @@ with arrays previously configured by AMD's Windows driver.
 4. **Implemented `rcraid.ko` from scratch** in C against the public
    Linux kernel headers, using only the protocol/layout information
    gathered above. Each non-trivial design choice is recorded in
-   `docs/GHIDRA_FINDINGS_2026.md`, `docs/STATUS.md`, or
-   `docs/OPEN_QUESTIONS.md`.
+   `docs/REVERSE_ENGINEERING.md`, `docs/STATUS.md`, or
+   `docs/REVERSE_ENGINEERING.md`.
 5. **Validated empirically** on real AMD-RAID hardware (TRX50 + two
    Crucial T700 NVMe drives configured as RAID0 in the BIOS) by
    running the driver and comparing observed behaviour to what
