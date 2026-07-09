@@ -24,6 +24,10 @@ fail() {
     dmesg | tail -n 40
     echo "RCRAID-TEST-FAIL"
     poweroff -f
+    # Backstop: if poweroff somehow doesn't halt PID 1, do NOT return to
+    # the caller — falling through could reach the PASS marker and report
+    # a false pass to the host runner.
+    exit 1
 }
 
 expected_sectors=""

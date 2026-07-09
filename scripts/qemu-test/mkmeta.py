@@ -150,7 +150,13 @@ def main():
     if len(args.images) < 2:
         sys.exit("mkmeta: need at least 2 member images")
 
-    chunk_sectors = CHUNK_INDEX_SECTORS[args.chunk_index & 3]
+    if not 0 <= args.chunk_index <= 3:
+        # Masking to &3 would lay the image out for one chunk size while
+        # the driver (rc_volume_chunk_sectors_for) treats on-disk values
+        # > 3 as "not understood" and falls back to 64 KiB —
+        # self-inconsistent metadata.  Refuse instead.
+        sys.exit("mkmeta: --chunk-index must be 0-3")
+    chunk_sectors = CHUNK_INDEX_SECTORS[args.chunk_index]
 
     sizes = []
     for img in args.images:

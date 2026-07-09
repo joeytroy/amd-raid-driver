@@ -125,15 +125,29 @@ static int rc_bottom_map_bars(struct rc_adapter *adapter)
                   bar->virt);
     }
 
-    /* For device ID 0xb000 (NVMe RAID Bottom), MMIO is in BAR0 */
-    /* For device ID 0x43bd (Promontory), MMIO is in BAR5 */
-    /* Any other NVMe-class function also uses BAR0 — the NVMe spec puts
-     * the controller registers there (MLBAR/MUBAR), and rc_classify_device
-     * already routes class 0x0108 to the NVMe path.  This is what lets the
-     * QEMU test rig bind virtual NVMe controllers (1b36:0010) at runtime
-     * via new_id — see scripts/qemu-test/. */
-    if (adapter->device_id == 0xb000 ||
-        (adapter->pdev->class >> 8) == 0x0108) {
+    /* For device ID 0x43bd (Promontory), MMIO is in BAR5.  Checked FIRST
+     * so the precedence matches rc_classify_device() (explicit device-ID
+     * matches win over the class fallback) and the two functions can
+     * never disagree about a device's code path.
+     *
+     * Everything else NVMe-class uses BAR0 — the NVMe spec puts the
+     * controller registers there (MLBAR/MUBAR), and rc_classify_device
+     * routes class 0x0108 to the NVMe path.  Covers 0xb000 (NVMe RAID
+     * Bottom, class 0x010802) and the QEMU test rig's virtual
+     * controllers (1b36:0010, bound at runtime via new_id — see
+     * scripts/qemu-test/). */
+    if (adapter->device_id == 0x43bd) {
+        if (!ctx->bar[5].virt) {
+            rc_printk(RC_ERROR, "rc_bottom: BAR5 missing for Promontory device\n");
+            return -ENODEV;
+        }
+        ctx->mmio_base = ctx->bar[5].virt;
+        ctx->mmio_len = ctx->bar[5].len;
+        ctx->mmio_phys = ctx->bar[5].phys;
+        rc_printk(RC_INFO, "rc_bottom: Using BAR5 for Promontory device (phys=0x%llx len=0x%llx)\n",
+                  (unsigned long long)ctx->mmio_phys, (unsigned long long)ctx->mmio_len);
+    } else if (adapter->device_id == 0xb000 ||
+               (adapter->pdev->class >> 8) == 0x0108) {
         if (!ctx->bar[0].virt) {
             rc_printk(RC_ERROR, "rc_bottom: BAR0 missing for NVMe-class device\n");
             return -ENODEV;
@@ -142,16 +156,6 @@ static int rc_bottom_map_bars(struct rc_adapter *adapter)
         ctx->mmio_len = ctx->bar[0].len;
         ctx->mmio_phys = ctx->bar[0].phys;
         rc_printk(RC_INFO, "rc_bottom: Using BAR0 for NVMe RAID Bottom (phys=0x%llx len=0x%llx)\n",
-                  (unsigned long long)ctx->mmio_phys, (unsigned long long)ctx->mmio_len);
-    } else if (adapter->device_id == 0x43bd) {
-    if (!ctx->bar[5].virt) {
-            rc_printk(RC_ERROR, "rc_bottom: BAR5 missing for Promontory device\n");
-            return -ENODEV;
-        }
-        ctx->mmio_base = ctx->bar[5].virt;
-        ctx->mmio_len = ctx->bar[5].len;
-        ctx->mmio_phys = ctx->bar[5].phys;
-        rc_printk(RC_INFO, "rc_bottom: Using BAR5 for Promontory device (phys=0x%llx len=0x%llx)\n",
                   (unsigned long long)ctx->mmio_phys, (unsigned long long)ctx->mmio_len);
     } else {
         rc_printk(RC_ERROR, "rc_bottom: Unknown device ID 0x%04x\n", adapter->device_id);
