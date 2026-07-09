@@ -6,7 +6,7 @@ release. Grouped by priority: blockers first, then features, then polish.
 Check items off as PRs land. Each item should resolve to a PR (or a
 documented "won't fix" with reasoning).
 
-For status of work already done, see [`docs/STATUS.md`](docs/STATUS.md).
+For status of work already done, see [`STATUS.md`](STATUS.md).
 
 ---
 
@@ -195,19 +195,42 @@ For status of work already done, see [`docs/STATUS.md`](docs/STATUS.md).
 
 ## 🚀 Performance — diminishing returns beyond ~75 % of NAND spec
 
-Current measured (`fio --direct=1` sustained, 2× Crucial T700, 256 KiB stripe):
+Current measured (`fio --direct=1` sustained 15 s, 2× Crucial T700,
+256 KiB stripe, re-measured 2026-07 after the VWC-enable fix):
 
 | Pattern | We get | Spec ceiling | Notes |
 |---|---:|---:|---|
-| SEQ1M Q8T1 read | 20.2 GB/s | ~24 GB/s | 84 % — close to wall |
-| SEQ1M Q8T1 write | 8.9 GB/s | ~12 GB/s | 74 % — NAND-limited |
+| SEQ1M Q8T1 read | 19.7 GB/s | ~24.8 GB/s | 79 % — close to wall |
+| SEQ1M Q8T1 write | 19.7 GB/s | ~23.6 GB/s | 83 % — symmetric with read |
 | RND4K Q32T16 read | 6.2 GB/s (1.5 M IOPS) | ~7 GB/s | excellent |
 | RND4K Q1T1 read | 96 MB/s | ~110 MB/s | latency-bound |
 
+(Spec ceilings are 2× the per-drive T700 2 TB figures: 12.4 GB/s read /
+11.8 GB/s write each. An earlier revision of this table showed 8.9 GB/s
+write — that was measured before the driver enabled each member's
+volatile write cache at init; it is not a current limit. The README
+quotes 19.7 read / 18.7 write from KDiskMark 3.3.0 on the same array;
+the ~1 GB/s write-side gap vs this table is KDiskMark harness overhead,
+not the driver — raw `fio` measures the two directions identical.)
+
 Windows CDM's headline 22 GB/s sequential write is a benchmark artifact
-(CDM uses tiny test sizes that fit in the drive's SLC cache). We're not
-actually slower than Windows for real sustained workloads — we just
-measure honestly.
+(CDM uses tiny test sizes that fit in the drive's SLC cache). For real
+sustained workloads we're at parity with Windows — we just measure
+honestly.
+
+- [ ] **Single-request multi-stripe fan-out (READ/WRITE)** — deliberately
+      disabled: `queue_limits.chunk_sectors` is set to the stripe size, so
+      blk-mq splits every READ/WRITE at stripe boundaries and each request
+      maps to exactly one member. Parallelism across members comes from many
+      requests in flight concurrently, not from one request fanning out.
+      The fan-out path (`rc_volume_dispatch_multi_stripe`) is wired up and
+      kept ready, but unreachable for READ/WRITE by design — enabling it
+      means raising `chunk_sectors`, and history says to be careful: the
+      old always-fan-out dispatch corrupted data on fragmented buffered
+      writeback. Not worth enabling today; 256 KiB single-member commands
+      already deliver the symmetric ~19.7 GB/s above.
+      *Touch points:* `rc_volume_create_disk` (`queue_limits.chunk_sectors`),
+      `rc_volume_queue_rq`, `rc_volume_dispatch_multi_stripe`.
 
 - [ ] **SGL for big transfers** — for transfers > MDTS we currently
       split into multiple PRP-list commands. SGL would let one
@@ -228,7 +251,7 @@ measure honestly.
 
 ## 🤔 Open reverse-engineering questions
 
-See [`docs/OPEN_QUESTIONS.md`](docs/OPEN_QUESTIONS.md). Most relevant
+See [`OPEN_QUESTIONS.md`](OPEN_QUESTIONS.md). Most relevant
 remaining items:
 
 - [ ] `rcraid.sys` completion ISR (`FUN_14000d2b8`) — never decompiled.
