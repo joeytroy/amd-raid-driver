@@ -1,12 +1,14 @@
 # AMD RAID Driver — Build and Test
 
-> **Status (2026-05-23)**: `/dev/rcraid0` is up end-to-end on the dev
-> box.  Controller bring-up, admin + I/O queues, NVMe Identify,
-> RAID0 volume assembly from on-disk metadata, blk-mq read and write
-> (writes gated behind `enable_writes=1`).  See `docs/STATUS.md` for
-> the full picture, `docs/REVERSE_ENGINEERING.md` for the
-> reverse-engineering background, and `RE_METHODOLOGY.md` at the
-> repository root for the license and legal record.
+> **Status (2026-07-10)**: the driver is a working daily driver for
+> **RAID0 and RAID1** — both hardware-validated up to installing and
+> booting Linux from the array.  This document covers the
+> **development setup** (build loop, manual testing, troubleshooting);
+> for the user-facing install flows (live-USB install onto the array,
+> DKMS install) see the **README quick start**.  See `docs/STATUS.md`
+> for the full state, `docs/REVERSE_ENGINEERING.md` for the
+> reverse-engineering background, and `docs/RE_METHODOLOGY.md`
+> for the license and legal record.
 
 The fastest, safest setup is described first. The Live USB approach is
 kept at the bottom as a fallback for when no separate Linux drive is
@@ -118,16 +120,16 @@ Or, once the driver is loaded:
 watch -n1 'cat /sys/bus/pci/drivers/rcbottom/*/rcraid/queue_stats'
 ```
 
-### What you will NOT see yet
+### What you should see
 
-Don't be surprised by either of these — they're expected at the
-current implementation state:
-
-- **No `/dev/sd*` or `/dev/rcraid*`** for the RAID volume. The driver
-  doesn't create block devices yet.
-- **No SCSI host entry** in `lsblk`. Same reason.
-- **`lspci -k` showing `Kernel driver in use: rcbottom`** *is* expected
-  once the driver loads successfully. That's the binding milestone.
+- **`/dev/rcraid0`** (plus `/dev/rcraid0pN` for any partitions) once the
+  volume assembles — check `lsblk /dev/rcraid0` and
+  `dmesg | grep rc_volume` for the assembly log (committed config
+  generation, RAID level, capacity).
+- **`lspci -k` showing `Kernel driver in use: rcbottom`** for every
+  array member.
+- Writes only when loaded with `enable_writes=1` (the installers set
+  it; a bare `insmod` stays read-only).
 
 ---
 
@@ -153,8 +155,9 @@ Two things to know:
 - It unbinds **only** PCI devices matching `1022:b000` (the AMD RAID
   controller). It can never touch your Samsung OS drive, even if the
   Samsung-protection branch is irrelevant to your model.
-- It does no writes against the RAID volume. The driver doesn't even
-  implement writes yet — it can't.
+- It does no writes against the RAID volume: its checks are read-only,
+  and it loads the driver without `enable_writes=1`, so the volume
+  itself is read-only for the whole run.
 
 ### Kernel oopses still hang you
 
@@ -326,8 +329,9 @@ Changes you make to the source on the Live USB session don't persist
 across reboots unless you set up persistence on the USB. Push to git or
 copy to external storage before powering down.
 
-The previous workflow in this file (chroot into `/target`, copy
-`rcraid.ko` into the installed system's `/lib/modules`, regenerate
-initramfs, boot from RAID) is **not appropriate yet** — the driver
-can't present block devices for booting. Don't try to install onto the
-RAID until the port is far more complete.
+To actually **install Linux onto the array** from a live session, don't
+do it by hand — run `sudo ./install-livecd.sh` and follow the README's
+quick-start path 🅐. It builds and loads the driver, hands
+`/dev/rcraid0` to the distro installer, then chroots into the fresh
+install to set up DKMS, the initramfs hook, and a UEFI boot entry.
+Validated end to end on RAID0 and RAID1.

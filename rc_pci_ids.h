@@ -5,7 +5,7 @@
  * Copyright (C) 2025-2026 Joey Troy and contributors.
  *
  * IDs identified through clean-room reverse engineering of AMD's
- * Windows .inf files and .sys binaries.  See RE_METHODOLOGY.md.
+ * Windows .inf files and .sys binaries.  See docs/RE_METHODOLOGY.md.
  */
 
 #ifndef _RC_PCI_IDS_H_

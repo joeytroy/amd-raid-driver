@@ -152,18 +152,23 @@ For status of work already done, see [`STATUS.md`](STATUS.md).
 
 ### RAID feature parity
 
-- [ ] **RAID1 (mirror)** — read from either member (load-balance);
-      write to both. Per-member error → mark degraded, keep going.
-      Metadata parser already recognises `RC_LDT_RAID1`.
-      *Progress:* the I/O path shipped — round-robin read balancing,
-      write/discard fan-out to every mirror completing on last ACK,
-      RAID-level seeding + consistency checks at registration.
-      Validated on the QEMU rig (mirror images byte-identical after the
-      test workload); hardware validation pending a real RAID1 array.
-      Still open (and why this box stays unchecked): **degraded mode** —
-      today a member error fails the volume like RAID0 instead of
-      serving from the survivor.  That lands with hot-plug / failure
-      handling below.
+- [x] **RAID1 (mirror)** — read from either member (load-balance);
+      write to both.
+      *Resolved (2026-07-10, PRs #41/#44/#45):* round-robin read
+      balancing, write/discard fan-out to every mirror completing on
+      last ACK, RAID-level derivation from the committed config
+      generation's FirstCount × SecondCount (firmware writes DeviceType
+      0x1BF6 for both levels — `RC_LDT_RAID1` is never seen on disk),
+      and contiguous-fragment merging in the fan-out sg builders (mkfs
+      metadata writeback is otherwise unexpressible as PRPs).
+      **Hardware-validated end to end**: Kubuntu 24.04 installed onto
+      and booting from a 2× T700 BIOS RAID1; KDiskMark 20.5 GB/s read /
+      11.1 GB/s write on the mirror as rootfs. Full findings in
+      STATUS.md's 2026-07-10 log entry.
+      Deliberately NOT included: **degraded mode** — today a member
+      error fails the volume like RAID0 instead of serving from the
+      survivor. That lands with hot-plug / failure handling below (now
+      the top roadmap item).
 
 - [ ] **RAID10** — combination of RAID0 + RAID1. Stripe across
       mirrored pairs. Reuses RAID0 stripe math + RAID1 mirror dispatch.
@@ -380,26 +385,29 @@ remaining items:
 ## Suggested next-PR order
 
 The original daily-driver sequence (partition scan, fast discard,
-DKMS/udev, suspend/resume, boot-from-RAID) has shipped. Current order,
-aimed at the enterprise bar:
+DKMS/udev, suspend/resume, boot-from-RAID) has shipped, and **RAID1 has
+shipped and is hardware-validated** (2026-07-10 — the dev box now boots
+from the mirror; the QEMU rig + CI qemu-rig jobs cover both levels on
+every PR). Current order, aimed at the enterprise bar:
 
-1. **RAID1 support** — first redundancy level; unlocks everything in
-   the enterprise category. Needs a second test array (can't reformat
-   the dev box's rootfs RAID0), or a loopback/qemu harness first.
-2. **Hot-plug / drive-failure handling** — degraded-mode semantics;
-   pairs with RAID1 (for RAID0 it just means failing the volume
-   cleanly instead of oopsing).
-3. **Rebuild** — background resync kthread + progress reporting;
+1. **Hot-plug / drive-failure handling + RAID1 degraded mode** — the
+   mirror must serve from the survivor when a member dies (today the
+   volume fails like RAID0; the data survives but availability doesn't).
+   Rig gains failure injection (QEMU device detach) alongside.
+2. **Rebuild** — background resync kthread + progress reporting;
    completes the redundancy trio.
-4. **Array state observability + uevents** — sysfs status attrs and
+3. **Array state observability + uevents** — sysfs status attrs and
    state-transition events; cheap once the degraded-state machinery
-   from (2) exists.
-5. **SMART pass-through** — per-member health visibility.
-6. **Kernel test suite integration** — blktests/xfstests in CI so the
+   from (1) exists.
+4. **SMART pass-through** — per-member health visibility.
+5. **Kernel test suite integration** — blktests/xfstests in CI so the
    redundancy work above stays regression-backed.
-7. **Secure Boot documentation** (MOK enrollment; the DKMS/shim path
+6. **Secure Boot documentation** (MOK enrollment; the DKMS/shim path
    already signs) and **writes-enabled-by-default latch**.
-8. **Multi-volume support**, then the remaining enterprise doc items
-   (support matrix, runbook, durability statement) alongside.
+7. **Multi-volume support** (the BIOS can carry multiple arrays; the
+   committed-generation parser already sees every LD record — the
+   volume layer is what's single-instance), then the remaining
+   enterprise doc items (support matrix, runbook, durability
+   statement) alongside.
 
 Everything else can come after.

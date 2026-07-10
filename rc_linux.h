@@ -8,7 +8,7 @@
  * engineering of the AMD-RAID Windows driver binaries (rcbottom.sys,
  * rcraid.sys, rccfg.sys) under DMCA §1201(f) interoperability
  * protections. No code is copied from AMD source distributions.
- * See RE_METHODOLOGY.md at the repository root for the full process
+ * See docs/RE_METHODOLOGY.md for the full process
  * and legal record.
  */
 
