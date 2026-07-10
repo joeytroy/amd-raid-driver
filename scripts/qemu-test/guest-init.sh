@@ -122,5 +122,17 @@ echo 3 > /proc/sys/vm/drop_caches
 got=$(dd if=/dev/rcraid0 bs=1M skip=33 count=4 2>/dev/null | md5sum | cut -d' ' -f1)
 [ "$got" = "$want" ] || fail "data mismatch after module reload"
 
+# Discard an 8 MiB region, then write+readback into it — exercises the DSM
+# path (RAID0 multi-member fan-out / RAID1 mirror fan-out) and proves the
+# volume still serves I/O afterward.  Post-discard content is undefined per
+# spec, so only the post-discard WRITE is content-checked.
+echo "rcraid-test: discard + rewrite"
+blkdiscard -o 0 -l 8388608 /dev/rcraid0 || fail "blkdiscard"
+dd if=/pattern of=/dev/rcraid0 bs=1M conv=fsync 2>/dev/null \
+    || fail "write after discard"
+echo 3 > /proc/sys/vm/drop_caches
+got=$(dd if=/dev/rcraid0 bs=1M count=4 2>/dev/null | md5sum | cut -d' ' -f1)
+[ "$got" = "$want" ] || fail "readback mismatch after discard"
+
 echo "RCRAID-TEST-PASS"
 poweroff -f

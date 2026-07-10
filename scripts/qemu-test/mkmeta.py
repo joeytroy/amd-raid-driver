@@ -192,6 +192,7 @@ def main():
     print(f"level={args.level} members={len(args.images)} "
           f"chunk_sectors={chunk_sectors} user_size={user_size}")
     print(f"capacity_sectors={capacity}")
+    print(f"userdata_offset_sectors={USERDATA_START}")
 
 
 if __name__ == "__main__":

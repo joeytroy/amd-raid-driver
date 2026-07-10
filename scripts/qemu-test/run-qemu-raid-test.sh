@@ -140,6 +140,25 @@ timeout --foreground 300 qemu-system-x86_64 \
 # 5. Verdict comes from the guest's marker line.
 # ----------------------------------------------------------------------------
 if grep -q "RCRAID-TEST-PASS" "$CONSOLE_LOG"; then
+    # RAID1: the guest's readback proves the volume serves data, but not
+    # that every mirror got it (round-robin reads could probabilistically
+    # hide a lame member).  Prove it from outside: after the VM exits,
+    # every member's user-data region must be byte-identical (only the
+    # metadata region legitimately differs, by per-member device_id).
+    if [ "$LEVEL" = raid1 ]; then
+        UD_OFF="$(echo "$MKMETA_OUT" | awk -F= '/^userdata_offset_sectors=/ {print $2}')"
+        UD_BYTES=$((UD_OFF * 512))
+        for i in $(seq 1 $((MEMBERS - 1))); do
+            if ! cmp --ignore-initial="$UD_BYTES" \
+                     "${IMAGES[0]}" "${IMAGES[$i]}"; then
+                echo "==> FAIL — mirror divergence: member0 vs member$i user data differ"
+                trap - EXIT
+                echo "==> artifacts kept in $WORKDIR"
+                exit 1
+            fi
+        done
+        echo "==> mirror check: all $MEMBERS member user-data regions identical"
+    fi
     echo "==> PASS"
     grep "rcraid-test:" "$CONSOLE_LOG" | sed 's/^/    /'
     exit 0

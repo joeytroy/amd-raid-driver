@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * AMD-RAID Linux driver — NVMe controller + RAID0 volume I/O path
+ * AMD-RAID Linux driver — NVMe controller + RAID0/RAID1 volume I/O path
  *
  * Copyright (C) 2025-2026 Joey Troy and contributors.
  *
@@ -55,6 +55,17 @@ static struct rc_adapter *rc_volume_members[RC_VOLUME_MAX_MEMBERS];
 static u64 rc_volume_member_phys_offset[RC_VOLUME_MAX_MEMBERS];
 static int rc_volume_member_count;
 static u32 rc_volume_stripe_sectors;
+/* RAID level of the assembled volume (RC_LDT_*).  Seeded by the first
+ * registered member from its on-disk LD DeviceType (RC_LDT_RAID0 for the
+ * legacy no-LD fallback); later members must match or are rejected, same
+ * contract as stripe_sectors/expected_members.  Everything level-specific
+ * (map_lba, mirror fan-out in queue_rq) keys off this. */
+static u32 rc_volume_raid_level;
+/* RAID1 read balancer: monotonically increasing cursor; each read maps to
+ * member (cursor % nmembers).  Plain round-robin — both mirrors see half
+ * the reads, which on identical members approximates the 2x read speedup
+ * without tracking per-member queue depth. */
+static atomic_t rc_volume_rr_next;
 /* Geometry-trust reason.  NULL while every member was placed from the
  * deterministic on-disk Logical Device (ld_my_position + LD-derived stripe).
  * Set to a human-readable cause by whichever site revokes trust.  The two
@@ -1792,16 +1803,40 @@ done:
 	dma_free_coherent(dev, chunk_bytes, buf, buf_dma);
 }
 
-/* Map a logical RAID0 LBA to (member_index, physical LBA on that member).
+/* Map a logical LBA to (member_index, physical LBA on that member).
+ *
+ * RAID0: stripe math — the stripe number picks the member, and stripes
+ * owned by one member are packed contiguously on its drive.
+ *
+ * RAID1: identity — every member holds the full LBA space, so the mapping
+ * only has to PICK a member.  Only READ paths (dispatch, cache fill,
+ * prefetch) may use this for RAID1: writes and discards must touch every
+ * mirror and go through rc_volume_dispatch_mirror instead.  The pick is
+ * round-robin, which halves each mirror's read load.
+ *
  * Caller must hold rc_volume_lock (or be in a single-threaded init path). */
 static void rc_volume_map_lba(u64 logical_lba, int *out_member, u64 *out_phys)
 {
 	u32 stripe = rc_volume_stripe_sectors;
 	int nmembers = rc_volume_member_count;
-	u64 stripe_num = div_u64(logical_lba, stripe);
-	u32 stripe_off = (u32)(logical_lba - stripe_num * stripe);
-	u32 member_idx = (u32)(stripe_num % (u32)nmembers);
-	u64 phys_stripe = div_u64(stripe_num, (u32)nmembers);
+	u64 stripe_num;
+	u32 stripe_off;
+	u32 member_idx;
+	u64 phys_stripe;
+
+	if (rc_volume_raid_level == RC_LDT_RAID1) {
+		member_idx = (u32)((u32)atomic_inc_return(&rc_volume_rr_next) %
+				   (u32)nmembers);
+		*out_member = (int)member_idx;
+		*out_phys   = logical_lba +
+			      rc_volume_member_phys_offset[member_idx];
+		return;
+	}
+
+	stripe_num  = div_u64(logical_lba, stripe);
+	stripe_off  = (u32)(logical_lba - stripe_num * stripe);
+	member_idx  = (u32)(stripe_num % (u32)nmembers);
+	phys_stripe = div_u64(stripe_num, (u32)nmembers);
 
 	*out_member = (int)member_idx;
 	*out_phys   = phys_stripe * stripe + stripe_off
@@ -1941,6 +1976,15 @@ static u32 rc_volume_chunk_sectors_for(u32 devtype, u32 ld_chunk,
 		case 1:
 		default: return 128u;
 		}
+	case RC_LDT_RAID1:
+		/* Mirrors don't stripe — this is purely the request-split
+		 * granule (queue_limits.chunk_sectors), picked so one request
+		 * maps to exactly one NVMe command per member: 512 sectors =
+		 * 256 KiB, comfortably under MDTS (512 KiB) and under the
+		 * per-member sg array (RC_VOLUME_MS_PAGES_PER_MEMBER pages).
+		 * Also the granularity the read cache/prefetch operate at,
+		 * same as the RAID0 default. */
+		return 512u;
 	default:
 		return 0u;
 	}
@@ -2010,11 +2054,23 @@ static void rc_volume_register_member(struct rc_adapter *adapter)
 		chunk_sectors = rc_volume_stripe_override;
 	}
 
-	/* First member: seed expected count + stripe.  Later members must match. */
+	/* First member: seed expected count + stripe + RAID level.  Later
+	 * members must match. */
 	if (rc_volume_member_count == 0) {
 		rc_volume_expected_members = expected;
 		rc_volume_stripe_sectors   = chunk_sectors;
+		rc_volume_raid_level       = have_ld ? nvme->ld_device_type
+						     : RC_LDT_RAID0;
 	} else {
+		if ((have_ld ? nvme->ld_device_type : RC_LDT_RAID0) !=
+		    rc_volume_raid_level) {
+			rc_printk(RC_WARN,
+				  "rc_volume_register_member: %s RAID-level mismatch 0x%x vs 0x%x — ignoring\n",
+				  pci_name(adapter->pdev),
+				  have_ld ? nvme->ld_device_type : RC_LDT_RAID0,
+				  rc_volume_raid_level);
+			goto out;
+		}
 		if (expected != rc_volume_expected_members) {
 			rc_printk(RC_WARN,
 				  "rc_volume_register_member: %s expected-member mismatch %u vs %u — ignoring\n",
@@ -2624,6 +2680,124 @@ static blk_status_t rc_volume_dispatch_multi_stripe_discard(
 	return BLK_STS_OK;
 }
 
+/* RAID1: fan a WRITE or DISCARD out to every mirror member.
+ *
+ * Mirrors hold identical LBA spaces, so every member receives the SAME
+ * logical range (offset by its own userdata base) — for WRITE that means
+ * the same bio pages DMA'd to each member, for DISCARD the same DSM range.
+ * The request completes when the LAST member ACKs (members_pending, same
+ * contract as FLUSH and the RAID0 multi-stripe path); rc_volume_complete /
+ * the ISR fast path unmap via ms_active.
+ *
+ * DATA-INTEGRITY INVARIANT — a mirror write must not complete until EVERY
+ * member has it: completing on the first ACK would let an fsync pass while
+ * one mirror still holds stale data, which a later degraded-mode read (or
+ * the read balancer, TODAY) would happily serve.
+ *
+ * WRITE size is bounded by queue_limits.chunk_sectors (512 sectors for
+ * RAID1), so one NVMe command per member always suffices and the per-member
+ * sg arrays can't overflow.  DISCARD is NOT chunk-split by blk-mq, but a
+ * mirror discard of any size is still one contiguous DSM range per member —
+ * identity mapping keeps every logical range physically contiguous. */
+static blk_status_t rc_volume_dispatch_mirror(
+		struct blk_mq_hw_ctx *hctx, struct request *req,
+		struct rc_volume_pdu *pdu, sector_t pos, u32 nr_sectors,
+		enum req_op op)
+{
+	const int nm = rc_volume_member_count;
+	u32 tag = req->tag;
+	int m;
+
+	if (nm <= 0 || nm > RC_VOLUME_MAX_MEMBERS) {
+		rc_printk(RC_ERROR,
+			  "rc_volume_dispatch_mirror: bad volume state (members=%d) — pos=%llu len=%u rejected\n",
+			  nm, (u64)pos, nr_sectors);
+		return BLK_STS_IOERR;
+	}
+
+	if (op == REQ_OP_WRITE) {
+		struct req_iterator iter;
+		struct bio_vec bv;
+		u32 used = 0;
+
+		for (m = 0; m < nm; m++)
+			sg_init_table(pdu->ms_sg[m], RC_VOLUME_MS_PAGES_PER_MEMBER);
+
+		/* Same pages onto every member's scatterlist.  Separate sg
+		 * arrays are mandatory even though the contents match:
+		 * dma_map_sg writes each member's IOVAs into the entries,
+		 * and every member owns a distinct IOMMU domain. */
+		rq_for_each_segment(bv, req, iter) {
+			if (used >= RC_VOLUME_MS_PAGES_PER_MEMBER) {
+				rc_printk(RC_ERROR,
+					  "rc_volume_dispatch_mirror: sg overflow (>%u entries) — pos=%llu len=%u rejected\n",
+					  RC_VOLUME_MS_PAGES_PER_MEMBER,
+					  (u64)pos, nr_sectors);
+				return BLK_STS_IOERR;
+			}
+			for (m = 0; m < nm; m++)
+				sg_set_page(&pdu->ms_sg[m][used], bv.bv_page,
+					    bv.bv_len, bv.bv_offset);
+			used++;
+		}
+		if (!used)
+			return BLK_STS_IOERR;
+		for (m = 0; m < nm; m++)
+			sg_mark_end(&pdu->ms_sg[m][used - 1]);
+
+		pdu->ms_active = true;
+		for (m = 0; m < nm; m++) {
+			struct device *dma_dev =
+				&rc_volume_members[m]->pdev->dev;
+			int mapped = dma_map_sg(dma_dev, pdu->ms_sg[m], used,
+						DMA_TO_DEVICE);
+
+			if (mapped == 0) {
+				rc_printk(RC_ERROR,
+					  "rc_volume_dispatch_mirror: dma_map_sg failed (member %d) — pos=%llu len=%u rejected\n",
+					  m, (u64)pos, nr_sectors);
+				pdu->ms_nents[m] = 0;
+				for (--m; m >= 0; m--) {
+					dma_dev = &rc_volume_members[m]->pdev->dev;
+					dma_unmap_sg(dma_dev, pdu->ms_sg[m],
+						     pdu->ms_nents[m],
+						     DMA_TO_DEVICE);
+					pdu->ms_nents[m] = 0;
+				}
+				pdu->ms_active = false;
+				return BLK_STS_IOERR;
+			}
+			pdu->ms_nents[m] = mapped;
+		}
+	}
+	/* DISCARD: no DMA mapping — nents/ms_active stay zero from queue_rq's
+	 * memset, so unmap no-ops; the DSM range lives in the per-tag PRP
+	 * buffer, one per (hctx, member, tag). */
+
+	pdu->member_idx = -1;	/* multi-member — timeout/drain treat as all */
+	atomic_set(&pdu->members_pending, nm);
+
+	blk_mq_start_request(req);
+	for (m = 0; m < nm; m++) {
+		struct rc_nvme_sqe cmd;
+		u64 phys = (u64)pos + rc_volume_member_phys_offset[m];
+
+		if (op == REQ_OP_WRITE)
+			rc_volume_build_io_sqe(&cmd, hctx->queue_num, m, tag,
+					       RC_NVME_NVM_OP_WRITE,
+					       phys, (u16)(nr_sectors - 1),
+					       (req->cmd_flags & REQ_FUA) != 0,
+					       pdu->ms_sg[m], pdu->ms_nents[m]);
+		else
+			rc_volume_build_discard_sqe(&cmd, hctx->queue_num, m,
+						    tag, phys, nr_sectors);
+		rc_nvme_io_submit(rc_volume_members[m]->ctx.nvme.io_queues[hctx->queue_num],
+				  &cmd);
+	}
+
+	return BLK_STS_OK;
+}
+
 static blk_status_t rc_volume_queue_rq(struct blk_mq_hw_ctx *hctx,
 				       const struct blk_mq_queue_data *bd)
 {
@@ -2712,6 +2886,37 @@ static blk_status_t rc_volume_queue_rq(struct blk_mq_hw_ctx *hctx,
 		blk_mq_start_request(req);
 		rc_cache_dec_inflight(pdu);
 		blk_mq_end_request(req, BLK_STS_IOERR);
+		return BLK_STS_OK;
+	}
+
+	/* RAID1 WRITE/DISCARD: every mirror must receive the data, so these
+	 * never take the single-member or multi-stripe paths.  Checked BEFORE
+	 * the multi-stripe branches because blk-mq does not split DISCARD at
+	 * chunk_sectors — a large mirror discard would otherwise wander into
+	 * the RAID0 stripe-math discard fan-out.  READs fall through: the
+	 * normal single-member path (and cache/prefetch) work as-is once
+	 * rc_volume_map_lba picks a mirror. */
+	if (rc_volume_raid_level == RC_LDT_RAID1 &&
+	    (op == REQ_OP_WRITE || op == REQ_OP_DISCARD)) {
+		/* The shared invalidation below (cache at the WRITE else-if,
+		 * prefetch at op != READ) sits later in this function, so do
+		 * both here — serving a stale cached stripe after a mirror
+		 * write would defeat the mirror. */
+		if (rc_cache_entries)
+			rc_cache_invalidate_range(pos, nr_sectors);
+		if (rc_volume_prefetch_enabled &&
+		    hctx->queue_num < RC_VOLUME_MAX_HCTX)
+			rc_volume_prefetch_invalidate(hctx->queue_num);
+
+		st = rc_volume_dispatch_mirror(hctx, req, pdu, pos,
+					       nr_sectors, op);
+		if (st != BLK_STS_OK) {
+			/* Errors return before dispatch_mirror's internal
+			 * blk_mq_start_request — start before ending. */
+			blk_mq_start_request(req);
+			rc_cache_dec_inflight(pdu);
+			blk_mq_end_request(req, st);
+		}
 		return BLK_STS_OK;
 	}
 
@@ -3182,9 +3387,21 @@ struct rc_volume_drain_ctx {
 	unsigned int dead_mask;	/* bit i set => member i is dead */
 };
 
+/* Does this request need `member` to complete?  FLUSH and every
+ * multi-member dispatch (member_idx == -1: RAID0 multi-stripe R/W, RAID0
+ * multi-member discard, RAID1 mirror write/discard) involve all members —
+ * for a multi-stripe request that only touched a subset this is
+ * conservative, but a volume with any dead member is failing those
+ * requests anyway.  Single-member requests involve exactly member_idx. */
+static bool rc_volume_req_involves(const struct rc_volume_pdu *pdu, int member)
+{
+	if (pdu->op == REQ_OP_FLUSH || pdu->member_idx < 0)
+		return true;
+	return pdu->member_idx == member;
+}
+
 /* blk_mq_tagset_busy_iter callback.  For each in-flight request, decide
- * whether it can no longer make progress (it targeted a now-dead adapter,
- * or it's a FLUSH that needs every member and at least one is dead) and
+ * whether it can no longer make progress (a member it needs is dead) and
  * complete it with the dead-controller sentinel if so.  blk-mq makes
  * blk_mq_complete_request atomic against the ISR's competing call, so a
  * naturally-arriving CQE during this iteration races safely. */
@@ -3192,15 +3409,17 @@ static bool rc_volume_drain_iter(struct request *req, void *priv)
 {
 	struct rc_volume_drain_ctx *ctx = priv;
 	struct rc_volume_pdu *pdu = blk_mq_rq_to_pdu(req);
-	bool kill;
+	bool kill = false;
+	int i;
 
-	if (pdu->op == REQ_OP_FLUSH)
-		kill = ctx->dead_mask != 0;
-	else if (pdu->member_idx >= 0 &&
-		 pdu->member_idx < RC_VOLUME_MAX_MEMBERS)
-		kill = (ctx->dead_mask & BIT(pdu->member_idx)) != 0;
-	else
-		kill = false;
+	for (i = 0; i < rc_volume_member_count && i < RC_VOLUME_MAX_MEMBERS;
+	     i++) {
+		if ((ctx->dead_mask & BIT(i)) &&
+		    rc_volume_req_involves(pdu, i)) {
+			kill = true;
+			break;
+		}
+	}
 
 	if (kill && !blk_mq_request_completed(req)) {
 		pdu->sc_sct = RC_VOLUME_SC_DEAD;
@@ -3229,13 +3448,9 @@ static void rc_volume_schedule_auto_reset_for_req(struct rc_volume_pdu *pdu)
 {
 	int i;
 
-	if (pdu->op == REQ_OP_FLUSH) {
-		for (i = 0; i < rc_volume_member_count; i++)
+	for (i = 0; i < rc_volume_member_count; i++)
+		if (rc_volume_req_involves(pdu, i))
 			rc_nvme_schedule_auto_reset(rc_volume_members[i]);
-	} else if (pdu->member_idx >= 0 &&
-		   pdu->member_idx < rc_volume_member_count) {
-		rc_nvme_schedule_auto_reset(rc_volume_members[pdu->member_idx]);
-	}
 }
 
 /* Build the dead-member mask and run the drain iterator.  No-op if no
@@ -3278,14 +3493,10 @@ static enum blk_eh_timer_return rc_volume_timeout(struct request *req)
 	if (blk_mq_request_completed(req))
 		return BLK_EH_DONE;
 
-	if (pdu->op == REQ_OP_FLUSH) {
-		for (i = 0; i < rc_volume_member_count; i++)
-			if (rc_nvme_check_dead(rc_volume_members[i]))
-				any_dead = true;
-	} else if (pdu->member_idx >= 0 &&
-		   pdu->member_idx < rc_volume_member_count) {
-		any_dead = rc_nvme_check_dead(rc_volume_members[pdu->member_idx]);
-	}
+	for (i = 0; i < rc_volume_member_count; i++)
+		if (rc_volume_req_involves(pdu, i) &&
+		    rc_nvme_check_dead(rc_volume_members[i]))
+			any_dead = true;
 
 	if (any_dead) {
 		rc_printk(RC_ERROR,
@@ -3307,26 +3518,17 @@ static enum blk_eh_timer_return rc_volume_timeout(struct request *req)
 	rc_printk(RC_WARN,
 		  "rc_volume_timeout: tag=%u op=%u: issuing NVMe Abort\n",
 		  req->tag, pdu->op);
-	if (pdu->op == REQ_OP_FLUSH) {
-		for (i = 0; i < rc_volume_member_count; i++)
+	for (i = 0; i < rc_volume_member_count; i++)
+		if (rc_volume_req_involves(pdu, i))
 			(void)rc_nvme_abort(rc_volume_members[i],
 					    RC_NVME_IO_QID, (u16)req->tag);
-	} else if (pdu->member_idx >= 0 &&
-		   pdu->member_idx < rc_volume_member_count) {
-		(void)rc_nvme_abort(rc_volume_members[pdu->member_idx],
-				    RC_NVME_IO_QID, (u16)req->tag);
-	}
 
 	if (blk_mq_request_completed(req))
 		return BLK_EH_DONE;
 
-	if (pdu->op == REQ_OP_FLUSH) {
-		for (i = 0; i < rc_volume_member_count; i++)
+	for (i = 0; i < rc_volume_member_count; i++)
+		if (rc_volume_req_involves(pdu, i))
 			WRITE_ONCE(rc_volume_members[i]->ctx.nvme.dead, true);
-	} else if (pdu->member_idx >= 0 &&
-		   pdu->member_idx < rc_volume_member_count) {
-		WRITE_ONCE(rc_volume_members[pdu->member_idx]->ctx.nvme.dead, true);
-	}
 	rc_volume_drain_dead();
 	rc_volume_schedule_auto_reset_for_req(pdu);
 	if (!blk_mq_request_completed(req)) {
