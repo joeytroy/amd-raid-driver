@@ -21,14 +21,22 @@ mount -t devtmpfs devtmpfs /dev 2>/dev/null
 
 fail() {
     echo "rcraid-test: FAILURE DETAIL: $1"
+    echo "rcraid-test: --- /proc/interrupts (MSI-X vector counts) ---"
+    cat /proc/interrupts
     echo "rcraid-test: --- last dmesg lines ---"
-    dmesg | tail -n 40
+    dmesg | tail -n 150
     echo "RCRAID-TEST-FAIL"
     poweroff -f
     # Backstop: if poweroff somehow doesn't halt PID 1, do NOT return to
     # the caller — falling through could reach the PASS marker and report
     # a false pass to the host runner.
     exit 1
+}
+
+# Timeline marker: lands in dmesg between the driver's own log lines, so
+# failures can be anchored to the test step that triggered them.
+mark() {
+    echo "rcraid-test: MARK $1" > /dev/kmsg
 }
 
 expected_sectors=""
@@ -151,9 +159,14 @@ got=$(dd if=/dev/rcraid0 bs=1M skip=33 count=4 2>/dev/null | md5sum | cut -d' ' 
 # volume still serves I/O afterward.  Post-discard content is undefined per
 # spec, so only the post-discard WRITE is content-checked.
 echo "rcraid-test: discard + rewrite"
+grep -E "rcraid|nvme" /proc/interrupts
+mark "blkdiscard start"
 blkdiscard -o 0 -l 8388608 /dev/rcraid0 || fail "blkdiscard"
+mark "blkdiscard done, writing"
+grep -E "rcraid|nvme" /proc/interrupts
 dd if=/pattern of=/dev/rcraid0 bs=1M conv=fsync 2>/dev/null \
     || fail "write after discard"
+mark "post-discard write done"
 echo 3 > /proc/sys/vm/drop_caches
 got=$(dd if=/dev/rcraid0 bs=1M count=4 2>/dev/null | md5sum | cut -d' ' -f1)
 [ "$got" = "$want" ] || fail "readback mismatch after discard"

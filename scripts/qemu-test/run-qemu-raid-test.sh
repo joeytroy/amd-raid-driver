@@ -180,7 +180,7 @@ if grep -q "RCRAID-TEST-PASS" "$CONSOLE_LOG"; then
 fi
 
 echo "==> FAIL — guest console tail:"
-tail -n 60 "$CONSOLE_LOG" | sed 's/^/    /'
+tail -n 200 "$CONSOLE_LOG" | sed 's/^/    /'
 # Keep the workdir for debugging on failure.
 trap - EXIT
 echo "==> artifacts kept in $WORKDIR"
