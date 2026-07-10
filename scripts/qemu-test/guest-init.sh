@@ -184,5 +184,36 @@ echo 3 > /proc/sys/vm/drop_caches
 got=$(dd if=/dev/rcraid0 bs=1M count=4 2>/dev/null | md5sum | cut -d' ' -f1)
 [ "$got" = "$want" ] || fail "readback mismatch after discard"
 
+# Sub-page buffered-write test: real mke2fs metadata writeback goes
+# through buffer heads smaller than a page, producing bios whose bvecs
+# the driver must MERGE before building PRPs (non-first segments at
+# in-page offsets are unexpressible — the controller rejects them with
+# SC 0x13 "PRP Offset Invalid").  This is the exact failure that killed
+# the OS install on real hardware while every dd-style test passed.
+# -b 1024 forces 1 KiB blocks for the worst-case pattern.
+MKE2FS=""
+for p in /usr/sbin/mke2fs /sbin/mke2fs; do
+    [ -x "$p" ] && MKE2FS="$p" && break
+done
+if [ -n "$MKE2FS" ]; then
+    echo "rcraid-test: mke2fs sub-page buffered-write test"
+    mark "mke2fs start"
+    errs_before=$(dmesg | grep -c "I/O error")
+    "$MKE2FS" -q -b 1024 /dev/rcraid0 || fail "mke2fs on /dev/rcraid0"
+    sync
+    errs_after=$(dmesg | grep -c "I/O error")
+    [ "$errs_before" = "$errs_after" ] \
+        || fail "I/O errors during mke2fs (PRP/segment-merge regression?)"
+    echo 3 > /proc/sys/vm/drop_caches
+    # ext2 superblock magic 0xEF53 lives at byte offset 1080.
+    magic=$(dd if=/dev/rcraid0 bs=1 skip=1080 count=2 2>/dev/null \
+            | od -An -tx1 | tr -d ' \n')
+    [ "$magic" = "53ef" ] \
+        || fail "ext2 superblock magic wrong after mke2fs (got '$magic')"
+    echo "rcraid-test: mke2fs OK, superblock verified on the volume"
+else
+    echo "rcraid-test: mke2fs not bundled — skipping sub-page write test"
+fi
+
 echo "RCRAID-TEST-PASS"
 poweroff -f

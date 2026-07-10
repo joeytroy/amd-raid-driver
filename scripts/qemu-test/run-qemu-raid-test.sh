@@ -117,6 +117,27 @@ mkdir -p "$INITRD_DIR/bin" "$INITRD_DIR/sbin" "$INITRD_DIR/proc" \
 cp "$BUSYBOX" "$INITRD_DIR/bin/busybox"
 ln -s busybox "$INITRD_DIR/bin/sh"    # /init's shebang needs a shell to exist
 cp "$REPO_DIR/rcraid.ko" "$INITRD_DIR/rcraid.ko"
+
+# Bundle mke2fs (+ the shared libraries it needs) when the host has it.
+# Real mkfs is the only faithful generator of sub-page buffer-head
+# writeback — the bvec pattern that PRPs can't express unless the driver
+# merges contiguous fragments.  dd-style tests are always page-aligned and
+# CANNOT catch that class (it shipped: mke2fs failed every RAID1 mirror
+# write with SC 0x13 on real hardware while the whole rig battery passed).
+add_binary() {
+    install -D "$1" "$INITRD_DIR$1"
+    ldd "$1" 2>/dev/null | awk '{for(i=1;i<=NF;i++) if ($i ~ /^\//) print $i}' \
+        | sort -u | while read -r lib; do
+        install -D "$lib" "$INITRD_DIR$lib" 2>/dev/null || true
+    done
+}
+MKE2FS="$(command -v mke2fs || true)"
+if [ -n "$MKE2FS" ]; then
+    add_binary "$MKE2FS"
+    echo "==> bundled $MKE2FS for the sub-page buffered-write test"
+else
+    echo "==> mke2fs not found on host — guest will skip the sub-page write test"
+fi
 install -m 0755 "$SCRIPT_DIR/guest-init.sh" "$INITRD_DIR/init"
 (cd "$INITRD_DIR" && find . | cpio -o -H newc --quiet | gzip -1) \
     > "$WORKDIR/initramfs.gz"

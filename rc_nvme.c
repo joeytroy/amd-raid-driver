@@ -2573,10 +2573,16 @@ static void rc_volume_unmap_request_sg(struct rc_volume_pdu *pdu)
  *
  * For >2 pages, PRP2 is replaced with the address of the per-tag PRP
  * list buffer (filled in along the way).  Two-page transfers use PRP2
- * directly.  Single-page transfers leave PRP2 zero. */
-static void rc_volume_build_prp(struct rc_nvme_sqe *cmd, unsigned int hctx_idx,
-				int member_idx, u32 tag,
-				struct scatterlist *sgl, int nents)
+ * directly.  Single-page transfers leave PRP2 zero.
+ *
+ * Returns 0, or -EINVAL for a scatterlist PRPs cannot express (a
+ * non-first segment starting at an in-page offset).  The sg builders
+ * merge contiguous fragments precisely so this can't happen — the check
+ * turns any future regression into one clean I/O error instead of the
+ * controller silently rejecting every command with SC 0x13. */
+static int rc_volume_build_prp(struct rc_nvme_sqe *cmd, unsigned int hctx_idx,
+			       int member_idx, u32 tag,
+			       struct scatterlist *sgl, int nents)
 {
 	__le64 *prp_list      = rc_volume_prp_va[hctx_idx][member_idx][tag];
 	dma_addr_t prp_list_pa = rc_volume_prp_pa[hctx_idx][member_idx][tag];
@@ -2590,6 +2596,13 @@ static void rc_volume_build_prp(struct rc_nvme_sqe *cmd, unsigned int hctx_idx,
 	for_each_sg(sgl, sg, nents, i) {
 		dma_addr_t addr = sg_dma_address(sg);
 		unsigned int len = sg_dma_len(sg);
+
+		if (i > 0 && offset_in_page(addr)) {
+			rc_printk(RC_ERROR,
+				  "rc_volume_build_prp: sg entry %d starts at in-page offset %lu — unexpressible as PRPs, rejecting\n",
+				  i, (unsigned long)offset_in_page(addr));
+			return -EINVAL;
+		}
 
 		if (i == 0) {
 			unsigned int off = offset_in_page(addr);
@@ -2620,16 +2633,19 @@ static void rc_volume_build_prp(struct rc_nvme_sqe *cmd, unsigned int hctx_idx,
 
 	if (n_pages > 2)
 		cmd->prp2 = cpu_to_le64(prp_list_pa);
+	return 0;
 }
 
 /* Build an NVMe READ/WRITE SQE.  CID = tag.  FUA passed through when the
  * request has REQ_FUA set.  Caller has already dma_map_sg'd the bvecs
  * into pdu->sg / pdu->nents; rc_volume_build_prp enumerates those pages
- * into PRP1/PRP2 (and the per-tag PRP list if > 2 pages). */
-static void rc_volume_build_io_sqe(struct rc_nvme_sqe *cmd, unsigned int hctx_idx,
-				   int member_idx,
-				   u32 tag, u8 opc, u64 slba, u16 nlb_zbased,
-				   bool fua, struct scatterlist *sgl, int nents)
+ * into PRP1/PRP2 (and the per-tag PRP list if > 2 pages).  Returns 0 or
+ * -EINVAL from the PRP expressibility check — the caller must fail the
+ * request instead of submitting. */
+static int rc_volume_build_io_sqe(struct rc_nvme_sqe *cmd, unsigned int hctx_idx,
+				  int member_idx,
+				  u32 tag, u8 opc, u64 slba, u16 nlb_zbased,
+				  bool fua, struct scatterlist *sgl, int nents)
 {
 	u32 cdw12 = nlb_zbased;
 
@@ -2644,7 +2660,7 @@ static void rc_volume_build_io_sqe(struct rc_nvme_sqe *cmd, unsigned int hctx_id
 	cmd->cdw11 = cpu_to_le32((u32)(slba >> 32));
 	cmd->cdw12 = cpu_to_le32(cdw12);
 
-	rc_volume_build_prp(cmd, hctx_idx, member_idx, tag, sgl, nents);
+	return rc_volume_build_prp(cmd, hctx_idx, member_idx, tag, sgl, nents);
 }
 
 /* Build an NVMe FLUSH SQE for one member.  No data, no PRPs, just opcode +
@@ -2725,6 +2741,40 @@ static void rc_cache_submit_fill(unsigned int hctx_idx,
  * ends the request.  Hardware DMAs directly to/from the bio's user
  * pages — no bounce buffers, no memcpy on either side. */
 
+/* Append (page, len, offset) to a scatterlist under construction, merging
+ * into the previous entry when physically contiguous — the same coalescing
+ * blk_rq_map_sg performs for the single-member path.  The hand-rolled bvec
+ * walks (mirror fan-out, multi-stripe split) MUST do this too: buffer-head
+ * writeback (e.g. mkfs metadata) legally fills a bio with runs of sub-page
+ * bvecs that are contiguous within a page, and virt_boundary allows them
+ * precisely because they are gap-free.  One sg entry per bvec puts every
+ * non-first segment at an in-page offset — which an NVMe PRP list cannot
+ * express — so the controller rejects the command.  Observed on hardware:
+ * every RAID1 mirror write of mke2fs metadata failed with SC 0x13 ("PRP
+ * Offset Invalid") on both members, killing the OS install at the
+ * create-filesystem step, while page-aligned I/O (dd, the QEMU rig) sailed
+ * through.
+ *
+ * Returns the new entry count, or 0 when a fresh entry is needed but the
+ * array is full (caller rejects the request). */
+static u32 rc_volume_sg_append(struct scatterlist *sgl, u32 used, u32 max,
+			       struct page *page, u32 len, u32 offset)
+{
+	if (used) {
+		struct scatterlist *prev = &sgl[used - 1];
+
+		if (page_to_phys(page) + offset ==
+		    page_to_phys(sg_page(prev)) + prev->offset + prev->length) {
+			prev->length += len;
+			return used;
+		}
+	}
+	if (used >= max)
+		return 0;
+	sg_set_page(&sgl[used], page, len, offset);
+	return used + 1;
+}
+
 /* Dispatch a READ/WRITE that spans multiple RAID0 stripes (and thus
  * multiple members).  Walks the request's bvec stripe-by-stripe, building
  * per-member scatterlists; the pages belonging to member 0 are
@@ -2797,14 +2847,6 @@ static blk_status_t rc_volume_dispatch_multi_stripe(
 					  (u64)pos, nr_sectors);
 				return BLK_STS_IOERR;
 			}
-			if (sg_used[mbr] >= RC_VOLUME_MS_PAGES_PER_MEMBER) {
-				rc_printk(RC_ERROR,
-					  "rc_volume_dispatch_multi_stripe: member %d sg overflow (>%u entries) — pos=%llu len=%u rejected\n",
-					  mbr, RC_VOLUME_MS_PAGES_PER_MEMBER,
-					  (u64)pos, nr_sectors);
-				return BLK_STS_IOERR;
-			}
-
 			if (!member_has_data[mbr]) {
 				u64 phys_lba;
 				int phys_member;
@@ -2823,9 +2865,22 @@ static blk_status_t rc_volume_dispatch_multi_stripe(
 				members_with_data++;
 			}
 
-			sg_set_page(&pdu->ms_sg[mbr][sg_used[mbr]],
-				    seg_page, chunk_bytes, seg_off_in_page);
-			sg_used[mbr]++;
+			/* Merge physically-contiguous fragments (sub-page
+			 * bvec runs, or consecutive stripes owned by the
+			 * same member) — non-first sg entries at in-page
+			 * offsets are unexpressible as PRPs. */
+			sg_used[mbr] = rc_volume_sg_append(
+					pdu->ms_sg[mbr], sg_used[mbr],
+					RC_VOLUME_MS_PAGES_PER_MEMBER,
+					seg_page, chunk_bytes,
+					seg_off_in_page);
+			if (!sg_used[mbr]) {
+				rc_printk(RC_ERROR,
+					  "rc_volume_dispatch_multi_stripe: member %d sg overflow (>%u entries) — pos=%llu len=%u rejected\n",
+					  mbr, RC_VOLUME_MS_PAGES_PER_MEMBER,
+					  (u64)pos, nr_sectors);
+				return BLK_STS_IOERR;
+			}
 			member_sectors[mbr] += chunk_sectors;
 
 			seg_off_in_page += chunk_bytes;
@@ -2887,29 +2942,41 @@ static blk_status_t rc_volume_dispatch_multi_stripe(
 	pdu->member_idx = -1;	/* multi-member — no single member to attribute */
 	atomic_set(&pdu->members_pending, members_with_data);
 
-	/* Submit one NVMe cmd per member.  Must call blk_mq_start_request
-	 * before the first submit (an ISR completion racing us would otherwise
-	 * call blk_mq_complete on a request blk-mq doesn't yet consider
-	 * started). */
-	blk_mq_start_request(req);
-	for (m = 0; m < nm; m++) {
-		struct rc_nvme_sqe cmd;
+	/* Build every member's SQE BEFORE starting/submitting anything, so a
+	 * PRP-expressibility failure can still cleanly reject the request
+	 * (after the first doorbell there is no unsubmitting). */
+	{
+		struct rc_nvme_sqe cmds[RC_VOLUME_MAX_MEMBERS];
 		u32 tag = req->tag;
-		u32 nvme_nlb = member_sectors[m];
 
-		if (!pdu->ms_nents[m])
-			continue;
+		for (m = 0; m < nm; m++) {
+			if (!pdu->ms_nents[m])
+				continue;
+			if (rc_volume_build_io_sqe(&cmds[m], hctx->queue_num,
+					m, tag,
+					op == REQ_OP_WRITE ?
+					  RC_NVME_NVM_OP_WRITE :
+					  RC_NVME_NVM_OP_READ,
+					member_start_lba[m],
+					(u16)(member_sectors[m] - 1),
+					(req->cmd_flags & REQ_FUA) != 0,
+					pdu->ms_sg[m], pdu->ms_nents[m])) {
+				rc_volume_unmap_request_sg(pdu);
+				return BLK_STS_IOERR;
+			}
+		}
 
-		rc_volume_build_io_sqe(&cmd, hctx->queue_num, m, tag,
-				       op == REQ_OP_WRITE ?
-					 RC_NVME_NVM_OP_WRITE :
-					 RC_NVME_NVM_OP_READ,
-				       member_start_lba[m],
-				       (u16)(nvme_nlb - 1),
-				       (req->cmd_flags & REQ_FUA) != 0,
-				       pdu->ms_sg[m], pdu->ms_nents[m]);
-		rc_nvme_io_submit(rc_volume_members[m]->ctx.nvme.io_queues[hctx->queue_num],
-				  &cmd);
+		/* Must call blk_mq_start_request before the first submit (an
+		 * ISR completion racing us would otherwise call
+		 * blk_mq_complete on a request blk-mq doesn't yet consider
+		 * started). */
+		blk_mq_start_request(req);
+		for (m = 0; m < nm; m++) {
+			if (!pdu->ms_nents[m])
+				continue;
+			rc_nvme_io_submit(rc_volume_members[m]->ctx.nvme.io_queues[hctx->queue_num],
+					  &cmds[m]);
+		}
 	}
 
 	return BLK_STS_OK;
@@ -3055,19 +3122,39 @@ static blk_status_t rc_volume_dispatch_mirror(
 		/* Same pages onto every member's scatterlist.  Separate sg
 		 * arrays are mandatory even though the contents match:
 		 * dma_map_sg writes each member's IOVAs into the entries,
-		 * and every member owns a distinct IOMMU domain. */
+		 * and every member owns a distinct IOMMU domain.
+		 *
+		 * Physically-contiguous bvecs must MERGE into one sg entry
+		 * (see rc_volume_sg_append) — sub-page bvec runs from
+		 * buffer-head writeback otherwise land non-first segments at
+		 * in-page offsets that PRPs can't express.  The layout is
+		 * identical across members, so the merge decision from
+		 * member 0's array applies to all. */
 		rq_for_each_segment(bv, req, iter) {
-			if (used >= RC_VOLUME_MS_PAGES_PER_MEMBER) {
+			u32 newused = rc_volume_sg_append(
+					pdu->ms_sg[0], used,
+					RC_VOLUME_MS_PAGES_PER_MEMBER,
+					bv.bv_page, bv.bv_len, bv.bv_offset);
+
+			if (!newused) {
 				rc_printk(RC_ERROR,
 					  "rc_volume_dispatch_mirror: sg overflow (>%u entries) — pos=%llu len=%u rejected\n",
 					  RC_VOLUME_MS_PAGES_PER_MEMBER,
 					  (u64)pos, nr_sectors);
 				return BLK_STS_IOERR;
 			}
-			for (m = 0; m < nm; m++)
-				sg_set_page(&pdu->ms_sg[m][used], bv.bv_page,
-					    bv.bv_len, bv.bv_offset);
-			used++;
+			if (newused == used) {
+				/* merged into the previous entry */
+				for (m = 1; m < nm; m++)
+					pdu->ms_sg[m][used - 1].length +=
+						bv.bv_len;
+			} else {
+				for (m = 1; m < nm; m++)
+					sg_set_page(&pdu->ms_sg[m][used],
+						    bv.bv_page, bv.bv_len,
+						    bv.bv_offset);
+				used = newused;
+			}
 		}
 		if (!used)
 			return BLK_STS_IOERR;
@@ -3106,22 +3193,36 @@ static blk_status_t rc_volume_dispatch_mirror(
 	pdu->member_idx = -1;	/* multi-member — timeout/drain treat as all */
 	atomic_set(&pdu->members_pending, nm);
 
-	blk_mq_start_request(req);
-	for (m = 0; m < nm; m++) {
-		struct rc_nvme_sqe cmd;
-		u64 phys = (u64)pos + rc_volume_member_phys_offset[m];
+	/* Build all SQEs before starting/submitting so a PRP-expressibility
+	 * failure can still cleanly reject the request. */
+	{
+		struct rc_nvme_sqe cmds[RC_VOLUME_MAX_MEMBERS];
 
-		if (op == REQ_OP_WRITE)
-			rc_volume_build_io_sqe(&cmd, hctx->queue_num, m, tag,
-					       RC_NVME_NVM_OP_WRITE,
-					       phys, (u16)(nr_sectors - 1),
-					       (req->cmd_flags & REQ_FUA) != 0,
-					       pdu->ms_sg[m], pdu->ms_nents[m]);
-		else
-			rc_volume_build_discard_sqe(&cmd, hctx->queue_num, m,
-						    tag, phys, nr_sectors);
-		rc_nvme_io_submit(rc_volume_members[m]->ctx.nvme.io_queues[hctx->queue_num],
-				  &cmd);
+		for (m = 0; m < nm; m++) {
+			u64 phys = (u64)pos + rc_volume_member_phys_offset[m];
+
+			if (op == REQ_OP_WRITE) {
+				if (rc_volume_build_io_sqe(&cmds[m],
+						hctx->queue_num, m, tag,
+						RC_NVME_NVM_OP_WRITE,
+						phys, (u16)(nr_sectors - 1),
+						(req->cmd_flags & REQ_FUA) != 0,
+						pdu->ms_sg[m],
+						pdu->ms_nents[m])) {
+					rc_volume_unmap_request_sg(pdu);
+					return BLK_STS_IOERR;
+				}
+			} else {
+				rc_volume_build_discard_sqe(&cmds[m],
+						hctx->queue_num, m,
+						tag, phys, nr_sectors);
+			}
+		}
+
+		blk_mq_start_request(req);
+		for (m = 0; m < nm; m++)
+			rc_nvme_io_submit(rc_volume_members[m]->ctx.nvme.io_queues[hctx->queue_num],
+					  &cmds[m]);
 	}
 
 	return BLK_STS_OK;
@@ -3544,12 +3645,20 @@ static blk_status_t rc_volume_queue_rq(struct blk_mq_hw_ctx *hctx,
 		return BLK_STS_OK;
 	}
 
-	rc_volume_build_io_sqe(&cmd, hctx->queue_num, member_idx, tag,
+	if (rc_volume_build_io_sqe(&cmd, hctx->queue_num, member_idx, tag,
 			       op == REQ_OP_WRITE ? RC_NVME_NVM_OP_WRITE
 						  : RC_NVME_NVM_OP_READ,
 			       phys_lba, (u16)(nr_sectors - 1),
 			       (req->cmd_flags & REQ_FUA) != 0,
-			       pdu->sg, pdu->nents);
+			       pdu->sg, pdu->nents)) {
+		blk_mq_start_request(req);
+		if (rc_volume_claim_completion(pdu)) {
+			rc_volume_unmap_request_sg(pdu);
+			rc_cache_dec_inflight(pdu);
+			blk_mq_end_request(req, BLK_STS_IOERR);
+		}
+		return BLK_STS_OK;
+	}
 
 	/* Must call blk_mq_start_request BEFORE submitting — otherwise the
 	 * ISR could complete the request before blk-mq considers it started. */
