@@ -164,7 +164,11 @@ jobs:
         env:
           RCRAID_QEMU_TIMEOUT: "600"   # headroom for a TCG fallback
         run: |
-          KVER="$(ls /lib/modules | sort -V | tail -1)"
+          # Pick the HWE -generic kernel we installed, NOT sort's overall
+          # newest: the runner's own azure flavor can sort higher (e.g.
+          # 6.17.0-1018-azure > 6.17.0-14-generic) and differs from the
+          # RAID box's target stack.
+          KVER="$(ls /lib/modules | grep -- '-generic$' | sort -V | tail -1)"
           echo "target kernel: $KVER"
           sudo install -m 644 "/boot/vmlinuz-$KVER" ./vmlinuz
           scripts/qemu-test/run-qemu-raid-test.sh \

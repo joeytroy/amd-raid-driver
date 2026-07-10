@@ -41,16 +41,24 @@ for arg in $(cat /proc/cmdline); do
 done
 [ -n "$expected_sectors" ] || fail "no expected_sectors= on kernel cmdline"
 
-# Bind every NVMe-class PCI function to rcbottom.  new_id entries die
-# with the module, so the reload cycle below calls this again.
+# Bind every NVMe-class PCI function to rcbottom, the same way the real
+# installers do it: pin with driver_override, unbind whatever driver holds
+# the device, and kick a re-probe.  new_id alone is NOT enough — kernels
+# with the in-tree nvme driver built in (e.g. Ubuntu's azure flavor on CI
+# runners) bind the virtual disks during boot, and new_id can't steal an
+# already-bound device.  driver_override outlives a module reload, but the
+# devices sit unbound after rmmod — the reload cycle below calls this again
+# for the re-probe kick.
 bind_nvme_functions() {
     found=0
     for d in /sys/bus/pci/devices/*; do
         [ "$(cat "$d/class")" = "0x010802" ] || continue
-        v=$(cat "$d/vendor"); dev=$(cat "$d/device")
-        # Duplicate IDs EEXIST on the second write; that's fine — actual
-        # bind success is verified by the driver-symlink check below.
-        echo "${v#0x} ${dev#0x}" > /sys/bus/pci/drivers/rcbottom/new_id 2>/dev/null
+        bdf="${d##*/}"
+        echo rcbottom > "$d/driver_override"
+        if [ -e "$d/driver" ]; then
+            echo "$bdf" > "$d/driver/unbind" 2>/dev/null
+        fi
+        echo "$bdf" > /sys/bus/pci/drivers_probe 2>/dev/null
         found=$((found + 1))
     done
     [ "$found" -ge 2 ] || fail "found $found NVMe functions, need >= 2"
