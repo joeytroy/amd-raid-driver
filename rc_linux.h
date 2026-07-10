@@ -202,6 +202,18 @@ struct rc_nvme_io_queue {
     // is up the ISR routes CQEs to blk_mq_complete_request instead.
     wait_queue_head_t cq_wait;
 
+    // Sync-command handshake (CID 0), guarded by `lock`.  The sync helper
+    // arms sync_pending before ringing the doorbell; whichever consumer
+    // sees the CQE first — the helper's poll loop or the ISR (live and
+    // processing this CQ whenever rc_volume_disk exists, e.g. module
+    // reload or controller auto-reset while the volume is up) — records
+    // the status in sync_sc and clears sync_pending under the lock.
+    // Without the handshake both consumers advance cq_head for the same
+    // CQE and the queue desyncs (observed on CI: the ISR ate a metadata
+    // read's CQE as "unknown CID=0" and the sync helper timed out).
+    bool           sync_pending;
+    u16            sync_sc;
+
     // hctx index this queue is mapped to.  Used by the per-queue ISR
     // to look up the right blk_mq_tags array.  -1 until blk-mq mapping
     // is established (step 3b); during 3a all queues map to hctx 0 and

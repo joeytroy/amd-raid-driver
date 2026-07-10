@@ -394,6 +394,17 @@ struct rc_volume_pdu {
 	u16                sc_sct;         /* NVMe SC/SCT, 0 = success */
 	u8                 hctx_idx;       /* for inflight counter decrement */
 	atomic_t           members_pending;
+	/* Single-completion claim.  Multiple actors can race to finish one
+	 * request — the ISR (batched direct-end fast path), the dead-member
+	 * drain, the .timeout handler, and queue_rq's own inline error/hit
+	 * paths — and blk-mq does NOT arbitrate between them (the ISR fast
+	 * path deliberately bypasses blk_mq_complete_request's state machine).
+	 * Every completion-initiating site must win
+	 * rc_volume_claim_completion() first; losers back off, the winner's
+	 * path performs the cleanup + end.  Observed unclaimed: mass-timeout
+	 * drain racing the ISR direct-end → request ref double-put WARN at
+	 * block/blk.h (CI qemu-rig). */
+	atomic_t           completed;
 	int                nents;          /* dma_map_sg output count, 0 = not mapped */
 	/* Multi-stripe (multi-member) dispatch.  When ms_active is true, the
 	 * request was split across multiple members in queue_rq; ms_nents[m]
@@ -409,6 +420,15 @@ struct rc_volume_pdu {
 	struct scatterlist sg[RC_VOLUME_DATA_PAGES];
 	struct scatterlist ms_sg[RC_VOLUME_MAX_MEMBERS][RC_VOLUME_MS_PAGES_PER_MEMBER];
 };
+
+/* Claim the exclusive right to complete this request.  Returns true for
+ * exactly one caller per request lifetime; every site that initiates
+ * completion (ISR, drain, timeout, queue_rq inline paths) must call this
+ * first and back off on false — the winner's path owns cleanup + end. */
+static inline bool rc_volume_claim_completion(struct rc_volume_pdu *pdu)
+{
+	return atomic_cmpxchg(&pdu->completed, 0, 1) == 0;
+}
 
 /* Helper: decrement the per-hctx inflight counter that was incremented at
  * the top of queue_rq.  Called from every code path that ends a request. */
@@ -550,7 +570,18 @@ irqreturn_t rc_nvme_io_queue_irq(int irq, void *dev_id)
 			break;
 
 		cid = le16_to_cpu(cqe->cid);
-		if (cid & RC_VOLUME_CACHE_CID_MASK) {
+		if (cid == 0 && q->sync_pending) {
+			/* Boot/reset-time sync command (rc_nvme_io_cmd_sync,
+			 * always CID 0): record the status and let the sync
+			 * waiter return.  This ISR is live and consuming this
+			 * CQ whenever rc_volume_disk exists (module reload,
+			 * controller auto-reset), so without this claim it
+			 * would eat the sync CQE as "unknown CID" and the
+			 * waiter would time out — dropping the member to the
+			 * legacy fallback path mid-reload. */
+			q->sync_sc = (status >> 1) & 0x7fff;
+			q->sync_pending = false;
+		} else if (cid & RC_VOLUME_CACHE_CID_MASK) {
 			/* Cache fill completion (CID 0x2000..0x2FFF):
 			 * bits 12..1 = entry_idx, bit 0 = cmd index. */
 			u16 sc = (status >> 1) & 0x7fff;
@@ -575,9 +606,13 @@ irqreturn_t rc_nvme_io_queue_irq(int irq, void *dev_id)
 						  (u64)blk_rq_pos(req),
 						  blk_rq_sectors(req), sc);
 				}
-				if (atomic_dec_and_test(&pdu->members_pending)) {
+				if (atomic_dec_and_test(&pdu->members_pending) &&
+				    rc_volume_claim_completion(pdu)) {
 					/* Try to defer to local batch; fall back
-					 * to the softirq path if the batch is full. */
+					 * to the softirq path if the batch is full.
+					 * (A lost claim means the drain/timeout
+					 * path is already finishing this request
+					 * — touching it again double-completes.) */
 					if (done_n < ARRAY_SIZE(done_reqs))
 						done_reqs[done_n++] = req;
 					else
@@ -598,6 +633,12 @@ irqreturn_t rc_nvme_io_queue_irq(int irq, void *dev_id)
 	if (advanced)
 		rc_nvme_ring_cq_doorbell(adapter, q->qid, q->cq_head);
 	spin_unlock(&q->lock);
+
+	/* The entry-time wake fires before CQ processing; wake again now so
+	 * a sync waiter whose CQE we just claimed doesn't sleep out its
+	 * current poll tick. */
+	if (advanced)
+		wake_up(&q->cq_wait);
 
 	/* Finish requests inline (no softirq round-trip).  Each call does
 	 * dma_unmap_sg + blk_mq_end_request.  Saves the .complete softirq
@@ -1417,55 +1458,90 @@ static void rc_nvme_io_submit(struct rc_nvme_io_queue *q,
 	spin_unlock_irqrestore(&q->lock, flags);
 }
 
-/* Synchronous I/O command used at boot time to read metadata before the
- * blk-mq disk is up.  Always runs against I/O queue 0 (qid=1).  Submits
- * a single SQE with CID=0, waits on q->cq_wait until the CQE arrives
- * (woken by rc_nvme_io_queue_irq), consumes the CQE, advances head +
- * doorbell.  Safe because the ISR returns early — without consuming
- * CQEs through blk_mq_complete_request — while rc_volume_disk is NULL. */
+/* Synchronous I/O command (always CID 0) used for metadata reads before
+ * the blk-mq disk is up — and during module reload / controller auto-reset,
+ * when the disk from the surviving assembly EXISTS and this queue's ISR is
+ * therefore live and consuming CQEs.  That concurrency is the whole design
+ * problem here: two consumers of one CQ.  The sync_pending handshake makes
+ * the CQE single-consumer — whichever side sees it first (the ISR's claim
+ * branch, or this poll loop under q->lock) records the status and clears
+ * sync_pending; head/phase/doorbell advance exactly once, under the lock.
+ * The old lock-free version snapshotted the CQ slot and raced the ISR:
+ * the ISR ate the CQE ("unknown CID=0"), this helper timed out, and the
+ * member dropped to the legacy fallback mid-reload (seen on CI). */
 static int rc_nvme_io_cmd_sync(struct rc_adapter *adapter,
 			       struct rc_nvme_sqe *cmd)
 {
 	struct rc_nvme_state *nvme = &adapter->ctx.nvme;
 	struct rc_nvme_io_queue *q;
-	struct rc_nvme_cqe *cqe;
 	unsigned long deadline;
-	u8 expected_phase;
-	u16 status, sc_sct;
+	unsigned long flags;
+	u16 sc_sct = 0;
+	bool done = false;
 
 	if (!nvme->io_queues[0])
 		return -ENODEV;
 	q = nvme->io_queues[0];
 
 	cmd->cid = cpu_to_le16(0);
+
+	/* Arm the handshake BEFORE the doorbell rings — the ISR can run the
+	 * moment the controller sees the SQE. */
+	spin_lock_irqsave(&q->lock, flags);
+	q->sync_pending = true;
+	q->sync_sc = 0;
+	spin_unlock_irqrestore(&q->lock, flags);
+
 	rc_nvme_io_submit(q, cmd);
 
-	cqe = (struct rc_nvme_cqe *)q->cq + q->cq_head;
-	expected_phase = q->cq_phase;
 	deadline = jiffies + msecs_to_jiffies(RC_NVME_ADMIN_TIMEOUT_MS);
-	while (time_before(jiffies, deadline)) {
+	while (!done && time_before(jiffies, deadline)) {
 		long left = deadline - jiffies;
 		long tick = min_t(long, left, max_t(long, 1, msecs_to_jiffies(1)));
 
-		if (wait_event_timeout(q->cq_wait,
-				       (le16_to_cpu(READ_ONCE(cqe->status)) & 1) ==
-					       expected_phase,
-				       tick) > 0)
-			goto have_cqe;
+		wait_event_timeout(q->cq_wait, !READ_ONCE(q->sync_pending),
+				   tick);
+
+		spin_lock_irqsave(&q->lock, flags);
+		if (!q->sync_pending) {
+			/* ISR claimed our CQE and recorded the status. */
+			sc_sct = q->sync_sc;
+			done = true;
+		} else {
+			/* Poll the CQ head ourselves — early boot runs before
+			 * IRQ delivery is functional.  Consume ONLY our own
+			 * CQE (CID 0); anything else on this queue belongs to
+			 * the ISR and is left in place. */
+			struct rc_nvme_cqe *cqe =
+				(struct rc_nvme_cqe *)q->cq + q->cq_head;
+			u16 status = le16_to_cpu(READ_ONCE(cqe->status));
+
+			if ((status & 1) == q->cq_phase &&
+			    le16_to_cpu(cqe->cid) == 0) {
+				sc_sct = (status >> 1) & 0x7fff;
+				q->sync_pending = false;
+				q->cq_head = (q->cq_head + 1) % q->cq_depth;
+				if (q->cq_head == 0)
+					q->cq_phase ^= 1;
+				rc_nvme_ring_cq_doorbell(adapter, q->qid,
+							 q->cq_head);
+				done = true;
+			}
+		}
+		spin_unlock_irqrestore(&q->lock, flags);
 	}
-	rc_printk(RC_ERROR,
-		  "rc_nvme_io_cmd_sync: timeout waiting for CQE (opc=0x%02x)\n",
-		  cmd->opc);
-	return -ETIMEDOUT;
 
-have_cqe:
-	status = le16_to_cpu(READ_ONCE(cqe->status));
-	sc_sct = (status >> 1) & 0x7fff;
-
-	q->cq_head = (q->cq_head + 1) % q->cq_depth;
-	if (q->cq_head == 0)
-		q->cq_phase ^= 1;
-	rc_nvme_ring_cq_doorbell(adapter, q->qid, q->cq_head);
+	if (!done) {
+		/* Disarm so a late CQE doesn't satisfy the NEXT sync command
+		 * with this one's stale status. */
+		spin_lock_irqsave(&q->lock, flags);
+		q->sync_pending = false;
+		spin_unlock_irqrestore(&q->lock, flags);
+		rc_printk(RC_ERROR,
+			  "rc_nvme_io_cmd_sync: timeout waiting for CQE (opc=0x%02x)\n",
+			  cmd->opc);
+		return -ETIMEDOUT;
+	}
 
 	if (sc_sct) {
 		rc_printk(RC_ERROR,
@@ -2989,6 +3065,7 @@ static blk_status_t rc_volume_queue_rq(struct blk_mq_hw_ctx *hctx,
 	pdu->ms_active = false;
 	memset(pdu->ms_nents, 0, sizeof(pdu->ms_nents));
 	pdu->cache_entry = NULL;
+	atomic_set(&pdu->completed, 0);
 	pdu->hctx_idx = (u8)(hctx->queue_num < RC_VOLUME_MAX_HCTX ?
 			     hctx->queue_num : 0xff);
 	if (pdu->hctx_idx < RC_VOLUME_MAX_HCTX)
@@ -3000,8 +3077,10 @@ static blk_status_t rc_volume_queue_rq(struct blk_mq_hw_ctx *hctx,
 	 * CIDs against a controller we no longer trust. */
 	if (rc_volume_any_member_dead()) {
 		blk_mq_start_request(req);
-		rc_cache_dec_inflight(pdu);
-		blk_mq_end_request(req, BLK_STS_IOERR);
+		if (rc_volume_claim_completion(pdu)) {
+			rc_cache_dec_inflight(pdu);
+			blk_mq_end_request(req, BLK_STS_IOERR);
+		}
 		return BLK_STS_OK;
 	}
 
@@ -3039,8 +3118,10 @@ static blk_status_t rc_volume_queue_rq(struct blk_mq_hw_ctx *hctx,
 		rc_printk(RC_ERROR,
 			  "rc_volume_queue_rq: unsupported op=%u rejected\n", op);
 		blk_mq_start_request(req);
-		rc_cache_dec_inflight(pdu);
-		blk_mq_end_request(req, BLK_STS_IOERR);
+		if (rc_volume_claim_completion(pdu)) {
+			rc_cache_dec_inflight(pdu);
+			blk_mq_end_request(req, BLK_STS_IOERR);
+		}
 		return BLK_STS_OK;
 	}
 
@@ -3054,8 +3135,10 @@ static blk_status_t rc_volume_queue_rq(struct blk_mq_hw_ctx *hctx,
 			  (u64)get_capacity(rc_volume_disk),
 			  RC_VOLUME_DATA_BYTES / 512);
 		blk_mq_start_request(req);
-		rc_cache_dec_inflight(pdu);
-		blk_mq_end_request(req, BLK_STS_IOERR);
+		if (rc_volume_claim_completion(pdu)) {
+			rc_cache_dec_inflight(pdu);
+			blk_mq_end_request(req, BLK_STS_IOERR);
+		}
 		return BLK_STS_OK;
 	}
 
@@ -3084,8 +3167,10 @@ static blk_status_t rc_volume_queue_rq(struct blk_mq_hw_ctx *hctx,
 			/* Errors return before dispatch_mirror's internal
 			 * blk_mq_start_request — start before ending. */
 			blk_mq_start_request(req);
-			rc_cache_dec_inflight(pdu);
-			blk_mq_end_request(req, st);
+			if (rc_volume_claim_completion(pdu)) {
+				rc_cache_dec_inflight(pdu);
+				blk_mq_end_request(req, st);
+			}
 		}
 		return BLK_STS_OK;
 	}
@@ -3111,8 +3196,10 @@ static blk_status_t rc_volume_queue_rq(struct blk_mq_hw_ctx *hctx,
 			 * blk-mq requires every request to be started exactly
 			 * once between queue_rq and end. */
 			blk_mq_start_request(req);
-			rc_cache_dec_inflight(pdu);
-			blk_mq_end_request(req, st);
+			if (rc_volume_claim_completion(pdu)) {
+				rc_cache_dec_inflight(pdu);
+				blk_mq_end_request(req, st);
+			}
 		}
 		return BLK_STS_OK;
 	}
@@ -3132,8 +3219,10 @@ static blk_status_t rc_volume_queue_rq(struct blk_mq_hw_ctx *hctx,
 				hctx, req, pdu, pos, nr_sectors);
 		if (st != BLK_STS_OK) {
 			blk_mq_start_request(req);
-			rc_cache_dec_inflight(pdu);
-			blk_mq_end_request(req, st);
+			if (rc_volume_claim_completion(pdu)) {
+				rc_cache_dec_inflight(pdu);
+				blk_mq_end_request(req, st);
+			}
 		}
 		return BLK_STS_OK;
 	}
@@ -3214,8 +3303,10 @@ static blk_status_t rc_volume_queue_rq(struct blk_mq_hw_ctx *hctx,
 			if (src && ce_status == 0) {
 				rc_volume_prefetch_copy_out(req, src);
 				blk_mq_start_request(req);
-				rc_cache_dec_inflight(pdu);
-				blk_mq_end_request(req, BLK_STS_OK);
+				if (rc_volume_claim_completion(pdu)) {
+					rc_cache_dec_inflight(pdu);
+					blk_mq_end_request(req, BLK_STS_OK);
+				}
 				return BLK_STS_OK;
 			}
 			if (issued_fill) {
@@ -3334,8 +3425,10 @@ static blk_status_t rc_volume_queue_rq(struct blk_mq_hw_ctx *hctx,
 					}
 				}
 				spin_unlock_irqrestore(&pf->lock, flags);
-				rc_cache_dec_inflight(pdu);
-				blk_mq_end_request(req, BLK_STS_OK);
+				if (rc_volume_claim_completion(pdu)) {
+					rc_cache_dec_inflight(pdu);
+					blk_mq_end_request(req, BLK_STS_OK);
+				}
 				return BLK_STS_OK;
 			}
 		} else if (op != REQ_OP_READ && hctx_idx < RC_VOLUME_MAX_HCTX) {
@@ -3361,8 +3454,10 @@ static blk_status_t rc_volume_queue_rq(struct blk_mq_hw_ctx *hctx,
 	st = rc_volume_map_request_sg(req, pdu, member_idx);
 	if (st != BLK_STS_OK) {
 		blk_mq_start_request(req);
-		rc_cache_dec_inflight(pdu);
-		blk_mq_end_request(req, st);
+		if (rc_volume_claim_completion(pdu)) {
+			rc_cache_dec_inflight(pdu);
+			blk_mq_end_request(req, st);
+		}
 		return BLK_STS_OK;
 	}
 
@@ -3591,7 +3686,13 @@ static bool rc_volume_drain_iter(struct request *req, void *priv)
 		}
 	}
 
-	if (kill && !blk_mq_request_completed(req)) {
+	if (kill && !blk_mq_request_completed(req) &&
+	    rc_volume_claim_completion(pdu)) {
+		/* The claim is what makes this safe against the ISR's
+		 * direct-end fast path, which bypasses the
+		 * blk_mq_complete_request state machine entirely — the
+		 * completed-state check alone leaves a double-completion
+		 * window there. */
 		pdu->sc_sct = RC_VOLUME_SC_DEAD;
 		blk_mq_complete_request(req);
 	}
@@ -3674,10 +3775,12 @@ static enum blk_eh_timer_return rc_volume_timeout(struct request *req)
 			  req->tag, pdu->op);
 		rc_volume_drain_dead();
 		rc_volume_schedule_auto_reset_for_req(pdu);
-		if (!blk_mq_request_completed(req)) {
+		if (!blk_mq_request_completed(req) &&
+		    rc_volume_claim_completion(pdu)) {
 			/* Drain should have caught it; if it didn't (e.g.,
 			 * member_idx out of range for some reason) the
-			 * direct end path bypasses .complete, so unmap here. */
+			 * direct end path bypasses .complete, so unmap here.
+			 * A lost claim means the drain or ISR owns it. */
 			rc_volume_unmap_request_sg(pdu);
 			rc_cache_dec_inflight(pdu);
 			blk_mq_end_request(req, BLK_STS_IOERR);
@@ -3701,7 +3804,8 @@ static enum blk_eh_timer_return rc_volume_timeout(struct request *req)
 			WRITE_ONCE(rc_volume_members[i]->ctx.nvme.dead, true);
 	rc_volume_drain_dead();
 	rc_volume_schedule_auto_reset_for_req(pdu);
-	if (!blk_mq_request_completed(req)) {
+	if (!blk_mq_request_completed(req) &&
+	    rc_volume_claim_completion(pdu)) {
 		rc_volume_unmap_request_sg(pdu);
 		rc_cache_dec_inflight(pdu);
 		blk_mq_end_request(req, BLK_STS_TIMEOUT);
@@ -4139,7 +4243,8 @@ static void rc_cache_isr(unsigned int entry_idx, u16 status)
 	}
 	spin_unlock_irqrestore(&rc_cache_lock, flags);
 
-	if (waiter)
+	if (waiter &&
+	    rc_volume_claim_completion(blk_mq_rq_to_pdu(waiter)))
 		blk_mq_complete_request(waiter);
 }
 

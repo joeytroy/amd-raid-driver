@@ -140,19 +140,32 @@ echo 3 > /proc/sys/vm/drop_caches
 got=$(dd if=/dev/rcraid0 bs=1M skip=33 count=4 2>/dev/null | md5sum | cut -d' ' -f1)
 [ "$got" = "$want" ] || fail "region at 33 MiB corrupted by later writes"
 
-echo "rcraid-test: reload cycle (metadata must still validate)"
-rmmod rcraid || fail "rmmod"
-insmod /rcraid.ko enable_writes=1 allow_foreign_nvme=1 || fail "re-insmod"
-bind_nvme_functions
-i=0
-while [ ! -b /dev/rcraid0 ]; do
-    i=$((i + 1))
-    [ "$i" -le 100 ] || fail "/dev/rcraid0 did not reappear after reload"
-    sleep 0.1
+# Three cycles, not one: the reload path is where the sync-metadata-read
+# vs ISR CQ race lived (the volume disk exists while the re-probed members
+# run their sync reads), and a single cycle reproduced it only sometimes.
+for cycle in 1 2 3; do
+    echo "rcraid-test: reload cycle $cycle (metadata must still validate)"
+    mark "reload cycle $cycle"
+    rmmod rcraid || fail "rmmod (cycle $cycle)"
+    insmod /rcraid.ko enable_writes=1 allow_foreign_nvme=1 \
+        || fail "re-insmod (cycle $cycle)"
+    bind_nvme_functions
+    i=0
+    while [ ! -b /dev/rcraid0 ]; do
+        i=$((i + 1))
+        [ "$i" -le 100 ] || fail "/dev/rcraid0 did not reappear after reload (cycle $cycle)"
+        sleep 0.1
+    done
+    echo 3 > /proc/sys/vm/drop_caches
+    got=$(dd if=/dev/rcraid0 bs=1M skip=33 count=4 2>/dev/null | md5sum | cut -d' ' -f1)
+    [ "$got" = "$want" ] || fail "data mismatch after module reload (cycle $cycle)"
+    # The reload must have come back via the commit-block path on every
+    # member — a legacy-fallback assembly here means the sync metadata
+    # reads raced the ISR (or the commit block failed to parse).
+    if dmesg | grep -q "falling back to legacy BDF ordering"; then
+        fail "a member fell back to legacy assembly during reload (cycle $cycle)"
+    fi
 done
-echo 3 > /proc/sys/vm/drop_caches
-got=$(dd if=/dev/rcraid0 bs=1M skip=33 count=4 2>/dev/null | md5sum | cut -d' ' -f1)
-[ "$got" = "$want" ] || fail "data mismatch after module reload"
 
 # Discard an 8 MiB region, then write+readback into it — exercises the DSM
 # path (RAID0 multi-member fan-out / RAID1 mirror fan-out) and proves the
