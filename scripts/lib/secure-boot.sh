@@ -15,10 +15,11 @@
 # where Secure Boot doesn't exist.
 #
 # A variable that exists but can't be read (firmware EIO quirks happen on
-# real boards) FAILS CLOSED: assume enforcing, warn, and let the user decide
-# via RCRAID_ALLOW_SECURE_BOOT=1.  Silently treating a read error as "not
-# enforcing" would reproduce the exact only-fails-at-next-boot behavior this
-# check exists to prevent.
+# real boards) — or reads back empty/truncated, which od reports as SUCCESS
+# with no output — FAILS CLOSED: assume enforcing, warn, and let the user
+# decide via RCRAID_ALLOW_SECURE_BOOT=1.  Silently treating an anomalous
+# variable as "not enforcing" would reproduce the exact only-fails-at-next-
+# boot behavior this check exists to prevent.
 #
 # RCRAID_EFIVARS_DIR overrides the efivarfs path (for tests only).
 
@@ -34,7 +35,13 @@ secure_boot_enforcing() {
             echo "      Secure Boot is ENFORCING (override: RCRAID_ALLOW_SECURE_BOOT=1)" >&2
             return 0
         fi
-        [ "${byte//[[:space:]]/}" = "1" ]
+        byte="${byte//[[:space:]]/}"
+        if [ -z "$byte" ]; then
+            echo "WARN: SecureBoot EFI variable exists but is empty/truncated — assuming" >&2
+            echo "      Secure Boot is ENFORCING (override: RCRAID_ALLOW_SECURE_BOOT=1)" >&2
+            return 0
+        fi
+        [ "$byte" = "1" ]
         return
     done
     return 1

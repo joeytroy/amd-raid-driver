@@ -211,9 +211,22 @@ sudo mokutil --import MOK.der   # set a one-time password; on the next
                                 # reboot the MOK manager prompts you to
                                 # enrol the key with that password
 
-# After every build (including every DKMS rebuild):
-sudo "/usr/src/linux-headers-$(uname -r)/scripts/sign-file" sha256 \
-    MOK.priv MOK.der rcraid.ko
+# After every build (including every DKMS rebuild), sign the module the
+# kernel actually loads — DKMS installs it under updates/dkms, not the
+# build directory you happen to be standing in:
+MODULE="/lib/modules/$(uname -r)/updates/dkms/rcraid.ko"
+
+# Debian/Ubuntu header layout:
+sudo "/usr/src/linux-headers-$(uname -r)/scripts/sign-file" \
+    sha256 MOK.priv MOK.der "$MODULE"
+# Fedora/RHEL layout:
+sudo "/usr/src/kernels/$(uname -r)/scripts/sign-file" \
+    sha256 MOK.priv MOK.der "$MODULE"
+
+# If the OS boots from the array, the initramfs carries its own copy of
+# the module — regenerate it so the copy loaded at boot is the signed one:
+sudo update-initramfs -u    # Debian/Ubuntu
+sudo dracut -f              # Fedora/RHEL
 ```
 
 Automatic signing of DKMS rebuilds (the dkms `sign_tool` hook) is not
