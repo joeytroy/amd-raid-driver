@@ -36,9 +36,9 @@ from it**.
 |---|---|
 | **RAID levels** | RAID0 ✅ &nbsp;·&nbsp; RAID1 ✅ &nbsp;·&nbsp; RAID10 🗺️ roadmap &nbsp;·&nbsp; RAID5 ❌ not planned |
 | **Boot from the array** | ✅ Validated on hardware for **both** levels — installer script, DKMS rebuilds, initramfs hook, UEFI fallback entry |
-| **Throughput** (2× T700, PCIe 5.0) | RAID0 **19.7 / 18.7 GB/s** · RAID1 **20.5 / 11.1 GB/s** (seq R/W — [details](#benchmarks)) |
+| **Throughput** (2× T700, PCIe 5.0) | RAID0 **20.6 / 19.7 GB/s** · RAID1 **20.5 / 11.1 GB/s** (seq R/W — [details](#benchmarks)) |
 | **Filesystem safety** | FLUSH · FUA · DISCARD/TRIM — `fsync`, journaling, and `fstrim` behave correctly |
-| **Kernel** | ≥ 6.15 (Ubuntu 24.04: the HWE stack, 6.17+) |
+| **Kernel** | ≥ 6.15, validated through **Linux 7.0** (Kubuntu 26.04). Ubuntu 24.04 needs the HWE stack (6.17+) |
 | **Metadata** | 100 % read from the on-disk RAIDXpert config — nothing hardcoded |
 | **License** | GPL-2.0-only, clean-room under DMCA §1201(f) — aiming for mainline |
 
@@ -74,11 +74,11 @@ NVMe RAID controller as PCI `1022:B000`, which is fully implemented here.
   (~2× single-drive throughput); writes and discards fan out to every
   mirror and complete only when the *last* member acknowledges — an
   `fsync` can never pass while one mirror holds stale data.
-- **Boot Linux from the array.** Validated end to end for both levels:
-  Kubuntu 24.04 (HWE kernel 6.17) installed onto and booting from a
-  2× Crucial T700 array — as RAID0 and, separately, as RAID1 — with DKMS
-  rebuilds and an initramfs hook that brings the array up before
-  `pivot_root`.
+- **Boot Linux from the array.** Validated end to end for both levels
+  and two LTS releases: Kubuntu 24.04 (kernel 6.17) and Kubuntu 26.04
+  (kernel 7.0) installed onto and booting from a 2× Crucial T700 array —
+  as RAID0 and, separately, as RAID1 — with DKMS rebuilds and an
+  initramfs hook that brings the array up before `pivot_root`.
 - **Filesystem-safe.** FLUSH, FUA, and DISCARD/TRIM are all wired up,
   so `fsync`, journaling, and `fstrim` behave correctly.
 - **Fast — and true to each RAID level's physics.** Interrupt-driven
@@ -98,25 +98,31 @@ read-only default only applies to a bare manual `insmod`.
 ## Benchmarks
 
 KDiskMark 3.3.0 on `/dev/rcraid0` — 2× Crucial T700 (PCIe 5.0) on a TRX50
-motherboard. The RAID1 run was measured **booted from the mirror**, with
-the array serving `/`.
+motherboard. Both runs were measured **booted from the array**, with the
+array serving `/`: the RAID0 run on Kubuntu 26.04 (Linux 7.0), the RAID1
+run on Kubuntu 24.04 (Linux 6.17).
 
-| SEQ1M Q8T1 | RAID0 | RAID1 |
+| SEQ1M Q8T1 | RAID0 (Linux 7.0) | RAID1 (Linux 6.17) |
 |---|---:|---:|
-| **Sequential read** | 19.7 GB/s | **20.5 GB/s** |
-| **Sequential write** | 18.7 GB/s | 11.1 GB/s |
-| **Random 4K read (Q32)** | — | 281 K IOPS |
-| **Random 4K write (Q32)** | — | 256 K IOPS |
+| **Sequential read** | **20.6 GB/s** | 20.5 GB/s |
+| **Sequential write** | **19.7 GB/s** | 11.1 GB/s |
+| **Sequential read (Q1)** | 10.6 GB/s | 5.9 GB/s |
+| **Sequential write (Q1)** | 11.4 GB/s | 7.4 GB/s |
+| **Random 4K read (Q32)** | 310 K IOPS | 281 K IOPS |
+| **Random 4K write (Q32)** | 282 K IOPS | 256 K IOPS |
 
-Why the numbers look the way they do: RAID1 **reads** beat even RAID0
-because both mirrors serve reads in parallel with no stripe-boundary
-splits; RAID1 **writes** are bounded by a single drive because every
-write must land on both mirrors — that's the mirror contract, not
-overhead.
+Why the numbers look the way they do: RAID1 **reads** keep pace with
+RAID0 because both mirrors serve reads in parallel with no
+stripe-boundary splits; RAID1 **writes** are bounded by a single drive
+because every write must land on both mirrors — that's the mirror
+contract, not overhead. And the driver gets faster with the kernel for
+free: the same RAID0 array that did 19.7 / 18.7 GB/s on Linux 6.17 does
+**20.6 / 19.7 GB/s on Linux 7.0** — the interrupt-driven, zero-copy
+design rides every block-layer improvement upstream lands.
 
 <p align="center">
   <img src="image/kdiskmark.png" width="480" alt="KDiskMark on /dev/rcraid0: 19,730 MB/s read, 18,715 MB/s write (SEQ1M Q8T1)"><br>
-  <em>KDiskMark 3.3.0 on <code>/dev/rcraid0</code> — RAID0 across two Crucial T700 NVMe SSDs (PCIe 5.0) on a TRX50 motherboard.</em>
+  <em>KDiskMark 3.3.0 on <code>/dev/rcraid0</code> — RAID0 across two Crucial T700 NVMe SSDs (PCIe 5.0) on a TRX50 motherboard (Linux 6.17 run).</em>
 </p>
 
 ---
