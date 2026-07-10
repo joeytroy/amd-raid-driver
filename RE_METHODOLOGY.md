@@ -147,10 +147,13 @@ identifier (`GPL-2.0-only`) and a copyright header crediting Joey Troy
 and contributors. The headers also state that the file is original
 work derived only from interoperability-protected reverse engineering.
 
-The directory `drivers/reference/amd-sdk-9.3.0/` contains AMD-shipped
+The directory `drivers/reference/amd-sdk-9.3.0/` contained AMD-shipped
 source (under their `LICENSE_SDK`) and the closed `rcblob.x86_64`.
-These files are reference material only. They are not compiled into,
-linked with, or otherwise incorporated into the produced kernel module.
+These files were reference material only. They were never compiled
+into, linked with, or otherwise incorporated into the produced kernel
+module, and have since been removed from the tree entirely — they
+remain in git history (`git checkout 69738ee -- drivers/`) and on
+AMD's public download pages.
 
 ## If you are AMD
 

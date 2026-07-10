@@ -20,8 +20,7 @@ New here? Read **REVERSE_ENGINEERING.md** for how the hardware works, then
 | Path | What's there |
 |---|---|
 | `rc_*.c` / `rc_linux.h` | Linux driver source |
-| `drivers/windows/trx50/9.3.2-00255/` | Windows driver, last vulnerable release (matches the RE docs) |
-| `drivers/windows/trx50/9.3.3-00291/` | Windows driver, current build (CVE-2024-21962 fixed in `rccfg.sys`) |
+| `drivers/windows/trx50/` | *(removed from the tree — restore with `git checkout 69738ee -- drivers/`)* Windows drivers the RE docs reference: 9.3.2-00255 (last vulnerable release, matches the Ghidra extracts) and 9.3.3-00291 (current, CVE-2024-21962 fixed in `rccfg.sys`) |
 | `scripts/ghidra/` | Headless Ghidra scripts that produced the `ghidra_output/` extracts |
 | `docs/ghidra_output/` | Raw Ghidra extracts (decomp, call-site buckets, hex dumps) |
 

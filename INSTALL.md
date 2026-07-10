@@ -221,9 +221,11 @@ and paste it into a new development session.
 
 ### "I just want to compare against the working Windows driver"
 
-The Windows binaries are at `drivers/windows/trx50/9.3.3-00291/` (CVE
-patched) and `drivers/windows/trx50/9.3.2-00255/` (the version all
-Ghidra docs reference). Use Ghidra headless via the script in
+The Windows binaries were removed from the tree (vendor-distributed
+material) — restore them from git history with
+`git checkout 69738ee -- drivers/`: `drivers/windows/trx50/9.3.3-00291/`
+(CVE patched) and `9.3.2-00255/` (the version all Ghidra docs
+reference). Use Ghidra headless via the script in
 `scripts/ghidra/HuntBlockers.java`. See `docs/README.md` for the
 command line.
 
