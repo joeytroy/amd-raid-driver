@@ -644,7 +644,14 @@ struct rc_raidcore_md {
 #define RC_LDT_RAID0			0x1BF6u
 #define RC_LDT_RAID1			0x1BF7u
 #define RC_LDT_SINGLE			0x1BF9u	/* per-disk raw/JBOD LD published
-						 * by firmware for non-members */
+						 * by firmware for non-members.
+						 * NEVER accepted as a volume:
+						 * its element array is the
+						 * disk's own DeviceID, so it
+						 * would match the ownership
+						 * check and assemble a bogus
+						 * 1-member volume (the parser
+						 * skips all devices<2 records) */
 #define RC_LDT_RAID5			0x1BFAu
 #define RC_LDT_RAID10			0x1BFBu
 

@@ -26,7 +26,9 @@ the live config):
     bug that shipped) assembles this dead config and fails the test's
     capacity/level checks.
   - the ACTIVE generation 16 sectors in, pointed at by the commit
-    block, holding the real LD record.
+    block, holding a raw single-disk LD (0x1BF9, member 0's own
+    DeviceID — must be skipped, not assembled) followed by the real
+    array LD record.
 
 RAID level is encoded the way firmware does it: DeviceType 0x1BF6 for
 both levels, with FirstCount x SecondCount = stripe width x mirror count
@@ -63,6 +65,10 @@ CONFIG_RING_SIZE = 2048  # RC_MetaData.ConfigRingSize, sectors
 DST_LOGICAL_DEVICE = 0x25BD
 # Firmware writes 0x1BF6 for RAID0 AND RAID1 (level lives in the counts).
 DEVTYPE_VOLUME = 0x1BF6
+# Per-disk "raw disk" LD firmware publishes for non-array disks (1x1
+# counts, element array = the disk's own DeviceID).  The driver must never
+# assemble one of these as a volume.
+DEVTYPE_SINGLE = 0x1BF9
 LEVELS = ("raid0", "raid1", "raid5", "raid10")
 
 # RC_LogicalDevice field offsets (rc_linux.h RC_LD_*_OFFSET)
@@ -156,6 +162,30 @@ def counts_for(level: str, members: int):
     if level == "raid1":
         return 1, 2
     raise ValueError(level)
+
+
+def build_raw_disk_ld(device_id: int, disk_sectors: int) -> bytes:
+    """The per-disk raw LD (0x1BF9): devices=1, FirstCount=SecondCount=1,
+    element array = this disk's own DeviceID, capacity = the raw disk.
+    Placed in the committed generation BEFORE the array LD, mimicking real
+    firmware — a parser that accepts it assembles a bogus 1-member volume
+    and fails the test's capacity/level checks."""
+    size = ELEM_ARRAY_OFFSET + LE_BYTES
+    ld = bytearray(size)
+    struct.pack_into("<I", ld, 0x00, DST_LOGICAL_DEVICE)
+    struct.pack_into("<I", ld, LD_ELEMENTOFFSET, ELEM_ARRAY_OFFSET)
+    struct.pack_into("<I", ld, LD_DEVICETYPE, DEVTYPE_SINGLE)
+    struct.pack_into("<Q", ld, LD_CAPACITY, disk_sectors)
+    struct.pack_into("<I", ld, LD_DEVICES, 1)
+    struct.pack_into("<I", ld, LD_FIRSTCOUNT, 1)
+    struct.pack_into("<I", ld, LD_SECONDCOUNT, 1)
+    struct.pack_into("<I", ld, LD_PACKETSIZE, size)
+    struct.pack_into("<I", ld, LD_CHUNKINDEX, 1)
+    e = ELEM_ARRAY_OFFSET
+    struct.pack_into("<Q", ld, e + LE_DEVICEID, device_id)
+    struct.pack_into("<Q", ld, e + LE_ALLOC_SIZE, disk_sectors)
+    struct.pack_into("<Q", ld, e + LE_USERDATA_SIZE, disk_sectors)
+    return bytes(ld)
 
 
 def build_ld_record(level: str, device_ids, capacity: int,
@@ -253,10 +283,16 @@ def main():
 
     device_ids = [0x5243544553540000 + i for i in range(len(args.images))]
 
-    # Active generation: the real config, named by the commit block.
+    # Active generation: the real config, named by the commit block.  A raw
+    # single-disk LD for member 0 goes FIRST, like real firmware layouts —
+    # its element array is member 0's own DeviceID, so a parser that treats
+    # raw-disk records as volumes matches it before the array LD and
+    # assembles a bogus 1-member volume (wrong capacity and level → the
+    # guest checks fail).
+    raw_ld = build_raw_disk_ld(device_ids[0], min_sectors)
     active_ld = build_ld_record(args.level, device_ids, capacity,
                                 user_size, args.chunk_index)
-    active_gen = build_generation(ACTIVE_GEN_TS, active_ld)
+    active_gen = build_generation(ACTIVE_GEN_TS, raw_ld + active_ld)
 
     # Decoy generation: a dead config for the OPPOSITE level with the same
     # DeviceIDs and a capacity that can't match the active one.  Sits at

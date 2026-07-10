@@ -1755,12 +1755,18 @@ static u32 rc_ld_level_from(u32 devtype, u32 first, u32 second, u32 devices)
 	if (devtype == RC_LDT_RAID1)
 		return RC_LDT_RAID1;	/* explicit encoding (synthetic rigs;
 					 * kept in case some firmware uses it) */
-	if (devtype != RC_LDT_RAID0 && devtype != RC_LDT_SINGLE)
+	/* RC_LDT_SINGLE (0x1BF9) is deliberately NOT accepted: those are the
+	 * per-physical-disk "raw disk" LDs firmware publishes for non-array
+	 * disks.  Their element array is exactly this disk's own DeviceID, so
+	 * they'd match the parser's ownership check and assemble a bogus
+	 * 1-member volume over the raw disk.  The parser also skips any
+	 * devices < 2 record for the same reason (belt and braces). */
+	if (devtype != RC_LDT_RAID0)
 		return 0;
 	if (!first || !second || first * second != devices)
 		return 0;
 	if (second == 1)
-		return RC_LDT_RAID0;	/* pure stripe (or single disk) */
+		return RC_LDT_RAID0;	/* pure stripe */
 	if (first == 1 && second == 2)
 		return RC_LDT_RAID1;	/* 2-way mirror */
 	return 0;
@@ -1916,6 +1922,19 @@ static void rc_volume_parse_logical_device(struct rc_adapter *adapter)
 			    RC_DST_LOGICAL_DEVICE)
 				continue;
 
+			/* Every fixed-offset field below must lie within the
+			 * bytes THIS transfer actually read — chunk_index at
+			 * +0x110 is the farthest.  A tag this close to the end
+			 * of a non-final chunk is re-scanned at the head of
+			 * the next (overlap); this close to the end of the
+			 * FINAL chunk the record is truncated by the committed
+			 * generation length and invalid anyway.  Without this
+			 * check the reads land in stale bytes from a previous
+			 * transfer — or, for avail == chunk_bytes, past the
+			 * end of the DMA buffer allocation entirely. */
+			if ((u64)i + RC_LD_CHUNKINDEX_OFFSET + 4 > avail)
+				continue;
+
 			ld = buf + i;
 			devtype  = get_unaligned_le32(ld + RC_LD_DEVICETYPE_OFFSET);
 			devices  = get_unaligned_le32(ld + RC_LD_DEVICES_OFFSET);
@@ -1976,27 +1995,19 @@ static void rc_volume_parse_logical_device(struct rc_adapter *adapter)
 				  (unsigned long long)user_off,
 				  (unsigned long long)user_sz,
 				  my_pos < 0 ? " (skip — not our member)" :
-					       " (match)");
+				  devices < 2 ? " (skip — raw single-disk LD)" :
+					        " (match)");
 
 			if (my_pos < 0)
 				continue;
 
-			/* Cross-check: total capacity must equal the
-			 * per-member user-data size times the stripe width
-			 * (mirrors don't add capacity).  A mismatch means we
-			 * misread the geometry somewhere — keep the volume
-			 * readable but veto writes. */
-			if (devices >= 2 && level &&
-			    capacity != user_sz * first_count) {
-				rc_printk(RC_WARN,
-					  "rc_volume_parse_logical_device: %s capacity %llu != user_sz %llu x first_count %u — geometry UNTRUSTED, writes will be vetoed\n",
-					  pci_name(adapter->pdev),
-					  (unsigned long long)capacity,
-					  (unsigned long long)user_sz,
-					  first_count);
-				rc_volume_geometry_untrust_reason =
-					"the LD record's total capacity doesn't equal per-member user size x stripe width — the on-disk geometry doesn't add up, so some field is being misread";
-			}
+			/* A devices < 2 record with our DeviceID is this
+			 * disk's own raw "single disk" LD (0x1BF9), which
+			 * firmware publishes for every non-array disk — NOT
+			 * the array we belong to.  Matching it would assemble
+			 * a bogus 1-member volume over the raw disk. */
+			if (devices < 2)
+				continue;
 
 			nvme->ld_device_type      = devtype;
 			nvme->ld_first_count      = first_count;
@@ -2253,6 +2264,24 @@ static void rc_volume_register_member(struct rc_adapter *adapter)
 				  nvme->ld_first_count, nvme->ld_second_count,
 				  nvme->ld_devices);
 			goto out;
+		}
+		/* Cross-check: total capacity must equal the per-member
+		 * user-data size times the stripe width (mirrors don't add
+		 * capacity).  A mismatch means we misread the geometry
+		 * somewhere — keep the volume readable but veto writes.
+		 * Runs here rather than in the parser so the write to the
+		 * lock-protected untrust reason happens under rc_volume_lock
+		 * like every other writer. */
+		if (nvme->ld_capacity_sectors !=
+		    nvme->ld_userdata_size * nvme->ld_first_count) {
+			rc_printk(RC_WARN,
+				  "rc_volume_register_member: %s capacity %llu != user_sz %llu x first_count %u — geometry UNTRUSTED, writes will be vetoed\n",
+				  pci_name(adapter->pdev),
+				  (unsigned long long)nvme->ld_capacity_sectors,
+				  (unsigned long long)nvme->ld_userdata_size,
+				  nvme->ld_first_count);
+			rc_volume_geometry_untrust_reason =
+				"the LD record's total capacity doesn't equal per-member user size x stripe width — the on-disk geometry doesn't add up, so some field is being misread";
 		}
 		expected = nvme->ld_devices;
 		chunk_sectors = rc_volume_chunk_sectors_for(nvme->ld_level,
