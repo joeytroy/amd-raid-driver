@@ -155,6 +155,15 @@ For status of work already done, see [`STATUS.md`](STATUS.md).
 - [ ] **RAID1 (mirror)** — read from either member (load-balance);
       write to both. Per-member error → mark degraded, keep going.
       Metadata parser already recognises `RC_LDT_RAID1`.
+      *Progress:* the I/O path shipped — round-robin read balancing,
+      write/discard fan-out to every mirror completing on last ACK,
+      RAID-level seeding + consistency checks at registration.
+      Validated on the QEMU rig (mirror images byte-identical after the
+      test workload); hardware validation pending a real RAID1 array.
+      Still open (and why this box stays unchecked): **degraded mode** —
+      today a member error fails the volume like RAID0 instead of
+      serving from the survivor.  That lands with hot-plug / failure
+      handling below.
 
 - [ ] **RAID10** — combination of RAID0 + RAID1. Stripe across
       mirrored pairs. Reuses RAID0 stripe math + RAID1 mirror dispatch.
