@@ -6,14 +6,30 @@ are best-effort/untested.
 
 ## Current state (2026-07)
 
-The driver is a working daily-driver for **NVMe RAID0**: it boots Linux from
-the array as rootfs, reads and writes at ~19.7 GB/s symmetric, and survives
-kernel updates via DKMS. What's live today:
+The driver is a working daily-driver for **NVMe RAID0 and RAID1**: it boots
+Linux from the array as rootfs (validated on hardware for both levels),
+reads and writes at drive-limited speeds, and survives kernel updates via
+DKMS. What's live today:
 
-- **NVMe RAID0**, geometry auto-detected from on-disk RAIDCore metadata
-  (member count, order, stripe size — nothing hardcoded).
+- **NVMe RAID0 + RAID1**, geometry auto-detected from on-disk RAIDCore
+  metadata (member count, order, stripe size, RAID level — nothing
+  hardcoded). The parser follows the **config-commit block** to the active
+  config generation (the ring is a journal; deleted arrays' records
+  persist in older generations) and derives the RAID level from
+  **FirstCount × SecondCount** (firmware writes DeviceType 0x1BF6 for both
+  levels). See the 2026-07-10 log entry below and
+  [`REVERSE_ENGINEERING.md`](REVERSE_ENGINEERING.md).
+- **RAID1 mirror semantics**: round-robin read balancing (~2× single-drive
+  read throughput), write/discard fan-out to every mirror with last-ACK
+  completion (an fsync can't pass while a mirror holds stale data).
+  Hardware-validated 2026-07-10: Kubuntu 24.04 installed onto and booting
+  from a 2× T700 RAID1; KDiskMark SEQ1M Q8T1 20.5 GB/s read /
+  11.1 GB/s write on the mirror as rootfs.
 - **Reads and writes** (`enable_writes=1`; installers set it). Writes stage
-  through scatterlist-native DMA — no bounce buffers.
+  through scatterlist-native DMA — no bounce buffers. The fan-out paths
+  merge physically-contiguous bio fragments before building PRPs
+  (sub-page buffer-head writeback — mkfs metadata — is unexpressible as
+  PRPs otherwise; see the 2026-07-10 log entry).
 - **4 I/O queues × depth 256** per controller (blk-mq `nr_hw_queues=4`,
   1024 outstanding), MSI-X, fully interrupt-driven async completion. Each
   hctx has its own PRP-list pool (per-tag-per-member-per-hctx).
@@ -25,14 +41,63 @@ kernel updates via DKMS. What's live today:
 - **Boot-from-RAID** via dracut / initramfs-tools hooks; DKMS + udev autobind;
   live-CD install workflow; suspend/resume (S3/S4).
 
-Not yet: RAID1/10/5, hot-plug/rebuild, SMART pass-through, multi-volume,
-Secure Boot signing out of the box, array creation from Linux. The prioritized
-roadmap is in [`IMPLEMENTATION.MD`](IMPLEMENTATION.MD); the RE ground truth is
-in [`REVERSE_ENGINEERING.md`](REVERSE_ENGINEERING.md).
+Not yet: **RAID1 degraded mode** (a member failure still fails the volume —
+the mirror's data survives on both drives but the volume goes down; this is
+the top roadmap item), RAID10/5, hot-plug/rebuild, SMART pass-through,
+multi-volume, Secure Boot signing out of the box, array creation from Linux.
+The prioritized roadmap is in [`IMPLEMENTATION.MD`](IMPLEMENTATION.MD); the
+RE ground truth is in [`REVERSE_ENGINEERING.md`](REVERSE_ENGINEERING.md).
 
 The sections below are the dated implementation log — how each piece was built,
 kept for forensics. Where an early "Not started" / "Next steps" note has since
 been implemented, it's marked.
+
+## 2026-07-10 — RAID1 hardware validation (PRs #43, #44, #45)
+
+Reformatting the dev box for a real BIOS RAID1 array turned hardware
+validation into a bug hunt that ended with the box booting from the mirror.
+Every failure below shipped past the QEMU rig as it then existed; each fix
+landed with the rig upgraded to regression-test that exact class.
+
+- **Secure Boot preflight** (#43): the live installer died at insmod with
+  "Key was rejected by service" — a BIOS reset had silently re-enabled
+  Secure Boot. Both installers now read the SecureBoot efivar up front
+  (failing closed on unreadable/truncated variables) and abort with
+  instructions before building anything.
+- **The config ring is a journal; the commit block names the truth** (#44):
+  the driver assembled the box's *deleted* RAID0 (3.69 TB, writable!)
+  instead of the new RAID1 — deleted arrays' LD records persist in older
+  config generations, DeviceIDs are per-disk, so first-match-in-ring finds
+  the corpse, and the stale record is internally consistent so the
+  geometry-trust gate never fires. The commit block at ConfigCommitOffset
+  names the active generation (extent + timestamp linkage, both now
+  validated). Same PR: firmware writes DeviceType 0x1BF6 for RAID0 *and*
+  RAID1 — the real level encoding is FirstCount × SecondCount (stripe
+  width × mirror count).
+- **Three latent concurrency bugs** (#44, exposed by the new CI rig):
+  boot-time sync metadata reads raced the per-queue ISR on the same CQ
+  during module reload (fixed with a locked handshake + dedicated
+  *sequenced* sync CIDs — a fixed CID 0 aliases blk-mq tag 0, and a stale
+  CQE from a timed-out sync command must not satisfy the next one); the
+  ISR's direct-end fast path could double-complete a request against the
+  dead-member drain (fixed with an atomic per-request completion claim);
+  raw single-disk LDs (0x1BF9) could assemble as a bogus 1-member volume
+  (their element array *is* the disk's own DeviceID — devices < 2 records
+  are now skipped).
+- **Fan-out scatterlists must merge contiguous fragments** (#45): the OS
+  install died at mkfs — every mirror write of mke2fs metadata rejected by
+  both members with NVMe SC 0x13 "PRP Offset Invalid". The hand-rolled
+  bvec walks in the mirror/multi-stripe paths built one sg entry per bvec;
+  sub-page buffer-head writeback then puts non-first segments at in-page
+  offsets, which PRP lists cannot express. `blk_rq_map_sg` (the
+  single-member path) merges — the fan-out builders now do too
+  (`rc_volume_sg_append`), and `rc_volume_build_prp` rejects
+  unexpressible layouts with one clean I/O error instead of submitting.
+- **CI now boots the driver in QEMU on every PR** (`qemu-rig` jobs,
+  raid0 + raid1): synthetic metadata booby-trapped with a stale decoy
+  generation and a raw single-disk LD, plus a guest battery of
+  write/readback, 3× module-reload cycles (with legacy-fallback
+  detection), discard+rewrite, and a real bundled `mke2fs` run.
 
 ## Where we are
 
