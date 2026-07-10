@@ -251,8 +251,7 @@ inclusion.
 | `rc_*.c`, `rc_*.h` | The driver (SPDX `GPL-2.0-only`) |
 | `Makefile`, `build.sh`, `test_driver.sh`, `bench.sh`, `unload.sh` | Build + test helpers |
 | `docs/` | Status, open questions, Ghidra findings, decompiled extracts |
-| `drivers/windows/trx50/` | AMD Windows binaries used as RE input |
-| `drivers/reference/` | Third-party reference material (own licenses; not compiled in) |
+| `drivers/` | *(removed from the tree)* AMD Windows binaries + Linux SDK used as RE input — vendor-distributed material, never compiled in. Retrievable from git history: `git checkout 69738ee -- drivers/`, or from AMD's public download pages |
 | `scripts/ghidra/` | Headless-Ghidra extraction scripts |
 
 ---

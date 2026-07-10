@@ -5,7 +5,9 @@ reverse-engineered from the shipped binaries, and how the Linux port mirrors
 it. This is the single source of truth for the RE work; where an older doc
 disagrees with this file, this file wins.
 
-**Binaries analysed** (under `drivers/windows/trx50/`):
+**Binaries analysed** (formerly under `drivers/windows/trx50/` — removed
+from the tree; restore with `git checkout 69738ee -- drivers/` or
+download from AMD):
 
 | Binary | Version | Role |
 |---|---|---|
@@ -443,7 +445,8 @@ Ghidra 12 needs JDK 17+. The project is stored outside the repo.
 ```sh
 export JAVA_HOME="C:\Program Files\Eclipse Adoptium\jdk-21.0.11.10-hotspot"
 
-# Re-import
+# Re-import (binaries are no longer in the tree — first restore them
+# with `git checkout 69738ee -- drivers/` or download from AMD)
 "C:\Program Files\ghidra_12.1_PUBLIC\support\analyzeHeadless.bat" \
   C:/Users/dev/ghidra_projects amd-raid \
   -import drivers/windows/trx50/9.3.2-00255/rcbottom/rcbottom.sys -overwrite
