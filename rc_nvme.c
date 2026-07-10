@@ -1966,6 +1966,18 @@ static u32 rc_volume_expected_members;
 static u32 rc_volume_chunk_sectors_for(u32 devtype, u32 ld_chunk,
 				       u32 ld_chunk_index)
 {
+	/* RAID1 first, BEFORE the ld_chunk early return: mirrors don't
+	 * stripe, so ChunkSize is not a data-layout parameter for them, and
+	 * every size assumption in the mirror fan-out (per-member sg arrays,
+	 * one NVMe command per member, u16 NLB) is derived from this fixed
+	 * granule — an on-disk ChunkSize, whatever real RAID1 firmware
+	 * metadata encodes there, must not override it.  512 sectors =
+	 * 256 KiB: comfortably under MDTS (512 KiB) and the per-member sg
+	 * array (RC_VOLUME_MS_PAGES_PER_MEMBER pages), and the same
+	 * cache/prefetch granularity as the RAID0 default. */
+	if (devtype == RC_LDT_RAID1)
+		return 512u;
+
 	if (ld_chunk)
 		return ld_chunk;
 	switch (devtype) {
@@ -1976,15 +1988,6 @@ static u32 rc_volume_chunk_sectors_for(u32 devtype, u32 ld_chunk,
 		case 1:
 		default: return 128u;
 		}
-	case RC_LDT_RAID1:
-		/* Mirrors don't stripe — this is purely the request-split
-		 * granule (queue_limits.chunk_sectors), picked so one request
-		 * maps to exactly one NVMe command per member: 512 sectors =
-		 * 256 KiB, comfortably under MDTS (512 KiB) and under the
-		 * per-member sg array (RC_VOLUME_MS_PAGES_PER_MEMBER pages).
-		 * Also the granularity the read cache/prefetch operate at,
-		 * same as the RAID0 default. */
-		return 512u;
 	default:
 		return 0u;
 	}
@@ -2695,8 +2698,11 @@ static blk_status_t rc_volume_dispatch_multi_stripe_discard(
  * the read balancer, TODAY) would happily serve.
  *
  * WRITE size is bounded by queue_limits.chunk_sectors (512 sectors for
- * RAID1), so one NVMe command per member always suffices and the per-member
- * sg arrays can't overflow.  DISCARD is NOT chunk-split by blk-mq, but a
+ * RAID1) so one NVMe command per member always suffices, and segment count
+ * by the RAID1 max_segments cap (= RC_VOLUME_MS_PAGES_PER_MEMBER, set in
+ * rc_volume_create_disk) so the per-member sg arrays can't overflow — the
+ * runtime guard below is a belt-and-braces backstop, not the contract.
+ * DISCARD is NOT chunk-split by blk-mq, but a
  * mirror discard of any size is still one contiguous DSM range per member —
  * identity mapping keeps every logical range physically contiguous. */
 static blk_status_t rc_volume_dispatch_mirror(
@@ -4278,7 +4284,17 @@ static int rc_volume_create_disk(void)
 			 * for multi-stripe requests, into one NVMe cmd per
 			 * member via rc_volume_dispatch_multi_stripe). */
 			.max_hw_sectors      = RC_VOLUME_DATA_BYTES / 512,
-			.max_segments        = RC_VOLUME_DATA_PAGES,
+			/* RAID1 caps segments at the per-member sg array size:
+			 * mirror writes copy the request's segments into
+			 * ms_sg[member][RC_VOLUME_MS_PAGES_PER_MEMBER], so
+			 * blk-mq must never legally hand queue_rq more
+			 * segments than that array holds.  (virt_boundary
+			 * already bounds a 256 KiB request to ~65 segments in
+			 * practice, but the advertised contract is what
+			 * matters — don't rely on the implicit math.) */
+			.max_segments        = rc_volume_raid_level == RC_LDT_RAID1
+						? RC_VOLUME_MS_PAGES_PER_MEMBER
+						: RC_VOLUME_DATA_PAGES,
 			.max_segment_size    = PAGE_SIZE,
 			/* NVMe PRP semantics: PRP1 may carry an in-page offset,
 			 * PRP2 and PRP-list entries must point at page starts.
