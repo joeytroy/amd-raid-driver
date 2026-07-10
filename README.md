@@ -1,21 +1,53 @@
-# rcraid — AMD-RAID driver for Linux
+<div align="center">
+
+# ⚡ rcraid
+
+### The native Linux driver for AMD-RAID NVMe arrays
+
+**Clean-room. GPL-2.0. No Windows, no proprietary blob.**
+
+[![CI](https://github.com/joeytroy/amd-raid-driver/actions/workflows/ci.yml/badge.svg)](https://github.com/joeytroy/amd-raid-driver/actions/workflows/ci.yml)
+[![License: GPL-2.0-only](https://img.shields.io/badge/License-GPL--2.0--only-blue.svg)](LICENSE)
+[![Kernel](https://img.shields.io/badge/Kernel-%E2%89%A5%206.15-orange.svg)](#-quick-start)
+[![RAID](https://img.shields.io/badge/RAID0%20%2B%20RAID1-hardware%20validated-success.svg)](#-benchmarks)
+[![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](#-for-developers)
 [![Donate via PayPal](https://img.shields.io/badge/Donate-PayPal-blue.svg)](https://www.paypal.com/paypalme/joeytroynm)
 
-A clean-room Linux kernel module that lets you read and write your
-**AMD-RAID NVMe arrays** natively — no Windows, no proprietary blob.
+Your RAIDXpert array becomes an ordinary block device at `/dev/rcraid0` —
+partition it, format it, mount it, benchmark it, and **boot Linux straight
+from it**.
 
-If your motherboard is in RAID mode and you built an array in RAIDXpert,
-`rcraid` assembles it into an ordinary block device at `/dev/rcraid0`
-that you can partition, format, mount, and even **boot Linux from**.
+[Quick start](#-quick-start) ·
+[Supported hardware](#-is-my-hardware-supported) ·
+[Benchmarks](#-benchmarks) ·
+[Safety](#-safety-first) ·
+[Roadmap](#-not-yet-supported) ·
+[Contributing](#-for-developers)
 
-> ⚠️ **Read the [safety notes](#safety-first) before loading the driver.**
-> The AMD chipset makes *every* NVMe look like the same PCI device, so
-> the driver has guardrails to keep it off your OS disk — but you must
-> point it at the right drives.
+</div>
 
 ---
 
-## Is my hardware supported?
+> ⚠️ **Read the [safety notes](#-safety-first) before loading the driver.**
+> The AMD chipset makes *every* NVMe look like the same PCI device, so the
+> driver has guardrails to keep it off your OS disk — but you must point it
+> at the right drives.
+
+## 📌 At a glance
+
+| | |
+|---|---|
+| **RAID levels** | RAID0 ✅ &nbsp;·&nbsp; RAID1 ✅ &nbsp;·&nbsp; RAID10 🗺️ roadmap &nbsp;·&nbsp; RAID5 ❌ not planned |
+| **Boot from the array** | ✅ Validated on hardware for **both** levels — installer script, DKMS rebuilds, initramfs hook, UEFI fallback entry |
+| **Throughput** (2× T700, PCIe 5.0) | RAID0 **19.7 / 18.7 GB/s** · RAID1 **20.5 / 11.1 GB/s** (seq R/W — [details](#-benchmarks)) |
+| **Filesystem safety** | FLUSH · FUA · DISCARD/TRIM — `fsync`, journaling, and `fstrim` behave correctly |
+| **Kernel** | ≥ 6.15 (Ubuntu 24.04: the HWE stack, 6.17+) |
+| **Metadata** | 100 % read from the on-disk RAIDXpert config — nothing hardcoded |
+| **License** | GPL-2.0-only, clean-room under DMCA §1201(f) — aiming for mainline |
+
+---
+
+## 🔌 Is my hardware supported?
 
 **Yes, if you have an AMD-RAID NVMe array** on any recent AMD platform —
 Ryzen 7000+, Ryzen AI 300 / AI Max, Threadripper 7000 / 9000 (TRX50 /
@@ -27,46 +59,63 @@ NVMe RAID controller as PCI `1022:B000`, which is fully implemented here.
 | `1022:B000` | NVMe RAID Bottom (TRX50, WRX90, X870/X670, B850/B650, …) | ✅ **RAID0 + RAID1 read/write, boot-from-array validated** |
 | `1022:43BD` `7905` `7916` `7917` | SATA RAID (Promontory / older) | ⚙️ Claimed but stubbed — not yet implemented |
 
-**RAID level:** RAID0 and RAID1 both work today, each validated on real
-hardware up to installing and booting Linux from the array. RAID10 is on
-the roadmap. RAID5 is not planned (AMD only supports it on 3rd-gen
-Threadripper). Note that RAID1 **degraded mode is not implemented yet** —
-see [Not yet supported](#not-yet-supported).
+> **Heads-up for RAID1 users:** degraded mode is **not implemented yet** —
+> a member failure downs the volume (your data stays safe on both drives,
+> but availability goes with it). Details under
+> [Not yet supported](#-not-yet-supported).
 
 ---
 
-## What works today
+## ✨ What works today
 
-- **RAID0 and RAID1 volumes, read *and* write** at `/dev/rcraid0` —
-  member count, member order, stripe size, RAID level, and capacity are
-  all read from the on-disk RAIDXpert metadata (specifically from the
-  **committed** config generation, so a previously deleted array on the
-  same disks can never be assembled by mistake). Nothing is hardcoded.
-- **RAID1 mirrors done right**: reads round-robin across both members
-  (~2× single-drive throughput), writes and discards fan out to every
+- 🧠 **Metadata-native assembly.** Member count, member order, stripe
+  size, RAID level, and capacity all come from the on-disk RAIDXpert
+  metadata — read from the **committed** config generation, so a
+  previously deleted array on the same disks can never be assembled by
+  mistake. Nothing is hardcoded.
+- 🪞 **RAID1 mirrors done right.** Reads round-robin across both members
+  (~2× single-drive throughput); writes and discards fan out to every
   mirror and complete only when the *last* member acknowledges — an
   `fsync` can never pass while one mirror holds stale data.
-- **Boot Linux from the array.** Validated end to end for both levels:
+- 🥾 **Boot Linux from the array.** Validated end to end for both levels:
   Kubuntu 24.04 (HWE kernel 6.17) installed onto and booting from a
   2× Crucial T700 array — as RAID0 and, separately, as RAID1 — with DKMS
   rebuilds and an initramfs hook that brings the array up before
   `pivot_root`.
-- **Filesystem-safe.** FLUSH, FUA, and DISCARD/TRIM are all wired up, so
-  `fsync`, journaling, and `fstrim` behave correctly.
-- **Fast — and true to each RAID level's physics.** On the same 2-drive
-  array (KDiskMark 3.3.0, SEQ1M Q8T1): **RAID0** ~19.7 GB/s read /
-  ~18.7 GB/s write; **RAID1** ~20.5 GB/s read (both mirrors serving in
-  parallel) / ~11.1 GB/s write (bounded by one drive, as every mirror
-  write must be). Interrupt-driven async completion with a
-  scatterlist-native DMA path — the hardware reads and writes your
-  pages directly, no bounce buffers or memcpy.
-- **Resilient.** 30 s command timeouts, controller health tracking,
+- 🧾 **Filesystem-safe.** FLUSH, FUA, and DISCARD/TRIM are all wired up,
+  so `fsync`, journaling, and `fstrim` behave correctly.
+- 🚀 **Fast — and true to each RAID level's physics.** Interrupt-driven
+  async completion with a scatterlist-native DMA path: the hardware reads
+  and writes your pages directly, no bounce buffers, no memcpy. Numbers
+  below.
+- 🛡️ **Resilient.** 30 s command timeouts, controller health tracking,
   best-effort NVMe Abort, and automatic controller reset on the first
   timeout — with a manual sysfs reset as a fallback.
 
 Writes are **off by the module's default** (`enable_writes=1` to opt in) —
 the `install-livecd.sh` and DKMS installers turn writes on for you; the
 read-only default only applies to a bare manual `insmod`.
+
+---
+
+## 📊 Benchmarks
+
+KDiskMark 3.3.0 on `/dev/rcraid0` — 2× Crucial T700 (PCIe 5.0) on a TRX50
+motherboard. The RAID1 run was measured **booted from the mirror**, with
+the array serving `/`.
+
+| SEQ1M Q8T1 | RAID0 | RAID1 |
+|---|---:|---:|
+| **Sequential read** | 19.7 GB/s | **20.5 GB/s** |
+| **Sequential write** | 18.7 GB/s | 11.1 GB/s |
+| **Random 4K read (Q32)** | — | 281 K IOPS |
+| **Random 4K write (Q32)** | — | 256 K IOPS |
+
+Why the numbers look the way they do: RAID1 **reads** beat even RAID0
+because both mirrors serve reads in parallel with no stripe-boundary
+splits; RAID1 **writes** are bounded by a single drive because every
+write must land on both mirrors — that's the mirror contract, not
+overhead.
 
 <p align="center">
   <img src="image/kdiskmark.png" width="480" alt="KDiskMark on /dev/rcraid0: 19,730 MB/s read, 18,715 MB/s write (SEQ1M Q8T1)"><br>
@@ -75,7 +124,7 @@ read-only default only applies to a bare manual `insmod`.
 
 ---
 
-## Safety first
+## 🛟 Safety first
 
 Two things protect your data and your OS install. Understand both:
 
@@ -95,12 +144,14 @@ Two things protect your data and your OS install. Understand both:
 
 Also note: the module is **unsigned**, so **Secure Boot must be off**
 (or you sign the module yourself and enrol the key — see `INSTALL.md`).
+Both installers check this up front and tell you exactly what to do.
 
 ---
 
-## Quick start
+## 🚀 Quick start
 
 **Prerequisites**
+
 - BIOS in RAID mode, array already created in RAIDXpert (see `INSTALL.md`
   for the one-time BIOS setup).
 - Secure Boot disabled.
@@ -217,7 +268,7 @@ Full setup, troubleshooting, and the Secure-Boot / signing details are in
 
 ---
 
-## Not yet supported
+## 🚧 Not yet supported
 
 - **RAID1 degraded mode / rebuild** — ⚠️ **know this before trusting the
   mirror**: today a member failure fails the whole volume (same behavior
@@ -225,7 +276,8 @@ Full setup, troubleshooting, and the Secure-Boot / signing details are in
   still duplicated on both drives — nothing is lost — but the volume
   goes down until the array is healthy again. Degraded-mode operation,
   hot-plug handling, and background rebuild are the next roadmap items.
-- **RAID10** — roadmap. **RAID5** — not planned.
+- **RAID10** — roadmap. **RAID5** — not planned (AMD only supports it on
+  3rd-gen Threadripper).
 - **SATA RAID** — the `43BD / 7905 / 7916 / 7917` controllers are claimed
   but the AHCI path is a stub.
 - **No array management** — create/modify the array in BIOS/RAIDXpert.
@@ -247,7 +299,7 @@ The prioritized checklist lives in
 
 ---
 
-## For developers
+## 🤝 For developers
 
 This is a clean-room driver reverse-engineered from AMD's publicly
 distributed Windows binaries under DMCA §1201(f) interoperability
@@ -286,7 +338,7 @@ page-aligned tests can never generate).
 
 ---
 
-## License
+## ⚖️ License
 
 **GPL-2.0-only** — see [`LICENSE`](LICENSE). Maintained by Joey Troy
 (`@joeytroy`).
