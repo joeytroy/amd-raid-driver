@@ -32,9 +32,11 @@ fail() {
 }
 
 expected_sectors=""
+expected_level=""
 for arg in $(cat /proc/cmdline); do
     case "$arg" in
         expected_sectors=*) expected_sectors="${arg#expected_sectors=}" ;;
+        expected_level=*)   expected_level="${arg#expected_level=}" ;;
     esac
 done
 [ -n "$expected_sectors" ] || fail "no expected_sectors= on kernel cmdline"
@@ -84,6 +86,20 @@ done
 size=$(cat /sys/block/rcraid0/size)
 echo "rcraid-test: /dev/rcraid0 up, $size sectors (expected $expected_sectors)"
 [ "$size" = "$expected_sectors" ] || fail "capacity mismatch: $size != $expected_sectors"
+
+# The volume must have assembled at the requested RAID level — the metadata
+# images carry a DECOY generation for the OPPOSITE level (same DeviceIDs),
+# so a parser that ignores the commit block matches the decoy and shows the
+# wrong level here (and the wrong capacity above).  The parse log prints
+# "(level=RAID1) ... (match)" for the record it accepted.
+if [ -n "$expected_level" ]; then
+    want_level=$(echo "$expected_level" | tr 'a-z' 'A-Z')
+    if ! dmesg | grep "rc_volume_parse_logical_device" | grep "(match)" \
+            | grep -q "level=$want_level"; then
+        fail "volume did not assemble as $want_level (decoy generation matched?)"
+    fi
+    echo "rcraid-test: assembled level verified: $want_level"
+fi
 
 # Round-trip test: 4 MiB of /dev/urandom at three offsets — volume start,
 # an unaligned mid-volume position (crosses stripe boundaries), and the

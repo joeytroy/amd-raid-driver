@@ -264,7 +264,13 @@ struct rc_nvme_state {
     // this member's config ring (LBA md_config_ring_lba + scan).  Populated
     // after rc_volume_parse_logical_device runs.
     bool           ld_valid;
-    u32            ld_device_type;      // RC_LogicalDevice.DeviceType (RC_LDT_*)
+    u32            ld_device_type;      // RC_LogicalDevice.DeviceType (raw on-disk value)
+    u32            ld_first_count;      // RC_LogicalDevice.FirstCount (stripe width)
+    u32            ld_second_count;     // RC_LogicalDevice.SecondCount (mirror count)
+    u32            ld_level;            // normalized level derived from the three
+                                        // fields above: RC_LDT_RAID0, RC_LDT_RAID1,
+                                        // or 0 for a layout this driver has no
+                                        // dispatch path for (member is refused)
     u32            ld_devices;          // RC_LogicalDevice.Devices (member count)
     u32            ld_chunk_sectors;    // RC_LogicalDevice.ChunkSize (0 → use RAID-level default)
     u32            ld_chunk_index;      // RC_LogicalDevice field@0x110 — RAID0 stripe encoding (1→64K, 2→128K, 3→256K, ...)
@@ -607,11 +613,55 @@ struct rc_raidcore_md {
  * the basic RAID levels use an undocumented range that the writer dispatches
  * on directly (see RC_CreateRaidArray in rcblob).  RAID0 = 0x1BF6 confirmed
  * by reading the live array on the dev box.  Other values listed here are
- * inferred from the dispatch table and are best-effort. */
+ * inferred from the dispatch table and are best-effort.
+ *
+ * IMPORTANT (2026-07-10, real TRX50 RAID1 dumps): firmware writes DeviceType
+ * 0x1BF6 for BOTH RAID0 and RAID1 volumes.  The actual layout is encoded in
+ * FirstCount × SecondCount (stripe width × mirror count):
+ *
+ *     BIOS RAID0, 2 disks:  DeviceType=0x1BF6 FirstCount=2 SecondCount=1
+ *     BIOS RAID1, 2 disks:  DeviceType=0x1BF6 FirstCount=1 SecondCount=2
+ *     raw single disk:      DeviceType=0x1BF9 FirstCount=1 SecondCount=1
+ *
+ * FirstCount * SecondCount == Devices holds on every observed record.  So
+ * 0x1BF6 is better read as "generic striped/mirrored volume"; the driver
+ * derives the effective level from the counts (rc_ld_level_from()) and only
+ * uses these RC_LDT_* values as its own normalized level identifiers.
+ * 0x1BF7 is retained as an explicit RAID1 encoding (accepted if some
+ * firmware writes it; also what our synthetic rig wrote historically). */
 #define RC_LDT_RAID0			0x1BF6u
 #define RC_LDT_RAID1			0x1BF7u
+#define RC_LDT_SINGLE			0x1BF9u	/* per-disk raw/JBOD LD published
+						 * by firmware for non-members */
 #define RC_LDT_RAID5			0x1BFAu
 #define RC_LDT_RAID10			0x1BFBu
+
+/* Config-commit block — one sector at RC_MetaData.config_commit_lba
+ * (0x5001 on every observed disk).  Decoded from real TRX50 firmware dumps
+ * (2026-07-10): the config ring is a JOURNAL of whole config generations
+ * (each: one header sector, then packed PhysicalDevice / LogicalDevice
+ * records), and this block is the two-phase-commit pointer that names the
+ * ACTIVE generation.  Deleted arrays' records persist in older generations
+ * — parsing the ring from the start and taking the first DeviceID match
+ * assembles a DEAD array (that exact bug shipped: a deleted RAID0's record
+ * shadowed the live RAID1 and presented a 2x-size striped volume).
+ *
+ *   +0x00 u64 — commit-block write timestamp (not consumed)
+ *   +0x08 u32 — active generation start LBA (absolute, inside the ring)
+ *   +0x0C u32 — active generation length in BYTES
+ *   +0x10 u64 — active generation's timestamp; must equal the u64 at
+ *               offset 0 of the generation's header sector (this is the
+ *               commit linkage the driver validates)
+ *   +0x30 u32 — generation sequence number (logged for forensics)
+ *
+ * The generation header sector carries the same timestamp at +0x00 plus
+ * intra-generation table offsets the driver doesn't need (records are
+ * located by tag scan within the generation extent). */
+#define RC_COMMIT_TS_OFFSET		0x00u
+#define RC_COMMIT_GEN_LBA_OFFSET	0x08u
+#define RC_COMMIT_GEN_LEN_OFFSET	0x0Cu
+#define RC_COMMIT_GEN_TS_OFFSET		0x10u
+#define RC_COMMIT_GEN_SEQ_OFFSET	0x30u
 
 /* On-disk RC_LogicalDevice record — describes one RAID volume.  Layout
  * matches `struct RC_LogicalDevice` from rcblob.x86_64 (pahole-confirmed,
@@ -626,8 +676,8 @@ struct rc_raidcore_md {
  * We declare only the fields the driver consumes; the trailing reserved
  * area is implicit. */
 #define RC_LD_DEVICES_OFFSET		0x68u	/* u32 — member count */
-#define RC_LD_FIRSTCOUNT_OFFSET		0x6Cu	/* u32 */
-#define RC_LD_SECONDCOUNT_OFFSET	0x70u	/* u32 */
+#define RC_LD_FIRSTCOUNT_OFFSET		0x6Cu	/* u32 — stripe width (see RC_LDT_* note) */
+#define RC_LD_SECONDCOUNT_OFFSET	0x70u	/* u32 — mirror count (see RC_LDT_* note) */
 #define RC_LD_CHUNKSIZE_OFFSET		0xACu	/* u32 — sectors, 0 for RAID0 */
 #define RC_LD_CHUNKINDEX_OFFSET		0x110u	/* u32 — RAID0 stripe index, see
 						 * rc_volume_chunk_sectors_for() */

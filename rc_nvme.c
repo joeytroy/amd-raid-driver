@@ -55,11 +55,14 @@ static struct rc_adapter *rc_volume_members[RC_VOLUME_MAX_MEMBERS];
 static u64 rc_volume_member_phys_offset[RC_VOLUME_MAX_MEMBERS];
 static int rc_volume_member_count;
 static u32 rc_volume_stripe_sectors;
-/* RAID level of the assembled volume (RC_LDT_*).  Seeded by the first
- * registered member from its on-disk LD DeviceType (RC_LDT_RAID0 for the
- * legacy no-LD fallback); later members must match or are rejected, same
- * contract as stripe_sectors/expected_members.  Everything level-specific
- * (map_lba, mirror fan-out in queue_rq) keys off this. */
+/* RAID level of the assembled volume — the NORMALIZED level (RC_LDT_RAID0 /
+ * RC_LDT_RAID1) derived by rc_ld_level_from() from the on-disk DeviceType +
+ * FirstCount x SecondCount, NOT the raw DeviceType (real firmware writes
+ * 0x1BF6 for both levels).  Seeded by the first registered member
+ * (RC_LDT_RAID0 for the legacy no-LD fallback); later members must match or
+ * are rejected, same contract as stripe_sectors/expected_members.
+ * Everything level-specific (map_lba, mirror fan-out in queue_rq) keys off
+ * this. */
 static u32 rc_volume_raid_level;
 /* RAID1 read balancer: monotonically increasing cursor; each read maps to
  * member (cursor % nmembers).  Plain round-robin — both mirrors see half
@@ -1653,19 +1656,113 @@ static int rc_volume_bdf_cmp(struct rc_adapter *a, struct rc_adapter *b)
 	return rc_volume_reverse_order ? -cmp : cmp;
 }
 
-/* How far into the config ring to scan for the first RC_LogicalDevice
- * record.  On the dev box the active LD is at ring+0x1d sectors; 128
- * sectors is plenty of headroom even for arrays with chains of older
- * configs preceding the current one. */
-#define RC_LD_SCAN_CHUNK_SECTORS	16u	/* 8 KiB = max 2-page rc_nvme_read_lba */
-#define RC_LD_SCAN_MAX_CHUNKS		8u	/* total = 128 sectors = 64 KiB */
+/* Chunking for the active-generation scan.  rc_nvme_read_lba caps a transfer
+ * at 2 pages (8 KiB = 16 sectors).  Consecutive chunks overlap by
+ * RC_LD_SCAN_OVERLAP_SECTORS so a record that starts near the end of one
+ * chunk is re-read whole at the head of the next: new record tags are only
+ * accepted in the first (CHUNK - OVERLAP) sectors of a non-final chunk.  The
+ * overlap (1 KiB) exceeds the largest possible LD record
+ * (0x130 fixed bytes + RC_VOLUME_MAX_MEMBERS * RC_LE_BYTES). */
+#define RC_LD_SCAN_CHUNK_SECTORS	16u
+#define RC_LD_SCAN_OVERLAP_SECTORS	2u
 
-/* Read sectors from the config ring and locate the first valid
- * RC_LogicalDevice record (tag 0x25BD).  Parse Devices, DeviceType,
+/* Derive the effective RAID level from the on-disk DeviceType +
+ * FirstCount (stripe width) x SecondCount (mirror count).  Real firmware
+ * writes DeviceType 0x1BF6 for BOTH RAID0 and RAID1 and encodes the layout
+ * in the counts (verified on TRX50 hardware dumps, 2026-07-10 — see the
+ * RC_LDT_* note in rc_linux.h).  Returns a normalized RC_LDT_RAID0 /
+ * RC_LDT_RAID1, or 0 for any layout this driver has no dispatch path for
+ * (RAID10, >2-way mirrors, count/device mismatches) — the caller must
+ * refuse to assemble those rather than guess. */
+static u32 rc_ld_level_from(u32 devtype, u32 first, u32 second, u32 devices)
+{
+	if (devtype == RC_LDT_RAID1)
+		return RC_LDT_RAID1;	/* explicit encoding (synthetic rigs;
+					 * kept in case some firmware uses it) */
+	if (devtype != RC_LDT_RAID0 && devtype != RC_LDT_SINGLE)
+		return 0;
+	if (!first || !second || first * second != devices)
+		return 0;
+	if (second == 1)
+		return RC_LDT_RAID0;	/* pure stripe (or single disk) */
+	if (first == 1 && second == 2)
+		return RC_LDT_RAID1;	/* 2-way mirror */
+	return 0;
+}
+
+/* Read the config-commit block and return the active config generation's
+ * extent within the ring.  The ring is a journal — records of DELETED
+ * arrays persist in older generations, and both can list this disk's
+ * DeviceID, so only records inside the committed generation may be trusted
+ * (assembling the first DeviceID match presented a deleted RAID0 in place
+ * of the live RAID1 on real hardware).  Layout in rc_linux.h.
+ *
+ * Validation: the extent must lie fully inside the config ring, and the
+ * generation header's leading timestamp must equal the commit block's
+ * recorded generation timestamp (two-phase-commit linkage) — checked by
+ * the caller when it reads the first chunk.  Returns 0 and fills the out
+ * params on success. */
+static int rc_volume_read_commit(struct rc_adapter *adapter, u8 *buf,
+				 dma_addr_t buf_dma, u64 *out_gen_lba,
+				 u32 *out_gen_bytes, u64 *out_gen_ts)
+{
+	struct rc_nvme_state *nvme = &adapter->ctx.nvme;
+	u64 ring_lba  = nvme->md_config_ring_lba;
+	u64 ring_end  = ring_lba + nvme->md_stripe_sectors; /* ConfigRingSize */
+	u64 gen_lba, gen_ts;
+	u32 gen_bytes, gen_seq;
+	int ret;
+
+	ret = rc_nvme_read_lba(adapter, nvme->md_config_commit_lba, 0,
+			       buf_dma);
+	if (ret) {
+		rc_printk(RC_WARN,
+			  "rc_volume_read_commit: %s read commit LBA 0x%llx failed (%d)\n",
+			  pci_name(adapter->pdev),
+			  (unsigned long long)nvme->md_config_commit_lba, ret);
+		return ret;
+	}
+
+	gen_lba   = get_unaligned_le32(buf + RC_COMMIT_GEN_LBA_OFFSET);
+	gen_bytes = get_unaligned_le32(buf + RC_COMMIT_GEN_LEN_OFFSET);
+	gen_ts    = get_unaligned_le64(buf + RC_COMMIT_GEN_TS_OFFSET);
+	gen_seq   = get_unaligned_le32(buf + RC_COMMIT_GEN_SEQ_OFFSET);
+
+	if (gen_lba < ring_lba || gen_lba >= ring_end ||
+	    !gen_bytes || gen_bytes % 512u ||
+	    gen_lba + gen_bytes / 512u > ring_end ||
+	    !gen_ts) {
+		rc_printk(RC_WARN,
+			  "rc_volume_read_commit: %s commit block invalid (gen@0x%llx len=%u ts=0x%016llx, ring 0x%llx..0x%llx) — cannot locate the active config generation\n",
+			  pci_name(adapter->pdev),
+			  (unsigned long long)gen_lba, gen_bytes,
+			  (unsigned long long)gen_ts,
+			  (unsigned long long)ring_lba,
+			  (unsigned long long)ring_end);
+		return -EBADMSG;
+	}
+
+	rc_printk(RC_NOTE,
+		  "rc_volume_read_commit: %s active config generation @LBA 0x%llx len=%u seq=%u ts=0x%016llx\n",
+		  pci_name(adapter->pdev), (unsigned long long)gen_lba,
+		  gen_bytes, gen_seq, (unsigned long long)gen_ts);
+
+	*out_gen_lba   = gen_lba;
+	*out_gen_bytes = gen_bytes;
+	*out_gen_ts    = gen_ts;
+	return 0;
+}
+
+/* Locate this member's RC_LogicalDevice record (tag 0x25BD) inside the
+ * ACTIVE config generation — the extent named by the commit block, NOT the
+ * whole ring (older generations hold records of deleted arrays that also
+ * list this disk's DeviceID).  Parse Devices, DeviceType,
+ * FirstCount/SecondCount (from which the effective RAID level is derived),
  * Capacity, ChunkSize, and walk the LogicalElement array to find this
  * adapter's position (where md_device_id matches an element's DeviceID).
  * Results land in adapter->ctx.nvme.ld_*.  Failure leaves ld_valid=false
- * — the caller falls back to the legacy BDF-ordered registration path. */
+ * — the caller falls back to the legacy BDF-ordered registration path,
+ * which is marked geometry-untrusted (read-only). */
 static void rc_volume_parse_logical_device(struct rc_adapter *adapter)
 {
 	struct device *dev = &adapter->pdev->dev;
@@ -1673,15 +1770,18 @@ static void rc_volume_parse_logical_device(struct rc_adapter *adapter)
 	u8 *buf;
 	dma_addr_t buf_dma;
 	const u32 chunk_bytes = RC_LD_SCAN_CHUNK_SECTORS * 512u;
-	u64 ring_lba = nvme->md_config_ring_lba;
-	u32 scan;
+	const u32 chunk_step  = (RC_LD_SCAN_CHUNK_SECTORS -
+				 RC_LD_SCAN_OVERLAP_SECTORS) * 512u;
+	u64 gen_lba, gen_ts;
+	u32 gen_bytes;
+	u32 pos;
 
 	nvme->ld_valid = false;
 	nvme->ld_my_position = -1;
 
-	if (!ring_lba) {
+	if (!nvme->md_config_ring_lba || !nvme->md_config_commit_lba) {
 		rc_printk(RC_WARN,
-			  "rc_volume_parse_logical_device: %s no config_ring_lba in metadata\n",
+			  "rc_volume_parse_logical_device: %s no config ring/commit LBA in metadata\n",
 			  pci_name(adapter->pdev));
 		return;
 	}
@@ -1690,25 +1790,48 @@ static void rc_volume_parse_logical_device(struct rc_adapter *adapter)
 	if (!buf)
 		return;
 
-	for (scan = 0; scan < RC_LD_SCAN_MAX_CHUNKS; scan++) {
-		u64 chunk_lba = ring_lba + scan * RC_LD_SCAN_CHUNK_SECTORS;
+	if (rc_volume_read_commit(adapter, buf, buf_dma,
+				  &gen_lba, &gen_bytes, &gen_ts))
+		goto done;
+
+	/* Walk the generation extent in overlapping chunks.  `pos` is the
+	 * byte offset of the current chunk within the generation. */
+	for (pos = 0; pos < gen_bytes; pos += chunk_step) {
+		u32 avail = min(chunk_bytes, gen_bytes - pos);
+		bool final = (pos + chunk_bytes >= gen_bytes);
+		/* Records whose tag starts in the overlap tail are picked up
+		 * by the next chunk instead (they may spill past this one). */
+		u32 scan_limit = final ? avail : chunk_step;
 		u32 i;
 		int ret;
 
-		ret = rc_nvme_read_lba(adapter, chunk_lba,
-				       (u16)(RC_LD_SCAN_CHUNK_SECTORS - 1),
-				       buf_dma);
+		ret = rc_nvme_read_lba(adapter, gen_lba + pos / 512u,
+				       (u16)(avail / 512u - 1), buf_dma);
 		if (ret) {
 			rc_printk(RC_WARN,
 				  "rc_volume_parse_logical_device: %s read LBA 0x%llx failed (%d)\n",
 				  pci_name(adapter->pdev),
-				  (unsigned long long)chunk_lba, ret);
+				  (unsigned long long)(gen_lba + pos / 512u),
+				  ret);
 			break;
 		}
 
-		for (i = 0; i + 4 <= chunk_bytes; i += 4) {
+		/* First chunk carries the generation header: verify the
+		 * two-phase-commit linkage before trusting any record. */
+		if (pos == 0 &&
+		    get_unaligned_le64(buf + RC_COMMIT_TS_OFFSET) != gen_ts) {
+			rc_printk(RC_WARN,
+				  "rc_volume_parse_logical_device: %s generation header ts 0x%016llx != committed ts 0x%016llx — commit/journal mismatch, refusing to parse\n",
+				  pci_name(adapter->pdev),
+				  (unsigned long long)get_unaligned_le64(buf + RC_COMMIT_TS_OFFSET),
+				  (unsigned long long)gen_ts);
+			break;
+		}
+
+		for (i = 0; i + 4 <= scan_limit; i += 4) {
 			u8 *ld;
 			u32 devtype, devices, elem_off, chunk, chunk_index;
+			u32 first_count, second_count, level;
 			u64 capacity;
 			int my_pos = -1;
 			u32 j;
@@ -1724,23 +1847,19 @@ static void rc_volume_parse_logical_device(struct rc_adapter *adapter)
 			chunk    = get_unaligned_le32(ld + RC_LD_CHUNKSIZE_OFFSET);
 			chunk_index = get_unaligned_le32(ld + RC_LD_CHUNKINDEX_OFFSET);
 			capacity = get_unaligned_le64(ld + RC_LD_CAPACITY_OFFSET);
-
-			/* Diagnostic.  An earlier reading of rcraid.sys 9.3.2
-			 * guessed SECONDCOUNT (+0x70) might be the authoritative
-			 * RAID0 member count instead of DEVICES (+0x68).
-			 * On-hardware boot logging DISPROVED that: on a healthy
-			 * 2-member RAID0 this array reports DEVICES=2 and
-			 * SECONDCOUNT=1.  So DEVICES is the member count (what we
-			 * key assembly off — correct), and SECONDCOUNT is some
-			 * other field.  Keep logging it purely for forensics.
-			 * See docs/REVERSE_ENGINEERING.md. */
-			u32 second_count =
+			/* FirstCount x SecondCount = stripe width x mirror
+			 * count — the REAL RAID-level encoding (DeviceType is
+			 * 0x1BF6 for both RAID0 and RAID1 on real firmware;
+			 * see rc_ld_level_from). */
+			first_count =
+				get_unaligned_le32(ld + RC_LD_FIRSTCOUNT_OFFSET);
+			second_count =
 				get_unaligned_le32(ld + RC_LD_SECONDCOUNT_OFFSET);
 
 			if (devices < 1 || devices > RC_VOLUME_MAX_MEMBERS)
 				continue;
 			if ((u64)i + elem_off +
-			    (u64)devices * RC_LE_BYTES > chunk_bytes)
+			    (u64)devices * RC_LE_BYTES > avail)
 				continue;
 
 			/* AMD also publishes one single-device "raw disk"
@@ -1763,12 +1882,18 @@ static void rc_volume_parse_logical_device(struct rc_adapter *adapter)
 				}
 			}
 
+			level = rc_ld_level_from(devtype, first_count,
+						 second_count, devices);
+
 			rc_printk(RC_INFO,
-				  "rc_volume_parse_logical_device: %s LD@ring+%u.%u devtype=0x%04x devices=%u second_count=%u chunk=%u chunk_idx=%u capacity=%llu my_pos=%d alloc_off=%llu alloc_sz=%llu user_off=%llu user_sz=%llu%s\n",
+				  "rc_volume_parse_logical_device: %s LD@gen+%u.%u devtype=0x%04x first=%u second=%u (level=%s) devices=%u chunk=%u chunk_idx=%u capacity=%llu my_pos=%d alloc_off=%llu alloc_sz=%llu user_off=%llu user_sz=%llu%s\n",
 				  pci_name(adapter->pdev),
-				  scan * RC_LD_SCAN_CHUNK_SECTORS + (i / 512),
-				  i % 512,
-				  devtype, devices, second_count, chunk, chunk_index,
+				  (pos + i) / 512, (pos + i) % 512,
+				  devtype, first_count, second_count,
+				  level == RC_LDT_RAID1 ? "RAID1" :
+				  level == RC_LDT_RAID0 ? "RAID0" :
+							  "UNSUPPORTED",
+				  devices, chunk, chunk_index,
 				  (unsigned long long)capacity, my_pos,
 				  (unsigned long long)alloc_off,
 				  (unsigned long long)alloc_sz,
@@ -1780,7 +1905,27 @@ static void rc_volume_parse_logical_device(struct rc_adapter *adapter)
 			if (my_pos < 0)
 				continue;
 
+			/* Cross-check: total capacity must equal the
+			 * per-member user-data size times the stripe width
+			 * (mirrors don't add capacity).  A mismatch means we
+			 * misread the geometry somewhere — keep the volume
+			 * readable but veto writes. */
+			if (devices >= 2 && level &&
+			    capacity != user_sz * first_count) {
+				rc_printk(RC_WARN,
+					  "rc_volume_parse_logical_device: %s capacity %llu != user_sz %llu x first_count %u — geometry UNTRUSTED, writes will be vetoed\n",
+					  pci_name(adapter->pdev),
+					  (unsigned long long)capacity,
+					  (unsigned long long)user_sz,
+					  first_count);
+				rc_volume_geometry_untrust_reason =
+					"the LD record's total capacity doesn't equal per-member user size x stripe width — the on-disk geometry doesn't add up, so some field is being misread";
+			}
+
 			nvme->ld_device_type      = devtype;
+			nvme->ld_first_count      = first_count;
+			nvme->ld_second_count     = second_count;
+			nvme->ld_level            = level;
 			nvme->ld_devices          = devices;
 			nvme->ld_chunk_sectors    = chunk;
 			nvme->ld_chunk_index      = chunk_index;
@@ -1795,9 +1940,9 @@ static void rc_volume_parse_logical_device(struct rc_adapter *adapter)
 		}
 	}
 	rc_printk(RC_WARN,
-		  "rc_volume_parse_logical_device: %s no matching LogicalDevice record found in first %u sectors of config ring\n",
-		  pci_name(adapter->pdev),
-		  RC_LD_SCAN_MAX_CHUNKS * RC_LD_SCAN_CHUNK_SECTORS);
+		  "rc_volume_parse_logical_device: %s no matching LogicalDevice record in the active config generation (%u bytes @LBA 0x%llx)\n",
+		  pci_name(adapter->pdev), gen_bytes,
+		  (unsigned long long)gen_lba);
 
 done:
 	dma_free_coherent(dev, chunk_bytes, buf, buf_dma);
@@ -1971,10 +2116,15 @@ static u32 rc_volume_chunk_sectors_for(u32 devtype, u32 ld_chunk,
 	 * every size assumption in the mirror fan-out (per-member sg arrays,
 	 * one NVMe command per member, u16 NLB) is derived from this fixed
 	 * granule — an on-disk ChunkSize, whatever real RAID1 firmware
-	 * metadata encodes there, must not override it.  512 sectors =
+	 * metadata encodes there, must not override it.  (Confirmed on real
+	 * TRX50 RAID1 metadata: the record carries chunk_index=3 even though
+	 * mirrors don't stripe — it must be ignored here.)  512 sectors =
 	 * 256 KiB: comfortably under MDTS (512 KiB) and the per-member sg
 	 * array (RC_VOLUME_MS_PAGES_PER_MEMBER pages), and the same
-	 * cache/prefetch granularity as the RAID0 default. */
+	 * cache/prefetch granularity as the RAID0 default.
+	 *
+	 * @devtype is the NORMALIZED level from rc_ld_level_from(), not the
+	 * raw on-disk DeviceType. */
 	if (devtype == RC_LDT_RAID1)
 		return 512u;
 
@@ -2015,8 +2165,21 @@ static void rc_volume_register_member(struct rc_adapter *adapter)
 	}
 
 	if (have_ld) {
+		/* Refuse layouts with no dispatch path (RAID10, >2-way
+		 * mirrors, FirstCount x SecondCount != Devices).  Guessing a
+		 * mapping for them turns every read into garbage and every
+		 * write into corruption, so the member is not registered at
+		 * all and the volume never assembles. */
+		if (!nvme->ld_level) {
+			rc_printk(RC_WARN,
+				  "rc_volume_register_member: %s unsupported RAID layout (DeviceType=0x%x FirstCount=%u SecondCount=%u Devices=%u) — ignoring member\n",
+				  pci_name(adapter->pdev), nvme->ld_device_type,
+				  nvme->ld_first_count, nvme->ld_second_count,
+				  nvme->ld_devices);
+			goto out;
+		}
 		expected = nvme->ld_devices;
-		chunk_sectors = rc_volume_chunk_sectors_for(nvme->ld_device_type,
+		chunk_sectors = rc_volume_chunk_sectors_for(nvme->ld_level,
 							    nvme->ld_chunk_sectors,
 							    nvme->ld_chunk_index);
 		if (!chunk_sectors) {
@@ -2032,7 +2195,7 @@ static void rc_volume_register_member(struct rc_adapter *adapter)
 		 * WRONG for a real 512 KiB / 1 MiB stripe and corrupt the array
 		 * on write.  Keep 64 KiB so reads still work, but distrust the
 		 * geometry so create_disk forces read-only. */
-		if (nvme->ld_device_type == RC_LDT_RAID0 &&
+		if (nvme->ld_level == RC_LDT_RAID0 &&
 		    nvme->ld_chunk_sectors == 0 && nvme->ld_chunk_index > 3) {
 			rc_printk(RC_WARN,
 				  "rc_volume_register_member: %s RAID0 chunk_index=%u not understood (only 0..3 map to a known stripe) — geometry UNTRUSTED, writes will be vetoed\n",
@@ -2057,20 +2220,21 @@ static void rc_volume_register_member(struct rc_adapter *adapter)
 		chunk_sectors = rc_volume_stripe_override;
 	}
 
-	/* First member: seed expected count + stripe + RAID level.  Later
-	 * members must match. */
+	/* First member: seed expected count + stripe + RAID level (the
+	 * NORMALIZED level from rc_ld_level_from — the raw on-disk DeviceType
+	 * is 0x1BF6 for both RAID0 and RAID1).  Later members must match. */
 	if (rc_volume_member_count == 0) {
 		rc_volume_expected_members = expected;
 		rc_volume_stripe_sectors   = chunk_sectors;
-		rc_volume_raid_level       = have_ld ? nvme->ld_device_type
+		rc_volume_raid_level       = have_ld ? nvme->ld_level
 						     : RC_LDT_RAID0;
 	} else {
-		if ((have_ld ? nvme->ld_device_type : RC_LDT_RAID0) !=
+		if ((have_ld ? nvme->ld_level : RC_LDT_RAID0) !=
 		    rc_volume_raid_level) {
 			rc_printk(RC_WARN,
 				  "rc_volume_register_member: %s RAID-level mismatch 0x%x vs 0x%x — ignoring\n",
 				  pci_name(adapter->pdev),
-				  have_ld ? nvme->ld_device_type : RC_LDT_RAID0,
+				  have_ld ? nvme->ld_level : RC_LDT_RAID0,
 				  rc_volume_raid_level);
 			goto out;
 		}

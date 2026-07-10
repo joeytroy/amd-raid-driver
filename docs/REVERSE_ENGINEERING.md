@@ -281,8 +281,8 @@ From `FUN_140018444` (`param_2` = on-disk packet, `param_1` = in-memory LD):
 | element-array offset | `+0x04` | `RC_LD_ELEMENTOFFSET_OFFSET 0x04` | ✅ |
 | Capacity (u64) | `+0x50` | `RC_LD_CAPACITY_OFFSET 0x50` | ✅ |
 | DEVICES (member count) | `+0x68` | `RC_LD_DEVICES_OFFSET 0x68` | ✅ **confirmed on hw (=2)** |
-| (FirstCount) | `+0x6C` | `RC_LD_FIRSTCOUNT_OFFSET 0x6C` | ✅ |
-| (SecondCount) | `+0x70` | `RC_LD_SECONDCOUNT_OFFSET 0x70` | ℹ️ =1 on 2-member RAID0 — NOT the member count |
+| FirstCount (stripe width) | `+0x6C` | `RC_LD_FIRSTCOUNT_OFFSET 0x6C` | ✅ **=2 on RAID0, =1 on RAID1 (hw)** |
+| SecondCount (mirror count) | `+0x70` | `RC_LD_SECONDCOUNT_OFFSET 0x70` | ✅ **=1 on RAID0, =2 on RAID1 (hw)** |
 | PacketSize | `+0x90` | `RC_LD_PACKETSIZE_OFFSET 0x90` | ✅ |
 | ChunkSize (u32 sectors; 0 for RAID0) | `+0xAC` | `RC_LD_CHUNKSIZE_OFFSET 0xAC` | ✅ |
 | chunk_index (u32) | `+0x110` | `RC_LD_CHUNKINDEX_OFFSET 0x110` | ✅ |
@@ -308,7 +308,7 @@ Identical to the Linux `rc_volume_chunk_sectors_for` (`case 3 → 512`,
 explicitly; every other value (including `1` and `0`→`1`) falls to 64 KiB.
 **There is no index ≥ 4 handling** — see the latent gap below.
 
-### DeviceType → RAID level (verified)
+### DeviceType → RAID level: the on-disk truth is FirstCount × SecondCount
 
 `FUN_14001c674` switches on DeviceType (in-mem `+4` ← on-disk `+0x0C`):
 
@@ -316,10 +316,25 @@ explicitly; every other value (including `1` and `0`→`1`) falls to 64 KiB.
 |---|---|---|
 | `0x1BF5` | (RAID-related; not in Linux enum) | — |
 | `0x1BF6` | RAID0 | `RC_LDT_RAID0` ✅ |
-| `0x1BF7` | RAID1 | `RC_LDT_RAID1` ✅ |
-| `0x1BF9` | (per-member "raw disk" variant) | — |
+| `0x1BF7` | RAID1 | `RC_LDT_RAID1` (never yet seen on disk) |
+| `0x1BF9` | (per-member "raw disk" variant) | `RC_LDT_SINGLE` |
 | `0x1BFA` | RAID5 | `RC_LDT_RAID5` ✅ |
 | `0x1BFB` | RAID10 | `RC_LDT_RAID10` |
+
+**Hardware correction (2026-07-10, TRX50 metadata dumps during RAID1
+validation): firmware writes DeviceType `0x1BF6` for BIOS-created RAID1
+volumes too.** The record for the live 2-disk RAID1 reads
+`devtype=0x1BF6, FirstCount=1, SecondCount=2, Capacity=<one member's user
+size>`; the old RAID0's record reads `devtype=0x1BF6, FirstCount=2,
+SecondCount=1, Capacity=<2× user size>`. So the on-disk RAID level is
+encoded as **FirstCount × SecondCount = stripe width × mirror count**
+(`FirstCount * SecondCount == Devices` on every observed record, including
+the `0x1BF9` raw-disk LDs at 1×1), and `0x1BF6` is best read as "generic
+striped/mirrored volume". Whatever the `0x1BF7` dispatch arm in
+`FUN_14001c674` consumes, it is not what this firmware writes to disk —
+the Windows in-memory DeviceType is presumably recomputed from the counts.
+The Linux driver derives the level from the counts (`rc_ld_level_from`)
+and refuses combinations it has no dispatch path for.
 
 AMD also writes one single-device "raw disk" LD per physical member
 (`devtype=0x1BF9, devices=1, capacity=NSZE`); the parser skips those by
@@ -331,10 +346,53 @@ checking whether our `DeviceId` appears in the element array.
 `0x70`→`[0x2e]`). A static read of the striping calc suggested `0x70` might be
 authoritative, but **on-hardware logging disproved it**: on the healthy
 2-member RAID0, `devices(0x68)=2` and `second_count(0x70)=1`. So `0x68` is the
-member count (Linux is correct); the driver still logs `0x70` for forensics on
-exotic layouts but deliberately keys off `0x68` — keying off `0x70` would have
-mis-counted the array as 1 member and broken assembly. A clean example of
-empirical validation catching a plausible-but-wrong decompiler inference.
+member count (Linux is correct). The 2026-07-10 RAID1 dumps then identified
+what `0x70` actually is — the **mirror count** (see the FirstCount ×
+SecondCount section above): keying off it on RAID0 would have mis-counted the
+array as 1 member, and the "forensic" logging of it is what let the RAID1
+level encoding be recognized. A clean example of empirical validation
+catching a plausible-but-wrong decompiler inference — twice.
+
+### Config ring is a journal; the commit block names the active generation
+
+**Verified on hardware (2026-07-10), found the hard way.** The config ring
+(LBA `0x5800`, `ConfigRingSize`=2048 sectors) is not a table — it is a
+journal of complete config **generations**, appended on every config change
+(array create/delete, and periodically: the dumps show ~19 generations for
+a handful of user actions). Each generation is:
+
+```
++0x000  header sector: u64 timestamp, then intra-generation table offsets
++0x200  packed records: PhysicalDevice (0x25BC) × N, LogicalDevice (0x25BD) × M
+```
+
+Deleted arrays' LD records **persist in older generations** with no
+tombstone — the whole generation is simply superseded. The **config-commit
+block** (one sector at `RC_MetaData.ConfigCommitOffset`, `0x5001` on every
+observed disk) is the two-phase-commit pointer that names the live
+generation:
+
+| Offset | Field |
+|---|---|
+| `+0x00` | u64 commit-write timestamp |
+| `+0x08` | u32 active generation start LBA |
+| `+0x0C` | u32 active generation length, bytes |
+| `+0x10` | u64 active generation's timestamp (== gen header `+0x00`) |
+| `+0x30` | u32 generation sequence number |
+
+Consequence: **scanning the ring from the start and taking the first LD
+whose element array contains the disk's DeviceID assembles a DEAD array.**
+DeviceIDs are per-physical-disk and survive array delete/create, so a
+deleted RAID0's record matches the same disks as the live RAID1 created
+after it. That exact bug shipped and presented a deleted 2-disk RAID0 (4 TB,
+striped, writable) in place of the live RAID1 (2 TB, mirrored) during
+hardware validation — caught only because the size looked wrong before the
+OS install. The parser must read the commit block, validate the extent and
+the timestamp linkage, and only trust records inside the committed
+generation. One quirk: the live generation carries the volume LD **twice**
+(identical geometry, two trailing fields differing — possibly
+current-vs-target tables for migration); first match within the committed
+extent is safe precisely because they agree.
 
 ### Latent gap: chunk_index ≥ 4
 
