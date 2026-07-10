@@ -184,6 +184,42 @@ booting from it).
 
 ## Troubleshooting
 
+### Secure Boot: `insmod` fails with `Key was rejected by service`
+
+Secure Boot is enabled. `rcraid.ko` is unsigned, so the lockdown kernel
+refuses to load it (`dmesg` shows `Loading of unsigned module is
+rejected`). Both installers (`install-livecd.sh` and `install-dkms.sh`)
+check for this up front and abort with instructions before building
+anything. Watch out for BIOS resets (CMOS clear, firmware update,
+"load optimized defaults"): they silently re-enable Secure Boot.
+
+**Fix: disable Secure Boot in BIOS setup — and keep it off.** DKMS
+rebuilds the module unsigned on every kernel update, so re-enabling
+Secure Boot later stops the array from coming up at boot; if the OS
+lives on the array, the machine won't boot at all.
+
+If you must run with Secure Boot on, sign the module with your own
+Machine Owner Key and bypass the installer check with
+`RCRAID_ALLOW_SECURE_BOOT=1`:
+
+```bash
+# One-time: create and enrol a signing key.
+openssl req -new -x509 -newkey rsa:2048 -nodes -days 36500 \
+    -subj "/CN=rcraid module signing/" \
+    -keyout MOK.priv -outform DER -out MOK.der
+sudo mokutil --import MOK.der   # set a one-time password; on the next
+                                # reboot the MOK manager prompts you to
+                                # enrol the key with that password
+
+# After every build (including every DKMS rebuild):
+sudo "/usr/src/linux-headers-$(uname -r)/scripts/sign-file" sha256 \
+    MOK.priv MOK.der rcraid.ko
+```
+
+Automatic signing of DKMS rebuilds (the dkms `sign_tool` hook) is not
+wired up yet, so each kernel update needs a manual re-sign — which is
+why disabling Secure Boot remains the supported path.
+
 ### Driver builds but `lspci` shows the device with no driver bound
 
 Check that BIOS is in **RAID mode**, not AHCI. In AHCI mode the
