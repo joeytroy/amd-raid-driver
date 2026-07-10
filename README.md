@@ -121,8 +121,8 @@ free: the same RAID0 array that did 19.7 / 18.7 GB/s on Linux 6.17 does
 design rides every block-layer improvement upstream lands.
 
 <p align="center">
-  <img src="image/kdiskmark.png" width="480" alt="KDiskMark on /dev/rcraid0: 19,730 MB/s read, 18,715 MB/s write (SEQ1M Q8T1)"><br>
-  <em>KDiskMark 3.3.0 on <code>/dev/rcraid0</code> — RAID0 across two Crucial T700 NVMe SSDs (PCIe 5.0) on a TRX50 motherboard (Linux 6.17 run).</em>
+  <img src="image/kdiskmark.png" width="480" alt="KDiskMark on the RAID0 array: 20,563 MB/s read, 19,699 MB/s write (SEQ1M Q8T1)"><br>
+  <em>KDiskMark 3.3.0 on the RAID0 array serving <code>/</code> — 2× Crucial T700 NVMe SSDs (PCIe 5.0), TRX50, Kubuntu 26.04 (Linux 7.0).</em>
 </p>
 
 ---
