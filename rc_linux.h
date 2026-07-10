@@ -215,6 +215,11 @@ struct rc_nvme_io_queue {
     // read's CQE as "unknown CID=0" and the sync helper timed out).
     bool           sync_pending;
     u16            sync_sc;
+    u16            sync_cid;     // full CID of the in-flight sync command
+                                 // (RC_VOLUME_SYNC_CID_BASE | low seq byte)
+    u16            sync_seq;     // rolling sequence; low byte lands in the CID
+                                 // so a stale CQE from a timed-out sync command
+                                 // can't satisfy the next one
 
     // hctx index this queue is mapped to.  Used by the per-queue ISR
     // to look up the right blk_mq_tags array.  -1 until blk-mq mapping

@@ -202,17 +202,22 @@ static dma_addr_t  rc_volume_prp_pa[RC_VOLUME_MAX_HCTX][RC_VOLUME_MAX_MEMBERS][R
 #define RC_VOLUME_PREFETCH_PAGES	(RC_VOLUME_PREFETCH_BYTES / PAGE_SIZE)
 #define RC_VOLUME_PREFETCH_CID_BASE	0x100u
 
-/* CID for boot/reset-time synchronous commands (rc_nvme_io_cmd_sync).
- * Deliberately OUTSIDE every other CID space — blk-mq tags run 0..
- * RC_VOLUME_QUEUE_DEPTH-1 (255), prefetch CIDs carry bit 8 (0x100..),
- * cache fills bit 13 (0x2000..) — because sync commands share io_queues[0]
- * with live volume traffic during module reload / controller auto-reset.
- * The previous literal CID 0 aliased blk-mq tag 0: with sync_pending armed
- * the ISR would swallow a real tag-0 request's CQE as the sync completion
- * and that request would hang to a spurious timeout.  A stale sync CQE
- * (sync_pending already cleared) falls through to blk_mq_tag_to_rq(0x400)
- * → NULL → the unknown-CID log line, never a misrouted completion. */
-#define RC_VOLUME_SYNC_CID		0x400u
+/* CID range for boot/reset-time synchronous commands (rc_nvme_io_cmd_sync):
+ * 0x400 | (per-queue sequence & 0xFF), i.e. 0x400..0x4FF.  Deliberately
+ * OUTSIDE every other CID space — blk-mq tags run 0..RC_VOLUME_QUEUE_DEPTH-1
+ * (255), prefetch CIDs carry bit 8 (0x100..), cache fills bit 13 (0x2000..)
+ * — because sync commands share io_queues[0] with live volume traffic
+ * during module reload / controller auto-reset.  (A literal CID 0 aliased
+ * blk-mq tag 0: with sync_pending armed the ISR would swallow a real tag-0
+ * request's CQE as the sync completion.)
+ *
+ * The low byte is a rolling sequence so a STALE sync CQE — left on the ring
+ * by a previous sync command that timed out and disarmed without consuming
+ * it — can never be misattributed to the CURRENT command: both consumers
+ * match the full expected CID (q->sync_cid), and a sync-range CQE with the
+ * wrong sequence is consumed and dropped. */
+#define RC_VOLUME_SYNC_CID_BASE		0x400u
+#define RC_VOLUME_SYNC_CID_MASK		0xFF00u	/* (cid & MASK) == BASE → sync range */
 #define RC_VOLUME_PREFETCH_SLOTS	2u
 
 enum rc_prefetch_state {
@@ -582,7 +587,7 @@ irqreturn_t rc_nvme_io_queue_irq(int irq, void *dev_id)
 			break;
 
 		cid = le16_to_cpu(cqe->cid);
-		if (cid == RC_VOLUME_SYNC_CID && q->sync_pending) {
+		if ((cid & RC_VOLUME_SYNC_CID_MASK) == RC_VOLUME_SYNC_CID_BASE) {
 			/* Boot/reset-time sync command (rc_nvme_io_cmd_sync):
 			 * record the status and let the sync waiter return.
 			 * This ISR is live and consuming this CQ whenever
@@ -590,9 +595,20 @@ irqreturn_t rc_nvme_io_queue_irq(int irq, void *dev_id)
 			 * auto-reset), so without this claim it would eat the
 			 * sync CQE as "unknown CID" and the waiter would time
 			 * out — dropping the member to the legacy fallback
-			 * path mid-reload. */
-			q->sync_sc = (status >> 1) & 0x7fff;
-			q->sync_pending = false;
+			 * path mid-reload.  A sequence mismatch (or no waiter)
+			 * means a STALE CQE from a timed-out earlier sync
+			 * command: consume and drop it — attributing it to the
+			 * current command would hand the metadata parser a
+			 * status for a read that never completed. */
+			if (q->sync_pending && cid == q->sync_cid) {
+				q->sync_sc = (status >> 1) & 0x7fff;
+				q->sync_pending = false;
+			} else {
+				rc_printk(RC_WARN,
+					  "rc_nvme_io_queue_irq: %s qid=%u dropping stale sync CQE CID=0x%x (expected 0x%x pending=%d)\n",
+					  pci_name(adapter->pdev), q->qid, cid,
+					  q->sync_cid, q->sync_pending);
+			}
 		} else if (cid & RC_VOLUME_CACHE_CID_MASK) {
 			/* Cache fill completion (CID 0x2000..0x2FFF):
 			 * bits 12..1 = entry_idx, bit 0 = cmd index. */
@@ -1496,13 +1512,16 @@ static int rc_nvme_io_cmd_sync(struct rc_adapter *adapter,
 		return -ENODEV;
 	q = nvme->io_queues[0];
 
-	cmd->cid = cpu_to_le16(RC_VOLUME_SYNC_CID);
-
 	/* Arm the handshake BEFORE the doorbell rings — the ISR can run the
-	 * moment the controller sees the SQE. */
+	 * moment the controller sees the SQE.  The rolling sequence in the
+	 * CID's low byte keeps a stale CQE from a previously timed-out sync
+	 * command from satisfying this one. */
 	spin_lock_irqsave(&q->lock, flags);
+	q->sync_seq++;
+	q->sync_cid = (u16)(RC_VOLUME_SYNC_CID_BASE | (q->sync_seq & 0xFFu));
 	q->sync_pending = true;
 	q->sync_sc = 0;
+	cmd->cid = cpu_to_le16(q->sync_cid);
 	spin_unlock_irqrestore(&q->lock, flags);
 
 	rc_nvme_io_submit(q, cmd);
@@ -1522,24 +1541,35 @@ static int rc_nvme_io_cmd_sync(struct rc_adapter *adapter,
 			done = true;
 		} else {
 			/* Poll the CQ head ourselves — early boot runs before
-			 * IRQ delivery is functional.  Consume ONLY our own
-			 * CQE (RC_VOLUME_SYNC_CID); anything else on this
-			 * queue belongs to
-			 * the ISR and is left in place. */
+			 * IRQ delivery is functional.  Consume only CQEs in
+			 * the sync CID range: ours (sequence match) completes
+			 * the wait; a stale one from a previously timed-out
+			 * sync command is consumed and DROPPED (attributing
+			 * it to this command would report a status for a read
+			 * that never completed).  Anything else on this queue
+			 * belongs to the ISR and is left in place. */
 			struct rc_nvme_cqe *cqe =
 				(struct rc_nvme_cqe *)q->cq + q->cq_head;
 			u16 status = le16_to_cpu(READ_ONCE(cqe->status));
+			u16 ccid = le16_to_cpu(cqe->cid);
 
 			if ((status & 1) == q->cq_phase &&
-			    le16_to_cpu(cqe->cid) == RC_VOLUME_SYNC_CID) {
-				sc_sct = (status >> 1) & 0x7fff;
-				q->sync_pending = false;
+			    (ccid & RC_VOLUME_SYNC_CID_MASK) ==
+					RC_VOLUME_SYNC_CID_BASE) {
+				if (ccid == q->sync_cid) {
+					sc_sct = (status >> 1) & 0x7fff;
+					q->sync_pending = false;
+					done = true;
+				} else {
+					rc_printk(RC_WARN,
+						  "rc_nvme_io_cmd_sync: dropping stale sync CQE CID=0x%x (expected 0x%x)\n",
+						  ccid, q->sync_cid);
+				}
 				q->cq_head = (q->cq_head + 1) % q->cq_depth;
 				if (q->cq_head == 0)
 					q->cq_phase ^= 1;
 				rc_nvme_ring_cq_doorbell(adapter, q->qid,
 							 q->cq_head);
-				done = true;
 			}
 		}
 		spin_unlock_irqrestore(&q->lock, flags);
@@ -1767,8 +1797,15 @@ static int rc_volume_bdf_cmp(struct rc_adapter *a, struct rc_adapter *b)
 static u32 rc_ld_level_from(u32 devtype, u32 first, u32 second, u32 devices)
 {
 	if (devtype == RC_LDT_RAID1)
-		return RC_LDT_RAID1;	/* explicit encoding (synthetic rigs;
-					 * kept in case some firmware uses it) */
+		/* Explicit encoding (kept in case some firmware uses it) —
+		 * but held to the same 2-way-mirror policy as the
+		 * counts-derived path: exactly 2 members, and counts (when
+		 * present) must agree.  first/second == 0 is tolerated
+		 * because encodings that set an explicit RAID1 DeviceType
+		 * may not populate the counts at all. */
+		return (devices == 2 &&
+			(!first || !second ||
+			 (first == 1 && second == 2))) ? RC_LDT_RAID1 : 0;
 	/* RC_LDT_SINGLE (0x1BF9) is deliberately NOT accepted: those are the
 	 * per-physical-disk "raw disk" LDs firmware publishes for non-array
 	 * disks.  Their element array is exactly this disk's own DeviceID, so
@@ -1898,7 +1935,10 @@ static void rc_volume_parse_logical_device(struct rc_adapter *adapter)
 		/* Records whose tag starts in the overlap tail are picked up
 		 * by the next chunk instead (they may spill past this one). */
 		u32 scan_limit = final ? avail : chunk_step;
-		u32 i;
+		/* The generation's first 0x200 bytes are its header sector
+		 * (timestamp + table offsets), not records — skip it rather
+		 * than tag-scan bytes the on-disk format says aren't records. */
+		u32 i = (pos == 0) ? min(0x200u, scan_limit) : 0;
 		int ret;
 
 		ret = rc_nvme_read_lba(adapter, gen_lba + pos / 512u,
@@ -1924,7 +1964,7 @@ static void rc_volume_parse_logical_device(struct rc_adapter *adapter)
 			break;
 		}
 
-		for (i = 0; i + 4 <= scan_limit; i += 4) {
+		for (; i + 4 <= scan_limit; i += 4) {
 			u8 *ld;
 			u32 devtype, devices, elem_off, chunk, chunk_index;
 			u32 first_count, second_count, level;
