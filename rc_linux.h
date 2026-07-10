@@ -202,7 +202,9 @@ struct rc_nvme_io_queue {
     // is up the ISR routes CQEs to blk_mq_complete_request instead.
     wait_queue_head_t cq_wait;
 
-    // Sync-command handshake (CID 0), guarded by `lock`.  The sync helper
+    // Sync-command handshake (CID RC_VOLUME_SYNC_CID — a value outside the
+    // blk-mq tag space, so it can never alias a real request's CQE),
+    // guarded by `lock`.  The sync helper
     // arms sync_pending before ringing the doorbell; whichever consumer
     // sees the CQE first — the helper's poll loop or the ISR (live and
     // processing this CQ whenever rc_volume_disk exists, e.g. module

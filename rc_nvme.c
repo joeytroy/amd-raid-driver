@@ -201,6 +201,18 @@ static dma_addr_t  rc_volume_prp_pa[RC_VOLUME_MAX_HCTX][RC_VOLUME_MAX_MEMBERS][R
 #define RC_VOLUME_PREFETCH_SECTORS	(RC_VOLUME_PREFETCH_BYTES / 512u)
 #define RC_VOLUME_PREFETCH_PAGES	(RC_VOLUME_PREFETCH_BYTES / PAGE_SIZE)
 #define RC_VOLUME_PREFETCH_CID_BASE	0x100u
+
+/* CID for boot/reset-time synchronous commands (rc_nvme_io_cmd_sync).
+ * Deliberately OUTSIDE every other CID space — blk-mq tags run 0..
+ * RC_VOLUME_QUEUE_DEPTH-1 (255), prefetch CIDs carry bit 8 (0x100..),
+ * cache fills bit 13 (0x2000..) — because sync commands share io_queues[0]
+ * with live volume traffic during module reload / controller auto-reset.
+ * The previous literal CID 0 aliased blk-mq tag 0: with sync_pending armed
+ * the ISR would swallow a real tag-0 request's CQE as the sync completion
+ * and that request would hang to a spurious timeout.  A stale sync CQE
+ * (sync_pending already cleared) falls through to blk_mq_tag_to_rq(0x400)
+ * → NULL → the unknown-CID log line, never a misrouted completion. */
+#define RC_VOLUME_SYNC_CID		0x400u
 #define RC_VOLUME_PREFETCH_SLOTS	2u
 
 enum rc_prefetch_state {
@@ -570,15 +582,15 @@ irqreturn_t rc_nvme_io_queue_irq(int irq, void *dev_id)
 			break;
 
 		cid = le16_to_cpu(cqe->cid);
-		if (cid == 0 && q->sync_pending) {
-			/* Boot/reset-time sync command (rc_nvme_io_cmd_sync,
-			 * always CID 0): record the status and let the sync
-			 * waiter return.  This ISR is live and consuming this
-			 * CQ whenever rc_volume_disk exists (module reload,
-			 * controller auto-reset), so without this claim it
-			 * would eat the sync CQE as "unknown CID" and the
-			 * waiter would time out — dropping the member to the
-			 * legacy fallback path mid-reload. */
+		if (cid == RC_VOLUME_SYNC_CID && q->sync_pending) {
+			/* Boot/reset-time sync command (rc_nvme_io_cmd_sync):
+			 * record the status and let the sync waiter return.
+			 * This ISR is live and consuming this CQ whenever
+			 * rc_volume_disk exists (module reload, controller
+			 * auto-reset), so without this claim it would eat the
+			 * sync CQE as "unknown CID" and the waiter would time
+			 * out — dropping the member to the legacy fallback
+			 * path mid-reload. */
 			q->sync_sc = (status >> 1) & 0x7fff;
 			q->sync_pending = false;
 		} else if (cid & RC_VOLUME_CACHE_CID_MASK) {
@@ -1458,7 +1470,8 @@ static void rc_nvme_io_submit(struct rc_nvme_io_queue *q,
 	spin_unlock_irqrestore(&q->lock, flags);
 }
 
-/* Synchronous I/O command (always CID 0) used for metadata reads before
+/* Synchronous I/O command (always CID RC_VOLUME_SYNC_CID, a value outside
+ * the blk-mq tag space) used for metadata reads before
  * the blk-mq disk is up — and during module reload / controller auto-reset,
  * when the disk from the surviving assembly EXISTS and this queue's ISR is
  * therefore live and consuming CQEs.  That concurrency is the whole design
@@ -1483,7 +1496,7 @@ static int rc_nvme_io_cmd_sync(struct rc_adapter *adapter,
 		return -ENODEV;
 	q = nvme->io_queues[0];
 
-	cmd->cid = cpu_to_le16(0);
+	cmd->cid = cpu_to_le16(RC_VOLUME_SYNC_CID);
 
 	/* Arm the handshake BEFORE the doorbell rings — the ISR can run the
 	 * moment the controller sees the SQE. */
@@ -1510,14 +1523,15 @@ static int rc_nvme_io_cmd_sync(struct rc_adapter *adapter,
 		} else {
 			/* Poll the CQ head ourselves — early boot runs before
 			 * IRQ delivery is functional.  Consume ONLY our own
-			 * CQE (CID 0); anything else on this queue belongs to
+			 * CQE (RC_VOLUME_SYNC_CID); anything else on this
+			 * queue belongs to
 			 * the ISR and is left in place. */
 			struct rc_nvme_cqe *cqe =
 				(struct rc_nvme_cqe *)q->cq + q->cq_head;
 			u16 status = le16_to_cpu(READ_ONCE(cqe->status));
 
 			if ((status & 1) == q->cq_phase &&
-			    le16_to_cpu(cqe->cid) == 0) {
+			    le16_to_cpu(cqe->cid) == RC_VOLUME_SYNC_CID) {
 				sc_sct = (status >> 1) & 0x7fff;
 				q->sync_pending = false;
 				q->cq_head = (q->cq_head + 1) % q->cq_depth;
