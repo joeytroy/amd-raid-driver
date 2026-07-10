@@ -55,11 +55,14 @@ static struct rc_adapter *rc_volume_members[RC_VOLUME_MAX_MEMBERS];
 static u64 rc_volume_member_phys_offset[RC_VOLUME_MAX_MEMBERS];
 static int rc_volume_member_count;
 static u32 rc_volume_stripe_sectors;
-/* RAID level of the assembled volume (RC_LDT_*).  Seeded by the first
- * registered member from its on-disk LD DeviceType (RC_LDT_RAID0 for the
- * legacy no-LD fallback); later members must match or are rejected, same
- * contract as stripe_sectors/expected_members.  Everything level-specific
- * (map_lba, mirror fan-out in queue_rq) keys off this. */
+/* RAID level of the assembled volume — the NORMALIZED level (RC_LDT_RAID0 /
+ * RC_LDT_RAID1) derived by rc_ld_level_from() from the on-disk DeviceType +
+ * FirstCount x SecondCount, NOT the raw DeviceType (real firmware writes
+ * 0x1BF6 for both levels).  Seeded by the first registered member
+ * (RC_LDT_RAID0 for the legacy no-LD fallback); later members must match or
+ * are rejected, same contract as stripe_sectors/expected_members.
+ * Everything level-specific (map_lba, mirror fan-out in queue_rq) keys off
+ * this. */
 static u32 rc_volume_raid_level;
 /* RAID1 read balancer: monotonically increasing cursor; each read maps to
  * member (cursor % nmembers).  Plain round-robin — both mirrors see half
@@ -198,6 +201,23 @@ static dma_addr_t  rc_volume_prp_pa[RC_VOLUME_MAX_HCTX][RC_VOLUME_MAX_MEMBERS][R
 #define RC_VOLUME_PREFETCH_SECTORS	(RC_VOLUME_PREFETCH_BYTES / 512u)
 #define RC_VOLUME_PREFETCH_PAGES	(RC_VOLUME_PREFETCH_BYTES / PAGE_SIZE)
 #define RC_VOLUME_PREFETCH_CID_BASE	0x100u
+
+/* CID range for boot/reset-time synchronous commands (rc_nvme_io_cmd_sync):
+ * 0x400 | (per-queue sequence & 0xFF), i.e. 0x400..0x4FF.  Deliberately
+ * OUTSIDE every other CID space — blk-mq tags run 0..RC_VOLUME_QUEUE_DEPTH-1
+ * (255), prefetch CIDs carry bit 8 (0x100..), cache fills bit 13 (0x2000..)
+ * — because sync commands share io_queues[0] with live volume traffic
+ * during module reload / controller auto-reset.  (A literal CID 0 aliased
+ * blk-mq tag 0: with sync_pending armed the ISR would swallow a real tag-0
+ * request's CQE as the sync completion.)
+ *
+ * The low byte is a rolling sequence so a STALE sync CQE — left on the ring
+ * by a previous sync command that timed out and disarmed without consuming
+ * it — can never be misattributed to the CURRENT command: both consumers
+ * match the full expected CID (q->sync_cid), and a sync-range CQE with the
+ * wrong sequence is consumed and dropped. */
+#define RC_VOLUME_SYNC_CID_BASE		0x400u
+#define RC_VOLUME_SYNC_CID_MASK		0xFF00u	/* (cid & MASK) == BASE → sync range */
 #define RC_VOLUME_PREFETCH_SLOTS	2u
 
 enum rc_prefetch_state {
@@ -391,6 +411,17 @@ struct rc_volume_pdu {
 	u16                sc_sct;         /* NVMe SC/SCT, 0 = success */
 	u8                 hctx_idx;       /* for inflight counter decrement */
 	atomic_t           members_pending;
+	/* Single-completion claim.  Multiple actors can race to finish one
+	 * request — the ISR (batched direct-end fast path), the dead-member
+	 * drain, the .timeout handler, and queue_rq's own inline error/hit
+	 * paths — and blk-mq does NOT arbitrate between them (the ISR fast
+	 * path deliberately bypasses blk_mq_complete_request's state machine).
+	 * Every completion-initiating site must win
+	 * rc_volume_claim_completion() first; losers back off, the winner's
+	 * path performs the cleanup + end.  Observed unclaimed: mass-timeout
+	 * drain racing the ISR direct-end → request ref double-put WARN at
+	 * block/blk.h (CI qemu-rig). */
+	atomic_t           completed;
 	int                nents;          /* dma_map_sg output count, 0 = not mapped */
 	/* Multi-stripe (multi-member) dispatch.  When ms_active is true, the
 	 * request was split across multiple members in queue_rq; ms_nents[m]
@@ -406,6 +437,15 @@ struct rc_volume_pdu {
 	struct scatterlist sg[RC_VOLUME_DATA_PAGES];
 	struct scatterlist ms_sg[RC_VOLUME_MAX_MEMBERS][RC_VOLUME_MS_PAGES_PER_MEMBER];
 };
+
+/* Claim the exclusive right to complete this request.  Returns true for
+ * exactly one caller per request lifetime; every site that initiates
+ * completion (ISR, drain, timeout, queue_rq inline paths) must call this
+ * first and back off on false — the winner's path owns cleanup + end. */
+static inline bool rc_volume_claim_completion(struct rc_volume_pdu *pdu)
+{
+	return atomic_cmpxchg(&pdu->completed, 0, 1) == 0;
+}
 
 /* Helper: decrement the per-hctx inflight counter that was incremented at
  * the top of queue_rq.  Called from every code path that ends a request. */
@@ -547,7 +587,29 @@ irqreturn_t rc_nvme_io_queue_irq(int irq, void *dev_id)
 			break;
 
 		cid = le16_to_cpu(cqe->cid);
-		if (cid & RC_VOLUME_CACHE_CID_MASK) {
+		if ((cid & RC_VOLUME_SYNC_CID_MASK) == RC_VOLUME_SYNC_CID_BASE) {
+			/* Boot/reset-time sync command (rc_nvme_io_cmd_sync):
+			 * record the status and let the sync waiter return.
+			 * This ISR is live and consuming this CQ whenever
+			 * rc_volume_disk exists (module reload, controller
+			 * auto-reset), so without this claim it would eat the
+			 * sync CQE as "unknown CID" and the waiter would time
+			 * out — dropping the member to the legacy fallback
+			 * path mid-reload.  A sequence mismatch (or no waiter)
+			 * means a STALE CQE from a timed-out earlier sync
+			 * command: consume and drop it — attributing it to the
+			 * current command would hand the metadata parser a
+			 * status for a read that never completed. */
+			if (q->sync_pending && cid == q->sync_cid) {
+				q->sync_sc = (status >> 1) & 0x7fff;
+				q->sync_pending = false;
+			} else {
+				rc_printk(RC_WARN,
+					  "rc_nvme_io_queue_irq: %s qid=%u dropping stale sync CQE CID=0x%x (expected 0x%x pending=%d)\n",
+					  pci_name(adapter->pdev), q->qid, cid,
+					  q->sync_cid, q->sync_pending);
+			}
+		} else if (cid & RC_VOLUME_CACHE_CID_MASK) {
 			/* Cache fill completion (CID 0x2000..0x2FFF):
 			 * bits 12..1 = entry_idx, bit 0 = cmd index. */
 			u16 sc = (status >> 1) & 0x7fff;
@@ -572,9 +634,13 @@ irqreturn_t rc_nvme_io_queue_irq(int irq, void *dev_id)
 						  (u64)blk_rq_pos(req),
 						  blk_rq_sectors(req), sc);
 				}
-				if (atomic_dec_and_test(&pdu->members_pending)) {
+				if (atomic_dec_and_test(&pdu->members_pending) &&
+				    rc_volume_claim_completion(pdu)) {
 					/* Try to defer to local batch; fall back
-					 * to the softirq path if the batch is full. */
+					 * to the softirq path if the batch is full.
+					 * (A lost claim means the drain/timeout
+					 * path is already finishing this request
+					 * — touching it again double-completes.) */
 					if (done_n < ARRAY_SIZE(done_reqs))
 						done_reqs[done_n++] = req;
 					else
@@ -595,6 +661,12 @@ irqreturn_t rc_nvme_io_queue_irq(int irq, void *dev_id)
 	if (advanced)
 		rc_nvme_ring_cq_doorbell(adapter, q->qid, q->cq_head);
 	spin_unlock(&q->lock);
+
+	/* The entry-time wake fires before CQ processing; wake again now so
+	 * a sync waiter whose CQE we just claimed doesn't sleep out its
+	 * current poll tick. */
+	if (advanced)
+		wake_up(&q->cq_wait);
 
 	/* Finish requests inline (no softirq round-trip).  Each call does
 	 * dma_unmap_sg + blk_mq_end_request.  Saves the .complete softirq
@@ -1414,55 +1486,106 @@ static void rc_nvme_io_submit(struct rc_nvme_io_queue *q,
 	spin_unlock_irqrestore(&q->lock, flags);
 }
 
-/* Synchronous I/O command used at boot time to read metadata before the
- * blk-mq disk is up.  Always runs against I/O queue 0 (qid=1).  Submits
- * a single SQE with CID=0, waits on q->cq_wait until the CQE arrives
- * (woken by rc_nvme_io_queue_irq), consumes the CQE, advances head +
- * doorbell.  Safe because the ISR returns early — without consuming
- * CQEs through blk_mq_complete_request — while rc_volume_disk is NULL. */
+/* Synchronous I/O command (always CID RC_VOLUME_SYNC_CID, a value outside
+ * the blk-mq tag space) used for metadata reads before
+ * the blk-mq disk is up — and during module reload / controller auto-reset,
+ * when the disk from the surviving assembly EXISTS and this queue's ISR is
+ * therefore live and consuming CQEs.  That concurrency is the whole design
+ * problem here: two consumers of one CQ.  The sync_pending handshake makes
+ * the CQE single-consumer — whichever side sees it first (the ISR's claim
+ * branch, or this poll loop under q->lock) records the status and clears
+ * sync_pending; head/phase/doorbell advance exactly once, under the lock.
+ * The old lock-free version snapshotted the CQ slot and raced the ISR:
+ * the ISR ate the CQE ("unknown CID=0"), this helper timed out, and the
+ * member dropped to the legacy fallback mid-reload (seen on CI). */
 static int rc_nvme_io_cmd_sync(struct rc_adapter *adapter,
 			       struct rc_nvme_sqe *cmd)
 {
 	struct rc_nvme_state *nvme = &adapter->ctx.nvme;
 	struct rc_nvme_io_queue *q;
-	struct rc_nvme_cqe *cqe;
 	unsigned long deadline;
-	u8 expected_phase;
-	u16 status, sc_sct;
+	unsigned long flags;
+	u16 sc_sct = 0;
+	bool done = false;
 
 	if (!nvme->io_queues[0])
 		return -ENODEV;
 	q = nvme->io_queues[0];
 
-	cmd->cid = cpu_to_le16(0);
+	/* Arm the handshake BEFORE the doorbell rings — the ISR can run the
+	 * moment the controller sees the SQE.  The rolling sequence in the
+	 * CID's low byte keeps a stale CQE from a previously timed-out sync
+	 * command from satisfying this one. */
+	spin_lock_irqsave(&q->lock, flags);
+	q->sync_seq++;
+	q->sync_cid = (u16)(RC_VOLUME_SYNC_CID_BASE | (q->sync_seq & 0xFFu));
+	q->sync_pending = true;
+	q->sync_sc = 0;
+	cmd->cid = cpu_to_le16(q->sync_cid);
+	spin_unlock_irqrestore(&q->lock, flags);
+
 	rc_nvme_io_submit(q, cmd);
 
-	cqe = (struct rc_nvme_cqe *)q->cq + q->cq_head;
-	expected_phase = q->cq_phase;
 	deadline = jiffies + msecs_to_jiffies(RC_NVME_ADMIN_TIMEOUT_MS);
-	while (time_before(jiffies, deadline)) {
+	while (!done && time_before(jiffies, deadline)) {
 		long left = deadline - jiffies;
 		long tick = min_t(long, left, max_t(long, 1, msecs_to_jiffies(1)));
 
-		if (wait_event_timeout(q->cq_wait,
-				       (le16_to_cpu(READ_ONCE(cqe->status)) & 1) ==
-					       expected_phase,
-				       tick) > 0)
-			goto have_cqe;
+		wait_event_timeout(q->cq_wait, !READ_ONCE(q->sync_pending),
+				   tick);
+
+		spin_lock_irqsave(&q->lock, flags);
+		if (!q->sync_pending) {
+			/* ISR claimed our CQE and recorded the status. */
+			sc_sct = q->sync_sc;
+			done = true;
+		} else {
+			/* Poll the CQ head ourselves — early boot runs before
+			 * IRQ delivery is functional.  Consume only CQEs in
+			 * the sync CID range: ours (sequence match) completes
+			 * the wait; a stale one from a previously timed-out
+			 * sync command is consumed and DROPPED (attributing
+			 * it to this command would report a status for a read
+			 * that never completed).  Anything else on this queue
+			 * belongs to the ISR and is left in place. */
+			struct rc_nvme_cqe *cqe =
+				(struct rc_nvme_cqe *)q->cq + q->cq_head;
+			u16 status = le16_to_cpu(READ_ONCE(cqe->status));
+			u16 ccid = le16_to_cpu(cqe->cid);
+
+			if ((status & 1) == q->cq_phase &&
+			    (ccid & RC_VOLUME_SYNC_CID_MASK) ==
+					RC_VOLUME_SYNC_CID_BASE) {
+				if (ccid == q->sync_cid) {
+					sc_sct = (status >> 1) & 0x7fff;
+					q->sync_pending = false;
+					done = true;
+				} else {
+					rc_printk(RC_WARN,
+						  "rc_nvme_io_cmd_sync: dropping stale sync CQE CID=0x%x (expected 0x%x)\n",
+						  ccid, q->sync_cid);
+				}
+				q->cq_head = (q->cq_head + 1) % q->cq_depth;
+				if (q->cq_head == 0)
+					q->cq_phase ^= 1;
+				rc_nvme_ring_cq_doorbell(adapter, q->qid,
+							 q->cq_head);
+			}
+		}
+		spin_unlock_irqrestore(&q->lock, flags);
 	}
-	rc_printk(RC_ERROR,
-		  "rc_nvme_io_cmd_sync: timeout waiting for CQE (opc=0x%02x)\n",
-		  cmd->opc);
-	return -ETIMEDOUT;
 
-have_cqe:
-	status = le16_to_cpu(READ_ONCE(cqe->status));
-	sc_sct = (status >> 1) & 0x7fff;
-
-	q->cq_head = (q->cq_head + 1) % q->cq_depth;
-	if (q->cq_head == 0)
-		q->cq_phase ^= 1;
-	rc_nvme_ring_cq_doorbell(adapter, q->qid, q->cq_head);
+	if (!done) {
+		/* Disarm so a late CQE doesn't satisfy the NEXT sync command
+		 * with this one's stale status. */
+		spin_lock_irqsave(&q->lock, flags);
+		q->sync_pending = false;
+		spin_unlock_irqrestore(&q->lock, flags);
+		rc_printk(RC_ERROR,
+			  "rc_nvme_io_cmd_sync: timeout waiting for CQE (opc=0x%02x)\n",
+			  cmd->opc);
+		return -ETIMEDOUT;
+	}
 
 	if (sc_sct) {
 		rc_printk(RC_ERROR,
@@ -1653,19 +1776,126 @@ static int rc_volume_bdf_cmp(struct rc_adapter *a, struct rc_adapter *b)
 	return rc_volume_reverse_order ? -cmp : cmp;
 }
 
-/* How far into the config ring to scan for the first RC_LogicalDevice
- * record.  On the dev box the active LD is at ring+0x1d sectors; 128
- * sectors is plenty of headroom even for arrays with chains of older
- * configs preceding the current one. */
-#define RC_LD_SCAN_CHUNK_SECTORS	16u	/* 8 KiB = max 2-page rc_nvme_read_lba */
-#define RC_LD_SCAN_MAX_CHUNKS		8u	/* total = 128 sectors = 64 KiB */
+/* Chunking for the active-generation scan.  rc_nvme_read_lba caps a transfer
+ * at 2 pages (8 KiB = 16 sectors).  Consecutive chunks overlap by
+ * RC_LD_SCAN_OVERLAP_SECTORS so a record that starts near the end of one
+ * chunk is re-read whole at the head of the next: new record tags are only
+ * accepted in the first (CHUNK - OVERLAP) sectors of a non-final chunk.  The
+ * overlap (1 KiB) exceeds the largest possible LD record
+ * (0x130 fixed bytes + RC_VOLUME_MAX_MEMBERS * RC_LE_BYTES). */
+#define RC_LD_SCAN_CHUNK_SECTORS	16u
+#define RC_LD_SCAN_OVERLAP_SECTORS	2u
 
-/* Read sectors from the config ring and locate the first valid
- * RC_LogicalDevice record (tag 0x25BD).  Parse Devices, DeviceType,
+/* Derive the effective RAID level from the on-disk DeviceType +
+ * FirstCount (stripe width) x SecondCount (mirror count).  Real firmware
+ * writes DeviceType 0x1BF6 for BOTH RAID0 and RAID1 and encodes the layout
+ * in the counts (verified on TRX50 hardware dumps, 2026-07-10 — see the
+ * RC_LDT_* note in rc_linux.h).  Returns a normalized RC_LDT_RAID0 /
+ * RC_LDT_RAID1, or 0 for any layout this driver has no dispatch path for
+ * (RAID10, >2-way mirrors, count/device mismatches) — the caller must
+ * refuse to assemble those rather than guess. */
+static u32 rc_ld_level_from(u32 devtype, u32 first, u32 second, u32 devices)
+{
+	if (devtype == RC_LDT_RAID1)
+		/* Explicit encoding (kept in case some firmware uses it) —
+		 * but held to the same 2-way-mirror policy as the
+		 * counts-derived path: exactly 2 members, and counts (when
+		 * present) must agree.  first/second == 0 is tolerated
+		 * because encodings that set an explicit RAID1 DeviceType
+		 * may not populate the counts at all. */
+		return (devices == 2 &&
+			(!first || !second ||
+			 (first == 1 && second == 2))) ? RC_LDT_RAID1 : 0;
+	/* RC_LDT_SINGLE (0x1BF9) is deliberately NOT accepted: those are the
+	 * per-physical-disk "raw disk" LDs firmware publishes for non-array
+	 * disks.  Their element array is exactly this disk's own DeviceID, so
+	 * they'd match the parser's ownership check and assemble a bogus
+	 * 1-member volume over the raw disk.  The parser also skips any
+	 * devices < 2 record for the same reason (belt and braces). */
+	if (devtype != RC_LDT_RAID0)
+		return 0;
+	if (!first || !second || first * second != devices)
+		return 0;
+	if (second == 1)
+		return RC_LDT_RAID0;	/* pure stripe */
+	if (first == 1 && second == 2)
+		return RC_LDT_RAID1;	/* 2-way mirror */
+	return 0;
+}
+
+/* Read the config-commit block and return the active config generation's
+ * extent within the ring.  The ring is a journal — records of DELETED
+ * arrays persist in older generations, and both can list this disk's
+ * DeviceID, so only records inside the committed generation may be trusted
+ * (assembling the first DeviceID match presented a deleted RAID0 in place
+ * of the live RAID1 on real hardware).  Layout in rc_linux.h.
+ *
+ * Validation: the extent must lie fully inside the config ring, and the
+ * generation header's leading timestamp must equal the commit block's
+ * recorded generation timestamp (two-phase-commit linkage) — checked by
+ * the caller when it reads the first chunk.  Returns 0 and fills the out
+ * params on success. */
+static int rc_volume_read_commit(struct rc_adapter *adapter, u8 *buf,
+				 dma_addr_t buf_dma, u64 *out_gen_lba,
+				 u32 *out_gen_bytes, u64 *out_gen_ts)
+{
+	struct rc_nvme_state *nvme = &adapter->ctx.nvme;
+	u64 ring_lba  = nvme->md_config_ring_lba;
+	u64 ring_end  = ring_lba + nvme->md_stripe_sectors; /* ConfigRingSize */
+	u64 gen_lba, gen_ts;
+	u32 gen_bytes, gen_seq;
+	int ret;
+
+	ret = rc_nvme_read_lba(adapter, nvme->md_config_commit_lba, 0,
+			       buf_dma);
+	if (ret) {
+		rc_printk(RC_WARN,
+			  "rc_volume_read_commit: %s read commit LBA 0x%llx failed (%d)\n",
+			  pci_name(adapter->pdev),
+			  (unsigned long long)nvme->md_config_commit_lba, ret);
+		return ret;
+	}
+
+	gen_lba   = get_unaligned_le32(buf + RC_COMMIT_GEN_LBA_OFFSET);
+	gen_bytes = get_unaligned_le32(buf + RC_COMMIT_GEN_LEN_OFFSET);
+	gen_ts    = get_unaligned_le64(buf + RC_COMMIT_GEN_TS_OFFSET);
+	gen_seq   = get_unaligned_le32(buf + RC_COMMIT_GEN_SEQ_OFFSET);
+
+	if (gen_lba < ring_lba || gen_lba >= ring_end ||
+	    !gen_bytes || gen_bytes % 512u ||
+	    gen_lba + gen_bytes / 512u > ring_end ||
+	    !gen_ts) {
+		rc_printk(RC_WARN,
+			  "rc_volume_read_commit: %s commit block invalid (gen@0x%llx len=%u ts=0x%016llx, ring 0x%llx..0x%llx) — cannot locate the active config generation\n",
+			  pci_name(adapter->pdev),
+			  (unsigned long long)gen_lba, gen_bytes,
+			  (unsigned long long)gen_ts,
+			  (unsigned long long)ring_lba,
+			  (unsigned long long)ring_end);
+		return -EBADMSG;
+	}
+
+	rc_printk(RC_NOTE,
+		  "rc_volume_read_commit: %s active config generation @LBA 0x%llx len=%u seq=%u ts=0x%016llx\n",
+		  pci_name(adapter->pdev), (unsigned long long)gen_lba,
+		  gen_bytes, gen_seq, (unsigned long long)gen_ts);
+
+	*out_gen_lba   = gen_lba;
+	*out_gen_bytes = gen_bytes;
+	*out_gen_ts    = gen_ts;
+	return 0;
+}
+
+/* Locate this member's RC_LogicalDevice record (tag 0x25BD) inside the
+ * ACTIVE config generation — the extent named by the commit block, NOT the
+ * whole ring (older generations hold records of deleted arrays that also
+ * list this disk's DeviceID).  Parse Devices, DeviceType,
+ * FirstCount/SecondCount (from which the effective RAID level is derived),
  * Capacity, ChunkSize, and walk the LogicalElement array to find this
  * adapter's position (where md_device_id matches an element's DeviceID).
  * Results land in adapter->ctx.nvme.ld_*.  Failure leaves ld_valid=false
- * — the caller falls back to the legacy BDF-ordered registration path. */
+ * — the caller falls back to the legacy BDF-ordered registration path,
+ * which is marked geometry-untrusted (read-only). */
 static void rc_volume_parse_logical_device(struct rc_adapter *adapter)
 {
 	struct device *dev = &adapter->pdev->dev;
@@ -1673,15 +1903,18 @@ static void rc_volume_parse_logical_device(struct rc_adapter *adapter)
 	u8 *buf;
 	dma_addr_t buf_dma;
 	const u32 chunk_bytes = RC_LD_SCAN_CHUNK_SECTORS * 512u;
-	u64 ring_lba = nvme->md_config_ring_lba;
-	u32 scan;
+	const u32 chunk_step  = (RC_LD_SCAN_CHUNK_SECTORS -
+				 RC_LD_SCAN_OVERLAP_SECTORS) * 512u;
+	u64 gen_lba, gen_ts;
+	u32 gen_bytes;
+	u32 pos;
 
 	nvme->ld_valid = false;
 	nvme->ld_my_position = -1;
 
-	if (!ring_lba) {
+	if (!nvme->md_config_ring_lba || !nvme->md_config_commit_lba) {
 		rc_printk(RC_WARN,
-			  "rc_volume_parse_logical_device: %s no config_ring_lba in metadata\n",
+			  "rc_volume_parse_logical_device: %s no config ring/commit LBA in metadata\n",
 			  pci_name(adapter->pdev));
 		return;
 	}
@@ -1690,31 +1923,70 @@ static void rc_volume_parse_logical_device(struct rc_adapter *adapter)
 	if (!buf)
 		return;
 
-	for (scan = 0; scan < RC_LD_SCAN_MAX_CHUNKS; scan++) {
-		u64 chunk_lba = ring_lba + scan * RC_LD_SCAN_CHUNK_SECTORS;
-		u32 i;
+	if (rc_volume_read_commit(adapter, buf, buf_dma,
+				  &gen_lba, &gen_bytes, &gen_ts))
+		goto done;
+
+	/* Walk the generation extent in overlapping chunks.  `pos` is the
+	 * byte offset of the current chunk within the generation. */
+	for (pos = 0; pos < gen_bytes; pos += chunk_step) {
+		u32 avail = min(chunk_bytes, gen_bytes - pos);
+		bool final = (pos + chunk_bytes >= gen_bytes);
+		/* Records whose tag starts in the overlap tail are picked up
+		 * by the next chunk instead (they may spill past this one). */
+		u32 scan_limit = final ? avail : chunk_step;
+		/* The generation's first 0x200 bytes are its header sector
+		 * (timestamp + table offsets), not records — skip it rather
+		 * than tag-scan bytes the on-disk format says aren't records. */
+		u32 i = (pos == 0) ? min(0x200u, scan_limit) : 0;
 		int ret;
 
-		ret = rc_nvme_read_lba(adapter, chunk_lba,
-				       (u16)(RC_LD_SCAN_CHUNK_SECTORS - 1),
-				       buf_dma);
+		ret = rc_nvme_read_lba(adapter, gen_lba + pos / 512u,
+				       (u16)(avail / 512u - 1), buf_dma);
 		if (ret) {
 			rc_printk(RC_WARN,
 				  "rc_volume_parse_logical_device: %s read LBA 0x%llx failed (%d)\n",
 				  pci_name(adapter->pdev),
-				  (unsigned long long)chunk_lba, ret);
+				  (unsigned long long)(gen_lba + pos / 512u),
+				  ret);
 			break;
 		}
 
-		for (i = 0; i + 4 <= chunk_bytes; i += 4) {
+		/* First chunk carries the generation header: verify the
+		 * two-phase-commit linkage before trusting any record. */
+		if (pos == 0 &&
+		    get_unaligned_le64(buf + RC_COMMIT_TS_OFFSET) != gen_ts) {
+			rc_printk(RC_WARN,
+				  "rc_volume_parse_logical_device: %s generation header ts 0x%016llx != committed ts 0x%016llx — commit/journal mismatch, refusing to parse\n",
+				  pci_name(adapter->pdev),
+				  (unsigned long long)get_unaligned_le64(buf + RC_COMMIT_TS_OFFSET),
+				  (unsigned long long)gen_ts);
+			break;
+		}
+
+		for (; i + 4 <= scan_limit; i += 4) {
 			u8 *ld;
 			u32 devtype, devices, elem_off, chunk, chunk_index;
+			u32 first_count, second_count, level;
 			u64 capacity;
 			int my_pos = -1;
 			u32 j;
 
 			if (get_unaligned_le32(buf + i) !=
 			    RC_DST_LOGICAL_DEVICE)
+				continue;
+
+			/* Every fixed-offset field below must lie within the
+			 * bytes THIS transfer actually read — chunk_index at
+			 * +0x110 is the farthest.  A tag this close to the end
+			 * of a non-final chunk is re-scanned at the head of
+			 * the next (overlap); this close to the end of the
+			 * FINAL chunk the record is truncated by the committed
+			 * generation length and invalid anyway.  Without this
+			 * check the reads land in stale bytes from a previous
+			 * transfer — or, for avail == chunk_bytes, past the
+			 * end of the DMA buffer allocation entirely. */
+			if ((u64)i + RC_LD_CHUNKINDEX_OFFSET + 4 > avail)
 				continue;
 
 			ld = buf + i;
@@ -1724,23 +1996,19 @@ static void rc_volume_parse_logical_device(struct rc_adapter *adapter)
 			chunk    = get_unaligned_le32(ld + RC_LD_CHUNKSIZE_OFFSET);
 			chunk_index = get_unaligned_le32(ld + RC_LD_CHUNKINDEX_OFFSET);
 			capacity = get_unaligned_le64(ld + RC_LD_CAPACITY_OFFSET);
-
-			/* Diagnostic.  An earlier reading of rcraid.sys 9.3.2
-			 * guessed SECONDCOUNT (+0x70) might be the authoritative
-			 * RAID0 member count instead of DEVICES (+0x68).
-			 * On-hardware boot logging DISPROVED that: on a healthy
-			 * 2-member RAID0 this array reports DEVICES=2 and
-			 * SECONDCOUNT=1.  So DEVICES is the member count (what we
-			 * key assembly off — correct), and SECONDCOUNT is some
-			 * other field.  Keep logging it purely for forensics.
-			 * See docs/REVERSE_ENGINEERING.md. */
-			u32 second_count =
+			/* FirstCount x SecondCount = stripe width x mirror
+			 * count — the REAL RAID-level encoding (DeviceType is
+			 * 0x1BF6 for both RAID0 and RAID1 on real firmware;
+			 * see rc_ld_level_from). */
+			first_count =
+				get_unaligned_le32(ld + RC_LD_FIRSTCOUNT_OFFSET);
+			second_count =
 				get_unaligned_le32(ld + RC_LD_SECONDCOUNT_OFFSET);
 
 			if (devices < 1 || devices > RC_VOLUME_MAX_MEMBERS)
 				continue;
 			if ((u64)i + elem_off +
-			    (u64)devices * RC_LE_BYTES > chunk_bytes)
+			    (u64)devices * RC_LE_BYTES > avail)
 				continue;
 
 			/* AMD also publishes one single-device "raw disk"
@@ -1763,24 +2031,42 @@ static void rc_volume_parse_logical_device(struct rc_adapter *adapter)
 				}
 			}
 
+			level = rc_ld_level_from(devtype, first_count,
+						 second_count, devices);
+
 			rc_printk(RC_INFO,
-				  "rc_volume_parse_logical_device: %s LD@ring+%u.%u devtype=0x%04x devices=%u second_count=%u chunk=%u chunk_idx=%u capacity=%llu my_pos=%d alloc_off=%llu alloc_sz=%llu user_off=%llu user_sz=%llu%s\n",
+				  "rc_volume_parse_logical_device: %s LD@gen+%u.%u devtype=0x%04x first=%u second=%u (level=%s) devices=%u chunk=%u chunk_idx=%u capacity=%llu my_pos=%d alloc_off=%llu alloc_sz=%llu user_off=%llu user_sz=%llu%s\n",
 				  pci_name(adapter->pdev),
-				  scan * RC_LD_SCAN_CHUNK_SECTORS + (i / 512),
-				  i % 512,
-				  devtype, devices, second_count, chunk, chunk_index,
+				  (pos + i) / 512, (pos + i) % 512,
+				  devtype, first_count, second_count,
+				  level == RC_LDT_RAID1 ? "RAID1" :
+				  level == RC_LDT_RAID0 ? "RAID0" :
+							  "UNSUPPORTED",
+				  devices, chunk, chunk_index,
 				  (unsigned long long)capacity, my_pos,
 				  (unsigned long long)alloc_off,
 				  (unsigned long long)alloc_sz,
 				  (unsigned long long)user_off,
 				  (unsigned long long)user_sz,
 				  my_pos < 0 ? " (skip — not our member)" :
-					       " (match)");
+				  devices < 2 ? " (skip — raw single-disk LD)" :
+					        " (match)");
 
 			if (my_pos < 0)
 				continue;
 
+			/* A devices < 2 record with our DeviceID is this
+			 * disk's own raw "single disk" LD (0x1BF9), which
+			 * firmware publishes for every non-array disk — NOT
+			 * the array we belong to.  Matching it would assemble
+			 * a bogus 1-member volume over the raw disk. */
+			if (devices < 2)
+				continue;
+
 			nvme->ld_device_type      = devtype;
+			nvme->ld_first_count      = first_count;
+			nvme->ld_second_count     = second_count;
+			nvme->ld_level            = level;
 			nvme->ld_devices          = devices;
 			nvme->ld_chunk_sectors    = chunk;
 			nvme->ld_chunk_index      = chunk_index;
@@ -1795,9 +2081,9 @@ static void rc_volume_parse_logical_device(struct rc_adapter *adapter)
 		}
 	}
 	rc_printk(RC_WARN,
-		  "rc_volume_parse_logical_device: %s no matching LogicalDevice record found in first %u sectors of config ring\n",
-		  pci_name(adapter->pdev),
-		  RC_LD_SCAN_MAX_CHUNKS * RC_LD_SCAN_CHUNK_SECTORS);
+		  "rc_volume_parse_logical_device: %s no matching LogicalDevice record in the active config generation (%u bytes @LBA 0x%llx)\n",
+		  pci_name(adapter->pdev), gen_bytes,
+		  (unsigned long long)gen_lba);
 
 done:
 	dma_free_coherent(dev, chunk_bytes, buf, buf_dma);
@@ -1971,10 +2257,15 @@ static u32 rc_volume_chunk_sectors_for(u32 devtype, u32 ld_chunk,
 	 * every size assumption in the mirror fan-out (per-member sg arrays,
 	 * one NVMe command per member, u16 NLB) is derived from this fixed
 	 * granule — an on-disk ChunkSize, whatever real RAID1 firmware
-	 * metadata encodes there, must not override it.  512 sectors =
+	 * metadata encodes there, must not override it.  (Confirmed on real
+	 * TRX50 RAID1 metadata: the record carries chunk_index=3 even though
+	 * mirrors don't stripe — it must be ignored here.)  512 sectors =
 	 * 256 KiB: comfortably under MDTS (512 KiB) and the per-member sg
 	 * array (RC_VOLUME_MS_PAGES_PER_MEMBER pages), and the same
-	 * cache/prefetch granularity as the RAID0 default. */
+	 * cache/prefetch granularity as the RAID0 default.
+	 *
+	 * @devtype is the NORMALIZED level from rc_ld_level_from(), not the
+	 * raw on-disk DeviceType. */
 	if (devtype == RC_LDT_RAID1)
 		return 512u;
 
@@ -2015,8 +2306,39 @@ static void rc_volume_register_member(struct rc_adapter *adapter)
 	}
 
 	if (have_ld) {
+		/* Refuse layouts with no dispatch path (RAID10, >2-way
+		 * mirrors, FirstCount x SecondCount != Devices).  Guessing a
+		 * mapping for them turns every read into garbage and every
+		 * write into corruption, so the member is not registered at
+		 * all and the volume never assembles. */
+		if (!nvme->ld_level) {
+			rc_printk(RC_WARN,
+				  "rc_volume_register_member: %s unsupported RAID layout (DeviceType=0x%x FirstCount=%u SecondCount=%u Devices=%u) — ignoring member\n",
+				  pci_name(adapter->pdev), nvme->ld_device_type,
+				  nvme->ld_first_count, nvme->ld_second_count,
+				  nvme->ld_devices);
+			goto out;
+		}
+		/* Cross-check: total capacity must equal the per-member
+		 * user-data size times the stripe width (mirrors don't add
+		 * capacity).  A mismatch means we misread the geometry
+		 * somewhere — keep the volume readable but veto writes.
+		 * Runs here rather than in the parser so the write to the
+		 * lock-protected untrust reason happens under rc_volume_lock
+		 * like every other writer. */
+		if (nvme->ld_capacity_sectors !=
+		    nvme->ld_userdata_size * nvme->ld_first_count) {
+			rc_printk(RC_WARN,
+				  "rc_volume_register_member: %s capacity %llu != user_sz %llu x first_count %u — geometry UNTRUSTED, writes will be vetoed\n",
+				  pci_name(adapter->pdev),
+				  (unsigned long long)nvme->ld_capacity_sectors,
+				  (unsigned long long)nvme->ld_userdata_size,
+				  nvme->ld_first_count);
+			rc_volume_geometry_untrust_reason =
+				"the LD record's total capacity doesn't equal per-member user size x stripe width — the on-disk geometry doesn't add up, so some field is being misread";
+		}
 		expected = nvme->ld_devices;
-		chunk_sectors = rc_volume_chunk_sectors_for(nvme->ld_device_type,
+		chunk_sectors = rc_volume_chunk_sectors_for(nvme->ld_level,
 							    nvme->ld_chunk_sectors,
 							    nvme->ld_chunk_index);
 		if (!chunk_sectors) {
@@ -2032,7 +2354,7 @@ static void rc_volume_register_member(struct rc_adapter *adapter)
 		 * WRONG for a real 512 KiB / 1 MiB stripe and corrupt the array
 		 * on write.  Keep 64 KiB so reads still work, but distrust the
 		 * geometry so create_disk forces read-only. */
-		if (nvme->ld_device_type == RC_LDT_RAID0 &&
+		if (nvme->ld_level == RC_LDT_RAID0 &&
 		    nvme->ld_chunk_sectors == 0 && nvme->ld_chunk_index > 3) {
 			rc_printk(RC_WARN,
 				  "rc_volume_register_member: %s RAID0 chunk_index=%u not understood (only 0..3 map to a known stripe) — geometry UNTRUSTED, writes will be vetoed\n",
@@ -2057,20 +2379,21 @@ static void rc_volume_register_member(struct rc_adapter *adapter)
 		chunk_sectors = rc_volume_stripe_override;
 	}
 
-	/* First member: seed expected count + stripe + RAID level.  Later
-	 * members must match. */
+	/* First member: seed expected count + stripe + RAID level (the
+	 * NORMALIZED level from rc_ld_level_from — the raw on-disk DeviceType
+	 * is 0x1BF6 for both RAID0 and RAID1).  Later members must match. */
 	if (rc_volume_member_count == 0) {
 		rc_volume_expected_members = expected;
 		rc_volume_stripe_sectors   = chunk_sectors;
-		rc_volume_raid_level       = have_ld ? nvme->ld_device_type
+		rc_volume_raid_level       = have_ld ? nvme->ld_level
 						     : RC_LDT_RAID0;
 	} else {
-		if ((have_ld ? nvme->ld_device_type : RC_LDT_RAID0) !=
+		if ((have_ld ? nvme->ld_level : RC_LDT_RAID0) !=
 		    rc_volume_raid_level) {
 			rc_printk(RC_WARN,
 				  "rc_volume_register_member: %s RAID-level mismatch 0x%x vs 0x%x — ignoring\n",
 				  pci_name(adapter->pdev),
-				  have_ld ? nvme->ld_device_type : RC_LDT_RAID0,
+				  have_ld ? nvme->ld_level : RC_LDT_RAID0,
 				  rc_volume_raid_level);
 			goto out;
 		}
@@ -2825,6 +3148,7 @@ static blk_status_t rc_volume_queue_rq(struct blk_mq_hw_ctx *hctx,
 	pdu->ms_active = false;
 	memset(pdu->ms_nents, 0, sizeof(pdu->ms_nents));
 	pdu->cache_entry = NULL;
+	atomic_set(&pdu->completed, 0);
 	pdu->hctx_idx = (u8)(hctx->queue_num < RC_VOLUME_MAX_HCTX ?
 			     hctx->queue_num : 0xff);
 	if (pdu->hctx_idx < RC_VOLUME_MAX_HCTX)
@@ -2836,8 +3160,10 @@ static blk_status_t rc_volume_queue_rq(struct blk_mq_hw_ctx *hctx,
 	 * CIDs against a controller we no longer trust. */
 	if (rc_volume_any_member_dead()) {
 		blk_mq_start_request(req);
-		rc_cache_dec_inflight(pdu);
-		blk_mq_end_request(req, BLK_STS_IOERR);
+		if (rc_volume_claim_completion(pdu)) {
+			rc_cache_dec_inflight(pdu);
+			blk_mq_end_request(req, BLK_STS_IOERR);
+		}
 		return BLK_STS_OK;
 	}
 
@@ -2875,8 +3201,10 @@ static blk_status_t rc_volume_queue_rq(struct blk_mq_hw_ctx *hctx,
 		rc_printk(RC_ERROR,
 			  "rc_volume_queue_rq: unsupported op=%u rejected\n", op);
 		blk_mq_start_request(req);
-		rc_cache_dec_inflight(pdu);
-		blk_mq_end_request(req, BLK_STS_IOERR);
+		if (rc_volume_claim_completion(pdu)) {
+			rc_cache_dec_inflight(pdu);
+			blk_mq_end_request(req, BLK_STS_IOERR);
+		}
 		return BLK_STS_OK;
 	}
 
@@ -2890,8 +3218,10 @@ static blk_status_t rc_volume_queue_rq(struct blk_mq_hw_ctx *hctx,
 			  (u64)get_capacity(rc_volume_disk),
 			  RC_VOLUME_DATA_BYTES / 512);
 		blk_mq_start_request(req);
-		rc_cache_dec_inflight(pdu);
-		blk_mq_end_request(req, BLK_STS_IOERR);
+		if (rc_volume_claim_completion(pdu)) {
+			rc_cache_dec_inflight(pdu);
+			blk_mq_end_request(req, BLK_STS_IOERR);
+		}
 		return BLK_STS_OK;
 	}
 
@@ -2920,8 +3250,10 @@ static blk_status_t rc_volume_queue_rq(struct blk_mq_hw_ctx *hctx,
 			/* Errors return before dispatch_mirror's internal
 			 * blk_mq_start_request — start before ending. */
 			blk_mq_start_request(req);
-			rc_cache_dec_inflight(pdu);
-			blk_mq_end_request(req, st);
+			if (rc_volume_claim_completion(pdu)) {
+				rc_cache_dec_inflight(pdu);
+				blk_mq_end_request(req, st);
+			}
 		}
 		return BLK_STS_OK;
 	}
@@ -2947,8 +3279,10 @@ static blk_status_t rc_volume_queue_rq(struct blk_mq_hw_ctx *hctx,
 			 * blk-mq requires every request to be started exactly
 			 * once between queue_rq and end. */
 			blk_mq_start_request(req);
-			rc_cache_dec_inflight(pdu);
-			blk_mq_end_request(req, st);
+			if (rc_volume_claim_completion(pdu)) {
+				rc_cache_dec_inflight(pdu);
+				blk_mq_end_request(req, st);
+			}
 		}
 		return BLK_STS_OK;
 	}
@@ -2968,8 +3302,10 @@ static blk_status_t rc_volume_queue_rq(struct blk_mq_hw_ctx *hctx,
 				hctx, req, pdu, pos, nr_sectors);
 		if (st != BLK_STS_OK) {
 			blk_mq_start_request(req);
-			rc_cache_dec_inflight(pdu);
-			blk_mq_end_request(req, st);
+			if (rc_volume_claim_completion(pdu)) {
+				rc_cache_dec_inflight(pdu);
+				blk_mq_end_request(req, st);
+			}
 		}
 		return BLK_STS_OK;
 	}
@@ -3050,8 +3386,10 @@ static blk_status_t rc_volume_queue_rq(struct blk_mq_hw_ctx *hctx,
 			if (src && ce_status == 0) {
 				rc_volume_prefetch_copy_out(req, src);
 				blk_mq_start_request(req);
-				rc_cache_dec_inflight(pdu);
-				blk_mq_end_request(req, BLK_STS_OK);
+				if (rc_volume_claim_completion(pdu)) {
+					rc_cache_dec_inflight(pdu);
+					blk_mq_end_request(req, BLK_STS_OK);
+				}
 				return BLK_STS_OK;
 			}
 			if (issued_fill) {
@@ -3170,8 +3508,10 @@ static blk_status_t rc_volume_queue_rq(struct blk_mq_hw_ctx *hctx,
 					}
 				}
 				spin_unlock_irqrestore(&pf->lock, flags);
-				rc_cache_dec_inflight(pdu);
-				blk_mq_end_request(req, BLK_STS_OK);
+				if (rc_volume_claim_completion(pdu)) {
+					rc_cache_dec_inflight(pdu);
+					blk_mq_end_request(req, BLK_STS_OK);
+				}
 				return BLK_STS_OK;
 			}
 		} else if (op != REQ_OP_READ && hctx_idx < RC_VOLUME_MAX_HCTX) {
@@ -3197,8 +3537,10 @@ static blk_status_t rc_volume_queue_rq(struct blk_mq_hw_ctx *hctx,
 	st = rc_volume_map_request_sg(req, pdu, member_idx);
 	if (st != BLK_STS_OK) {
 		blk_mq_start_request(req);
-		rc_cache_dec_inflight(pdu);
-		blk_mq_end_request(req, st);
+		if (rc_volume_claim_completion(pdu)) {
+			rc_cache_dec_inflight(pdu);
+			blk_mq_end_request(req, st);
+		}
 		return BLK_STS_OK;
 	}
 
@@ -3427,7 +3769,13 @@ static bool rc_volume_drain_iter(struct request *req, void *priv)
 		}
 	}
 
-	if (kill && !blk_mq_request_completed(req)) {
+	if (kill && !blk_mq_request_completed(req) &&
+	    rc_volume_claim_completion(pdu)) {
+		/* The claim is what makes this safe against the ISR's
+		 * direct-end fast path, which bypasses the
+		 * blk_mq_complete_request state machine entirely — the
+		 * completed-state check alone leaves a double-completion
+		 * window there. */
 		pdu->sc_sct = RC_VOLUME_SC_DEAD;
 		blk_mq_complete_request(req);
 	}
@@ -3510,10 +3858,12 @@ static enum blk_eh_timer_return rc_volume_timeout(struct request *req)
 			  req->tag, pdu->op);
 		rc_volume_drain_dead();
 		rc_volume_schedule_auto_reset_for_req(pdu);
-		if (!blk_mq_request_completed(req)) {
+		if (!blk_mq_request_completed(req) &&
+		    rc_volume_claim_completion(pdu)) {
 			/* Drain should have caught it; if it didn't (e.g.,
 			 * member_idx out of range for some reason) the
-			 * direct end path bypasses .complete, so unmap here. */
+			 * direct end path bypasses .complete, so unmap here.
+			 * A lost claim means the drain or ISR owns it. */
 			rc_volume_unmap_request_sg(pdu);
 			rc_cache_dec_inflight(pdu);
 			blk_mq_end_request(req, BLK_STS_IOERR);
@@ -3537,7 +3887,8 @@ static enum blk_eh_timer_return rc_volume_timeout(struct request *req)
 			WRITE_ONCE(rc_volume_members[i]->ctx.nvme.dead, true);
 	rc_volume_drain_dead();
 	rc_volume_schedule_auto_reset_for_req(pdu);
-	if (!blk_mq_request_completed(req)) {
+	if (!blk_mq_request_completed(req) &&
+	    rc_volume_claim_completion(pdu)) {
 		rc_volume_unmap_request_sg(pdu);
 		rc_cache_dec_inflight(pdu);
 		blk_mq_end_request(req, BLK_STS_TIMEOUT);
@@ -3975,7 +4326,8 @@ static void rc_cache_isr(unsigned int entry_idx, u16 status)
 	}
 	spin_unlock_irqrestore(&rc_cache_lock, flags);
 
-	if (waiter)
+	if (waiter &&
+	    rc_volume_claim_completion(blk_mq_rq_to_pdu(waiter)))
 		blk_mq_complete_request(waiter);
 }
 

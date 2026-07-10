@@ -5,6 +5,9 @@
 # Blocking gates (a failure fails the check / blocks merge):
 #   * build      — compiles against multiple kernel versions
 #   * warnings   — the build must be warning-clean
+#   * qemu-rig   — boots the module in QEMU against synthetic RAID0/RAID1
+#                  arrays (incl. the stale-generation decoy) and runs the
+#                  full write/readback/discard battery
 #   * spdx       — every C/H source carries an SPDX GPL-2.0-only tag
 #   * whitespace — no trailing whitespace / no conflict markers in the diff
 #
@@ -120,6 +123,56 @@ jobs:
             exit 1
           fi
           echo "Driver sources are warning-clean (ignoring kernel-disabled -Wunused-parameter)."
+
+  # ---------------------------------------------------------------------------
+  # Functional test: boot the module in QEMU against synthetic member disks
+  # (scripts/qemu-test/).  The metadata images include a stale decoy config
+  # generation with the OPPOSITE RAID level and the same member DeviceIDs —
+  # the regression test for the deleted-array-assembled bug found during
+  # RAID1 hardware validation: the volume must assemble from the generation
+  # the commit block names, at the right level and capacity, then survive
+  # the guest's write/readback/reload/discard battery.
+  #
+  # Runs on the runner VM (not a container): it installs the HWE kernel as
+  # plain files and boots THAT in QEMU via the rig's --kver flag, since the
+  # runner's own azure kernel predates the driver's 6.15 minimum.  Uses KVM
+  # when the runner exposes /dev/kvm, TCG otherwise.
+  # ---------------------------------------------------------------------------
+  qemu-rig:
+    name: qemu-rig (${{ matrix.level }})
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        level: [raid0, raid1]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install HWE kernel, QEMU, busybox
+        run: |
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            build-essential linux-image-generic-hwe-24.04 \
+            linux-headers-generic-hwe-24.04 \
+            qemu-system-x86 busybox-static cpio
+
+      - name: Expose /dev/kvm when available
+        run: |
+          if [ -e /dev/kvm ]; then sudo chmod 666 /dev/kvm; else echo "no /dev/kvm — rig falls back to TCG"; fi
+
+      - name: Run the rig
+        env:
+          RCRAID_QEMU_TIMEOUT: "600"   # headroom for a TCG fallback
+        run: |
+          # Pick the HWE -generic kernel we installed, NOT sort's overall
+          # newest: the runner's own azure flavor can sort higher (e.g.
+          # 6.17.0-1018-azure > 6.17.0-14-generic) and differs from the
+          # RAID box's target stack.
+          KVER="$(ls /lib/modules | grep -- '-generic$' | sort -V | tail -1)"
+          echo "target kernel: $KVER"
+          sudo install -m 644 "/boot/vmlinuz-$KVER" ./vmlinuz
+          scripts/qemu-test/run-qemu-raid-test.sh \
+            --kver "$KVER" --kernel ./vmlinuz --level "${{ matrix.level }}"
 
   # ---------------------------------------------------------------------------
   # SPDX license tag — every driver source must declare GPL-2.0-only on line 1.

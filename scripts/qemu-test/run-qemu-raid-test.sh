@@ -15,15 +15,23 @@
 # otherwise falls back to TCG (slow but works, e.g. in CI).
 #
 # Usage:
-#   run-qemu-raid-test.sh [--kernel <vmlinuz>] [--level raid0|raid1]
+#   run-qemu-raid-test.sh [--kernel <vmlinuz>] [--kver <version>]
+#                         [--level raid0|raid1]
 #                         [--members N] [--size-mib M] [--workdir DIR]
+#
+# --kver builds the module against /lib/modules/<version>/build and boots
+# /boot/vmlinuz-<version> (unless --kernel overrides), so the test can run
+# against an installed kernel that is NOT the running one — e.g. CI runners
+# whose own kernel is older than the driver's minimum: install the HWE
+# kernel + headers as packages and point --kver at it, no reboot needed.
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
-KERNEL="/boot/vmlinuz-$(uname -r)"
+KVER="$(uname -r)"
+KERNEL=""
 LEVEL=raid0
 MEMBERS=2
 SIZE_MIB=256
@@ -32,6 +40,7 @@ WORKDIR=""
 while [ $# -gt 0 ]; do
     case "$1" in
         --kernel)   KERNEL="$2"; shift 2 ;;
+        --kver)     KVER="$2"; shift 2 ;;
         --level)    LEVEL="$2"; shift 2 ;;
         --members)  MEMBERS="$2"; shift 2 ;;
         --size-mib) SIZE_MIB="$2"; shift 2 ;;
@@ -39,6 +48,12 @@ while [ $# -gt 0 ]; do
         *) echo "unknown arg: $1" >&2; exit 2 ;;
     esac
 done
+[ -n "$KERNEL" ] || KERNEL="/boot/vmlinuz-$KVER"
+
+[ -d "/lib/modules/$KVER/build" ] || {
+    echo "no kernel headers at /lib/modules/$KVER/build" >&2
+    exit 2
+}
 
 [ -r "$KERNEL" ] || {
     echo "kernel image $KERNEL is not readable." >&2
@@ -64,10 +79,10 @@ mkdir -p "$WORKDIR"
 echo "==> workdir: $WORKDIR"
 
 # ----------------------------------------------------------------------------
-# 1. Build the module against the running kernel.
+# 1. Build the module against the target kernel (default: the running one).
 # ----------------------------------------------------------------------------
-echo "==> building rcraid.ko against $(uname -r)"
-make -C "/lib/modules/$(uname -r)/build" M="$REPO_DIR" modules \
+echo "==> building rcraid.ko against $KVER"
+make -C "/lib/modules/$KVER/build" M="$REPO_DIR" modules \
     > "$WORKDIR/build.log" 2>&1 || {
     tail -n 30 "$WORKDIR/build.log" >&2
     echo "module build failed — see $WORKDIR/build.log" >&2
@@ -127,11 +142,11 @@ done
 
 CONSOLE_LOG="$WORKDIR/console.log"
 echo "==> booting VM (console → $CONSOLE_LOG)"
-timeout --foreground 300 qemu-system-x86_64 \
+timeout --foreground "${RCRAID_QEMU_TIMEOUT:-300}" qemu-system-x86_64 \
     -M q35 -m 2048 -smp 4 "${ACCEL_ARGS[@]}" \
     -kernel "$KERNEL" \
     -initrd "$WORKDIR/initramfs.gz" \
-    -append "console=ttyS0 rdinit=/init expected_sectors=$EXPECTED_SECTORS panic=-1" \
+    -append "console=ttyS0 rdinit=/init expected_sectors=$EXPECTED_SECTORS expected_level=$LEVEL panic=-1" \
     "${DRIVE_ARGS[@]}" \
     -nographic -no-reboot \
     > "$CONSOLE_LOG" 2>&1 || true   # qemu exit code isn't the verdict
@@ -165,7 +180,7 @@ if grep -q "RCRAID-TEST-PASS" "$CONSOLE_LOG"; then
 fi
 
 echo "==> FAIL — guest console tail:"
-tail -n 60 "$CONSOLE_LOG" | sed 's/^/    /'
+tail -n 200 "$CONSOLE_LOG" | sed 's/^/    /'
 # Keep the workdir for debugging on failure.
 trap - EXIT
 echo "==> artifacts kept in $WORKDIR"

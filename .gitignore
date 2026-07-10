@@ -55,3 +55,4 @@ dmesg.log
 # Driver installation directory
 /dd/
 .ghidra_workspace/
+.*.d
