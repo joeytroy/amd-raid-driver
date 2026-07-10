@@ -55,22 +55,10 @@ echo
 # rcraid.ko is unsigned, so a Secure-Boot-enforcing kernel refuses to load it
 # — the script would install build deps, compile for a couple of minutes, and
 # only then die at step 4 with insmod's opaque "Key was rejected by service".
-# Catch it here instead, before anything is downloaded or built.
-#
-# Read the SecureBoot EFI variable directly rather than via mokutil (not
-# installed this early in a stock live session).  efivarfs layout: 4 bytes of
-# attributes followed by 1 data byte, 1 = enforcing.  No efivarfs entry at
-# all means a BIOS/CSM boot, where Secure Boot doesn't exist.
+# Catch it here instead, before anything is downloaded or built.  Detection
+# is shared with install-dkms.sh and fails closed on an unreadable variable.
 # ----------------------------------------------------------------------------
-secure_boot_enforcing() {
-    local var
-    for var in /sys/firmware/efi/efivars/SecureBoot-*; do
-        [ -e "$var" ] || break
-        [ "$(od -An -tu1 -j4 -N1 "$var" 2>/dev/null | tr -d '[:space:]')" = "1" ]
-        return
-    done
-    return 1
-}
+. "$SRC_DIR/scripts/lib/secure-boot.sh"
 
 if [ "${RCRAID_ALLOW_SECURE_BOOT:-0}" != 1 ] && secure_boot_enforcing; then
     cat >&2 <<'EOF'

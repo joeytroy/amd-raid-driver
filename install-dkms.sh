@@ -37,18 +37,9 @@ done
 # Secure Boot preflight — rcraid.ko is unsigned, so an enforcing kernel
 # refuses to load it ("Key was rejected by service").  Without this check the
 # install itself would look successful and the failure would only surface at
-# the next boot, with the array absent.  efivarfs layout: 4 attribute bytes
-# then 1 data byte, 1 = enforcing; no efivarfs entry means a BIOS/CSM boot,
-# where Secure Boot doesn't exist.
-secure_boot_enforcing() {
-    local var
-    for var in /sys/firmware/efi/efivars/SecureBoot-*; do
-        [ -e "$var" ] || break
-        [ "$(od -An -tu1 -j4 -N1 "$var" 2>/dev/null | tr -d '[:space:]')" = "1" ]
-        return
-    done
-    return 1
-}
+# the next boot, with the array absent.  Detection is shared with
+# install-livecd.sh and fails closed on an unreadable variable.
+. "$SRC_DIR/scripts/lib/secure-boot.sh"
 
 if [ "${RCRAID_ALLOW_SECURE_BOOT:-0}" != 1 ] && secure_boot_enforcing; then
     cat >&2 <<'EOF'
