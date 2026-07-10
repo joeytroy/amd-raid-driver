@@ -34,6 +34,32 @@ for tool in lspci dkms udevadm; do
     fi
 done
 
+# Secure Boot preflight — rcraid.ko is unsigned, so an enforcing kernel
+# refuses to load it ("Key was rejected by service").  Without this check the
+# install itself would look successful and the failure would only surface at
+# the next boot, with the array absent.  Detection is shared with
+# install-livecd.sh and fails closed on an unreadable variable.
+. "$SRC_DIR/scripts/lib/secure-boot.sh"
+
+if [ "${RCRAID_ALLOW_SECURE_BOOT:-0}" != 1 ] && secure_boot_enforcing; then
+    cat >&2 <<'EOF'
+ERROR: Secure Boot is enabled.
+
+rcraid.ko is unsigned, so the kernel will refuse to load it (insmod:
+"Key was rejected by service"; dmesg: "Loading of unsigned module is
+rejected").  Installing now would look successful but leave the array
+absent after the next reboot.
+
+Disable Secure Boot in BIOS setup and re-run this script — and keep it
+off: DKMS rebuilds on every kernel update are just as unsigned.
+
+If you sign the module and enrol a MOK yourself, re-run with
+RCRAID_ALLOW_SECURE_BOOT=1.  See INSTALL.md ("Secure Boot") for the
+signing procedure and its DKMS caveat.
+EOF
+    exit 1
+fi
+
 echo "==> rcraid install-dkms.sh  (driver ${DRIVER_VERSION}, dkms package ${PKG_NAME}-${PKG_VERSION})"
 echo
 

@@ -50,6 +50,37 @@ echo "==============================================================="
 echo
 
 # ----------------------------------------------------------------------------
+# Preflight — Secure Boot.
+#
+# rcraid.ko is unsigned, so a Secure-Boot-enforcing kernel refuses to load it
+# — the script would install build deps, compile for a couple of minutes, and
+# only then die at step 4 with insmod's opaque "Key was rejected by service".
+# Catch it here instead, before anything is downloaded or built.  Detection
+# is shared with install-dkms.sh and fails closed on an unreadable variable.
+# ----------------------------------------------------------------------------
+. "$SRC_DIR/scripts/lib/secure-boot.sh"
+
+if [ "${RCRAID_ALLOW_SECURE_BOOT:-0}" != 1 ] && secure_boot_enforcing; then
+    cat >&2 <<'EOF'
+ERROR: Secure Boot is enabled.
+
+rcraid.ko is unsigned, so the kernel will refuse to load it (insmod:
+"Key was rejected by service"; dmesg: "Loading of unsigned module is
+rejected").
+
+Reboot into BIOS setup, disable Secure Boot, and boot this live USB
+again.  Keep Secure Boot off afterwards: the installed system rebuilds
+the same unsigned module via DKMS, so re-enabling Secure Boot later
+makes the array — and the OS installed on it — unbootable.
+
+If you sign the module and enrol a MOK yourself, re-run with
+RCRAID_ALLOW_SECURE_BOOT=1.  See INSTALL.md ("Secure Boot") for the
+signing procedure and its DKMS caveat.
+EOF
+    exit 1
+fi
+
+# ----------------------------------------------------------------------------
 # Phase 1 — build + load into the live session
 # ----------------------------------------------------------------------------
 
