@@ -11,7 +11,7 @@
  *
  * Original work, independently authored from clean-room reverse
  * engineering of the AMD-RAID Windows driver binaries under DMCA
- * §1201(f) interoperability protections.  See RE_METHODOLOGY.md.
+ * §1201(f) interoperability protections.  See docs/RE_METHODOLOGY.md.
  */
 
 /****************************************************************************

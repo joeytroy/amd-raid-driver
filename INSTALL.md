@@ -7,8 +7,8 @@
 > for the user-facing install flows (live-USB install onto the array,
 > DKMS install) see the **README quick start**.  See `docs/STATUS.md`
 > for the full state, `docs/REVERSE_ENGINEERING.md` for the
-> reverse-engineering background, and `RE_METHODOLOGY.md` at the
-> repository root for the license and legal record.
+> reverse-engineering background, and `docs/RE_METHODOLOGY.md`
+> for the license and legal record.
 
 The fastest, safest setup is described first. The Live USB approach is
 kept at the bottom as a fallback for when no separate Linux drive is
