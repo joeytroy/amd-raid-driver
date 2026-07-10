@@ -24,28 +24,41 @@ NVMe RAID controller as PCI `1022:B000`, which is fully implemented here.
 
 | PCI ID | Controller | Status |
 |--------|-----------|--------|
-| `1022:B000` | NVMe RAID Bottom (TRX50, WRX90, X870/X670, B850/B650, …) | ✅ **RAID0 read/write, boot-from-array validated** |
+| `1022:B000` | NVMe RAID Bottom (TRX50, WRX90, X870/X670, B850/B650, …) | ✅ **RAID0 + RAID1 read/write, boot-from-array validated** |
 | `1022:43BD` `7905` `7916` `7917` | SATA RAID (Promontory / older) | ⚙️ Claimed but stubbed — not yet implemented |
 
-**RAID level:** RAID0 works today. RAID1 / RAID10 are on the roadmap.
-RAID5 is not planned (AMD only supports it on 3rd-gen Threadripper).
+**RAID level:** RAID0 and RAID1 both work today, each validated on real
+hardware up to installing and booting Linux from the array. RAID10 is on
+the roadmap. RAID5 is not planned (AMD only supports it on 3rd-gen
+Threadripper). Note that RAID1 **degraded mode is not implemented yet** —
+see [Not yet supported](#not-yet-supported).
 
 ---
 
 ## What works today
 
-- **RAID0 volumes, read *and* write** at `/dev/rcraid0` — member count,
-  member order, stripe size, and capacity are all read from the on-disk
-  RAIDXpert metadata. Nothing is hardcoded.
-- **Boot Linux from the array.** Validated end to end: Kubuntu 24.04
-  (HWE kernel 6.17) installed onto and booting from a 2× Crucial T700
-  RAID0 array, with DKMS rebuilds and an initramfs hook that brings the
-  array up before `pivot_root`.
+- **RAID0 and RAID1 volumes, read *and* write** at `/dev/rcraid0` —
+  member count, member order, stripe size, RAID level, and capacity are
+  all read from the on-disk RAIDXpert metadata (specifically from the
+  **committed** config generation, so a previously deleted array on the
+  same disks can never be assembled by mistake). Nothing is hardcoded.
+- **RAID1 mirrors done right**: reads round-robin across both members
+  (~2× single-drive throughput), writes and discards fan out to every
+  mirror and complete only when the *last* member acknowledges — an
+  `fsync` can never pass while one mirror holds stale data.
+- **Boot Linux from the array.** Validated end to end for both levels:
+  Kubuntu 24.04 (HWE kernel 6.17) installed onto and booting from a
+  2× Crucial T700 array — as RAID0 and, separately, as RAID1 — with DKMS
+  rebuilds and an initramfs hook that brings the array up before
+  `pivot_root`.
 - **Filesystem-safe.** FLUSH, FUA, and DISCARD/TRIM are all wired up, so
   `fsync`, journaling, and `fstrim` behave correctly.
-- **Fast — and symmetric.** ~19.7 GB/s read / ~18.7 GB/s write on that
-  2-drive array (KDiskMark 3.3.0, SEQ1M Q8T1). Interrupt-driven async completion
-  with a scatterlist-native DMA path — the hardware reads and writes your
+- **Fast — and true to each RAID level's physics.** On the same 2-drive
+  array (KDiskMark 3.3.0, SEQ1M Q8T1): **RAID0** ~19.7 GB/s read /
+  ~18.7 GB/s write; **RAID1** ~20.5 GB/s read (both mirrors serving in
+  parallel) / ~11.1 GB/s write (bounded by one drive, as every mirror
+  write must be). Interrupt-driven async completion with a
+  scatterlist-native DMA path — the hardware reads and writes your
   pages directly, no bounce buffers or memcpy.
 - **Resilient.** 30 s command timeouts, controller health tracking,
   best-effort NVMe Abort, and automatic controller reset on the first
@@ -206,7 +219,13 @@ Full setup, troubleshooting, and the Secure-Boot / signing details are in
 
 ## Not yet supported
 
-- **RAID1 / RAID10** — roadmap. **RAID5** — not planned.
+- **RAID1 degraded mode / rebuild** — ⚠️ **know this before trusting the
+  mirror**: today a member failure fails the whole volume (same behavior
+  as RAID0) instead of serving from the surviving mirror. Your data is
+  still duplicated on both drives — nothing is lost — but the volume
+  goes down until the array is healthy again. Degraded-mode operation,
+  hot-plug handling, and background rebuild are the next roadmap items.
+- **RAID10** — roadmap. **RAID5** — not planned.
 - **SATA RAID** — the `43BD / 7905 / 7916 / 7917` controllers are claimed
   but the AHCI path is a stub.
 - **No array management** — create/modify the array in BIOS/RAIDXpert.
@@ -237,6 +256,16 @@ open a PR, add yourself to the contributor list, and sign off your
 commits (`git commit -s`). The long-term goal is mainline kernel
 inclusion.
 
+Every PR is gated by CI that not only builds against three kernel
+lines but **boots the driver in QEMU** against synthetic RAID0 and
+RAID1 arrays (`scripts/qemu-test/`). The synthetic metadata is
+deliberately booby-trapped with the failure modes found during
+hardware validation — a stale deleted-array config generation, a raw
+single-disk record with a matching DeviceID — and the guest battery
+covers write/readback, module reload cycles, discard+rewrite, and a
+real `mke2fs` run (sub-page buffered writeback, the I/O pattern that
+page-aligned tests can never generate).
+
 | Doc | What's in it |
 |-----|--------------|
 | [`docs/STATUS.md`](docs/STATUS.md) | Current state, implementation history, and the timeout / reset / dead-controller design |
@@ -250,6 +279,7 @@ inclusion.
 |------|--------------|
 | `rc_*.c`, `rc_*.h` | The driver (SPDX `GPL-2.0-only`) |
 | `Makefile`, `build.sh`, `test_driver.sh`, `bench.sh`, `unload.sh` | Build + test helpers |
+| `scripts/qemu-test/` | QEMU functional-test rig: synthetic firmware-faithful metadata (`mkmeta.py`) + guest test battery, run by CI on every PR |
 | `docs/` | Status, open questions, Ghidra findings, decompiled extracts |
 | `drivers/` | *(removed from the tree)* AMD Windows binaries + Linux SDK used as RE input — vendor-distributed material, never compiled in. Retrievable from git history: `git checkout 69738ee -- drivers/`, or from AMD's public download pages |
 | `scripts/ghidra/` | Headless-Ghidra extraction scripts |
