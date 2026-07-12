@@ -48,17 +48,21 @@ echo "=== verify RAIDCore metadata (driver-validated at bind time) ==="
 # Count only lines from the most recent driver load — earlier binds in
 # the same boot (the load/rmmod/tweak/reload workflow) leave stale
 # validation lines in the ring buffer that would inflate the count.
-members=$(dmesg | awk '
-    /rc_init: AMD RAID Driver version/ { n = 0 }
+# Track whether the load banner is visible at all: driver-loaded-but-
+# zero-members-validated is a real failure, not a wrapped ring buffer.
+result=$(dmesg | awk '
+    /rc_init: AMD RAID Driver version/ { seen = 1; n = 0 }
     /rc_nvme_read_validate_metadata: RAIDCore/ { n++ }
-    END { print n + 0 }')
+    END { print seen + 0, n + 0 }')
+seen=${result%% *}
+members=${result##* }
 if [ "$members" -ge 2 ]; then
     echo "  PASS — driver validated RAIDCore metadata on $members members"
-elif [ "$members" -eq 1 ]; then
-    echo "  FAIL — only 1 member logged validated metadata (need >= 2)"
+elif [ "$seen" = "1" ]; then
+    echo "  FAIL — driver loaded but only $members member(s) validated (need >= 2)"
 else
-    echo "  WARN — no metadata-validation lines in dmesg (ring buffer may"
-    echo "         have wrapped since boot; not necessarily a failure)"
+    echo "  WARN — no driver-load banner in dmesg (ring buffer may have"
+    echo "         wrapped since boot); can't verify metadata validation"
 fi
 echo
 
