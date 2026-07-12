@@ -2176,7 +2176,11 @@ static void rc_volume_parse_logical_device(struct rc_adapter *adapter)
 			level = rc_ld_level_from(devtype, first_count,
 						 second_count, devices);
 
-			rc_printk(RC_INFO,
+			/* RC_NOTE, not RC_INFO: this is the one-time record of
+			 * which LD record assembled the volume and at what RAID
+			 * level — it must land in dmesg at the default
+			 * debug_level (the QEMU rig also asserts on it). */
+			rc_printk(RC_NOTE,
 				  "rc_volume_parse_logical_device: %s LD@gen+%u.%u devtype=0x%04x first=%u second=%u (level=%s) devices=%u chunk=%u chunk_idx=%u capacity=%llu my_pos=%d alloc_off=%llu alloc_sz=%llu user_off=%llu user_sz=%llu%s\n",
 				  pci_name(adapter->pdev),
 				  (pos + i) / 512, (pos + i) % 512,
