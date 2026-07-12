@@ -145,8 +145,7 @@ static struct blk_mq_tag_set rc_volume_tagset;
  * 512 KiB to each member, which is exactly 128 pages per member. */
 #define RC_VOLUME_MS_PAGES_PER_MEMBER	128
 /* SQ headroom reserved for internal (non-blk-mq) commands: boot/reset-time
- * sync commands (1 per queue), prefetch (2 slots × 2 cmds per hctx) and a
- * margin for cache fills.  Internal submitters additionally reserve their
+ * sync commands (1 per queue).  Internal submitters additionally reserve their
  * SQE slots explicitly via rc_nvme_sq_reserve() and back off when the SQ
  * is full, so this headroom is a throughput knob (keeps steady-state tag
  * load from starving internal commands into constant back-off), not the
@@ -156,7 +155,7 @@ static struct blk_mq_tag_set rc_volume_tagset;
  * RC_NVME_IO_QUEUE_DEPTH (256, matching Windows), but an NVMe SQ is full
  * at depth-1 and internal commands share the same SQs on top of the tags,
  * so the tag pool must sit below depth-1 minus internal headroom — sizing
- * them EQUAL let a full tag load plus one cache fill wrap the SQ tail
+ * them EQUAL let a full tag load plus one internal command wrap the SQ tail
  * over live SQEs (silent corruption).  Further clamped at volume-create
  * time against the actual granted queue depths (CAP.MQES can be < 256).
  * Total in-flight requests = nr_hw_queues × this. */
@@ -186,42 +185,10 @@ static struct blk_mq_tag_set rc_volume_tagset;
 static __le64     *rc_volume_prp_va[RC_VOLUME_MAX_HCTX][RC_VOLUME_MAX_MEMBERS][RC_VOLUME_QUEUE_DEPTH];
 static dma_addr_t  rc_volume_prp_pa[RC_VOLUME_MAX_HCTX][RC_VOLUME_MAX_MEMBERS][RC_VOLUME_QUEUE_DEPTH];
 
-/* Sequential read prefetch.
- *
- * Per-hctx state with multiple ping-pong slots.  When queue_rq sees a
- * READ that's contiguous with the previous READ on this hctx, it
- * speculatively issues a stripe-sized NVMe READ for the next stripe
- * (whose data lives on the OTHER member by RAID0 striping) into a
- * free slot's DMA buffer.  Subsequent app READs that fall within any
- * slot's [lba, lba+sectors) range are served from that buffer via
- * memcpy without touching the device.
- *
- * Two slots per hctx so a fresh prefetch can be in flight while the
- * previous slot is still being consumed by app reads.  Without the
- * second slot, the per-stripe consume → "now issue next prefetch" cycle
- * leaves a ~140 µs hole every other stripe (the time it takes the new
- * prefetch to complete).
- *
- * Each prefetch covers one stripe (1 MiB) and is dispatched as multiple
- * NVMe READ commands — each capped at the controller's MDTS (= 512 KiB
- * on the T700 dev box), so a 1 MiB prefetch issues 2 cmds.
- *
- * CID encoding (16-bit):
- *   bit 8        = prefetch marker (always set for PF CIDs)
- *   bit 7        = slot index (0..1)
- *   bits 6..4    = hctx_idx (0..7)
- *   bits 3..0    = cmd index within the prefetch (0..15)
- * Blk-mq tags (0..255) never set bit 8, so the dispatch is unambiguous. */
-#define RC_VOLUME_PREFETCH_BYTES	(1u * 1024 * 1024)
-#define RC_VOLUME_PREFETCH_SECTORS	(RC_VOLUME_PREFETCH_BYTES / 512u)
-#define RC_VOLUME_PREFETCH_PAGES	(RC_VOLUME_PREFETCH_BYTES / PAGE_SIZE)
-#define RC_VOLUME_PREFETCH_CID_BASE	0x100u
-
 /* CID range for boot/reset-time synchronous commands (rc_nvme_io_cmd_sync):
  * 0x400 | (per-queue sequence & 0xFF), i.e. 0x400..0x4FF.  Deliberately
- * OUTSIDE every other CID space — blk-mq tags run 0..RC_VOLUME_QUEUE_DEPTH-1
- * (255), prefetch CIDs carry bit 8 (0x100..), cache fills bit 13 (0x2000..)
- * — because sync commands share io_queues[0] with live volume traffic
+ * OUTSIDE the blk-mq tag CID space (tags run 0..RC_VOLUME_QUEUE_DEPTH-1,
+ * i.e. 255) because sync commands share io_queues[0] with live volume traffic
  * during module reload / controller auto-reset.  (A literal CID 0 aliased
  * blk-mq tag 0: with sync_pending armed the ISR would swallow a real tag-0
  * request's CQE as the sync completion.)
@@ -233,176 +200,6 @@ static dma_addr_t  rc_volume_prp_pa[RC_VOLUME_MAX_HCTX][RC_VOLUME_MAX_MEMBERS][R
  * wrong sequence is consumed and dropped. */
 #define RC_VOLUME_SYNC_CID_BASE		0x400u
 #define RC_VOLUME_SYNC_CID_MASK		0xFF00u	/* (cid & MASK) == BASE → sync range */
-#define RC_VOLUME_PREFETCH_SLOTS	2u
-
-enum rc_prefetch_state {
-	RC_PF_IDLE = 0,
-	RC_PF_INFLIGHT,
-	RC_PF_COMPLETE,
-};
-
-/* Sectors per NVMe command.  Bounded by the controller's MDTS — at
- * MDTS=7 with MPSMIN=0 this is 2^7 × 4 KiB = 512 KiB = 1024 sectors.
- * The 1 MiB prefetch buffer is filled by 2 of these commands. */
-#define RC_VOLUME_PREFETCH_CMD_SECTORS	1024u
-#define RC_VOLUME_PREFETCH_CMDS \
-	(RC_VOLUME_PREFETCH_SECTORS / RC_VOLUME_PREFETCH_CMD_SECTORS)
-
-struct rc_volume_prefetch_slot {
-	enum rc_prefetch_state	state;
-	u16			status;		/* NVMe SC/SCT, 0 = success */
-	atomic_t		cmds_pending;	/* NVMe cmds still outstanding */
-	sector_t		lba;		/* volume LBA prefetched (1 MiB-aligned) */
-	u32			sectors;	/* total prefetch size in sectors */
-	u32			served_sectors;	/* slot recycles when this reaches sectors */
-	int			member;		/* member the prefetch landed on */
-	/* Per-member DMA buffer + PRP list page (per member because IOMMU). */
-	void			*buf_va[RC_VOLUME_MAX_MEMBERS];
-	dma_addr_t		buf_pa[RC_VOLUME_MAX_MEMBERS];
-	__le64			*prp_va[RC_VOLUME_MAX_MEMBERS];
-	dma_addr_t		prp_pa[RC_VOLUME_MAX_MEMBERS];
-};
-
-struct rc_volume_prefetch {
-	spinlock_t			lock;
-	struct rc_volume_prefetch_slot	slots[RC_VOLUME_PREFETCH_SLOTS];
-	/* Sequential-stream tracking. */
-	sector_t			last_lba;
-	u32				last_sectors;
-	/* Stats. */
-	u64				hits;
-	u64				misses;
-	u64				issued;
-	u64				discarded;
-};
-
-static struct rc_volume_prefetch rc_volume_prefetch_state[RC_VOLUME_MAX_HCTX];
-
-static int rc_volume_prefetch_enabled;
-module_param_named(prefetch, rc_volume_prefetch_enabled, int, 0644);
-MODULE_PARM_DESC(prefetch,
-		 "Speculatively pre-issue the next stripe on sequential reads. "
-		 "Off by default — the buffer size is hardcoded to 1 MiB which "
-		 "over-prefetches on arrays with smaller stripes (256 KiB on the "
-		 "test array) and the baseline driver already saturates the "
-		 "device.  Set to 1 to opt in.");
-
-/* ============================ Read cache ===========================
- *
- * Stripe-granularity LRU buffer cache, modeled after the buffer pool we
- * decoded in rcraid.sys (FUN_140013234).  Sits below the FS layer so
- * O_DIRECT / FILE_FLAG_NO_BUFFERING reads still hit it, matching what
- * Windows does.  Read path: hash-lookup by stripe LBA; on hit, memcpy
- * from buffer to bio pages; on miss, allocate a free entry (evicting
- * LRU if full), dispatch the read into that entry, populate on
- * completion.  Write path: invalidate any cache entries that overlap.
- *
- * Each entry holds one full stripe (1 MiB) of data.  The backing buffer
- * is allocated per-member via dma_alloc_coherent so we can DMA fill it
- * from whichever member owns the stripe; memcpy-out uses the per-member
- * KVA of the member that holds the data.
- *
- * Memory cost: nr_entries × stripe × nr_members.  Default 64 entries =
- * 128 MiB on a 2-member array; tunable via insmod cache_entries=.
- *
- * Locking: one global spinlock for hash + LRU.  Held briefly across
- * lookup + allocate/touch.  Memcpy and DMA happen with lock released. */
-#define RC_VOLUME_CACHE_HASH_BITS	10
-#define RC_VOLUME_CACHE_HASH_SIZE	(1u << RC_VOLUME_CACHE_HASH_BITS)
-#define RC_VOLUME_CACHE_HASH_MASK	(RC_VOLUME_CACHE_HASH_SIZE - 1)
-
-enum rc_cache_state {
-	RC_CE_FREE = 0,
-	RC_CE_LOADING,
-	RC_CE_VALID,
-};
-
-struct rc_cache_entry {
-	enum rc_cache_state	state;
-	sector_t		lba;		/* volume LBA, stripe-aligned */
-	u16			status;		/* NVMe SC/SCT from populating cmd, 0 = ok */
-	atomic_t		cmds_pending;	/* NVMe cmds still in flight for LOADING entries */
-	int			member;		/* member the data is read from */
-	/* True when rc_cache_invalidate_range hit this entry while it was
-	 * still LOADING.  The fill's data must be discarded (a write made it
-	 * stale), so the ISR transitions to FREE instead of VALID on
-	 * completion.  Cleared on each LOADING transition. */
-	bool			abandoned;
-	/* Request that triggered the fill, waiting for it to complete.
-	 * Single waiter per entry — concurrent same-stripe requests just
-	 * dispatch normally (rare, suboptimal but correct).  ISR walks
-	 * this when transitioning LOADING → VALID. */
-	struct request		*waiter;
-	struct hlist_node	hash_node;
-	struct list_head	lru_node;
-	/* Per-member DMA buffer + PRP list.  buf_va[member] is the KVA we
-	 * memcpy from when serving a hit.  buf_pa[member] feeds NVMe READ
-	 * PRPs.  Only the member that actually holds the stripe is read
-	 * from / written to per entry, but the buffer is allocated for
-	 * both members so entries can be reused across members. */
-	void			*buf_va[RC_VOLUME_MAX_MEMBERS];
-	dma_addr_t		buf_pa[RC_VOLUME_MAX_MEMBERS];
-	__le64			*prp_va[RC_VOLUME_MAX_MEMBERS];
-	dma_addr_t		prp_pa[RC_VOLUME_MAX_MEMBERS];
-};
-
-static struct rc_cache_entry *rc_cache_entries;
-static u32 rc_cache_nr_entries;
-static spinlock_t rc_cache_lock;
-static struct hlist_head *rc_cache_buckets;
-static struct list_head rc_cache_lru;
-static u64 rc_cache_hits;
-static u64 rc_cache_misses;
-static u64 rc_cache_evictions;
-
-static int rc_cache_entries_param;
-module_param_named(cache_entries, rc_cache_entries_param, int, 0444);
-MODULE_PARM_DESC(cache_entries,
-		 "Number of stripe cache entries (each entry uses up to 1 MiB "
-		 "per member of DMA memory).  Off by default — measured against "
-		 "the actual stripe size, the cache hurts read throughput on "
-		 "non-repeating workloads and only the multi-member dispatch is "
-		 "responsible for the measured improvements.  Set to a non-zero "
-		 "value (e.g., 64, 128, 1100) to opt in for repeat-heavy "
-		 "workloads.");
-
-/* CIDs 0x2000..0x2FFF reserved for cache fills.  Each fill issues 2 cmds
- * (1 MiB / MDTS=512 KiB).  Layout: bit 13 = cache marker, bits 12..1 =
- * entry_idx (up to 4096 entries), bit 0 = cmd index within the fill. */
-#define RC_VOLUME_CACHE_CID_BASE	0x2000u
-#define RC_VOLUME_CACHE_CID_MASK	0x2000u
-#define RC_VOLUME_CACHE_MAX_ENTRIES	4096u
-#define RC_VOLUME_CACHE_CMD_SECTORS	1024u	/* 512 KiB per NVMe cmd, MDTS limit */
-
-/* "Ghost" cache: small direct-mapped hash of recently-seen stripe LBAs
- * used to gate real cache population.  A stripe is only promoted to the
- * real cache on its SECOND access — first access just records the LBA
- * here and dispatches the read normally.  This avoids the cache fill's
- * memcpy overhead on workloads that read each stripe once (cold streams,
- * boot-time loads) while still letting CDM-style "read the same region
- * 5 times" benchmarks ramp into cache for loops 2+.
- *
- * Direct-mapped + collisions overwrite — false-negatives are fine
- * (data still served correctly, just no caching that round) and false
- * positives are rare with the bucket count chosen.  Memory: 64 KiB. */
-#define RC_GHOST_HASH_BITS	13
-#define RC_GHOST_HASH_SIZE	(1u << RC_GHOST_HASH_BITS)
-#define RC_GHOST_HASH_MASK	(RC_GHOST_HASH_SIZE - 1)
-static sector_t *rc_ghost_table;	/* RC_GHOST_HASH_SIZE entries, 0 = empty */
-
-/* Per-hctx in-flight counter — cheap atomic proxy for "current queue
- * depth on this hctx".  Cache lookups still happen at any QD (hits are
- * fast), but cache FILLS are gated on QD < threshold: at high QD the
- * device itself outpaces the cache fill's memcpy overhead, so we'd be
- * adding work for no win.  Without this gate, SEQ1M Q8T1 drops from
- * ~19 GB/s native to ~14 GB/s cache-bound. */
-static atomic_t rc_cache_hctx_inflight[RC_VOLUME_MAX_HCTX];
-static int rc_cache_fill_max_qd = 2;
-module_param_named(cache_fill_max_qd, rc_cache_fill_max_qd, int, 0644);
-MODULE_PARM_DESC(cache_fill_max_qd,
-		 "Only populate cache when per-hctx in-flight count <= this (default 2). "
-		 "Cache HITS always serve regardless of QD.");
-
 /* blk-mq per-request command data.
  *
  * For READ/WRITE the request targets ONE member, members_pending is set
@@ -424,7 +221,9 @@ struct rc_volume_pdu {
 	int                member_idx;
 	u8                 op;             /* req_op() value */
 	u16                sc_sct;         /* NVMe SC/SCT, 0 = success */
-	u8                 hctx_idx;       /* for inflight counter decrement */
+	u8                 hctx_idx;       /* hctx the request was queued on;
+					    * .timeout uses it to derive the
+					    * NVMe SQID for Abort */
 	atomic_t           members_pending;
 	/* Single-completion claim.  Multiple actors can race to finish one
 	 * request — the ISR (batched direct-end fast path), the dead-member
@@ -445,10 +244,6 @@ struct rc_volume_pdu {
 	 * fields above are unused in this path. */
 	bool               ms_active;
 	int                ms_nents[RC_VOLUME_MAX_MEMBERS];
-	/* Non-NULL when this request is waiting on a cache fill.  .complete
-	 * copies from cache_entry->buf_va[member] into the bio and ends the
-	 * request without dma_unmap_sg (we never dma_map'd). */
-	struct rc_cache_entry *cache_entry;
 	struct scatterlist sg[RC_VOLUME_DATA_PAGES];
 	struct scatterlist ms_sg[RC_VOLUME_MAX_MEMBERS][RC_VOLUME_MS_PAGES_PER_MEMBER];
 };
@@ -460,14 +255,6 @@ struct rc_volume_pdu {
 static inline bool rc_volume_claim_completion(struct rc_volume_pdu *pdu)
 {
 	return atomic_cmpxchg(&pdu->completed, 0, 1) == 0;
-}
-
-/* Helper: decrement the per-hctx inflight counter that was incremented at
- * the top of queue_rq.  Called from every code path that ends a request. */
-static inline void rc_cache_dec_inflight(struct rc_volume_pdu *pdu)
-{
-	if (pdu->hctx_idx < RC_VOLUME_MAX_HCTX)
-		atomic_dec(&rc_cache_hctx_inflight[pdu->hctx_idx]);
 }
 
 /* Sentinel value stored into pdu->sc_sct by the drain path so .complete
@@ -554,11 +341,8 @@ irqreturn_t rc_nvme_admin_irq(int irq, void *dev_id)
 	return IRQ_HANDLED;
 }
 
-/* Forward declarations used inside the per-queue ISR. */
-static void rc_volume_prefetch_isr(unsigned int hctx_idx,
-				   unsigned int slot_idx, u16 status);
+/* Forward declaration used inside the per-queue ISR. */
 static void rc_volume_unmap_request_sg(struct rc_volume_pdu *pdu);
-static void rc_cache_isr(unsigned int entry_idx, u16 status);
 
 /* Per-I/O-queue ISR — registered for MSI-X vector qid.  Walks this
  * queue's CQ only.  Boot-time sync helpers sleep on q->cq_wait; once
@@ -624,17 +408,6 @@ irqreturn_t rc_nvme_io_queue_irq(int irq, void *dev_id)
 					  pci_name(adapter->pdev), q->qid, cid,
 					  q->sync_cid, q->sync_pending);
 			}
-		} else if (cid & RC_VOLUME_CACHE_CID_MASK) {
-			/* Cache fill completion (CID 0x2000..0x2FFF):
-			 * bits 12..1 = entry_idx, bit 0 = cmd index. */
-			u16 sc = (status >> 1) & 0x7fff;
-			unsigned int entry_idx = (cid >> 1) & 0xfff;
-			rc_cache_isr(entry_idx, sc);
-		} else if (cid & RC_VOLUME_PREFETCH_CID_BASE) {
-			u16 sc = (status >> 1) & 0x7fff;
-			unsigned int slot_idx = (cid >> 7) & 1;
-			unsigned int hctx_idx = (cid >> 4) & 7;
-			rc_volume_prefetch_isr(hctx_idx, slot_idx, sc);
 		} else {
 			req = blk_mq_tag_to_rq(tags, cid);
 			if (req) {
@@ -704,7 +477,6 @@ irqreturn_t rc_nvme_io_queue_irq(int irq, void *dev_id)
 			struct request *req = done_reqs[i];
 			struct rc_volume_pdu *pdu = blk_mq_rq_to_pdu(req);
 			rc_volume_unmap_request_sg(pdu);
-			rc_cache_dec_inflight(pdu);
 			if (pdu->sc_sct)
 				blk_mq_end_request(req, BLK_STS_IOERR);
 			else
@@ -1558,7 +1330,7 @@ static int rc_nvme_create_io_queues(struct rc_adapter *adapter)
 
 /* Reserve `n` SQE slots on this queue, failing when the SQ can't hold
  * them (an NVMe SQ is full at depth-1: tail may never catch head).  Every
- * submitter — blk-mq dispatch, cache fills, prefetch, sync commands —
+ * submitter — blk-mq dispatch and sync commands —
  * must win its slots here BEFORE calling rc_nvme_io_submit; without the
  * accounting a full tag load plus an internal command wrapped sq_tail
  * over an unconsumed SQE and the controller executed corrupted/duplicate
@@ -2241,9 +2013,9 @@ done:
  * owned by one member are packed contiguously on its drive.
  *
  * RAID1: identity — every member holds the full LBA space, so the mapping
- * only has to PICK a member.  Only READ paths (dispatch, cache fill,
- * prefetch) may use this for RAID1: writes and discards must touch every
- * mirror and go through rc_volume_dispatch_mirror instead.  The pick is
+ * only has to PICK a member.  Only READ paths may use this for RAID1:
+ * writes and discards must touch every mirror and go through
+ * rc_volume_dispatch_mirror instead.  The pick is
  * round-robin, which halves each mirror's read load.
  *
  * Caller must hold rc_volume_lock (or be in a single-threaded init path). */
@@ -2407,8 +2179,7 @@ static u32 rc_volume_chunk_sectors_for(u32 devtype, u32 ld_chunk,
 	 * TRX50 RAID1 metadata: the record carries chunk_index=3 even though
 	 * mirrors don't stripe — it must be ignored here.)  512 sectors =
 	 * 256 KiB: comfortably under MDTS (512 KiB) and the per-member sg
-	 * array (RC_VOLUME_MS_PAGES_PER_MEMBER pages), and the same
-	 * cache/prefetch granularity as the RAID0 default.
+	 * array (RC_VOLUME_MS_PAGES_PER_MEMBER pages).
 	 *
 	 * @devtype is the NORMALIZED level from rc_ld_level_from(), not the
 	 * raw on-disk DeviceType. */
@@ -2874,25 +2645,6 @@ static inline bool rc_volume_any_member_dead(void)
 			return true;
 	return false;
 }
-
-/* Forward declarations for prefetch + cache helpers used in queue_rq. */
-static void rc_volume_prefetch_submit(unsigned int hctx_idx,
-				      unsigned int slot_idx,
-				      struct rc_volume_prefetch *pf,
-				      u64 phys_lba);
-static void rc_volume_prefetch_copy_out(struct request *req, void *src);
-static void rc_volume_prefetch_invalidate(unsigned int hctx_idx);
-static void rc_volume_prefetch_invalidate_all(void);
-static u32 rc_cache_bucket_for(sector_t lba);
-static struct rc_cache_entry *rc_cache_lookup_valid(sector_t stripe_lba);
-static bool rc_cache_has_or_loading(sector_t stripe_lba);
-static struct rc_cache_entry *rc_cache_alloc_entry(void);
-static void rc_cache_invalidate_range(sector_t pos, u32 nr_sectors);
-static bool rc_ghost_check_and_mark(sector_t stripe_lba);
-static void rc_cache_submit_fill(unsigned int hctx_idx,
-				 u32 entry_idx,
-				 sector_t stripe_lba,
-				 u64 phys_lba);
 
 /* blk-mq request handler.  chunk_sectors=stripe_sectors in queue_limits
  * keeps each request inside one stripe, so it maps to exactly one member.
@@ -3460,12 +3212,9 @@ static blk_status_t rc_volume_queue_rq(struct blk_mq_hw_ctx *hctx,
 	pdu->nents = 0;
 	pdu->ms_active = false;
 	memset(pdu->ms_nents, 0, sizeof(pdu->ms_nents));
-	pdu->cache_entry = NULL;
 	atomic_set(&pdu->completed, 0);
 	pdu->hctx_idx = (u8)(hctx->queue_num < RC_VOLUME_MAX_HCTX ?
 			     hctx->queue_num : 0xff);
-	if (pdu->hctx_idx < RC_VOLUME_MAX_HCTX)
-		atomic_inc(&rc_cache_hctx_inflight[pdu->hctx_idx]);
 
 	/* If any member adapter has been flagged dead (by the ISR's CSTS
 	 * check, by a prior timeout, or by drain), the RAID0 volume can't
@@ -3481,7 +3230,6 @@ static blk_status_t rc_volume_queue_rq(struct blk_mq_hw_ctx *hctx,
 			rc_volume_disk ? rc_volume_disk->disk_name : "?");
 		blk_mq_start_request(req);
 		if (rc_volume_claim_completion(pdu)) {
-			rc_cache_dec_inflight(pdu);
 			blk_mq_end_request(req, BLK_STS_IOERR);
 		}
 		return BLK_STS_OK;
@@ -3510,7 +3258,6 @@ static blk_status_t rc_volume_queue_rq(struct blk_mq_hw_ctx *hctx,
 			if (!rc_nvme_sq_reserve(rc_volume_members[i]->ctx.nvme.io_queues[hctx->queue_num], 1)) {
 				while (i-- > 0)
 					rc_nvme_sq_unreserve(rc_volume_members[i]->ctx.nvme.io_queues[hctx->queue_num], 1);
-				rc_cache_dec_inflight(pdu);
 				return BLK_STS_DEV_RESOURCE;
 			}
 		}
@@ -3534,7 +3281,6 @@ static blk_status_t rc_volume_queue_rq(struct blk_mq_hw_ctx *hctx,
 			  "rc_volume_queue_rq: unsupported op=%u rejected\n", op);
 		blk_mq_start_request(req);
 		if (rc_volume_claim_completion(pdu)) {
-			rc_cache_dec_inflight(pdu);
 			blk_mq_end_request(req, BLK_STS_IOERR);
 		}
 		return BLK_STS_OK;
@@ -3551,7 +3297,6 @@ static blk_status_t rc_volume_queue_rq(struct blk_mq_hw_ctx *hctx,
 			  RC_VOLUME_DATA_BYTES / 512);
 		blk_mq_start_request(req);
 		if (rc_volume_claim_completion(pdu)) {
-			rc_cache_dec_inflight(pdu);
 			blk_mq_end_request(req, BLK_STS_IOERR);
 		}
 		return BLK_STS_OK;
@@ -3562,27 +3307,15 @@ static blk_status_t rc_volume_queue_rq(struct blk_mq_hw_ctx *hctx,
 	 * the multi-stripe branches because blk-mq does not split DISCARD at
 	 * chunk_sectors — a large mirror discard would otherwise wander into
 	 * the RAID0 stripe-math discard fan-out.  READs fall through: the
-	 * normal single-member path (and cache/prefetch) work as-is once
-	 * rc_volume_map_lba picks a mirror. */
+	 * normal single-member path works as-is once rc_volume_map_lba picks
+	 * a mirror. */
 	if (rc_volume_raid_level == RC_LDT_RAID1 &&
 	    (op == REQ_OP_WRITE || op == REQ_OP_DISCARD)) {
-		/* The shared invalidation below (cache at the WRITE else-if,
-		 * prefetch at op != READ) sits later in this function, so do
-		 * both here — serving a stale cached stripe after a mirror
-		 * write would defeat the mirror. */
-		if (rc_cache_entries)
-			rc_cache_invalidate_range(pos, nr_sectors);
-		/* Global (all-hctx) invalidation — see
-		 * rc_volume_prefetch_invalidate_all. */
-		if (rc_volume_prefetch_enabled)
-			rc_volume_prefetch_invalidate_all();
-
 		st = rc_volume_dispatch_mirror(hctx, req, pdu, pos,
 					       nr_sectors, op);
 		if (st == BLK_STS_DEV_RESOURCE) {
 			/* SQ full — hand back to blk-mq untouched for a
 			 * retry (the request was never started). */
-			rc_cache_dec_inflight(pdu);
 			return st;
 		}
 		if (st != BLK_STS_OK) {
@@ -3590,7 +3323,6 @@ static blk_status_t rc_volume_queue_rq(struct blk_mq_hw_ctx *hctx,
 			 * blk_mq_start_request — start before ending. */
 			blk_mq_start_request(req);
 			if (rc_volume_claim_completion(pdu)) {
-				rc_cache_dec_inflight(pdu);
 				blk_mq_end_request(req, st);
 			}
 		}
@@ -3613,7 +3345,6 @@ static blk_status_t rc_volume_queue_rq(struct blk_mq_hw_ctx *hctx,
 								  op);
 		if (st == BLK_STS_DEV_RESOURCE) {
 			/* SQ full — requeue; request never started. */
-			rc_cache_dec_inflight(pdu);
 			return st;
 		}
 		if (st != BLK_STS_OK) {
@@ -3624,7 +3355,6 @@ static blk_status_t rc_volume_queue_rq(struct blk_mq_hw_ctx *hctx,
 			 * once between queue_rq and end. */
 			blk_mq_start_request(req);
 			if (rc_volume_claim_completion(pdu)) {
-				rc_cache_dec_inflight(pdu);
 				blk_mq_end_request(req, st);
 			}
 		}
@@ -3646,261 +3376,15 @@ static blk_status_t rc_volume_queue_rq(struct blk_mq_hw_ctx *hctx,
 				hctx, req, pdu, pos, nr_sectors);
 		if (st == BLK_STS_DEV_RESOURCE) {
 			/* SQ full — requeue; request never started. */
-			rc_cache_dec_inflight(pdu);
 			return st;
 		}
 		if (st != BLK_STS_OK) {
 			blk_mq_start_request(req);
 			if (rc_volume_claim_completion(pdu)) {
-				rc_cache_dec_inflight(pdu);
 				blk_mq_end_request(req, st);
 			}
 		}
 		return BLK_STS_OK;
-	}
-
-	/* Read cache — fastest path: stripe-granularity LRU cache.
-	 * Check before prefetch.  On miss, allocate an entry and dispatch
-	 * the NVMe READ INTO the cache buffer (not the bio pages).  The
-	 * request registers as the entry's waiter; when the fill completes,
-	 * the ISR calls blk_mq_complete_request on the waiter and .complete
-	 * memcpys from the cache buffer into the bio.  Future reads of the
-	 * same stripe hit synchronously here. */
-	if (op == REQ_OP_READ && rc_cache_entries && rc_volume_stripe_sectors &&
-	    rc_volume_stripe_sectors <= RC_VOLUME_PREFETCH_SECTORS) {
-		/* The <= PREFETCH_SECTORS guard bounds the fill to the
-		 * 1 MiB entry buffer — a larger on-disk stripe must simply
-		 * bypass the cache rather than overrun the DMA buffer. */
-		sector_t stripe = rc_volume_stripe_sectors;
-		sector_t stripe_lba = (pos / stripe) * stripe;
-
-		if (pos + nr_sectors <= stripe_lba + stripe) {
-			struct rc_cache_entry *e;
-			unsigned long flags;
-			void *src = NULL;
-			u16 ce_status = 0;
-			bool issued_fill = false;
-			u32 fill_entry_idx = 0;
-			int fill_member = -1;
-			u64 fill_phys_lba = 0;
-
-			spin_lock_irqsave(&rc_cache_lock, flags);
-			e = rc_cache_lookup_valid(stripe_lba);
-			if (e) {
-				/* HIT — copy out synchronously. */
-				ce_status = e->status;
-				src = (u8 *)e->buf_va[e->member] +
-				      (u32)(pos - stripe_lba) * 512u;
-				rc_cache_hits++;
-			} else if (pdu->hctx_idx < RC_VOLUME_MAX_HCTX &&
-				   atomic_read(&rc_cache_hctx_inflight[pdu->hctx_idx]) <=
-				   rc_cache_fill_max_qd &&
-				   !rc_cache_has_or_loading(stripe_lba) &&
-				   rc_ghost_check_and_mark(stripe_lba)) {
-				/* Low queue depth + ghost hit (2nd+ access).
-				 * Worth caching now.  At high QD, skip fill
-				 * because the device's native parallelism beats
-				 * cache-fill memcpy. */
-				e = rc_cache_alloc_entry();
-				if (e) {
-					rc_volume_map_lba(stripe_lba,
-							  &fill_member, &fill_phys_lba);
-					if (stripe_lba + stripe <= get_capacity(rc_volume_disk)) {
-						e->state = RC_CE_LOADING;
-						e->abandoned = false;
-						e->member = fill_member;
-						e->lba = stripe_lba;
-						e->status = 0;
-						e->waiter = req;
-						pdu->cache_entry = e;
-						pdu->member_idx = fill_member;
-						pdu->nents = 0;
-						atomic_set(&pdu->members_pending, 1);
-						hlist_add_head(&e->hash_node,
-							       &rc_cache_buckets[rc_cache_bucket_for(stripe_lba)]);
-						list_add_tail(&e->lru_node, &rc_cache_lru);
-						fill_entry_idx = (u32)(e - rc_cache_entries);
-						issued_fill = true;
-						rc_cache_misses++;
-					} else {
-						/* Past end of disk — put back. */
-						list_add_tail(&e->lru_node, &rc_cache_lru);
-						rc_cache_misses++;
-					}
-				} else {
-					rc_cache_misses++;
-				}
-			} else {
-				/* Already LOADING — fall through to normal
-				 * dispatch (suboptimal duplicate, but correct). */
-				rc_cache_misses++;
-			}
-			spin_unlock_irqrestore(&rc_cache_lock, flags);
-
-			if (src && ce_status == 0) {
-				rc_volume_prefetch_copy_out(req, src);
-				blk_mq_start_request(req);
-				if (rc_volume_claim_completion(pdu)) {
-					rc_cache_dec_inflight(pdu);
-					blk_mq_end_request(req, BLK_STS_OK);
-				}
-				return BLK_STS_OK;
-			}
-			if (issued_fill) {
-				/* Reserve the fill's SQE slots (C-4).  Done
-				 * outside rc_cache_lock — the reserve takes
-				 * q->lock, and the ISR nests q->lock →
-				 * rc_cache_lock, so taking them in the
-				 * opposite order here would deadlock.  On a
-				 * full SQ the fill is abandoned and the READ
-				 * falls through to the normal dispatch path
-				 * below. */
-				u32 fill_cmds = DIV_ROUND_UP(rc_volume_stripe_sectors,
-							     RC_VOLUME_CACHE_CMD_SECTORS);
-
-				if (rc_nvme_sq_reserve(rc_volume_members[fill_member]->ctx.nvme.io_queues[hctx->queue_num],
-						       fill_cmds)) {
-					blk_mq_start_request(req);
-					rc_cache_submit_fill(hctx->queue_num,
-							     fill_entry_idx, stripe_lba,
-							     fill_phys_lba);
-					return BLK_STS_OK;
-				}
-
-				/* Roll the entry back to FREE and detach the
-				 * waiter — nothing was submitted. */
-				spin_lock_irqsave(&rc_cache_lock, flags);
-				hlist_del(&e->hash_node);
-				INIT_HLIST_NODE(&e->hash_node);
-				list_move(&e->lru_node, &rc_cache_lru);
-				e->state = RC_CE_FREE;
-				e->waiter = NULL;
-				spin_unlock_irqrestore(&rc_cache_lock, flags);
-				pdu->cache_entry = NULL;
-			}
-		}
-	} else if (op == REQ_OP_WRITE && rc_cache_entries) {
-		rc_cache_invalidate_range(pos, nr_sectors);
-	}
-
-	/* Prefetch — fast path: serve READ from any prefetch slot whose
-	 * cached range fully covers the request.  Non-READ ops invalidate.
-	 *
-	 * Sequential detection + speculation happens later in this function
-	 * after the normal dispatch path, using last_lba/last_sectors. */
-	if (rc_volume_prefetch_enabled) {
-		unsigned int hctx_idx = hctx->queue_num;
-		if (op == REQ_OP_READ && hctx_idx < RC_VOLUME_MAX_HCTX) {
-			struct rc_volume_prefetch *pf =
-				&rc_volume_prefetch_state[hctx_idx];
-			unsigned long flags;
-			void *src = NULL;
-			u16 pf_status = 0;
-			bool hit = false;
-			unsigned int s;
-
-			int hit_slot = -1;
-			spin_lock_irqsave(&pf->lock, flags);
-			for (s = 0; s < RC_VOLUME_PREFETCH_SLOTS; s++) {
-				struct rc_volume_prefetch_slot *sl = &pf->slots[s];
-				if (sl->state == RC_PF_COMPLETE &&
-				    pos >= sl->lba &&
-				    pos + nr_sectors <= sl->lba + sl->sectors) {
-					u32 off_sectors = (u32)(pos - sl->lba);
-					pf_status = sl->status;
-					src = (u8 *)sl->buf_va[sl->member] +
-					      off_sectors * 512u;
-					/* Leave the slot in COMPLETE state until after
-					 * the memcpy.  Marking IDLE here would let a
-					 * speculative prefetch reuse the buffer and
-					 * DMA over our source mid-copy. */
-					hit = true;
-					hit_slot = (int)s;
-					pf->hits++;
-					break;
-				}
-			}
-			spin_unlock_irqrestore(&pf->lock, flags);
-
-			if (hit && pf_status == 0) {
-				rc_volume_prefetch_copy_out(req, src);
-				blk_mq_start_request(req);
-				/* Now safe to release the slot, then try to issue
-				 * a new prefetch for any stripe we don't already
-				 * have cached. */
-				spin_lock_irqsave(&pf->lock, flags);
-				{
-					struct rc_volume_prefetch_slot *hsl =
-						&pf->slots[hit_slot];
-					hsl->served_sectors += nr_sectors;
-					if (hsl->served_sectors >= hsl->sectors) {
-						hsl->state = RC_PF_IDLE;
-						hsl->served_sectors = 0;
-					}
-				}
-				{
-					sector_t prev_last_lba = pf->last_lba;
-					u32 prev_last_sectors = pf->last_sectors;
-					bool was_seq = (prev_last_sectors &&
-							pos == prev_last_lba + prev_last_sectors);
-					pf->last_lba = pos;
-					pf->last_sectors = nr_sectors;
-					if (was_seq && rc_volume_stripe_sectors &&
-					    rc_volume_stripe_sectors <=
-						RC_VOLUME_PREFETCH_SECTORS) {
-						u64 cur_stripe = pos / rc_volume_stripe_sectors;
-						u64 want_lba;
-						int idle_slot = -1;
-						bool already_have = false;
-						unsigned int ss;
-						/* Aim 2 stripes ahead: by the time we
-						 * consume the current cached stripe and
-						 * the next one (slot N+1), slot N+2 needs
-						 * to be in flight or already done. */
-						want_lba = (cur_stripe + 2) * rc_volume_stripe_sectors;
-						for (ss = 0; ss < RC_VOLUME_PREFETCH_SLOTS; ss++) {
-							struct rc_volume_prefetch_slot *sl = &pf->slots[ss];
-							if ((sl->state == RC_PF_INFLIGHT ||
-							     sl->state == RC_PF_COMPLETE) &&
-							    sl->lba == want_lba) {
-								already_have = true;
-								break;
-							}
-							if (sl->state == RC_PF_IDLE && idle_slot < 0)
-								idle_slot = (int)ss;
-						}
-						if (!already_have && idle_slot >= 0 &&
-						    want_lba + rc_volume_stripe_sectors <=
-						    get_capacity(rc_volume_disk)) {
-							struct rc_volume_prefetch_slot *sl =
-								&pf->slots[idle_slot];
-							int nm;
-							u64 nphys;
-							rc_volume_map_lba(want_lba, &nm, &nphys);
-							sl->state = RC_PF_INFLIGHT;
-							sl->lba = want_lba;
-							sl->sectors = rc_volume_stripe_sectors;
-							sl->member = nm;
-							sl->served_sectors = 0;
-							rc_volume_prefetch_submit(hctx_idx,
-										  (unsigned int)idle_slot,
-										  pf, nphys);
-						}
-					}
-				}
-				spin_unlock_irqrestore(&pf->lock, flags);
-				if (rc_volume_claim_completion(pdu)) {
-					rc_cache_dec_inflight(pdu);
-					blk_mq_end_request(req, BLK_STS_OK);
-				}
-				return BLK_STS_OK;
-			}
-		} else if (op != REQ_OP_READ) {
-			/* Writes/discards invalidate EVERY hctx's slots — a
-			 * per-hctx invalidate left other hctxs serving stale
-			 * prefetched data for the written LBAs (H-3). */
-			rc_volume_prefetch_invalidate_all();
-		}
 	}
 
 	rc_volume_map_lba(pos, &member_idx, &phys_lba);
@@ -3909,7 +3393,6 @@ static blk_status_t rc_volume_queue_rq(struct blk_mq_hw_ctx *hctx,
 
 	if (op == REQ_OP_DISCARD) {
 		if (!rc_nvme_sq_reserve(rc_volume_members[member_idx]->ctx.nvme.io_queues[hctx->queue_num], 1)) {
-			rc_cache_dec_inflight(pdu);
 			return BLK_STS_DEV_RESOURCE;
 		}
 		rc_volume_build_discard_sqe(&cmd, hctx->queue_num, member_idx, tag,
@@ -3926,7 +3409,6 @@ static blk_status_t rc_volume_queue_rq(struct blk_mq_hw_ctx *hctx,
 	if (st != BLK_STS_OK) {
 		blk_mq_start_request(req);
 		if (rc_volume_claim_completion(pdu)) {
-			rc_cache_dec_inflight(pdu);
 			blk_mq_end_request(req, st);
 		}
 		return BLK_STS_OK;
@@ -3941,7 +3423,6 @@ static blk_status_t rc_volume_queue_rq(struct blk_mq_hw_ctx *hctx,
 		blk_mq_start_request(req);
 		if (rc_volume_claim_completion(pdu)) {
 			rc_volume_unmap_request_sg(pdu);
-			rc_cache_dec_inflight(pdu);
 			blk_mq_end_request(req, BLK_STS_IOERR);
 		}
 		return BLK_STS_OK;
@@ -3952,7 +3433,6 @@ static blk_status_t rc_volume_queue_rq(struct blk_mq_hw_ctx *hctx,
 	 * leak. */
 	if (!rc_nvme_sq_reserve(rc_volume_members[member_idx]->ctx.nvme.io_queues[hctx->queue_num], 1)) {
 		rc_volume_unmap_request_sg(pdu);
-		rc_cache_dec_inflight(pdu);
 		return BLK_STS_DEV_RESOURCE;
 	}
 
@@ -3962,80 +3442,6 @@ static blk_status_t rc_volume_queue_rq(struct blk_mq_hw_ctx *hctx,
 	rc_nvme_io_submit(rc_volume_members[member_idx]->ctx.nvme.io_queues[hctx->queue_num],
 			  &cmd);
 
-	/* Post-dispatch: if this READ continues a sequential stream and is
-	 * stripe-sized + stripe-aligned, speculatively issue the next stripe
-	 * to the OTHER member.  The result lands in the per-hctx prefetch
-	 * buffer; the next matching app READ skips the device entirely.
-	 * No-op if a prefetch is still in flight or no stream is detected. */
-	if (rc_volume_prefetch_enabled && op == REQ_OP_READ) {
-		unsigned int hctx_idx = hctx->queue_num;
-		if (hctx_idx < RC_VOLUME_MAX_HCTX) {
-			struct rc_volume_prefetch *pf =
-				&rc_volume_prefetch_state[hctx_idx];
-			unsigned long flags;
-
-			spin_lock_irqsave(&pf->lock, flags);
-			{
-				sector_t prev_last_lba = pf->last_lba;
-				u32 prev_last_sectors = pf->last_sectors;
-				bool was_seq = (prev_last_sectors &&
-						pos == prev_last_lba + prev_last_sectors);
-				pf->last_lba = pos;
-				pf->last_sectors = nr_sectors;
-				if (was_seq && rc_volume_stripe_sectors &&
-				    rc_volume_stripe_sectors <=
-					RC_VOLUME_PREFETCH_SECTORS) {
-					/* On a miss, fill IDLE slots aiming 1 and
-					 * 2 stripes ahead so the upcoming app reads
-					 * find data either complete or in flight. */
-					u64 cur_stripe = pos / rc_volume_stripe_sectors;
-					unsigned int ahead;
-					for (ahead = 1; ahead <= 2; ahead++) {
-						u64 want_lba = (cur_stripe + ahead)
-							* rc_volume_stripe_sectors;
-						int idle_slot = -1;
-						bool already_have = false;
-						unsigned int ss;
-						for (ss = 0; ss < RC_VOLUME_PREFETCH_SLOTS; ss++) {
-							struct rc_volume_prefetch_slot *sl = &pf->slots[ss];
-							if ((sl->state == RC_PF_INFLIGHT ||
-							     sl->state == RC_PF_COMPLETE) &&
-							    sl->lba == want_lba) {
-								already_have = true;
-								break;
-							}
-							if (sl->state == RC_PF_IDLE && idle_slot < 0)
-								idle_slot = (int)ss;
-						}
-						if (already_have || idle_slot < 0)
-							continue;
-						if (want_lba + rc_volume_stripe_sectors >
-						    get_capacity(rc_volume_disk))
-							continue;
-						{
-							struct rc_volume_prefetch_slot *sl =
-								&pf->slots[idle_slot];
-							int nm;
-							u64 nphys;
-							rc_volume_map_lba(want_lba, &nm, &nphys);
-							sl->state = RC_PF_INFLIGHT;
-							sl->lba = want_lba;
-							sl->sectors = rc_volume_stripe_sectors;
-							sl->member = nm;
-							sl->served_sectors = 0;
-							pf->misses++;
-							rc_volume_prefetch_submit(hctx_idx,
-										  (unsigned int)idle_slot,
-										  pf, nphys);
-						}
-					}
-				} else if (!was_seq) {
-					pf->misses++;
-				}
-			}
-			spin_unlock_irqrestore(&pf->lock, flags);
-		}
-	}
 	return BLK_STS_OK;
 }
 
@@ -4047,56 +3453,6 @@ static blk_status_t rc_volume_queue_rq(struct blk_mq_hw_ctx *hctx,
 static void rc_volume_complete(struct request *req)
 {
 	struct rc_volume_pdu *pdu = blk_mq_rq_to_pdu(req);
-
-	/* Cache-fill waiter: memcpy from cache buffer, then transition the
-	 * entry to VALID for future readers.  No dma_unmap (we didn't map). */
-	if (pdu->cache_entry) {
-		struct rc_cache_entry *e = pdu->cache_entry;
-		unsigned long flags;
-
-		if (e->status) {
-			spin_lock_irqsave(&rc_cache_lock, flags);
-			if (!hlist_unhashed(&e->hash_node)) {
-				hlist_del(&e->hash_node);
-				INIT_HLIST_NODE(&e->hash_node);
-				list_move(&e->lru_node, &rc_cache_lru);
-			}
-			e->state = RC_CE_FREE;
-			spin_unlock_irqrestore(&rc_cache_lock, flags);
-			pdu->cache_entry = NULL;
-			rc_cache_dec_inflight(pdu);
-			blk_mq_end_request(req, BLK_STS_IOERR);
-			return;
-		}
-
-		{
-			sector_t pos = blk_rq_pos(req);
-			void *src = (u8 *)e->buf_va[e->member] +
-				    (u32)(pos - e->lba) * 512u;
-			rc_volume_prefetch_copy_out(req, src);
-		}
-		spin_lock_irqsave(&rc_cache_lock, flags);
-		if (e->state == RC_CE_LOADING) {
-			if (e->abandoned) {
-				/* Write came in mid-fill; the data we just
-				 * memcpy'd into the bio was the device's
-				 * pre-write read, which is the correct result
-				 * for this READ.  Drop the entry rather than
-				 * publishing so subsequent readers go back to
-				 * the device. */
-				e->state = RC_CE_FREE;
-				e->abandoned = false;
-			} else {
-				e->state = RC_CE_VALID;
-				list_move_tail(&e->lru_node, &rc_cache_lru);
-			}
-		}
-		spin_unlock_irqrestore(&rc_cache_lock, flags);
-		pdu->cache_entry = NULL;
-		rc_cache_dec_inflight(pdu);
-		blk_mq_end_request(req, BLK_STS_OK);
-		return;
-	}
 
 	rc_volume_unmap_request_sg(pdu);
 
@@ -4129,41 +3485,16 @@ static void rc_volume_complete(struct request *req)
 				(unsigned long long)blk_rq_pos(req),
 				blk_rq_sectors(req));
 		}
-		rc_cache_dec_inflight(pdu);
 		blk_mq_end_request(req, BLK_STS_IOERR);
 		return;
 	}
 
-	rc_cache_dec_inflight(pdu);
 	blk_mq_end_request(req, BLK_STS_OK);
 }
 
 struct rc_volume_drain_ctx {
 	unsigned int dead_mask;	/* bit i set => member i is dead */
 };
-
-/* Detach a request from the cache entry it is waiting on (if any).  MUST
- * be called by every completion path that does not go through the normal
- * fill-completion route (drain, timeout direct-end): a stale e->waiter
- * outlives the request, and when the fill's CQE finally lands the ISR
- * would complete whatever request now owns that tag — possibly one not
- * yet submitted.  With the waiter cleared, rc_cache_isr performs the
- * entry's final state transition itself (publish VALID, or FREE when
- * abandoned) and completes nobody. */
-static void rc_cache_abandon_waiter(struct request *req,
-				    struct rc_volume_pdu *pdu)
-{
-	struct rc_cache_entry *e = pdu->cache_entry;
-	unsigned long flags;
-
-	if (!e)
-		return;
-	spin_lock_irqsave(&rc_cache_lock, flags);
-	if (e->waiter == req)
-		e->waiter = NULL;
-	spin_unlock_irqrestore(&rc_cache_lock, flags);
-	pdu->cache_entry = NULL;
-}
 
 /* H-1: disable a dead member's controller (clear CC.EN, bounded wait for
  * CSTS.RDY=0) BEFORE any in-flight request's DMA mappings are reclaimed.
@@ -4248,7 +3579,6 @@ static bool rc_volume_drain_iter(struct request *req, void *priv)
 		 * blk_mq_complete_request state machine entirely — the
 		 * completed-state check alone leaves a double-completion
 		 * window there. */
-		rc_cache_abandon_waiter(req, pdu);
 		WRITE_ONCE(pdu->sc_sct, RC_VOLUME_SC_DEAD);
 		blk_mq_complete_request(req);
 	}
@@ -4343,9 +3673,7 @@ static enum blk_eh_timer_return rc_volume_timeout(struct request *req)
 			 * member_idx out of range for some reason) the
 			 * direct end path bypasses .complete, so unmap here.
 			 * A lost claim means the drain or ISR owns it. */
-			rc_cache_abandon_waiter(req, pdu);
 			rc_volume_unmap_request_sg(pdu);
-			rc_cache_dec_inflight(pdu);
 			blk_mq_end_request(req, BLK_STS_IOERR);
 		}
 		return BLK_EH_DONE;
@@ -4378,9 +3706,7 @@ static enum blk_eh_timer_return rc_volume_timeout(struct request *req)
 	rc_volume_schedule_auto_reset_for_req(pdu);
 	if (!blk_mq_request_completed(req) &&
 	    rc_volume_claim_completion(pdu)) {
-		rc_cache_abandon_waiter(req, pdu);
 		rc_volume_unmap_request_sg(pdu);
-		rc_cache_dec_inflight(pdu);
 		blk_mq_end_request(req, BLK_STS_TIMEOUT);
 	}
 	return BLK_EH_DONE;
@@ -4408,641 +3734,6 @@ static void rc_volume_map_queues(struct blk_mq_tag_set *set)
 	} else {
 		blk_mq_map_queues(&set->map[HCTX_TYPE_DEFAULT]);
 	}
-}
-
-/* ============================== prefetch ============================== */
-
-/* Free all prefetch buffers + PRP pages.  Idempotent: skips slots that
- * never got allocated.  Walks every (hctx, slot, member) tuple. */
-static void rc_volume_prefetch_free_all(void)
-{
-	int h, m;
-	unsigned int s;
-
-	for (h = 0; h < (int)RC_VOLUME_MAX_HCTX; h++) {
-		struct rc_volume_prefetch *pf = &rc_volume_prefetch_state[h];
-		for (s = 0; s < RC_VOLUME_PREFETCH_SLOTS; s++) {
-			struct rc_volume_prefetch_slot *sl = &pf->slots[s];
-			for (m = 0; m < rc_volume_member_count; m++) {
-				struct device *dev;
-				if (!rc_volume_members[m])
-					continue;
-				dev = &rc_volume_members[m]->pdev->dev;
-				if (sl->buf_va[m]) {
-					dma_free_coherent(dev, RC_VOLUME_PREFETCH_BYTES,
-							  sl->buf_va[m], sl->buf_pa[m]);
-					sl->buf_va[m] = NULL;
-					sl->buf_pa[m] = 0;
-				}
-				if (sl->prp_va[m]) {
-					dma_free_coherent(dev, PAGE_SIZE,
-							  sl->prp_va[m], sl->prp_pa[m]);
-					sl->prp_va[m] = NULL;
-					sl->prp_pa[m] = 0;
-				}
-			}
-			sl->state = RC_PF_IDLE;
-		}
-		pf->last_lba = ~(sector_t)0;
-		pf->last_sectors = 0;
-	}
-}
-
-/* Allocate per-(hctx,member) prefetch DMA buffer + PRP list page, and
- * fill the PRP list with the buffer's per-member DMA addresses.  The
- * 1 MiB buffer is allocated with dma_alloc_coherent (so the kernel
- * memcpy from KVA is safe with no extra dma_sync needed) and the PRP
- * list mirrors what rc_volume_build_prp would have produced for that
- * physical layout. */
-static int rc_volume_prefetch_alloc_all(unsigned int nr_hw)
-{
-	int h, m;
-	unsigned int s, p;
-
-	if (nr_hw > RC_VOLUME_MAX_HCTX)
-		nr_hw = RC_VOLUME_MAX_HCTX;
-
-	for (h = 0; h < (int)nr_hw; h++) {
-		struct rc_volume_prefetch *pf = &rc_volume_prefetch_state[h];
-		spin_lock_init(&pf->lock);
-		pf->last_lba = ~(sector_t)0;
-		pf->last_sectors = 0;
-
-		for (s = 0; s < RC_VOLUME_PREFETCH_SLOTS; s++) {
-			struct rc_volume_prefetch_slot *sl = &pf->slots[s];
-			sl->state = RC_PF_IDLE;
-			atomic_set(&sl->cmds_pending, 0);
-			sl->served_sectors = 0;
-			for (m = 0; m < rc_volume_member_count; m++) {
-				struct device *dev = &rc_volume_members[m]->pdev->dev;
-
-				sl->buf_va[m] = dma_alloc_coherent(dev,
-								   RC_VOLUME_PREFETCH_BYTES,
-								   &sl->buf_pa[m],
-								   GFP_KERNEL);
-				if (!sl->buf_va[m]) {
-					rc_printk(RC_ERROR,
-						  "rc_volume_prefetch_alloc_all: hctx %d slot %u member %d buf alloc failed\n",
-						  h, s, m);
-					rc_volume_prefetch_free_all();
-					return -ENOMEM;
-				}
-				sl->prp_va[m] = dma_alloc_coherent(dev, PAGE_SIZE,
-								   &sl->prp_pa[m],
-								   GFP_KERNEL);
-				if (!sl->prp_va[m]) {
-					rc_volume_prefetch_free_all();
-					return -ENOMEM;
-				}
-				for (p = 0; p < RC_VOLUME_PREFETCH_PAGES - 1; p++)
-					sl->prp_va[m][p] =
-						cpu_to_le64(sl->buf_pa[m] + (p + 1) * PAGE_SIZE);
-			}
-		}
-	}
-	return 0;
-}
-
-/* ============================ Read cache impl ===========================
- *
- * See header comment near struct rc_cache_entry.  All helpers below
- * assume rc_cache_lock is held by the caller unless noted. */
-
-static inline u32 rc_cache_bucket_for(sector_t lba)
-{
-	return hash_64((u64)lba, RC_VOLUME_CACHE_HASH_BITS) & RC_VOLUME_CACHE_HASH_MASK;
-}
-
-/* Check ghost cache: if the stripe LBA was recently seen, return true
- * (and leave it marked).  Otherwise mark it seen and return false.
- * Caller hold rc_cache_lock. */
-static bool rc_ghost_check_and_mark(sector_t stripe_lba)
-{
-	u32 h;
-
-	if (!rc_ghost_table || !stripe_lba)
-		return false;	/* never promote if disabled or sentinel */
-	h = (u32)(hash_64((u64)stripe_lba, RC_GHOST_HASH_BITS) & RC_GHOST_HASH_MASK);
-	if (rc_ghost_table[h] == stripe_lba)
-		return true;
-	rc_ghost_table[h] = stripe_lba;
-	return false;
-}
-
-/* Look up a VALID entry for stripe_lba.  Returns NULL if not present or
- * the entry is still LOADING.  Touch-on-hit (move to MRU). */
-static struct rc_cache_entry *rc_cache_lookup_valid(sector_t stripe_lba)
-{
-	u32 h = rc_cache_bucket_for(stripe_lba);
-	struct rc_cache_entry *e;
-
-	hlist_for_each_entry(e, &rc_cache_buckets[h], hash_node) {
-		if (e->state == RC_CE_VALID && e->lba == stripe_lba) {
-			list_move_tail(&e->lru_node, &rc_cache_lru);
-			return e;
-		}
-	}
-	return NULL;
-}
-
-/* Look up any entry (VALID or LOADING) for stripe_lba.  Used to suppress
- * duplicate fills when one is already in flight. */
-static bool rc_cache_has_or_loading(sector_t stripe_lba)
-{
-	u32 h = rc_cache_bucket_for(stripe_lba);
-	struct rc_cache_entry *e;
-
-	hlist_for_each_entry(e, &rc_cache_buckets[h], hash_node) {
-		if (e->lba == stripe_lba)
-			return true;
-	}
-	return false;
-}
-
-/* Allocate a FREE entry.  If none free, evict LRU VALID entry.  Returns
- * NULL only if every entry is currently LOADING (unusual). */
-static struct rc_cache_entry *rc_cache_alloc_entry(void)
-{
-	struct rc_cache_entry *e;
-
-	list_for_each_entry(e, &rc_cache_lru, lru_node) {
-		if (e->state == RC_CE_FREE) {
-			list_del(&e->lru_node);
-			return e;
-		}
-	}
-	list_for_each_entry(e, &rc_cache_lru, lru_node) {
-		if (e->state == RC_CE_VALID) {
-			hlist_del(&e->hash_node);
-			list_del(&e->lru_node);
-			rc_cache_evictions++;
-			e->state = RC_CE_FREE;
-			return e;
-		}
-	}
-	return NULL;
-}
-
-/* Free all cache resources.  Idempotent. */
-static void rc_cache_teardown(void)
-{
-	u32 i, m;
-
-	rc_printk(RC_NOTE,
-		  "rc_cache_teardown: hits=%llu misses=%llu evictions=%llu\n",
-		  (unsigned long long)rc_cache_hits,
-		  (unsigned long long)rc_cache_misses,
-		  (unsigned long long)rc_cache_evictions);
-
-	if (!rc_cache_entries)
-		goto free_hash;
-
-	for (i = 0; i < rc_cache_nr_entries; i++) {
-		struct rc_cache_entry *e = &rc_cache_entries[i];
-		for (m = 0; m < (u32)rc_volume_member_count; m++) {
-			struct device *dev;
-			if (!rc_volume_members[m])
-				continue;
-			dev = &rc_volume_members[m]->pdev->dev;
-			if (e->buf_va[m]) {
-				dma_free_coherent(dev, RC_VOLUME_PREFETCH_BYTES,
-						  e->buf_va[m], e->buf_pa[m]);
-				e->buf_va[m] = NULL;
-				e->buf_pa[m] = 0;
-			}
-			if (e->prp_va[m]) {
-				dma_free_coherent(dev, PAGE_SIZE,
-						  e->prp_va[m], e->prp_pa[m]);
-				e->prp_va[m] = NULL;
-				e->prp_pa[m] = 0;
-			}
-		}
-	}
-	kfree(rc_cache_entries);
-	rc_cache_entries = NULL;
-	rc_cache_nr_entries = 0;
-
-free_hash:
-	if (rc_cache_buckets) {
-		kfree(rc_cache_buckets);
-		rc_cache_buckets = NULL;
-	}
-	if (rc_ghost_table) {
-		kvfree(rc_ghost_table);
-		rc_ghost_table = NULL;
-	}
-	INIT_LIST_HEAD(&rc_cache_lru);
-}
-
-/* Allocate cache pool: nr entries with per-member DMA buffer + PRP list. */
-static int rc_cache_init(u32 nr_entries)
-{
-	u32 i, m, p;
-
-	spin_lock_init(&rc_cache_lock);
-	INIT_LIST_HEAD(&rc_cache_lru);
-	rc_cache_hits = 0;
-	rc_cache_misses = 0;
-	rc_cache_evictions = 0;
-
-	if (nr_entries == 0)
-		return 0;
-
-	/* Clamp to the CID-space we actually have.  The cache-fill CID is
-	 *
-	 *   cid = RC_VOLUME_CACHE_CID_BASE
-	 *         | ((entry_idx & 0xfff) << 1)
-	 *         | (i & 1)
-	 *
-	 * so we have 12 bits of entry_idx = 4096 entries max.  Beyond that
-	 * the mask wraps and entries N and N+4096 would share a CID, routing
-	 * the wrong completion to the wrong entry — silent data corruption.
-	 * Clamp loudly so the user can see they've over-asked. */
-	if (nr_entries > RC_VOLUME_CACHE_MAX_ENTRIES) {
-		rc_printk(RC_WARN,
-			  "rc_cache_init: cache_entries=%u exceeds CID-space limit of %u — clamping\n",
-			  nr_entries, RC_VOLUME_CACHE_MAX_ENTRIES);
-		nr_entries = RC_VOLUME_CACHE_MAX_ENTRIES;
-	}
-
-	rc_ghost_table = kvzalloc(RC_GHOST_HASH_SIZE * sizeof(sector_t),
-				  GFP_KERNEL);
-	if (!rc_ghost_table)
-		return -ENOMEM;
-
-	rc_cache_buckets = kcalloc(RC_VOLUME_CACHE_HASH_SIZE,
-				sizeof(*rc_cache_buckets), GFP_KERNEL);
-	if (!rc_cache_buckets)
-		return -ENOMEM;
-	for (i = 0; i < RC_VOLUME_CACHE_HASH_SIZE; i++)
-		INIT_HLIST_HEAD(&rc_cache_buckets[i]);
-
-	rc_cache_entries = kcalloc(nr_entries, sizeof(*rc_cache_entries),
-				   GFP_KERNEL);
-	if (!rc_cache_entries) {
-		kfree(rc_cache_buckets);
-		rc_cache_buckets = NULL;
-		return -ENOMEM;
-	}
-	rc_cache_nr_entries = nr_entries;
-
-	for (i = 0; i < nr_entries; i++) {
-		struct rc_cache_entry *e = &rc_cache_entries[i];
-		e->state = RC_CE_FREE;
-		atomic_set(&e->cmds_pending, 0);
-		INIT_HLIST_NODE(&e->hash_node);
-		INIT_LIST_HEAD(&e->lru_node);
-		list_add_tail(&e->lru_node, &rc_cache_lru);
-
-		for (m = 0; m < (u32)rc_volume_member_count; m++) {
-			struct device *dev = &rc_volume_members[m]->pdev->dev;
-			e->buf_va[m] = dma_alloc_coherent(dev,
-							  RC_VOLUME_PREFETCH_BYTES,
-							  &e->buf_pa[m],
-							  GFP_KERNEL);
-			if (!e->buf_va[m]) {
-				rc_printk(RC_ERROR,
-					  "rc_cache_init: entry %u member %u buf alloc failed\n",
-					  i, m);
-				rc_cache_teardown();
-				return -ENOMEM;
-			}
-			e->prp_va[m] = dma_alloc_coherent(dev, PAGE_SIZE,
-							  &e->prp_pa[m],
-							  GFP_KERNEL);
-			if (!e->prp_va[m]) {
-				rc_cache_teardown();
-				return -ENOMEM;
-			}
-			for (p = 0; p < RC_VOLUME_PREFETCH_PAGES - 1; p++)
-				e->prp_va[m][p] =
-					cpu_to_le64(e->buf_pa[m] + (p + 1) * PAGE_SIZE);
-		}
-	}
-	rc_printk(RC_NOTE,
-		  "rc_cache_init: %u entries × 1 MiB × %d members = %u MiB cache\n",
-		  nr_entries, rc_volume_member_count,
-		  nr_entries * (1u) * rc_volume_member_count);
-	return 0;
-}
-
-/* Submit the multi-NVMe-cmd fill for a cache entry (1 MiB → 2 cmds at MDTS=7).
- * Caller must have set entry->state = RC_CE_LOADING and entry->member.
- * Caller holds rc_cache_lock during dispatch (kept short — submission is fast). */
-static void rc_cache_submit_fill(unsigned int hctx_idx,
-				 u32 entry_idx,
-				 sector_t stripe_lba,
-				 u64 phys_lba)
-{
-	struct rc_cache_entry *e = &rc_cache_entries[entry_idx];
-	int m = e->member;
-	/* Fill exactly ONE STRIPE, not a fixed 1 MiB: the cache is indexed
-	 * and served per stripe, and on arrays whose stripe is smaller than
-	 * the buffer a fixed-size fill read past the stripe — and, near
-	 * end-of-volume, past the namespace, turning a perfectly valid READ
-	 * into LBA-Out-of-Range → BLK_STS_IOERR.  The queue_rq guard caps
-	 * the stripe at RC_VOLUME_PREFETCH_SECTORS so the buffer always
-	 * holds it. */
-	u32 fill_sectors = rc_volume_stripe_sectors;
-	u32 cmds = DIV_ROUND_UP(fill_sectors, RC_VOLUME_CACHE_CMD_SECTORS);
-	u32 i;
-
-	atomic_set(&e->cmds_pending, (int)cmds);
-	e->status = 0;
-	e->lba = stripe_lba;
-
-	for (i = 0; i < cmds; i++) {
-		struct rc_nvme_sqe cmd;
-		u32 sec_in    = i * RC_VOLUME_CACHE_CMD_SECTORS;
-		u32 sec_this  = min(fill_sectors - sec_in,
-				    RC_VOLUME_CACHE_CMD_SECTORS);
-		u32 byte_off  = sec_in * 512u;
-		u32 page_off  = byte_off / (u32)PAGE_SIZE;
-		/* CID = CACHE_BASE | (entry_idx << 1) | cmd_idx.
-		 * Distinct per cmd so NVMe doesn't reject as duplicate. */
-		u16 cid       = (u16)(RC_VOLUME_CACHE_CID_BASE |
-				      ((entry_idx & 0xfff) << 1) | (i & 1));
-		u64 cmd_slba  = phys_lba + sec_in;
-
-		memset(&cmd, 0, sizeof(cmd));
-		cmd.opc   = RC_NVME_NVM_OP_READ;
-		cmd.cid   = cpu_to_le16(cid);
-		cmd.nsid  = cpu_to_le32(1);
-		cmd.cdw10 = cpu_to_le32((u32)(cmd_slba & 0xffffffff));
-		cmd.cdw11 = cpu_to_le32((u32)(cmd_slba >> 32));
-		cmd.cdw12 = cpu_to_le32(sec_this - 1);
-		cmd.prp1  = cpu_to_le64(e->buf_pa[m] + byte_off);
-		cmd.prp2  = cpu_to_le64(e->prp_pa[m] + page_off * sizeof(__le64));
-
-		rc_nvme_io_submit(rc_volume_members[m]->ctx.nvme.io_queues[hctx_idx],
-				  &cmd);
-	}
-}
-
-/* ISR helper for cache fill completion.  Same shape as the prefetch ISR:
- * decrement cmds_pending, transition LOADING → VALID on the last cmd,
- * insert into hash + LRU. */
-static void rc_cache_isr(unsigned int entry_idx, u16 status)
-{
-	struct rc_cache_entry *e;
-	struct request *waiter = NULL;
-	unsigned long flags;
-	bool last;
-
-	if (entry_idx >= rc_cache_nr_entries)
-		return;
-	e = &rc_cache_entries[entry_idx];
-
-	spin_lock_irqsave(&rc_cache_lock, flags);
-	if (status)
-		e->status = status;
-	last = atomic_dec_and_test(&e->cmds_pending);
-	if (last) {
-		if (e->state == RC_CE_LOADING) {
-			/* Defer the LOADING → final-state transition until the
-			 * waiter's .complete handler has finished memcpy'ing
-			 * out of the buffer — otherwise an evict could free
-			 * the buffer mid-copy.  ISR just schedules the
-			 * waiter; .complete handles the state transition
-			 * (LOADING → VALID normally; LOADING → FREE if the
-			 * entry was abandoned mid-fill by a write).
-			 *
-			 * If there is no waiter (rare — concurrent invalidate
-			 * already extracted it, or fill was issued from a
-			 * non-blocking path), do the final transition here. */
-			waiter = e->waiter;
-			e->waiter = NULL;
-			if (!waiter) {
-				if (e->abandoned) {
-					e->state = RC_CE_FREE;
-					e->abandoned = false;
-				} else {
-					e->state = RC_CE_VALID;
-					list_move_tail(&e->lru_node, &rc_cache_lru);
-				}
-			}
-		}
-	}
-	spin_unlock_irqrestore(&rc_cache_lock, flags);
-
-	if (waiter &&
-	    rc_volume_claim_completion(blk_mq_rq_to_pdu(waiter)))
-		blk_mq_complete_request(waiter);
-}
-
-/* Invalidate every cache entry overlapping [pos, pos+nr_sectors).
- * VALID entries are dropped immediately.  LOADING entries are marked
- * for drop on completion (state stays LOADING; rc_cache_isr will see
- * the lba mismatch... actually we set state = FREE so isr drops it). */
-static void rc_cache_invalidate_range(sector_t pos, u32 nr_sectors)
-{
-	u32 i;
-	unsigned long flags;
-
-	if (!rc_cache_entries)
-		return;
-
-	spin_lock_irqsave(&rc_cache_lock, flags);
-	for (i = 0; i < rc_cache_nr_entries; i++) {
-		struct rc_cache_entry *e = &rc_cache_entries[i];
-		if (e->state == RC_CE_FREE)
-			continue;
-		/* Entries hold exactly one stripe (see rc_cache_submit_fill);
-		 * overlap-test with the stripe span, not the buffer size. */
-		if (e->lba + rc_volume_stripe_sectors <= pos ||
-		    pos + nr_sectors <= e->lba)
-			continue;
-		/* Overlap.  Remove from hash so subsequent lookups miss.  For
-		 * a VALID entry we can also free it immediately.  For LOADING
-		 * we have to leave state==LOADING (NVMe cmds are still in
-		 * flight referencing this entry's CID / buf_pa) — instead mark
-		 * it abandoned so the ISR transitions it to FREE rather than
-		 * VALID on completion, dropping the now-stale fill data.  The
-		 * waiter still rides the fill to completion and gets the data
-		 * it read from the device, which is correct: the WRITE that
-		 * triggered this invalidation hadn't completed when the fill
-		 * was issued, so the fill's data is a valid pre-write read. */
-		hlist_del(&e->hash_node);
-		INIT_HLIST_NODE(&e->hash_node);
-		list_move(&e->lru_node, &rc_cache_lru);
-		rc_cache_evictions++;
-		if (e->state == RC_CE_LOADING)
-			e->abandoned = true;
-		else
-			e->state = RC_CE_FREE;
-	}
-	spin_unlock_irqrestore(&rc_cache_lock, flags);
-}
-
-/* Submit a multi-command prefetch.  Caller must hold pf->lock AND have
- * already set state = INFLIGHT and recorded {lba, sectors, member}.
- * Splits pf->sectors into chunks of RC_VOLUME_PREFETCH_CMD_SECTORS each
- * (= 1024 sectors = 512 KiB per cmd, matching the controller MDTS=7
- * limit of 2^7 × 4 KiB = 512 KiB), and submits one NVMe READ per chunk.
- *
- * CID scheme: bit 8 marks a prefetch CID.  Bits 7..4 carry hctx_idx
- * (0..15).  Bits 3..0 carry cmd index within this prefetch (0..15).
- * The ISR uses the hctx_idx to look up the slot and atomic_dec_and_test
- * cmds_pending across cmds to mark COMPLETE.
- *
- * PRP list layout (set up once at alloc time): prp_va[m][i] holds the
- * IOVA of buffer page i+1.  For cmd 0 (pages 0..127): PRP1 = page 0,
- * PRP2 = &prp_va[m][0] (entries 0..126 cover pages 1..127).  For cmd 1
- * (pages 128..255): PRP1 = page 128, PRP2 = &prp_va[m][128] (entries
- * 128..254 cover pages 129..255). */
-static void rc_volume_prefetch_submit(unsigned int hctx_idx,
-				      unsigned int slot_idx,
-				      struct rc_volume_prefetch *pf,
-				      u64 phys_lba)
-{
-	struct rc_volume_prefetch_slot *sl = &pf->slots[slot_idx];
-	int m = sl->member;
-	u32 cmds = (sl->sectors + RC_VOLUME_PREFETCH_CMD_SECTORS - 1) /
-		   RC_VOLUME_PREFETCH_CMD_SECTORS;
-	u32 i;
-
-	/* Speculative work never overruns the shared SQ: reserve the SQE
-	 * slots or skip this prefetch entirely (C-4). */
-	if (!rc_nvme_sq_reserve(rc_volume_members[m]->ctx.nvme.io_queues[hctx_idx],
-				cmds)) {
-		sl->state = RC_PF_IDLE;
-		pf->discarded++;
-		return;
-	}
-
-	atomic_set(&sl->cmds_pending, cmds);
-	sl->status = 0;
-
-	for (i = 0; i < cmds; i++) {
-		struct rc_nvme_sqe cmd;
-		u32 sec_in = i * RC_VOLUME_PREFETCH_CMD_SECTORS;
-		u32 sec_remain = sl->sectors - sec_in;
-		u32 sec_this = sec_remain < RC_VOLUME_PREFETCH_CMD_SECTORS
-			       ? sec_remain
-			       : RC_VOLUME_PREFETCH_CMD_SECTORS;
-		u32 byte_off = sec_in * 512u;
-		u32 page_off = byte_off / (u32)PAGE_SIZE;
-		u16 cid = (u16)(RC_VOLUME_PREFETCH_CID_BASE |
-				(slot_idx << 7) |
-				(hctx_idx << 4) | i);
-		u64 cmd_lba = phys_lba + sec_in;
-
-		memset(&cmd, 0, sizeof(cmd));
-		cmd.opc   = RC_NVME_NVM_OP_READ;
-		cmd.cid   = cpu_to_le16(cid);
-		cmd.nsid  = cpu_to_le32(1);
-		cmd.cdw10 = cpu_to_le32((u32)(cmd_lba & 0xffffffff));
-		cmd.cdw11 = cpu_to_le32((u32)(cmd_lba >> 32));
-		cmd.cdw12 = cpu_to_le32(sec_this - 1);
-		cmd.prp1  = cpu_to_le64(sl->buf_pa[m] + byte_off);
-		cmd.prp2  = cpu_to_le64(sl->prp_pa[m] + page_off * sizeof(__le64));
-
-		pf->issued++;
-		rc_nvme_io_submit(rc_volume_members[m]->ctx.nvme.io_queues[hctx_idx],
-				  &cmd);
-	}
-}
-
-/* ISR helper: handle a prefetch CID completion.  Called from
- * rc_nvme_io_queue_irq with q->lock held.  Records any error status
- * and decrements cmds_pending; the last command in transitions
- * INFLIGHT -> COMPLETE.  If the dispatch path marked the prefetch as
- * discarded (write invalidation), drop the buffer back to IDLE on the
- * last completion without retaining the data. */
-static void rc_volume_prefetch_isr(unsigned int hctx_idx,
-				   unsigned int slot_idx, u16 status)
-{
-	struct rc_volume_prefetch *pf;
-	struct rc_volume_prefetch_slot *sl;
-	unsigned long flags;
-	bool last;
-
-	if (hctx_idx >= RC_VOLUME_MAX_HCTX ||
-	    slot_idx >= RC_VOLUME_PREFETCH_SLOTS)
-		return;
-	pf = &rc_volume_prefetch_state[hctx_idx];
-	sl = &pf->slots[slot_idx];
-
-	spin_lock_irqsave(&pf->lock, flags);
-	if (status)
-		sl->status = status;	/* sticky on first error */
-	last = atomic_dec_and_test(&sl->cmds_pending);
-	if (last) {
-		if (sl->state == RC_PF_INFLIGHT) {
-			sl->state = RC_PF_COMPLETE;
-			sl->served_sectors = 0;
-		} else {
-			sl->state = RC_PF_IDLE;
-			pf->discarded++;
-		}
-	}
-	spin_unlock_irqrestore(&pf->lock, flags);
-}
-
-/* Copy data from the prefetch buffer into the request's bio pages.
- * Called from queue_rq (process context) on a cache hit.  The caller
- * is responsible for ensuring src remains valid for the duration of
- * the copy — true because we transitioned state to IDLE only AFTER
- * extracting src and pf->state IDLE means no new prefetch can land
- * (single-threaded per hctx). */
-static void rc_volume_prefetch_copy_out(struct request *req, void *src)
-{
-	struct bio *bio;
-	size_t off = 0;
-
-	__rq_for_each_bio(bio, req) {
-		struct bio_vec bv;
-		struct bvec_iter iter;
-
-		bio_for_each_segment(bv, bio, iter) {
-			void *dst = kmap_local_page(bv.bv_page) + bv.bv_offset;
-			memcpy(dst, (u8 *)src + off, bv.bv_len);
-			kunmap_local(dst - bv.bv_offset);
-			off += bv.bv_len;
-		}
-	}
-}
-
-/* Invalidate a slot — used when a write/discard targets the same
- * volume region or the stream goes non-sequential.  If a prefetch is
- * in flight we can't free the buffer yet (the controller may still
- * DMA into it); flag it discarded so the ISR drops it on completion. */
-static void rc_volume_prefetch_invalidate(unsigned int hctx_idx)
-{
-	struct rc_volume_prefetch *pf;
-	unsigned long flags;
-	unsigned int s;
-
-	if (hctx_idx >= RC_VOLUME_MAX_HCTX)
-		return;
-	pf = &rc_volume_prefetch_state[hctx_idx];
-
-	spin_lock_irqsave(&pf->lock, flags);
-	for (s = 0; s < RC_VOLUME_PREFETCH_SLOTS; s++) {
-		struct rc_volume_prefetch_slot *sl = &pf->slots[s];
-		if (sl->state == RC_PF_COMPLETE) {
-			sl->state = RC_PF_IDLE;
-			pf->discarded++;
-		}
-		/* INFLIGHT slots: ISR will hand them back to COMPLETE
-		 * normally; an out-of-range app read will not match and
-		 * the slot will be reused on the next prefetch. */
-	}
-	spin_unlock_irqrestore(&pf->lock, flags);
-}
-
-/* Invalidate the prefetch slots of EVERY hctx.  Writes/discards must use
- * this, not the per-hctx variant: a write dispatched on hctx A used to
- * invalidate only A's slots, so a read on hctx B covering the same LBAs
- * was still served from B's now-stale buffer — a write-then-read
- * consistency violation.  (The stripe cache always invalidated globally;
- * the prefetch layer now matches.) */
-static void rc_volume_prefetch_invalidate_all(void)
-{
-	unsigned int h;
-
-	for (h = 0; h < RC_VOLUME_MAX_HCTX; h++)
-		rc_volume_prefetch_invalidate(h);
 }
 
 static const struct blk_mq_ops rc_volume_mq_ops = {
@@ -5155,25 +3846,6 @@ static int rc_volume_create_disk(void)
 	ret = blk_mq_alloc_tag_set(&rc_volume_tagset);
 	if (ret)
 		goto err_free_dma;
-
-	ret = rc_volume_prefetch_alloc_all(rc_volume_tagset.nr_hw_queues);
-	if (ret) {
-		rc_printk(RC_WARN,
-			  "rc_volume_create_disk: prefetch alloc failed (%d) — continuing with prefetch disabled\n",
-			  ret);
-		rc_volume_prefetch_enabled = 0;
-		ret = 0;
-	}
-
-	if (rc_cache_entries_param > 0) {
-		ret = rc_cache_init((u32)rc_cache_entries_param);
-		if (ret) {
-			rc_printk(RC_WARN,
-				  "rc_volume_create_disk: cache init failed (%d) — continuing without cache\n",
-				  ret);
-			ret = 0;
-		}
-	}
 
 	{
 		struct queue_limits lim = {
@@ -5347,61 +4019,6 @@ err_free_dma:
 	return ret;
 }
 
-/* Wait (bounded) for every internal NVMe command — cache fills and
- * prefetches — to complete before their DMA buffers are freed.  These are
- * not blk-mq requests, so del_gendisk does NOT wait for them; freeing the
- * buffers with a fill still in flight lets the controller DMA into freed
- * memory.  On timeout (e.g. a dead controller whose CQEs will never
- * arrive) we log and proceed — the H-1 path has already disabled dead
- * controllers, so no DMA can land. */
-static void rc_volume_quiesce_internal_cmds(void)
-{
-	unsigned long deadline = jiffies + msecs_to_jiffies(5000);
-
-	for (;;) {
-		bool busy = false;
-		unsigned long flags;
-		unsigned int h, s;
-		u32 i;
-
-		if (rc_cache_entries) {
-			spin_lock_irqsave(&rc_cache_lock, flags);
-			for (i = 0; i < rc_cache_nr_entries; i++) {
-				struct rc_cache_entry *e = &rc_cache_entries[i];
-
-				if (e->state == RC_CE_LOADING ||
-				    atomic_read(&e->cmds_pending) > 0) {
-					busy = true;
-					break;
-				}
-			}
-			spin_unlock_irqrestore(&rc_cache_lock, flags);
-		}
-
-		for (h = 0; !busy && h < RC_VOLUME_MAX_HCTX; h++) {
-			struct rc_volume_prefetch *pf =
-				&rc_volume_prefetch_state[h];
-
-			for (s = 0; s < RC_VOLUME_PREFETCH_SLOTS; s++) {
-				if (READ_ONCE(pf->slots[s].state) ==
-				    RC_PF_INFLIGHT) {
-					busy = true;
-					break;
-				}
-			}
-		}
-
-		if (!busy)
-			return;
-		if (time_after(jiffies, deadline)) {
-			rc_printk(RC_ERROR,
-				  "rc_volume_quiesce_internal_cmds: internal commands still outstanding after 5 s — freeing buffers anyway (controllers should already be disabled)\n");
-			return;
-		}
-		msleep(10);
-	}
-}
-
 /* Tear down everything rc_volume_create_disk allocated.  Called from
  * rc_exit().  Safe to call when the disk was never created (state is
  * initialised to NULL/0). */
@@ -5416,10 +4033,6 @@ void rc_volume_teardown(void)
 		rc_volume_disk = NULL;
 		blk_mq_free_tag_set(&rc_volume_tagset);
 	}
-	/* Cache fills / prefetches are not blk-mq requests — wait for them
-	 * before rc_cache_teardown / rc_volume_prefetch_free_all release
-	 * the DMA memory they target (M-5). */
-	rc_volume_quiesce_internal_cmds();
 	for (i = 0; i < RC_VOLUME_MAX_MEMBERS; i++) {
 		if (rc_volume_members[i]) {
 			struct device *dev = &rc_volume_members[i]->pdev->dev;
@@ -5440,8 +4053,6 @@ void rc_volume_teardown(void)
 		rc_volume_members[i] = NULL;
 		rc_volume_member_phys_offset[i] = 0;
 	}
-	rc_cache_teardown();
-	rc_volume_prefetch_free_all();
 	rc_volume_member_count = 0;
 	rc_volume_stripe_sectors = 0;
 	mutex_unlock(&rc_volume_lock);

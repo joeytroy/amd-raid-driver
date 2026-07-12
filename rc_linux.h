@@ -207,8 +207,7 @@ struct rc_nvme_io_queue {
 
     // In-flight SQE accounting (guarded by `lock`).  Counts every SQE
     // submitted-but-not-yet-completed on this queue, regardless of origin:
-    // blk-mq tags, cache fills, prefetches, and boot/reset-time sync
-    // commands all share this SQ.  Every submitter must win a slot via
+    // blk-mq tags and boot/reset-time sync commands all share this SQ.  Every submitter must win a slot via
     // rc_nvme_sq_reserve() before ringing the doorbell (an NVMe SQ is full
     // at depth-1 — wrapping the tail over an unconsumed SQE corrupts a
     // live command silently).  Decremented once per CQE consumed; zeroed
