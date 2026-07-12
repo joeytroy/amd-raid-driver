@@ -10,6 +10,8 @@
 #                  full write/readback/discard battery
 #   * spdx       — every C/H source carries an SPDX GPL-2.0-only tag
 #   * whitespace — no trailing whitespace / no conflict markers in the diff
+#   * shellcheck — every shell script in the repo, severity warning+
+#                  (the scripts can brick boots; they merge linted)
 #
 # Advisory gate (reported, does NOT block — see checkpatch job comment):
 #   * checkpatch — kernel coding-style on the PR diff
@@ -226,6 +228,28 @@ jobs:
             ':(exclude)drivers/windows/**'
 
   # ---------------------------------------------------------------------------
+  # shellcheck — BLOCKING gate over every shell script in the repo.  The
+  # install/uninstall/boot-safety scripts are the code that can actually
+  # brick a boot, so they get at least the lint rigor the C code gets.
+  # Severity: warning and up (the tree is warning-clean; style-level chatter
+  # stays advisory via local runs).
+  # ---------------------------------------------------------------------------
+  shellcheck:
+    name: shellcheck
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install shellcheck
+        run: sudo apt-get update && sudo apt-get install -y shellcheck
+      - name: Lint all repo shell scripts
+        run: |
+          mapfile -t scripts < <(git ls-files '*.sh')
+          echo "Checking ${#scripts[@]} scripts:"
+          printf '  %s\n' "${scripts[@]}"
+          shellcheck --severity=warning "${scripts[@]}"
+          echo "All shell scripts are shellcheck-clean (severity >= warning)."
+
+  # ---------------------------------------------------------------------------
   # checkpatch — ADVISORY for now (continue-on-error).  Five source files
   # currently use 4-space indentation instead of kernel tabs, so a strict
   # blocking checkpatch would fail until the tree is normalized.  Once the
@@ -240,12 +264,16 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - name: Fetch checkpatch.pl
+      - name: Fetch checkpatch.pl (pinned)
         run: |
-          base=https://raw.githubusercontent.com/torvalds/linux/master/scripts
+          # Pinned to a release tag: `master` drifts (new checks appear
+          # unannounced) and a failed fetch must fail the job, not silently
+          # produce an empty checkpatch.pl.
+          ref=v6.15
+          base="https://raw.githubusercontent.com/torvalds/linux/$ref/scripts"
           mkdir -p scripts-cp
           for f in checkpatch.pl const_structs.checkpatch spelling.txt; do
-            curl -fsSL "$base/$f" -o "scripts-cp/$f" || true
+            curl -fsSL "$base/$f" -o "scripts-cp/$f"
           done
           chmod +x scripts-cp/checkpatch.pl
       - name: Run checkpatch on the diff

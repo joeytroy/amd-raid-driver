@@ -28,7 +28,9 @@ set -euo pipefail
 
 SRC_DIR="$(cd "$(dirname "$0")" && pwd)"
 PKG_NAME="rcraid"
-PKG_VERSION="$(awk -F'"' '/^PACKAGE_VERSION=/ {print $2}' "$SRC_DIR/dkms.conf")"
+# The dkms package version tracks the driver version (VERSION file); the
+# repo dkms.conf carries a @PKGVER@ placeholder substituted at staging time.
+PKG_VERSION="$(cat "$SRC_DIR/VERSION")"
 
 [ "$(id -u)" -eq 0 ] || { echo "must be root (try: sudo $0)" >&2; exit 1; }
 
@@ -288,12 +290,15 @@ for part in /dev/rcraid0p*; do
         if [ -e "$PROBE_DIR/etc/os-release" ] || \
            [ -e "$PROBE_DIR/usr/lib/os-release" ]; then
             TARGET_PART="$part"
-            # Note target's distro for the chroot install commands.
+            # Note target's distro for the chroot install commands.  Parse
+            # os-release instead of sourcing it: we're root and the file
+            # comes from a just-written target disk — never execute it.
             if [ -e "$PROBE_DIR/etc/os-release" ]; then
-                target_os=$(. "$PROBE_DIR/etc/os-release" && echo "$ID")
+                osrel="$PROBE_DIR/etc/os-release"
             else
-                target_os=$(. "$PROBE_DIR/usr/lib/os-release" && echo "$ID")
+                osrel="$PROBE_DIR/usr/lib/os-release"
             fi
+            target_os=$(awk -F= '$1 == "ID" {gsub(/["'\'']/, "", $2); print $2; exit}' "$osrel")
             umount "$PROBE_DIR"
             break
         fi
@@ -366,15 +371,17 @@ echo
 # Stage rcraid sources into the target and run the in-target install.
 echo "==> [7/8] installing rcraid into the target system"
 
-# Pick the kernel in the target that we'll build for.  Live and target kernels
-# can differ (e.g. Ubuntu 24.04 live boots HWE while the installed system uses
-# GA).  Use the newest one present in the target's /lib/modules.
-TARGET_KVER=$(ls "$TARGET/lib/modules" 2>/dev/null | sort -V | tail -1 || true)
-if [ -z "$TARGET_KVER" ]; then
+# Build for EVERY kernel staged in the target, not just the newest.  Live
+# and target kernels can differ (e.g. Ubuntu 24.04 live boots HWE while the
+# installed system uses GA), and some installs stage two kernels (GA + HWE)
+# — first boot may pick either, so each needs rcraid in its initramfs.
+TARGET_KVERS=$(ls "$TARGET/lib/modules" 2>/dev/null | sort -V | tr '\n' ' ' || true)
+TARGET_KVERS="${TARGET_KVERS% }"
+if [ -z "$TARGET_KVERS" ]; then
     echo "no kernel found at $TARGET/lib/modules — was the install incomplete?" >&2
     exit 1
 fi
-echo "    target kernel: $TARGET_KVER"
+echo "    target kernel(s): $TARGET_KVERS"
 
 # Copy sources into the target.  We deliberately copy only what DKMS needs
 # (matches install-dkms.sh) plus the packaging/ tree so the chroot can lay
@@ -389,6 +396,8 @@ cp -r \
     "$SRC_DIR"/rc_*.c \
     "$SRC_DIR"/rc_*.h \
     "$TARGET_SRC/"
+# Substitute the package version into the staged dkms.conf.
+sed -i "s/@PKGVER@/$PKG_VERSION/g" "$TARGET_SRC/dkms.conf"
 # Bake the source revision into the staged tree — it has no .git, so the
 # Makefile reads .rcraid_rev to stamp the module banner and modinfo.
 if rev=$(git -C "$SRC_DIR" describe --always --dirty 2>/dev/null); then
@@ -411,7 +420,7 @@ set -euo pipefail
 
 PKG_NAME="$PKG_NAME"
 PKG_VERSION="$PKG_VERSION"
-TARGET_KVER="$TARGET_KVER"
+TARGET_KVERS="$TARGET_KVERS"
 SUBSYSTEM_VENDOR="$SUBSYSTEM_VENDOR"
 TARGET_FAMILY="$TARGET_FAMILY"
 SRC_DIR="/usr/src/\${PKG_NAME}-\${PKG_VERSION}"
@@ -422,19 +431,32 @@ case "\$TARGET_FAMILY" in
     debian)
         export DEBIAN_FRONTEND=noninteractive
         apt-get update -qq
+        hdr_pkgs=()
+        for kver in \$TARGET_KVERS; do
+            hdr_pkgs+=("linux-headers-\$kver")
+        done
         apt-get install -y --no-install-recommends \\
-            build-essential "linux-headers-\$TARGET_KVER" dkms initramfs-tools
+            build-essential "\${hdr_pkgs[@]}" dkms initramfs-tools
         ;;
     fedora)
-        dnf install -y gcc make "kernel-devel-\$TARGET_KVER" \\
-            "kernel-headers-\$TARGET_KVER" dkms dracut
+        hdr_pkgs=()
+        for kver in \$TARGET_KVERS; do
+            hdr_pkgs+=("kernel-devel-\$kver" "kernel-headers-\$kver")
+        done
+        dnf install -y gcc make "\${hdr_pkgs[@]}" dkms dracut
         ;;
 esac
 
-echo "    dkms add/build/install rcraid (against kernel \$TARGET_KVER)"
-dkms add    -m "\$PKG_NAME" -v "\$PKG_VERSION"
-dkms build  -m "\$PKG_NAME" -v "\$PKG_VERSION" -k "\$TARGET_KVER"
-dkms install -m "\$PKG_NAME" -v "\$PKG_VERSION" -k "\$TARGET_KVER"
+# Guard the add so a Phase-2 re-run (after a mid-install failure) doesn't
+# die on "already added".
+if [ -z "\$(dkms status -m "\$PKG_NAME" -v "\$PKG_VERSION" 2>/dev/null)" ]; then
+    dkms add -m "\$PKG_NAME" -v "\$PKG_VERSION"
+fi
+for kver in \$TARGET_KVERS; do
+    echo "    dkms build/install rcraid (against kernel \$kver)"
+    dkms build   -m "\$PKG_NAME" -v "\$PKG_VERSION" -k "\$kver" --force
+    dkms install -m "\$PKG_NAME" -v "\$PKG_VERSION" -k "\$kver" --force
+done
 
 echo "    installing udev rule, modprobe drop-in, bind helper"
 install -m 0755 "\$PKG_DIR/sbin/rcraid-bind" /usr/sbin/rcraid-bind
@@ -447,19 +469,34 @@ sed "s/@SUBSYSTEM_VENDOR@/\$SUBSYSTEM_VENDOR/g" \\
     > /etc/modprobe.d/rcraid.conf
 chmod 0644 /etc/modprobe.d/rcraid.conf
 
+# On apt-based targets, keep kernel packages out of unattended-upgrades so
+# kernel updates (and the DKMS rebuild + initramfs regeneration they need)
+# are always deliberate.
+if [ -d /etc/apt/apt.conf.d ]; then
+    echo "    installing apt kernel-hold (52-rcraid-kernel-hold)"
+    install -m 0644 "\$PKG_DIR/apt.conf.d/52-rcraid-kernel-hold" \\
+        /etc/apt/apt.conf.d/52-rcraid-kernel-hold
+fi
+
 echo "    installing initramfs hook + regenerating initramfs"
+# Any initramfs failure below is fatal (set -e): an image without rcraid
+# cannot mount / from the array.
 if command -v dracut >/dev/null 2>&1; then
     install -d /usr/lib/dracut/modules.d/95rcraid
     install -m 0755 "\$PKG_DIR/dracut/95rcraid/module-setup.sh" \\
         /usr/lib/dracut/modules.d/95rcraid/module-setup.sh
-    dracut -f --kver "\$TARGET_KVER"
+    for kver in \$TARGET_KVERS; do
+        dracut -f --kver "\$kver"
+    done
 elif command -v update-initramfs >/dev/null 2>&1; then
     install -d /etc/initramfs-tools/hooks
     install -m 0755 "\$PKG_DIR/initramfs-tools/hooks/rcraid" \\
         /etc/initramfs-tools/hooks/rcraid
-    update-initramfs -u -k "\$TARGET_KVER"
+    for kver in \$TARGET_KVERS; do
+        update-initramfs -u -k "\$kver"
+    done
 else
-    echo "WARN: no initramfs generator in target — boot-from-RAID will fail" >&2
+    echo "ERROR: no initramfs generator in target — boot-from-RAID will fail" >&2
     exit 1
 fi
 EOF

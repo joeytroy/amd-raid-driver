@@ -44,7 +44,7 @@ echo "=== verify RAIDCore metadata via the volume (logical sector 40960) ==="
 got=$(dd if="$RCRAID" bs=512 skip=40960 count=1 status=none | xxd -l 16 -p)
 echo "  read 16 bytes: $got"
 case "$got" in
-    *5241494443\6f7265*)
+    *52414944436f7265*)
         echo "  PASS — 'RAIDCore' magic present at logical sector 40960"
         ;;
     *)
@@ -58,8 +58,12 @@ echo
 echo "=== stripe-boundary sanity (logical 2047 vs 2048) ==="
 # Sectors 0..2047 → member 0; sectors 2048..4095 → member 1.
 # Both should read as zeros (empty array) — what we're checking is no oops.
-dd if="$RCRAID" bs=512 skip=2047 count=2 status=none of=/tmp/rcraid_boundary.bin
-if [ "$(wc -c < /tmp/rcraid_boundary.bin)" = "1024" ]; then
+# mktemp, not a predictable /tmp name: we run as root and a fixed path
+# would be a symlink-clobber hazard.
+boundary_bin=$(mktemp)
+trap 'rm -f "$boundary_bin"' EXIT
+dd if="$RCRAID" bs=512 skip=2047 count=2 status=none of="$boundary_bin"
+if [ "$(wc -c < "$boundary_bin")" = "1024" ]; then
     echo "  PASS — straddling read across stripe boundary returned 1024 bytes"
 else
     echo "  FAIL — boundary read returned wrong size"

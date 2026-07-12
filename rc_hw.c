@@ -23,7 +23,11 @@ int rc_hw_init(struct rc_adapter *adapter)
 {
 	struct rc_hw_queue_context *hw = &adapter->hw;
 
-	memset(hw, 0, sizeof(*hw));
+	/* No memset here: adapter (and thus hw) comes kzalloc'ed from
+	 * rc_bottom_alloc_adapter, which also spin_lock_init's pending_lock /
+	 * irq_lock / sync_lock.  Wiping the struct at this point would run
+	 * with interrupts already live (request_irq happens earlier in
+	 * probe) and would destroy the initialized locks. */
 	hw->owner     = adapter;
 	hw->pdev      = adapter->pdev;
 	hw->mmio_base = adapter->ctx.mmio_base;

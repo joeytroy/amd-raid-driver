@@ -48,12 +48,18 @@ ifneq ($(RCRAID_VERSION),)
 ccflags-y += -DRC_DRIVER_VERSION=\"$(RCRAID_VERSION)\"
 endif
 
-# Build targets
+# Build targets.
+# No `find /usr/src | xargs sh -c` fallback: it silently picked an arbitrary
+# tree (whichever `head -1` produced), broke on paths with spaces, and
+# masked the real error from the primary build.  If the headers for the
+# running kernel are missing, say so and stop.
 all:
-	@echo "Attempting to build with current kernel..."
-	@$(MAKE) -C $(KERNELDIR) M=$(PWD) modules || \
-	(echo "Build failed, trying with older kernel..." && \
-	 find /usr/src -name "linux-source-*" -type d | head -1 | xargs -I {} sh -c 'if [ -d "{}/build" ]; then echo "Using kernel: {}"; $(MAKE) -C {}/build M=$(PWD) modules; else echo "No suitable kernel found"; exit 1; fi')
+	@if [ ! -d "$(KERNELDIR)" ]; then \
+		echo "error: kernel build directory '$(KERNELDIR)' not found." >&2; \
+		echo "       Install the headers for the running kernel, or set KERNELDIR=/path/to/kernel/build" >&2; \
+		exit 1; \
+	fi
+	$(MAKE) -C $(KERNELDIR) M=$(PWD) modules
 
 clean:
 	@echo "Cleaning build files..."
@@ -65,10 +71,13 @@ clean:
 # supported way to append flags from outside kbuild; EXTRA_CFLAGS on the
 # command line is ignored by modern kernels).
 simple:
+	@if [ ! -d "$(KERNELDIR)" ]; then \
+		echo "error: kernel build directory '$(KERNELDIR)' not found." >&2; \
+		echo "       Install the headers for the running kernel, or set KERNELDIR=/path/to/kernel/build" >&2; \
+		exit 1; \
+	fi
 	@echo "Building with minimal requirements..."
-	@$(MAKE) -C $(KERNELDIR) M=$(PWD) modules KCFLAGS="-Wno-error -Wno-unused-variable -Wno-unused-function -Wno-missing-field-initializers" || \
-	(echo "Trying with older kernel..." && \
-	 find /usr/src -name "linux-source-*" -type d | head -1 | xargs -I {} sh -c 'if [ -d "{}/build" ]; then echo "Using: {}"; $(MAKE) -C {}/build M=$(PWD) modules KCFLAGS="-Wno-error -Wno-unused-variable -Wno-unused-function -Wno-missing-field-initializers"; else echo "No kernel found"; exit 1; fi')
+	$(MAKE) -C $(KERNELDIR) M=$(PWD) modules KCFLAGS="-Wno-error -Wno-unused-variable -Wno-unused-function -Wno-missing-field-initializers"
 
 install:
 	$(MAKE) -C $(KERNELDIR) M=$(PWD) modules_install

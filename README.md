@@ -226,9 +226,20 @@ sudo ./install-dkms.sh
 
 It detects your array members (vs. your OS drive), installs the module
 via DKMS, pins the members to the driver with a udev rule, enables writes
-by default, and adds an initramfs hook. Reboot and `/dev/rcraid0` (plus
-any `/dev/rcraid0pN` partitions) is just there. `sudo ./uninstall-dkms.sh`
-reverses all of it.
+by default, and adds an initramfs hook. On apt-based systems it also
+excludes kernel packages from unattended-upgrades
+(`/etc/apt/apt.conf.d/52-rcraid-kernel-hold`), so a kernel update — and
+the DKMS rebuild + initramfs regeneration it requires — is always a
+deliberate act. Reboot and `/dev/rcraid0` (plus any `/dev/rcraid0pN`
+partitions) is just there. `sudo ./uninstall-dkms.sh` reverses all of it
+(and refuses to run if the system is currently booted from the array,
+unless you pass `--force`).
+
+**After every kernel update, run `scripts/verify-boot-safety.sh` before
+rebooting.** It checks, for every installed kernel, that DKMS built the
+module and that the module is actually inside that kernel's initramfs
+(both initramfs-tools and dracut systems are supported), and tells you
+the exact fix command for any kernel that would fail to boot.
 
 ### 🅒 Build and load by hand (dev iteration / one-off)
 
@@ -273,12 +284,16 @@ Full setup, troubleshooting, and the Secure-Boot / signing details are in
 
 ## Not yet supported
 
-- **RAID1 degraded mode / rebuild** — ⚠️ **know this before trusting the
-  mirror**: today a member failure fails the whole volume (same behavior
-  as RAID0) instead of serving from the surviving mirror. Your data is
-  still duplicated on both drives — nothing is lost — but the volume
-  goes down until the array is healthy again. Degraded-mode operation,
-  hot-plug handling, and background rebuild are the next roadmap items.
+- **RAID1 degraded mode / resync / rebuild** — ⚠️ **know this before
+  trusting the mirror**: today a member failure fails the whole volume
+  (same behavior as RAID0) instead of serving from the surviving mirror.
+  Your data is still duplicated on both drives — nothing is lost — but
+  the volume goes down until the array is healthy again. There is also
+  **no resync**: nothing tracks or repairs divergence between the copies
+  (e.g. after a write that failed on one mirror mid-flight), so RAID1
+  today provides redundancy of data at rest, not availability.
+  Degraded-mode operation, dirty-region tracking/resync, hot-plug
+  handling, and background rebuild are the next roadmap items.
 - **RAID10** — roadmap. **RAID5** — not planned (AMD only supports it on
   3rd-gen Threadripper).
 - **SATA RAID** — the `43BD / 7905 / 7916 / 7917` controllers are claimed

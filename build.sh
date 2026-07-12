@@ -3,18 +3,12 @@
 # AMD RAID Driver Build Script
 # Handles kernel header issues and provides fallback options
 
+set -e
+
 echo "AMD RAID Driver Build Script"
 echo "============================"
 
-# Check if we're running as root
-if [ "$EUID" -ne 0 ]; then
-    echo "Please run as root (use sudo)"
-    exit 1
-fi
-
-# Clean previous builds
-echo "Cleaning previous builds..."
-make clean
+# Building a module needs no privileges — only loading it does.
 
 # Try to find a working kernel build directory
 KERNELDIR=""
@@ -33,6 +27,10 @@ if [ -z "$KERNELDIR" ]; then
     exit 1
 fi
 
+# Clean previous builds (only once we know the kernel dir is valid)
+echo "Cleaning previous builds..."
+make -C "$KERNELDIR" M="$(pwd)" clean
+
 # Set environment variables.  KCFLAGS is the supported way to append
 # compiler flags from the environment; modern kbuild ignores EXTRA_CFLAGS.
 export KERNELDIR
@@ -43,20 +41,16 @@ echo "Extra CFLAGS (KCFLAGS): $KCFLAGS"
 
 # Build the module
 echo "Building AMD RAID driver..."
-make -C "$KERNELDIR" M="$(pwd)" modules
-
-if [ $? -eq 0 ]; then
+if make -C "$KERNELDIR" M="$(pwd)" modules; then
     echo "Build successful!"
     echo "Module files created:"
     ls -la *.ko 2>/dev/null || echo "No .ko files found"
 else
     echo "Build failed. Trying alternative approach..."
-    
+
     # Try with minimal flags
     export KCFLAGS="-Wno-error -Wno-unused-variable -Wno-unused-function -Wno-missing-field-initializers -Wno-unused-but-set-variable"
-    make -C "$KERNELDIR" M="$(pwd)" modules
-    
-    if [ $? -eq 0 ]; then
+    if make -C "$KERNELDIR" M="$(pwd)" modules; then
         echo "Build successful with minimal flags!"
         ls -la *.ko 2>/dev/null || echo "No .ko files found"
     else

@@ -8,7 +8,10 @@
 # into it. Run this AFTER any kernel update (and it's cheap enough to run any
 # time) — BEFORE you reboot into a freshly-installed kernel. Any kernel that
 # fails here must not be booted until fixed (rebuild with:
-#   sudo dkms install -m rcraid -v <ver> --force && sudo update-initramfs -u -k <kver>).
+#   sudo dkms install -m rcraid -v <ver> --force
+# then regenerate that kernel's initramfs:
+#   sudo update-initramfs -u -k <kver>     # Debian/Ubuntu (initramfs-tools)
+#   sudo dracut -f --kver <kver>           # Fedora/RHEL/Arch (dracut)).
 #
 # Exit status: 0 = every installed kernel is safe; 1 = at least one is not.
 
@@ -23,6 +26,25 @@ fi
 RUNNING="$(uname -r)"
 FAIL=0
 CHECKED=0
+
+# Detect the initramfs toolchain.  Debian/Ubuntu use initramfs-tools
+# (image /boot/initrd.img-<K>, listed with lsinitramfs); Fedora/RHEL/Arch/
+# openSUSE use dracut (image /boot/initramfs-<K>.img, listed with lsinitrd).
+# Fail LOUDLY when neither lister exists — silently swallowing the
+# command-not-found used to make every kernel falsely FAIL on dracut boxes.
+if command -v lsinitramfs >/dev/null 2>&1; then
+    INITRD_LISTER="lsinitramfs"
+    FIX_HINT="sudo update-initramfs -u -k"
+elif command -v lsinitrd >/dev/null 2>&1; then
+    INITRD_LISTER="lsinitrd"
+    FIX_HINT="sudo dracut -f --kver"
+else
+    echo "ERROR: neither lsinitramfs (initramfs-tools) nor lsinitrd (dracut)" >&2
+    echo "       is available, so initramfs contents CANNOT be verified." >&2
+    echo "       Install the tool matching your initramfs generator and" >&2
+    echo "       re-run.  Refusing to report PASS without checking." >&2
+    exit 1
+fi
 
 # Prefer the dkms-signed source version; fall back to whatever dkms knows.
 PKG_VER="$(dkms status "$PKG" 2>/dev/null | sed -n 's#^'"$PKG"'/\([^,]*\),.*#\1#p' | head -1)"
@@ -67,15 +89,19 @@ for img in /boot/vmlinuz-*; do
     fi
 
     # 4. THE decisive check: the module is inside THIS kernel's initramfs.
-    initrd="/boot/initrd.img-$K"
-    if [ ! -e "$initrd" ]; then
-        echo "   [FAIL] no initramfs ($initrd) — kernel cannot mount / via rcraid"
+    # Try both naming schemes so a mixed /boot doesn't confuse us.
+    initrd=""
+    for cand in "/boot/initrd.img-$K" "/boot/initramfs-$K.img"; do
+        if [ -e "$cand" ]; then initrd="$cand"; break; fi
+    done
+    if [ -z "$initrd" ]; then
+        echo "   [FAIL] no initramfs (initrd.img-$K / initramfs-$K.img) — kernel cannot mount / via rcraid"
         ok=0
-    elif lsinitramfs "$initrd" 2>/dev/null | grep -q 'rcraid\.ko'; then
-        echo "   [ok]   present in initramfs"
+    elif "$INITRD_LISTER" "$initrd" 2>/dev/null | grep -q 'rcraid\.ko'; then
+        echo "   [ok]   present in initramfs ($initrd)"
     else
         echo "   [FAIL] rcraid MISSING from initramfs — this kernel will NOT boot"
-        echo "          fix: sudo update-initramfs -u -k $K"
+        echo "          fix: $FIX_HINT $K"
         ok=0
     fi
 

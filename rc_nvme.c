@@ -144,9 +144,24 @@ static struct blk_mq_tag_set rc_volume_tagset;
  * For multi-member dispatch on a 2-member RAID0, a 1 MiB request maps
  * 512 KiB to each member, which is exactly 128 pages per member. */
 #define RC_VOLUME_MS_PAGES_PER_MEMBER	128
-/* blk-mq tag pool size per hctx.  Matches Windows per-queue SQ depth.
+/* SQ headroom reserved for internal (non-blk-mq) commands: boot/reset-time
+ * sync commands (1 per queue), prefetch (2 slots × 2 cmds per hctx) and a
+ * margin for cache fills.  Internal submitters additionally reserve their
+ * SQE slots explicitly via rc_nvme_sq_reserve() and back off when the SQ
+ * is full, so this headroom is a throughput knob (keeps steady-state tag
+ * load from starving internal commands into constant back-off), not the
+ * correctness mechanism. */
+#define RC_VOLUME_SQ_INTERNAL_HEADROOM	16u
+/* blk-mq tag pool size per hctx.  The per-queue NVMe SQ depth is
+ * RC_NVME_IO_QUEUE_DEPTH (256, matching Windows), but an NVMe SQ is full
+ * at depth-1 and internal commands share the same SQs on top of the tags,
+ * so the tag pool must sit below depth-1 minus internal headroom — sizing
+ * them EQUAL let a full tag load plus one cache fill wrap the SQ tail
+ * over live SQEs (silent corruption).  Further clamped at volume-create
+ * time against the actual granted queue depths (CAP.MQES can be < 256).
  * Total in-flight requests = nr_hw_queues × this. */
-#define RC_VOLUME_QUEUE_DEPTH	256
+#define RC_VOLUME_QUEUE_DEPTH	\
+	(RC_NVME_IO_QUEUE_DEPTH - RC_VOLUME_SQ_INTERNAL_HEADROOM)
 /* Max hardware queues (hctx) the volume exposes.  nr_hw_queues is the min
  * of every member's granted NVMe I/O queues, capped at
  * RC_NVME_IO_QUEUE_TARGET=4 in practice, but sized to 8 here as a ceiling.
@@ -626,7 +641,15 @@ irqreturn_t rc_nvme_io_queue_irq(int irq, void *dev_id)
 				u16 sc = (status >> 1) & 0x7fff;
 				pdu = blk_mq_rq_to_pdu(req);
 				if (sc) {
-					pdu->sc_sct = sc;
+					/* First-error-wins, single aligned
+					 * store: concurrent member ISRs on a
+					 * fan-out op race here, but each
+					 * store is atomic so the field holds
+					 * ONE of the members' statuses (never
+					 * a torn mix), and error-vs-success
+					 * is always preserved. */
+					if (!READ_ONCE(pdu->sc_sct))
+						WRITE_ONCE(pdu->sc_sct, sc);
 					rc_printk(RC_ERROR,
 						  "rc_nvme_io_queue_irq: %s qid=%u CID=%u op=%u pos=%llu len=%u failed SC/SCT=0x%04x\n",
 						  pci_name(adapter->pdev), q->qid,
@@ -652,6 +675,10 @@ irqreturn_t rc_nvme_io_queue_irq(int irq, void *dev_id)
 					  pci_name(adapter->pdev), q->qid, cid, status);
 			}
 		}
+
+		/* One CQE consumed = one SQE slot free (C-4 accounting). */
+		if (q->sq_inflight)
+			q->sq_inflight--;
 
 		q->cq_head = (q->cq_head + 1) % q->cq_depth;
 		if (q->cq_head == 0)
@@ -789,6 +816,34 @@ static int rc_nvme_disable_controller(struct rc_adapter *adapter)
 	return rc_nvme_wait_csts(adapter, RC_NVME_CSTS_RDY, 0);
 }
 
+/* NVMe-spec-conformant shutdown notification (CC.SHN = 01b "normal",
+ * wait for CSTS.SHST = 10b "complete").  The driver enables the members'
+ * volatile write caches, so ripping CC.EN low without this counts as an
+ * UNSAFE shutdown: the drive may drop cached writes and its
+ * unsafe-shutdown SMART counter climbs on every suspend/reboot.  Must be
+ * called BEFORE clearing CC.EN.  Best-effort: on timeout we log and let
+ * the caller proceed with the disable anyway. */
+static void rc_nvme_shutdown_notify(struct rc_adapter *adapter)
+{
+	void __iomem *base = adapter->ctx.mmio_base;
+	u32 cc;
+
+	if (!base)
+		return;
+	cc = readl(base + RC_NVME_REG_CC);
+	if (cc == 0xffffffff || !(cc & RC_NVME_CC_EN))
+		return;	/* gone or disabled — nothing to notify */
+
+	cc = (cc & ~RC_NVME_CC_SHN_MASK) | RC_NVME_CC_SHN_NORMAL;
+	writel(cc, base + RC_NVME_REG_CC);
+
+	if (rc_nvme_wait_csts(adapter, RC_NVME_CSTS_SHST_MASK,
+			      RC_NVME_CSTS_SHST_COMPLETE))
+		rc_printk(RC_WARN,
+			  "rc_nvme_shutdown_notify: %s shutdown processing did not complete — continuing with disable\n",
+			  pci_name(adapter->pdev));
+}
+
 static int rc_nvme_alloc_admin_queues(struct rc_adapter *adapter)
 {
 	struct device *dev = &adapter->pdev->dev;
@@ -895,11 +950,21 @@ static int __rc_nvme_admin_cmd_locked(struct rc_adapter *adapter,
 	struct rc_nvme_sqe *slot;
 	struct rc_nvme_cqe *cqe;
 	u32 tail;
-	u16 status, sc_sct;
+	u16 status, sc_sct, expected_cid, ccid;
 	int ret;
 
+	/* Rolling CID — the admin-path mirror of the I/O sync path's
+	 * sync_seq stale-CQE defense.  With a constant CID 0, a late CQE
+	 * from a previously TIMED-OUT admin command was consumed by the
+	 * next admin command as its own completion (same CID, matching
+	 * phase): wrong status attributed, admin_cq_head desynced.  Now
+	 * each command carries a fresh CID and mismatching CQEs are
+	 * consumed and dropped. */
+	nvme->admin_cid_seq++;
+	expected_cid = nvme->admin_cid_seq;
+
 	slot = (struct rc_nvme_sqe *)nvme->admin_sq + nvme->admin_sq_tail;
-	cmd->cid = cpu_to_le16(0);
+	cmd->cid = cpu_to_le16(expected_cid);
 	memcpy(slot, cmd, sizeof(*cmd));
 
 	tail = (nvme->admin_sq_tail + 1) % nvme->admin_sq_depth;
@@ -907,24 +972,36 @@ static int __rc_nvme_admin_cmd_locked(struct rc_adapter *adapter,
 	wmb();
 	rc_nvme_ring_sq_doorbell(adapter, 0, tail);
 
-	ret = rc_nvme_wait_admin_completion(adapter);
-	if (ret) {
-		rc_printk(RC_ERROR,
-			  "rc_nvme_admin_cmd: timeout waiting for CQE (opc=0x%02x)\n",
-			  cmd->opc);
-		return ret;
+	for (;;) {
+		ret = rc_nvme_wait_admin_completion(adapter);
+		if (ret) {
+			rc_printk(RC_ERROR,
+				  "rc_nvme_admin_cmd: timeout waiting for CQE (opc=0x%02x CID=0x%x)\n",
+				  cmd->opc, expected_cid);
+			return ret;
+		}
+
+		cqe = (struct rc_nvme_cqe *)nvme->admin_cq + nvme->admin_cq_head;
+		status = le16_to_cpu(cqe->status);
+		sc_sct = (status >> 1) & 0x7fff;
+		ccid   = le16_to_cpu(cqe->cid);
+		if (out_result)
+			*out_result = le32_to_cpu(cqe->result);
+
+		/* Consume the CQE unconditionally — a stale entry left on
+		 * the ring must not be re-examined forever. */
+		nvme->admin_cq_head = (nvme->admin_cq_head + 1) % nvme->admin_cq_depth;
+		if (nvme->admin_cq_head == 0)
+			nvme->admin_cq_phase ^= 1;
+		rc_nvme_ring_cq_doorbell(adapter, 0, nvme->admin_cq_head);
+
+		if (ccid == expected_cid)
+			break;
+
+		rc_printk(RC_WARN,
+			  "rc_nvme_admin_cmd: dropping stale admin CQE CID=0x%x (expected 0x%x, status=0x%04x)\n",
+			  ccid, expected_cid, status);
 	}
-
-	cqe = (struct rc_nvme_cqe *)nvme->admin_cq + nvme->admin_cq_head;
-	status = le16_to_cpu(cqe->status);
-	sc_sct = (status >> 1) & 0x7fff;
-	if (out_result)
-		*out_result = le32_to_cpu(cqe->result);
-
-	nvme->admin_cq_head = (nvme->admin_cq_head + 1) % nvme->admin_cq_depth;
-	if (nvme->admin_cq_head == 0)
-		nvme->admin_cq_phase ^= 1;
-	rc_nvme_ring_cq_doorbell(adapter, 0, nvme->admin_cq_head);
 
 	if (sc_sct) {
 		rc_printk(RC_ERROR,
@@ -1356,11 +1433,21 @@ static void rc_nvme_destroy_one_io_queue(struct rc_adapter *adapter,
 					 struct rc_nvme_io_queue *q)
 {
 	struct device *dev = &adapter->pdev->dev;
+	struct rc_nvme_state *nvme = &adapter->ctx.nvme;
 	struct rc_nvme_sqe cmd;
 	size_t sq_bytes, cq_bytes;
+	bool ctrl_alive;
 
 	if (!q)
 		return;
+
+	/* Don't issue Delete SQ / Delete CQ at a dead or surprise-removed
+	 * controller: each admin command would burn the full admin timeout
+	 * (2 s × 2 cmds × up to 4 queues on a hot-removed device).  The
+	 * DMA and IRQ cleanup below is host-side and always runs. */
+	ctrl_alive = !READ_ONCE(nvme->dead) && adapter->ctx.mmio_base &&
+		     readl(adapter->ctx.mmio_base + RC_NVME_REG_CSTS) !=
+			     0xffffffff;
 
 	if (q->irq_vector >= 0) {
 		free_irq(q->irq_vector, q);
@@ -1368,19 +1455,23 @@ static void rc_nvme_destroy_one_io_queue(struct rc_adapter *adapter,
 	}
 
 	if (q->sq) {
-		memset(&cmd, 0, sizeof(cmd));
-		cmd.opc   = RC_NVME_ADMIN_OP_DELETE_IO_SQ;
-		cmd.cdw10 = cpu_to_le32(q->qid);
-		(void)rc_nvme_admin_cmd(adapter, &cmd, NULL);
+		if (ctrl_alive) {
+			memset(&cmd, 0, sizeof(cmd));
+			cmd.opc   = RC_NVME_ADMIN_OP_DELETE_IO_SQ;
+			cmd.cdw10 = cpu_to_le32(q->qid);
+			(void)rc_nvme_admin_cmd(adapter, &cmd, NULL);
+		}
 		sq_bytes = (size_t)q->sq_depth * RC_NVME_SQ_ENTRY_SIZE;
 		dma_free_coherent(dev, sq_bytes, q->sq, q->sq_dma);
 		q->sq = NULL;
 	}
 	if (q->cq) {
-		memset(&cmd, 0, sizeof(cmd));
-		cmd.opc   = RC_NVME_ADMIN_OP_DELETE_IO_CQ;
-		cmd.cdw10 = cpu_to_le32(q->qid);
-		(void)rc_nvme_admin_cmd(adapter, &cmd, NULL);
+		if (ctrl_alive) {
+			memset(&cmd, 0, sizeof(cmd));
+			cmd.opc   = RC_NVME_ADMIN_OP_DELETE_IO_CQ;
+			cmd.cdw10 = cpu_to_le32(q->qid);
+			(void)rc_nvme_admin_cmd(adapter, &cmd, NULL);
+		}
 		cq_bytes = (size_t)q->cq_depth * RC_NVME_CQ_ENTRY_SIZE;
 		dma_free_coherent(dev, cq_bytes, q->cq, q->cq_dma);
 		q->cq = NULL;
@@ -1465,9 +1556,43 @@ static int rc_nvme_create_io_queues(struct rc_adapter *adapter)
 	return 0;
 }
 
+/* Reserve `n` SQE slots on this queue, failing when the SQ can't hold
+ * them (an NVMe SQ is full at depth-1: tail may never catch head).  Every
+ * submitter — blk-mq dispatch, cache fills, prefetch, sync commands —
+ * must win its slots here BEFORE calling rc_nvme_io_submit; without the
+ * accounting a full tag load plus an internal command wrapped sq_tail
+ * over an unconsumed SQE and the controller executed corrupted/duplicate
+ * commands.  Callers that reserve but then bail before submitting must
+ * give the slots back via rc_nvme_sq_unreserve. */
+static bool rc_nvme_sq_reserve(struct rc_nvme_io_queue *q, u32 n)
+{
+	unsigned long flags;
+	bool ok = false;
+
+	spin_lock_irqsave(&q->lock, flags);
+	if ((u32)q->sq_depth > n &&
+	    q->sq_inflight <= (u32)q->sq_depth - 1 - n) {
+		q->sq_inflight += n;
+		ok = true;
+	}
+	spin_unlock_irqrestore(&q->lock, flags);
+	return ok;
+}
+
+static void rc_nvme_sq_unreserve(struct rc_nvme_io_queue *q, u32 n)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&q->lock, flags);
+	q->sq_inflight = (q->sq_inflight >= n) ? q->sq_inflight - n : 0;
+	spin_unlock_irqrestore(&q->lock, flags);
+}
+
 /* Submit one I/O command to a specific NVMe I/O queue asynchronously.
  * Caller (blk-mq queue_rq) returns BLK_STS_OK immediately; completion
- * lands in rc_nvme_io_queue_irq → blk_mq_complete_request → .complete. */
+ * lands in rc_nvme_io_queue_irq → blk_mq_complete_request → .complete.
+ * The caller MUST hold an SQE reservation (rc_nvme_sq_reserve) for this
+ * command; the slot is released when its CQE is consumed. */
 static void rc_nvme_io_submit(struct rc_nvme_io_queue *q,
 			      struct rc_nvme_sqe *cmd)
 {
@@ -1515,8 +1640,22 @@ static int rc_nvme_io_cmd_sync(struct rc_adapter *adapter,
 	/* Arm the handshake BEFORE the doorbell rings — the ISR can run the
 	 * moment the controller sees the SQE.  The rolling sequence in the
 	 * CID's low byte keeps a stale CQE from a previously timed-out sync
-	 * command from satisfying this one. */
+	 * command from satisfying this one.
+	 *
+	 * The SQE slot is reserved in the same critical section (C-4): this
+	 * queue is shared with live blk-mq traffic during module reload /
+	 * auto-reset, and submitting into a full SQ would wrap the tail over
+	 * a live command. */
 	spin_lock_irqsave(&q->lock, flags);
+	if ((u32)q->sq_depth <= 1 ||
+	    q->sq_inflight > (u32)q->sq_depth - 2) {
+		spin_unlock_irqrestore(&q->lock, flags);
+		rc_printk(RC_WARN,
+			  "rc_nvme_io_cmd_sync: %s qid=%u SQ full (%u in flight) — try again\n",
+			  pci_name(adapter->pdev), q->qid, q->sq_inflight);
+		return -EBUSY;
+	}
+	q->sq_inflight++;
 	q->sync_seq++;
 	q->sync_cid = (u16)(RC_VOLUME_SYNC_CID_BASE | (q->sync_seq & 0xFFu));
 	q->sync_pending = true;
@@ -1565,6 +1704,9 @@ static int rc_nvme_io_cmd_sync(struct rc_adapter *adapter,
 						  "rc_nvme_io_cmd_sync: dropping stale sync CQE CID=0x%x (expected 0x%x)\n",
 						  ccid, q->sync_cid);
 				}
+				/* CQE consumed here → SQE slot free (C-4). */
+				if (q->sq_inflight)
+					q->sq_inflight--;
 				q->cq_head = (q->cq_head + 1) % q->cq_depth;
 				if (q->cq_head == 0)
 					q->cq_phase ^= 1;
@@ -2034,7 +2176,11 @@ static void rc_volume_parse_logical_device(struct rc_adapter *adapter)
 			level = rc_ld_level_from(devtype, first_count,
 						 second_count, devices);
 
-			rc_printk(RC_INFO,
+			/* RC_NOTE, not RC_INFO: this is the one-time record of
+			 * which LD record assembled the volume and at what RAID
+			 * level — it must land in dmesg at the default
+			 * debug_level (the QEMU rig also asserts on it). */
+			rc_printk(RC_NOTE,
 				  "rc_volume_parse_logical_device: %s LD@gen+%u.%u devtype=0x%04x first=%u second=%u (level=%s) devices=%u chunk=%u chunk_idx=%u capacity=%llu my_pos=%d alloc_off=%llu alloc_sz=%llu user_off=%llu user_sz=%llu%s\n",
 				  pci_name(adapter->pdev),
 				  (pos + i) / 512, (pos + i) % 512,
@@ -2361,6 +2507,22 @@ static void rc_volume_register_member(struct rc_adapter *adapter)
 				  pci_name(adapter->pdev), nvme->ld_chunk_index);
 			rc_volume_geometry_untrust_reason =
 				"the on-disk RAID0 chunk_index is not one this driver maps to a stripe size (see the earlier chunk_index warning) — an on-disk encoding this driver doesn't recognize, not a parse failure";
+		}
+		/* Sanity-bound a verbatim on-disk ChunkSize.  Every dispatch
+		 * assumption (per-member sg arrays, one NVMe cmd per member,
+		 * the 1 MiB max request) is derived from sane power-of-two
+		 * stripes; an implausible value means we're misreading the
+		 * field, so keep the array readable but veto writes. */
+		if (nvme->ld_level == RC_LDT_RAID0 && nvme->ld_chunk_sectors &&
+		    (chunk_sectors < 16u ||
+		     chunk_sectors > (RC_VOLUME_DATA_BYTES / 512u) ||
+		     (chunk_sectors & (chunk_sectors - 1)))) {
+			rc_printk(RC_WARN,
+				  "rc_volume_register_member: %s implausible on-disk ChunkSize=%u sectors (want a power of two in [16, %lu]) — geometry UNTRUSTED, writes will be vetoed\n",
+				  pci_name(adapter->pdev), chunk_sectors,
+				  RC_VOLUME_DATA_BYTES / 512u);
+			rc_volume_geometry_untrust_reason =
+				"the on-disk ChunkSize is not a plausible stripe size (power of two, 8 KiB..1 MiB) — the field is probably being misread, so the write path cannot trust the stripe math";
 		}
 	} else {
 		expected = RC_VOLUME_EXPECTED_MEMBERS;
@@ -2720,6 +2882,7 @@ static void rc_volume_prefetch_submit(unsigned int hctx_idx,
 				      u64 phys_lba);
 static void rc_volume_prefetch_copy_out(struct request *req, void *src);
 static void rc_volume_prefetch_invalidate(unsigned int hctx_idx);
+static void rc_volume_prefetch_invalidate_all(void);
 static u32 rc_cache_bucket_for(sector_t lba);
 static struct rc_cache_entry *rc_cache_lookup_valid(sector_t stripe_lba);
 static bool rc_cache_has_or_loading(sector_t stripe_lba);
@@ -2939,6 +3102,21 @@ static blk_status_t rc_volume_dispatch_multi_stripe(
 		pdu->ms_nents[m] = mapped;
 	}
 
+	/* One SQE on each involved member's queue — reserve or requeue
+	 * (C-4).  Runs before blk_mq_start_request so DEV_RESOURCE is a
+	 * clean retry. */
+	for (m = 0; m < nm; m++) {
+		if (!pdu->ms_nents[m])
+			continue;
+		if (!rc_nvme_sq_reserve(rc_volume_members[m]->ctx.nvme.io_queues[hctx->queue_num], 1)) {
+			while (m-- > 0)
+				if (pdu->ms_nents[m])
+					rc_nvme_sq_unreserve(rc_volume_members[m]->ctx.nvme.io_queues[hctx->queue_num], 1);
+			rc_volume_unmap_request_sg(pdu);
+			return BLK_STS_DEV_RESOURCE;
+		}
+	}
+
 	pdu->member_idx = -1;	/* multi-member — no single member to attribute */
 	atomic_set(&pdu->members_pending, members_with_data);
 
@@ -2961,6 +3139,11 @@ static blk_status_t rc_volume_dispatch_multi_stripe(
 					(u16)(member_sectors[m] - 1),
 					(req->cmd_flags & REQ_FUA) != 0,
 					pdu->ms_sg[m], pdu->ms_nents[m])) {
+				int u;
+
+				for (u = 0; u < nm; u++)
+					if (pdu->ms_nents[u])
+						rc_nvme_sq_unreserve(rc_volume_members[u]->ctx.nvme.io_queues[hctx->queue_num], 1);
 				rc_volume_unmap_request_sg(pdu);
 				return BLK_STS_IOERR;
 			}
@@ -3048,6 +3231,19 @@ static blk_status_t rc_volume_dispatch_multi_stripe_discard(
 
 	if (members_with_data == 0)
 		return BLK_STS_IOERR;
+
+	/* One DSM per involved member — reserve the SQE slots or requeue
+	 * (C-4). */
+	for (m = 0; m < nm; m++) {
+		if (!member_has_data[m])
+			continue;
+		if (!rc_nvme_sq_reserve(rc_volume_members[m]->ctx.nvme.io_queues[hctx->queue_num], 1)) {
+			while (m-- > 0)
+				if (member_has_data[m])
+					rc_nvme_sq_unreserve(rc_volume_members[m]->ctx.nvme.io_queues[hctx->queue_num], 1);
+			return BLK_STS_DEV_RESOURCE;
+		}
+	}
 
 	/* Discard has no DMA mapping — pdu->nents and pdu->ms_active stay zero
 	 * from queue_rq's memset, so rc_volume_unmap_request_sg no-ops on
@@ -3190,6 +3386,18 @@ static blk_status_t rc_volume_dispatch_mirror(
 	 * memset, so unmap no-ops; the DSM range lives in the per-tag PRP
 	 * buffer, one per (hctx, member, tag). */
 
+	/* One SQE per member — reserve them all or requeue (C-4).  Runs
+	 * before blk_mq_start_request so BLK_STS_DEV_RESOURCE is a clean
+	 * "try again" for blk-mq. */
+	for (m = 0; m < nm; m++) {
+		if (!rc_nvme_sq_reserve(rc_volume_members[m]->ctx.nvme.io_queues[hctx->queue_num], 1)) {
+			while (m-- > 0)
+				rc_nvme_sq_unreserve(rc_volume_members[m]->ctx.nvme.io_queues[hctx->queue_num], 1);
+			rc_volume_unmap_request_sg(pdu);
+			return BLK_STS_DEV_RESOURCE;
+		}
+	}
+
 	pdu->member_idx = -1;	/* multi-member — timeout/drain treat as all */
 	atomic_set(&pdu->members_pending, nm);
 
@@ -3209,6 +3417,10 @@ static blk_status_t rc_volume_dispatch_mirror(
 						(req->cmd_flags & REQ_FUA) != 0,
 						pdu->ms_sg[m],
 						pdu->ms_nents[m])) {
+					int u;
+
+					for (u = 0; u < nm; u++)
+						rc_nvme_sq_unreserve(rc_volume_members[u]->ctx.nvme.io_queues[hctx->queue_num], 1);
 					rc_volume_unmap_request_sg(pdu);
 					return BLK_STS_IOERR;
 				}
@@ -3260,6 +3472,13 @@ static blk_status_t rc_volume_queue_rq(struct blk_mq_hw_ctx *hctx,
 	 * serve I/O.  Fail every incoming request rather than wedging more
 	 * CIDs against a controller we no longer trust. */
 	if (rc_volume_any_member_dead()) {
+		/* NO DEGRADED MODE (yet): one dead member fails the whole
+		 * volume — including RAID1, which therefore provides
+		 * redundancy of data at rest but not availability.  Say so
+		 * explicitly instead of failing I/O silently. */
+		printk_ratelimited(KERN_ERR
+			"rcraid: %s: failing I/O — a member controller is dead and the driver has no degraded mode (all I/O fails until reset/reload)\n",
+			rc_volume_disk ? rc_volume_disk->disk_name : "?");
 		blk_mq_start_request(req);
 		if (rc_volume_claim_completion(pdu)) {
 			rc_cache_dec_inflight(pdu);
@@ -3284,6 +3503,18 @@ static blk_status_t rc_volume_queue_rq(struct blk_mq_hw_ctx *hctx,
 	 * completes on the last ack — that is the correct and optimal shape.
 	 * fsync cost is NVMe flush latency (physics), not a driver defect. */
 	if (op == REQ_OP_FLUSH) {
+		/* Reserve one SQE per member queue before starting; on a
+		 * full SQ hand the request back to blk-mq for a retry
+		 * instead of overrunning the ring (C-4). */
+		for (i = 0; i < rc_volume_member_count; i++) {
+			if (!rc_nvme_sq_reserve(rc_volume_members[i]->ctx.nvme.io_queues[hctx->queue_num], 1)) {
+				while (i-- > 0)
+					rc_nvme_sq_unreserve(rc_volume_members[i]->ctx.nvme.io_queues[hctx->queue_num], 1);
+				rc_cache_dec_inflight(pdu);
+				return BLK_STS_DEV_RESOURCE;
+			}
+		}
+
 		atomic_set(&pdu->members_pending, rc_volume_member_count);
 		pdu->member_idx = -1;
 		rc_volume_build_flush_sqe(&cmd, tag);
@@ -3341,12 +3572,19 @@ static blk_status_t rc_volume_queue_rq(struct blk_mq_hw_ctx *hctx,
 		 * write would defeat the mirror. */
 		if (rc_cache_entries)
 			rc_cache_invalidate_range(pos, nr_sectors);
-		if (rc_volume_prefetch_enabled &&
-		    hctx->queue_num < RC_VOLUME_MAX_HCTX)
-			rc_volume_prefetch_invalidate(hctx->queue_num);
+		/* Global (all-hctx) invalidation — see
+		 * rc_volume_prefetch_invalidate_all. */
+		if (rc_volume_prefetch_enabled)
+			rc_volume_prefetch_invalidate_all();
 
 		st = rc_volume_dispatch_mirror(hctx, req, pdu, pos,
 					       nr_sectors, op);
+		if (st == BLK_STS_DEV_RESOURCE) {
+			/* SQ full — hand back to blk-mq untouched for a
+			 * retry (the request was never started). */
+			rc_cache_dec_inflight(pdu);
+			return st;
+		}
 		if (st != BLK_STS_OK) {
 			/* Errors return before dispatch_mirror's internal
 			 * blk_mq_start_request — start before ending. */
@@ -3373,6 +3611,11 @@ static blk_status_t rc_volume_queue_rq(struct blk_mq_hw_ctx *hctx,
 								  pdu, pos,
 								  nr_sectors,
 								  op);
+		if (st == BLK_STS_DEV_RESOURCE) {
+			/* SQ full — requeue; request never started. */
+			rc_cache_dec_inflight(pdu);
+			return st;
+		}
 		if (st != BLK_STS_OK) {
 			/* dispatch_multi_stripe returns errors from paths
 			 * BEFORE its internal blk_mq_start_request, so we
@@ -3401,6 +3644,11 @@ static blk_status_t rc_volume_queue_rq(struct blk_mq_hw_ctx *hctx,
 		((pos + nr_sectors - 1) / rc_volume_stripe_sectors)) {
 		blk_status_t st = rc_volume_dispatch_multi_stripe_discard(
 				hctx, req, pdu, pos, nr_sectors);
+		if (st == BLK_STS_DEV_RESOURCE) {
+			/* SQ full — requeue; request never started. */
+			rc_cache_dec_inflight(pdu);
+			return st;
+		}
 		if (st != BLK_STS_OK) {
 			blk_mq_start_request(req);
 			if (rc_volume_claim_completion(pdu)) {
@@ -3418,7 +3666,11 @@ static blk_status_t rc_volume_queue_rq(struct blk_mq_hw_ctx *hctx,
 	 * the ISR calls blk_mq_complete_request on the waiter and .complete
 	 * memcpys from the cache buffer into the bio.  Future reads of the
 	 * same stripe hit synchronously here. */
-	if (op == REQ_OP_READ && rc_cache_entries && rc_volume_stripe_sectors) {
+	if (op == REQ_OP_READ && rc_cache_entries && rc_volume_stripe_sectors &&
+	    rc_volume_stripe_sectors <= RC_VOLUME_PREFETCH_SECTORS) {
+		/* The <= PREFETCH_SECTORS guard bounds the fill to the
+		 * 1 MiB entry buffer — a larger on-disk stripe must simply
+		 * bypass the cache rather than overrun the DMA buffer. */
 		sector_t stripe = rc_volume_stripe_sectors;
 		sector_t stripe_lba = (pos / stripe) * stripe;
 
@@ -3440,7 +3692,8 @@ static blk_status_t rc_volume_queue_rq(struct blk_mq_hw_ctx *hctx,
 				src = (u8 *)e->buf_va[e->member] +
 				      (u32)(pos - stripe_lba) * 512u;
 				rc_cache_hits++;
-			} else if (atomic_read(&rc_cache_hctx_inflight[pdu->hctx_idx]) <=
+			} else if (pdu->hctx_idx < RC_VOLUME_MAX_HCTX &&
+				   atomic_read(&rc_cache_hctx_inflight[pdu->hctx_idx]) <=
 				   rc_cache_fill_max_qd &&
 				   !rc_cache_has_or_loading(stripe_lba) &&
 				   rc_ghost_check_and_mark(stripe_lba)) {
@@ -3494,11 +3747,36 @@ static blk_status_t rc_volume_queue_rq(struct blk_mq_hw_ctx *hctx,
 				return BLK_STS_OK;
 			}
 			if (issued_fill) {
-				blk_mq_start_request(req);
-				rc_cache_submit_fill(hctx->queue_num,
-						     fill_entry_idx, stripe_lba,
-						     fill_phys_lba);
-				return BLK_STS_OK;
+				/* Reserve the fill's SQE slots (C-4).  Done
+				 * outside rc_cache_lock — the reserve takes
+				 * q->lock, and the ISR nests q->lock →
+				 * rc_cache_lock, so taking them in the
+				 * opposite order here would deadlock.  On a
+				 * full SQ the fill is abandoned and the READ
+				 * falls through to the normal dispatch path
+				 * below. */
+				u32 fill_cmds = DIV_ROUND_UP(rc_volume_stripe_sectors,
+							     RC_VOLUME_CACHE_CMD_SECTORS);
+
+				if (rc_nvme_sq_reserve(rc_volume_members[fill_member]->ctx.nvme.io_queues[hctx->queue_num],
+						       fill_cmds)) {
+					blk_mq_start_request(req);
+					rc_cache_submit_fill(hctx->queue_num,
+							     fill_entry_idx, stripe_lba,
+							     fill_phys_lba);
+					return BLK_STS_OK;
+				}
+
+				/* Roll the entry back to FREE and detach the
+				 * waiter — nothing was submitted. */
+				spin_lock_irqsave(&rc_cache_lock, flags);
+				hlist_del(&e->hash_node);
+				INIT_HLIST_NODE(&e->hash_node);
+				list_move(&e->lru_node, &rc_cache_lru);
+				e->state = RC_CE_FREE;
+				e->waiter = NULL;
+				spin_unlock_irqrestore(&rc_cache_lock, flags);
+				pdu->cache_entry = NULL;
 			}
 		}
 	} else if (op == REQ_OP_WRITE && rc_cache_entries) {
@@ -3567,7 +3845,9 @@ static blk_status_t rc_volume_queue_rq(struct blk_mq_hw_ctx *hctx,
 							pos == prev_last_lba + prev_last_sectors);
 					pf->last_lba = pos;
 					pf->last_sectors = nr_sectors;
-					if (was_seq && rc_volume_stripe_sectors) {
+					if (was_seq && rc_volume_stripe_sectors &&
+					    rc_volume_stripe_sectors <=
+						RC_VOLUME_PREFETCH_SECTORS) {
 						u64 cur_stripe = pos / rc_volume_stripe_sectors;
 						u64 want_lba;
 						int idle_slot = -1;
@@ -3615,8 +3895,11 @@ static blk_status_t rc_volume_queue_rq(struct blk_mq_hw_ctx *hctx,
 				}
 				return BLK_STS_OK;
 			}
-		} else if (op != REQ_OP_READ && hctx_idx < RC_VOLUME_MAX_HCTX) {
-			rc_volume_prefetch_invalidate(hctx_idx);
+		} else if (op != REQ_OP_READ) {
+			/* Writes/discards invalidate EVERY hctx's slots — a
+			 * per-hctx invalidate left other hctxs serving stale
+			 * prefetched data for the written LBAs (H-3). */
+			rc_volume_prefetch_invalidate_all();
 		}
 	}
 
@@ -3625,6 +3908,10 @@ static blk_status_t rc_volume_queue_rq(struct blk_mq_hw_ctx *hctx,
 	atomic_set(&pdu->members_pending, 1);
 
 	if (op == REQ_OP_DISCARD) {
+		if (!rc_nvme_sq_reserve(rc_volume_members[member_idx]->ctx.nvme.io_queues[hctx->queue_num], 1)) {
+			rc_cache_dec_inflight(pdu);
+			return BLK_STS_DEV_RESOURCE;
+		}
 		rc_volume_build_discard_sqe(&cmd, hctx->queue_num, member_idx, tag,
 					    phys_lba, nr_sectors);
 		blk_mq_start_request(req);
@@ -3660,6 +3947,15 @@ static blk_status_t rc_volume_queue_rq(struct blk_mq_hw_ctx *hctx,
 		return BLK_STS_OK;
 	}
 
+	/* Reserve the SQE slot (C-4); requeue on a full SQ.  Nothing can
+	 * fail between here and the doorbell, so the reservation cannot
+	 * leak. */
+	if (!rc_nvme_sq_reserve(rc_volume_members[member_idx]->ctx.nvme.io_queues[hctx->queue_num], 1)) {
+		rc_volume_unmap_request_sg(pdu);
+		rc_cache_dec_inflight(pdu);
+		return BLK_STS_DEV_RESOURCE;
+	}
+
 	/* Must call blk_mq_start_request BEFORE submitting — otherwise the
 	 * ISR could complete the request before blk-mq considers it started. */
 	blk_mq_start_request(req);
@@ -3686,7 +3982,9 @@ static blk_status_t rc_volume_queue_rq(struct blk_mq_hw_ctx *hctx,
 						pos == prev_last_lba + prev_last_sectors);
 				pf->last_lba = pos;
 				pf->last_sectors = nr_sectors;
-				if (was_seq && rc_volume_stripe_sectors) {
+				if (was_seq && rc_volume_stripe_sectors &&
+				    rc_volume_stripe_sectors <=
+					RC_VOLUME_PREFETCH_SECTORS) {
 					/* On a miss, fill IDLE slots aiming 1 and
 					 * 2 stripes ahead so the upcoming app reads
 					 * find data either complete or in flight. */
@@ -3844,6 +4142,71 @@ struct rc_volume_drain_ctx {
 	unsigned int dead_mask;	/* bit i set => member i is dead */
 };
 
+/* Detach a request from the cache entry it is waiting on (if any).  MUST
+ * be called by every completion path that does not go through the normal
+ * fill-completion route (drain, timeout direct-end): a stale e->waiter
+ * outlives the request, and when the fill's CQE finally lands the ISR
+ * would complete whatever request now owns that tag — possibly one not
+ * yet submitted.  With the waiter cleared, rc_cache_isr performs the
+ * entry's final state transition itself (publish VALID, or FREE when
+ * abandoned) and completes nobody. */
+static void rc_cache_abandon_waiter(struct request *req,
+				    struct rc_volume_pdu *pdu)
+{
+	struct rc_cache_entry *e = pdu->cache_entry;
+	unsigned long flags;
+
+	if (!e)
+		return;
+	spin_lock_irqsave(&rc_cache_lock, flags);
+	if (e->waiter == req)
+		e->waiter = NULL;
+	spin_unlock_irqrestore(&rc_cache_lock, flags);
+	pdu->cache_entry = NULL;
+}
+
+/* H-1: disable a dead member's controller (clear CC.EN, bounded wait for
+ * CSTS.RDY=0) BEFORE any in-flight request's DMA mappings are reclaimed.
+ * The .timeout path only flags `dead`; without this, drain would
+ * dma_unmap_sg + end requests whose commands are still live in hardware —
+ * a late device DMA then hits unmapped IOVAs (IOMMU fault) or, without an
+ * IOMMU, recycled pages (silent corruption of unrelated memory).  A later
+ * auto/manual reset re-enables the controller from the EN=0 state.
+ * Process context only (sleeps). */
+static void rc_nvme_disable_dead_controller(struct rc_adapter *adapter)
+{
+	void __iomem *base = adapter->ctx.mmio_base;
+	unsigned long deadline;
+	u32 csts, cc;
+
+	if (!base)
+		return;
+	csts = readl(base + RC_NVME_REG_CSTS);
+	if (csts == 0xffffffff)
+		return;		/* device gone — it can't DMA anything */
+
+	cc = readl(base + RC_NVME_REG_CC);
+	if (cc & RC_NVME_CC_EN)
+		writel(cc & ~RC_NVME_CC_EN, base + RC_NVME_REG_CC);
+
+	/* Bounded wait — the controller is already misbehaving, so don't
+	 * trust CAP.TO to be honoured.  3 s covers spec-compliant disables;
+	 * on expiry we proceed anyway (nothing better to do) but say so. */
+	deadline = jiffies + msecs_to_jiffies(3000);
+	for (;;) {
+		csts = readl(base + RC_NVME_REG_CSTS);
+		if (csts == 0xffffffff || !(csts & RC_NVME_CSTS_RDY))
+			return;
+		if (time_after(jiffies, deadline)) {
+			rc_printk(RC_ERROR,
+				  "rc_nvme_disable_dead_controller: %s CSTS.RDY stuck at 1 (CSTS=0x%08x) — reclaiming DMA anyway\n",
+				  pci_name(adapter->pdev), csts);
+			return;
+		}
+		msleep(1);
+	}
+}
+
 /* Does this request need `member` to complete?  FLUSH and every
  * multi-member dispatch (member_idx == -1: RAID0 multi-stripe R/W, RAID0
  * multi-member discard, RAID1 mirror write/discard) involve all members —
@@ -3885,7 +4248,8 @@ static bool rc_volume_drain_iter(struct request *req, void *priv)
 		 * blk_mq_complete_request state machine entirely — the
 		 * completed-state check alone leaves a double-completion
 		 * window there. */
-		pdu->sc_sct = RC_VOLUME_SC_DEAD;
+		rc_cache_abandon_waiter(req, pdu);
+		WRITE_ONCE(pdu->sc_sct, RC_VOLUME_SC_DEAD);
 		blk_mq_complete_request(req);
 	}
 	return true;
@@ -3930,6 +4294,12 @@ static void rc_volume_drain_dead(void)
 			ctx.dead_mask |= BIT(i);
 	if (!ctx.dead_mask)
 		return;
+	/* H-1: quiesce the dead controllers' DMA engines BEFORE ending
+	 * requests — ending a request unmaps its scatterlist, and a still-
+	 * enabled controller may still be working the command. */
+	for (i = 0; i < rc_volume_member_count; i++)
+		if (ctx.dead_mask & BIT(i))
+			rc_nvme_disable_dead_controller(rc_volume_members[i]);
 	blk_mq_tagset_busy_iter(&rc_volume_tagset, rc_volume_drain_iter, &ctx);
 }
 
@@ -3973,6 +4343,7 @@ static enum blk_eh_timer_return rc_volume_timeout(struct request *req)
 			 * member_idx out of range for some reason) the
 			 * direct end path bypasses .complete, so unmap here.
 			 * A lost claim means the drain or ISR owns it. */
+			rc_cache_abandon_waiter(req, pdu);
 			rc_volume_unmap_request_sg(pdu);
 			rc_cache_dec_inflight(pdu);
 			blk_mq_end_request(req, BLK_STS_IOERR);
@@ -3983,10 +4354,19 @@ static enum blk_eh_timer_return rc_volume_timeout(struct request *req)
 	rc_printk(RC_WARN,
 		  "rc_volume_timeout: tag=%u op=%u: issuing NVMe Abort\n",
 		  req->tag, pdu->op);
-	for (i = 0; i < rc_volume_member_count; i++)
-		if (rc_volume_req_involves(pdu, i))
-			(void)rc_nvme_abort(rc_volume_members[i],
-					    RC_NVME_IO_QID, (u16)req->tag);
+	/* Abort must name the SQ the command was actually submitted on:
+	 * hctx i maps to NVMe qid i+1 on every member.  Always aborting
+	 * SQ 1 could never abort hctx>0 requests and could kill an
+	 * unrelated live command on queue 1 that shares the tag value. */
+	{
+		u16 sqid = (pdu->hctx_idx < RC_VOLUME_MAX_HCTX)
+				? (u16)(pdu->hctx_idx + 1) : RC_NVME_IO_QID;
+
+		for (i = 0; i < rc_volume_member_count; i++)
+			if (rc_volume_req_involves(pdu, i))
+				(void)rc_nvme_abort(rc_volume_members[i],
+						    sqid, (u16)req->tag);
+	}
 
 	if (blk_mq_request_completed(req))
 		return BLK_EH_DONE;
@@ -3998,6 +4378,7 @@ static enum blk_eh_timer_return rc_volume_timeout(struct request *req)
 	rc_volume_schedule_auto_reset_for_req(pdu);
 	if (!blk_mq_request_completed(req) &&
 	    rc_volume_claim_completion(pdu)) {
+		rc_cache_abandon_waiter(req, pdu);
 		rc_volume_unmap_request_sg(pdu);
 		rc_cache_dec_inflight(pdu);
 		blk_mq_end_request(req, BLK_STS_TIMEOUT);
@@ -4355,7 +4736,15 @@ static void rc_cache_submit_fill(unsigned int hctx_idx,
 {
 	struct rc_cache_entry *e = &rc_cache_entries[entry_idx];
 	int m = e->member;
-	u32 cmds = RC_VOLUME_PREFETCH_BYTES / (RC_VOLUME_CACHE_CMD_SECTORS * 512u);
+	/* Fill exactly ONE STRIPE, not a fixed 1 MiB: the cache is indexed
+	 * and served per stripe, and on arrays whose stripe is smaller than
+	 * the buffer a fixed-size fill read past the stripe — and, near
+	 * end-of-volume, past the namespace, turning a perfectly valid READ
+	 * into LBA-Out-of-Range → BLK_STS_IOERR.  The queue_rq guard caps
+	 * the stripe at RC_VOLUME_PREFETCH_SECTORS so the buffer always
+	 * holds it. */
+	u32 fill_sectors = rc_volume_stripe_sectors;
+	u32 cmds = DIV_ROUND_UP(fill_sectors, RC_VOLUME_CACHE_CMD_SECTORS);
 	u32 i;
 
 	atomic_set(&e->cmds_pending, (int)cmds);
@@ -4365,6 +4754,8 @@ static void rc_cache_submit_fill(unsigned int hctx_idx,
 	for (i = 0; i < cmds; i++) {
 		struct rc_nvme_sqe cmd;
 		u32 sec_in    = i * RC_VOLUME_CACHE_CMD_SECTORS;
+		u32 sec_this  = min(fill_sectors - sec_in,
+				    RC_VOLUME_CACHE_CMD_SECTORS);
 		u32 byte_off  = sec_in * 512u;
 		u32 page_off  = byte_off / (u32)PAGE_SIZE;
 		/* CID = CACHE_BASE | (entry_idx << 1) | cmd_idx.
@@ -4373,14 +4764,13 @@ static void rc_cache_submit_fill(unsigned int hctx_idx,
 				      ((entry_idx & 0xfff) << 1) | (i & 1));
 		u64 cmd_slba  = phys_lba + sec_in;
 
-		(void)i;
 		memset(&cmd, 0, sizeof(cmd));
 		cmd.opc   = RC_NVME_NVM_OP_READ;
 		cmd.cid   = cpu_to_le16(cid);
 		cmd.nsid  = cpu_to_le32(1);
 		cmd.cdw10 = cpu_to_le32((u32)(cmd_slba & 0xffffffff));
 		cmd.cdw11 = cpu_to_le32((u32)(cmd_slba >> 32));
-		cmd.cdw12 = cpu_to_le32(RC_VOLUME_CACHE_CMD_SECTORS - 1);
+		cmd.cdw12 = cpu_to_le32(sec_this - 1);
 		cmd.prp1  = cpu_to_le64(e->buf_pa[m] + byte_off);
 		cmd.prp2  = cpu_to_le64(e->prp_pa[m] + page_off * sizeof(__le64));
 
@@ -4457,7 +4847,9 @@ static void rc_cache_invalidate_range(sector_t pos, u32 nr_sectors)
 		struct rc_cache_entry *e = &rc_cache_entries[i];
 		if (e->state == RC_CE_FREE)
 			continue;
-		if (e->lba + (RC_VOLUME_PREFETCH_BYTES / 512u) <= pos ||
+		/* Entries hold exactly one stripe (see rc_cache_submit_fill);
+		 * overlap-test with the stripe span, not the buffer size. */
+		if (e->lba + rc_volume_stripe_sectors <= pos ||
 		    pos + nr_sectors <= e->lba)
 			continue;
 		/* Overlap.  Remove from hash so subsequent lookups miss.  For
@@ -4508,6 +4900,15 @@ static void rc_volume_prefetch_submit(unsigned int hctx_idx,
 	u32 cmds = (sl->sectors + RC_VOLUME_PREFETCH_CMD_SECTORS - 1) /
 		   RC_VOLUME_PREFETCH_CMD_SECTORS;
 	u32 i;
+
+	/* Speculative work never overruns the shared SQ: reserve the SQE
+	 * slots or skip this prefetch entirely (C-4). */
+	if (!rc_nvme_sq_reserve(rc_volume_members[m]->ctx.nvme.io_queues[hctx_idx],
+				cmds)) {
+		sl->state = RC_PF_IDLE;
+		pf->discarded++;
+		return;
+	}
 
 	atomic_set(&sl->cmds_pending, cmds);
 	sl->status = 0;
@@ -4630,6 +5031,20 @@ static void rc_volume_prefetch_invalidate(unsigned int hctx_idx)
 	spin_unlock_irqrestore(&pf->lock, flags);
 }
 
+/* Invalidate the prefetch slots of EVERY hctx.  Writes/discards must use
+ * this, not the per-hctx variant: a write dispatched on hctx A used to
+ * invalidate only A's slots, so a read on hctx B covering the same LBAs
+ * was still served from B's now-stale buffer — a write-then-read
+ * consistency violation.  (The stripe cache always invalidated globally;
+ * the prefetch layer now matches.) */
+static void rc_volume_prefetch_invalidate_all(void)
+{
+	unsigned int h;
+
+	for (h = 0; h < RC_VOLUME_MAX_HCTX; h++)
+		rc_volume_prefetch_invalidate(h);
+}
+
 static const struct blk_mq_ops rc_volume_mq_ops = {
 	.queue_rq   = rc_volume_queue_rq,
 	.complete   = rc_volume_complete,
@@ -4695,10 +5110,34 @@ static int rc_volume_create_disk(void)
 	}
 
 	{
+		/* Tag pool sizing (C-4): tags + worst-case internal commands
+		 * must stay ≤ min(actual SQ depth across all member queues)
+		 * − 1 (an NVMe SQ is full at depth−1).  The queues are
+		 * clamped to CAP.MQES at create time, which can be < the
+		 * static RC_NVME_IO_QUEUE_DEPTH — the tagset must follow the
+		 * REAL depth, not the compile-time constant. */
+		u32 depth = RC_VOLUME_QUEUE_DEPTH;
+
+		for (i = 0; i < rc_volume_member_count; i++) {
+			for (h = 0; h < nr_hw; h++) {
+				struct rc_nvme_io_queue *q =
+					rc_volume_members[i]->ctx.nvme.io_queues[h];
+
+				if (q && (u32)q->sq_depth >
+					 RC_VOLUME_SQ_INTERNAL_HEADROOM &&
+				    depth > (u32)q->sq_depth - 1 -
+					    RC_VOLUME_SQ_INTERNAL_HEADROOM)
+					depth = (u32)q->sq_depth - 1 -
+						RC_VOLUME_SQ_INTERNAL_HEADROOM;
+			}
+		}
+		if (depth < 1)
+			depth = 1;
+
 		memset(&rc_volume_tagset, 0, sizeof(rc_volume_tagset));
 		rc_volume_tagset.ops          = &rc_volume_mq_ops;
 		rc_volume_tagset.nr_hw_queues = nr_hw;
-		rc_volume_tagset.queue_depth  = RC_VOLUME_QUEUE_DEPTH;
+		rc_volume_tagset.queue_depth  = depth;
 		rc_volume_tagset.numa_node    = NUMA_NO_NODE;
 		rc_volume_tagset.cmd_size     = sizeof(struct rc_volume_pdu);
 		/* Async dispatch — queue_rq returns BLK_STS_OK immediately
@@ -4708,9 +5147,9 @@ static int rc_volume_create_disk(void)
 		rc_volume_tagset.flags        = 0;
 
 		rc_printk(RC_NOTE,
-			  "rc_volume_create_disk: blk-mq nr_hw_queues=%u (queue_depth=%u → %u total outstanding)\n",
-			  nr_hw, RC_VOLUME_QUEUE_DEPTH,
-			  nr_hw * RC_VOLUME_QUEUE_DEPTH);
+			  "rc_volume_create_disk: blk-mq nr_hw_queues=%u (queue_depth=%u → %u total outstanding, %u SQEs/queue reserved for internal cmds)\n",
+			  nr_hw, depth, nr_hw * depth,
+			  RC_VOLUME_SQ_INTERNAL_HEADROOM);
 	}
 
 	ret = blk_mq_alloc_tag_set(&rc_volume_tagset);
@@ -4908,6 +5347,61 @@ err_free_dma:
 	return ret;
 }
 
+/* Wait (bounded) for every internal NVMe command — cache fills and
+ * prefetches — to complete before their DMA buffers are freed.  These are
+ * not blk-mq requests, so del_gendisk does NOT wait for them; freeing the
+ * buffers with a fill still in flight lets the controller DMA into freed
+ * memory.  On timeout (e.g. a dead controller whose CQEs will never
+ * arrive) we log and proceed — the H-1 path has already disabled dead
+ * controllers, so no DMA can land. */
+static void rc_volume_quiesce_internal_cmds(void)
+{
+	unsigned long deadline = jiffies + msecs_to_jiffies(5000);
+
+	for (;;) {
+		bool busy = false;
+		unsigned long flags;
+		unsigned int h, s;
+		u32 i;
+
+		if (rc_cache_entries) {
+			spin_lock_irqsave(&rc_cache_lock, flags);
+			for (i = 0; i < rc_cache_nr_entries; i++) {
+				struct rc_cache_entry *e = &rc_cache_entries[i];
+
+				if (e->state == RC_CE_LOADING ||
+				    atomic_read(&e->cmds_pending) > 0) {
+					busy = true;
+					break;
+				}
+			}
+			spin_unlock_irqrestore(&rc_cache_lock, flags);
+		}
+
+		for (h = 0; !busy && h < RC_VOLUME_MAX_HCTX; h++) {
+			struct rc_volume_prefetch *pf =
+				&rc_volume_prefetch_state[h];
+
+			for (s = 0; s < RC_VOLUME_PREFETCH_SLOTS; s++) {
+				if (READ_ONCE(pf->slots[s].state) ==
+				    RC_PF_INFLIGHT) {
+					busy = true;
+					break;
+				}
+			}
+		}
+
+		if (!busy)
+			return;
+		if (time_after(jiffies, deadline)) {
+			rc_printk(RC_ERROR,
+				  "rc_volume_quiesce_internal_cmds: internal commands still outstanding after 5 s — freeing buffers anyway (controllers should already be disabled)\n");
+			return;
+		}
+		msleep(10);
+	}
+}
+
 /* Tear down everything rc_volume_create_disk allocated.  Called from
  * rc_exit().  Safe to call when the disk was never created (state is
  * initialised to NULL/0). */
@@ -4922,6 +5416,10 @@ void rc_volume_teardown(void)
 		rc_volume_disk = NULL;
 		blk_mq_free_tag_set(&rc_volume_tagset);
 	}
+	/* Cache fills / prefetches are not blk-mq requests — wait for them
+	 * before rc_cache_teardown / rc_volume_prefetch_free_all release
+	 * the DMA memory they target (M-5). */
+	rc_volume_quiesce_internal_cmds();
 	for (i = 0; i < RC_VOLUME_MAX_MEMBERS; i++) {
 		if (rc_volume_members[i]) {
 			struct device *dev = &rc_volume_members[i]->pdev->dev;
@@ -4947,6 +5445,42 @@ void rc_volume_teardown(void)
 	rc_volume_member_count = 0;
 	rc_volume_stripe_sectors = 0;
 	mutex_unlock(&rc_volume_lock);
+}
+
+/* PCI-remove hook (also used by probe error paths).  A member adapter is
+ * about to be kfree'd; if it is registered in rc_volume_members[] the
+ * assembled volume still dereferences it on every I/O — surprise-remove
+ * or sysfs unbind of one member with /dev/rcraid0 mounted was a
+ * use-after-free on the hot path.  There is no per-member detach (no
+ * degraded mode), so the whole volume is torn down: mark the departing
+ * member dead, fail the in-flight I/O cleanly (drain disables the dead
+ * controller first, per H-1), then dismantle the gendisk + DMA pools.
+ * No-op when the adapter never registered. */
+void rc_volume_remove_member(struct rc_adapter *adapter)
+{
+	bool member = false;
+	int i;
+
+	mutex_lock(&rc_volume_lock);
+	for (i = 0; i < RC_VOLUME_MAX_MEMBERS; i++)
+		if (rc_volume_members[i] == adapter)
+			member = true;
+	mutex_unlock(&rc_volume_lock);
+
+	if (!member)
+		return;
+
+	rc_printk(RC_WARN,
+		  "rc_volume_remove_member: %s is a live volume member — tearing down /dev/rcraid0 before releasing the adapter (no degraded mode)\n",
+		  pci_name(adapter->pdev));
+
+	/* Fail fast: no new dispatches reach this adapter, and every
+	 * in-flight request touching it is ended before the teardown
+	 * (del_gendisk would otherwise wait forever on requests whose
+	 * CQEs can no longer arrive). */
+	WRITE_ONCE(adapter->ctx.nvme.dead, true);
+	rc_volume_drain_dead();
+	rc_volume_teardown();
 }
 
 /* Counterpart to create_io_queues; called from cleanup_controller and
@@ -5110,8 +5644,15 @@ int rc_nvme_reset_controller(struct rc_adapter *adapter)
 
 	for (i = 0; i < RC_NVME_IO_QUEUE_TARGET; i++) {
 		struct rc_nvme_io_queue *q = nvme->io_queues[i];
+		unsigned long qflags;
+
 		if (!q)
 			continue;
+		/* Under q->lock: a queue_rq that passed the dead-check just
+		 * before the quiesce could still be inside rc_nvme_io_submit
+		 * — memset'ing the SQ under its feet corrupts the SQE it is
+		 * writing.  The lock closes that window. */
+		spin_lock_irqsave(&q->lock, qflags);
 		if (q->sq)
 			memset(q->sq, 0,
 			       (size_t)q->sq_depth * RC_NVME_SQ_ENTRY_SIZE);
@@ -5121,6 +5662,10 @@ int rc_nvme_reset_controller(struct rc_adapter *adapter)
 		q->sq_tail  = 0;
 		q->cq_head  = 0;
 		q->cq_phase = 1;
+		/* Reservations held by commands the reset wiped (their CQEs
+		 * will never arrive) must not leak SQ capacity forever. */
+		q->sq_inflight = 0;
+		spin_unlock_irqrestore(&q->lock, qflags);
 	}
 
 	aqa = RC_NVME_AQA(nvme->admin_sq_depth, nvme->admin_cq_depth);
@@ -5179,8 +5724,16 @@ int rc_nvme_reset_controller(struct rc_adapter *adapter)
 		goto err_irq_enabled;
 	}
 	if (nvme->nr_io_queues < saved_nr_io_queues) {
+		/* Deliberately fail-closed rather than degrade: the volume's
+		 * blk-mq tagset was sized with nr_hw_queues = min(members'
+		 * queue counts) at create time and every hctx routes to
+		 * io_queues[hctx] on EVERY member — accepting a smaller
+		 * grant here would leave hctxs > granted dispatching into
+		 * NULL queues.  Recovering by reshaping the tagset is a
+		 * bigger change than a reset path should make; a module
+		 * reload re-negotiates cleanly. */
 		rc_printk(RC_ERROR,
-			  "rc_nvme_reset_controller: %s granted only %u queues, had %u before reset — adapter remains dead\n",
+			  "rc_nvme_reset_controller: %s granted only %u queues, had %u before reset — cannot shrink a live volume's queue map, adapter remains dead (reload the module to renegotiate)\n",
 			  pci_name(adapter->pdev),
 			  nvme->nr_io_queues, saved_nr_io_queues);
 		ret = -EIO;
@@ -5312,6 +5865,11 @@ int rc_nvme_pm_suspend_adapter(struct rc_adapter *adapter)
 	 * phase masks the Linux IRQ side cleanly on the host's behalf. */
 	writel(0xffffffffu, base + RC_NVME_REG_INTMS);
 
+	/* Spec-conformant shutdown BEFORE dropping CC.EN — the members run
+	 * with WCE enabled, and skipping CC.SHN made every suspend an
+	 * "unsafe shutdown" from the drive's point of view. */
+	rc_nvme_shutdown_notify(adapter);
+
 	cur_cc = readl(base + RC_NVME_REG_CC);
 	if (cur_cc & RC_NVME_CC_EN) {
 		writel(cur_cc & ~RC_NVME_CC_EN, base + RC_NVME_REG_CC);
@@ -5356,6 +5914,23 @@ int rc_nvme_pm_resume_adapter(struct rc_adapter *adapter)
 	return rc_nvme_reset_controller(adapter);
 }
 
+/* Initialize the NVMe-state members that an interrupt handler can touch,
+ * independent of any hardware access.  Called from rc_bottom_alloc_adapter
+ * BEFORE request_irq: on a legacy shared INTx line, another device's
+ * interrupt can invoke rc_nvme_irq() (once ctrl_mode is set) before
+ * rc_nvme_init_controller runs — waking a zeroed waitqueue is a NULL
+ * deref in hard-IRQ context.  cancel_work_sync in the cleanup path also
+ * requires auto_reset_work to be initialized regardless of how far the
+ * controller bring-up got. */
+void rc_nvme_early_init(struct rc_adapter *adapter)
+{
+	struct rc_nvme_state *nvme = &adapter->ctx.nvme;
+
+	init_waitqueue_head(&nvme->admin_cq_wait);
+	mutex_init(&nvme->admin_mutex);
+	INIT_WORK(&nvme->auto_reset_work, rc_nvme_auto_reset_fn);
+}
+
 int rc_nvme_init_controller(struct rc_adapter *adapter)
 {
 	void __iomem *base = adapter->ctx.mmio_base;
@@ -5382,11 +5957,11 @@ int rc_nvme_init_controller(struct rc_adapter *adapter)
 	nvme->dstrd = RC_NVME_CAP_DSTRD(cap);
 	nvme->timeout_500ms = RC_NVME_CAP_TO(cap);
 	nvme->sq_doorbell_base = base + RC_NVME_REG_DBL_BASE;
-	init_waitqueue_head(&nvme->admin_cq_wait);
-	/* Per-I/O-queue waitqueue + lock are initialized in
-	 * rc_nvme_create_one_io_queue when each queue is allocated. */
-	mutex_init(&nvme->admin_mutex);
-	INIT_WORK(&nvme->auto_reset_work, rc_nvme_auto_reset_fn);
+	/* admin_cq_wait / admin_mutex / auto_reset_work are initialized in
+	 * rc_nvme_early_init (called from probe BEFORE request_irq — see
+	 * that function's comment).  Per-I/O-queue waitqueue + lock are
+	 * initialized in rc_nvme_create_one_io_queue when each queue is
+	 * allocated. */
 
 	rc_printk(RC_NOTE,
 		  "rc_nvme_init_controller: CAP=0x%016llx VS=0x%08x MQES=%u DSTRD=%u TO=%u (%u ms)\n",
@@ -5514,12 +6089,19 @@ int rc_nvme_init_controller(struct rc_adapter *adapter)
 	if (ret) {
 		/* All queues were rolled back — zero the advertised count so
 		 * nothing downstream (volume nr_hw_queues, sync I/O helpers)
-		 * trusts a count whose io_queues[] slots are NULL. */
+		 * trusts a count whose io_queues[] slots are NULL.
+		 *
+		 * FATAL: an adapter with no I/O queues can never serve the
+		 * volume or read metadata; treating this as success left a
+		 * half-dead adapter exported through sysfs/debugfs.  Return
+		 * the error — probe unwinds via rc_nvme_cleanup_controller,
+		 * which releases the admin queue + disables the controller. */
 		nvme->nr_io_queues = 0;
-		rc_printk(RC_WARN,
-			  "rc_nvme_init_controller: I/O queue creation failed (%d) — admin still works\n",
+		rc_printk(RC_ERROR,
+			  "rc_nvme_init_controller: I/O queue creation failed (%d) — failing init\n",
 			  ret);
-		return 0;
+		rc_nvme_cleanup_controller(adapter);
+		return ret;
 	}
 
 	/* Unmask all interrupt vectors so the MSI handler starts firing on
@@ -5554,14 +6136,26 @@ void rc_nvme_cleanup_controller(struct rc_adapter *adapter)
 	 * try to re-bind queues we just freed. */
 	cancel_work_sync(&adapter->ctx.nvme.auto_reset_work);
 
+	/* A dead-flagged controller gets no admin Delete commands (see
+	 * rc_nvme_destroy_one_io_queue), so its queue DMA is about to be
+	 * freed while CC.EN may still be 1 — disable it first so it can't
+	 * DMA into freed memory. */
+	if (READ_ONCE(adapter->ctx.nvme.dead))
+		rc_nvme_disable_dead_controller(adapter);
+
 	/* Tear down I/O queues *before* disabling the controller so the
 	 * Delete SQ / Delete CQ admin commands still go through. */
 	rc_nvme_destroy_io_queues(adapter);
 
 	if (base) {
-		/* Best-effort graceful shutdown. */
-		u32 cc = readl(base + RC_NVME_REG_CC);
-		if (cc & RC_NVME_CC_EN) {
+		/* Best-effort graceful shutdown: CC.SHN notification first
+		 * (the members run write-back — a bare CC.EN drop is an
+		 * unsafe shutdown per spec), then disable. */
+		u32 cc;
+
+		rc_nvme_shutdown_notify(adapter);
+		cc = readl(base + RC_NVME_REG_CC);
+		if (cc != 0xffffffff && (cc & RC_NVME_CC_EN)) {
 			writel(cc & ~RC_NVME_CC_EN, base + RC_NVME_REG_CC);
 			rc_nvme_wait_csts(adapter, RC_NVME_CSTS_RDY, 0);
 		}

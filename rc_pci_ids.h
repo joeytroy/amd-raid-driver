@@ -26,11 +26,17 @@
  */
 #define RC_PD_VID_AMD                0x1022
 
-/* SATA RAID variants — class code 0x0104, AHCI-style path. */
-#define RC_PD_DID_BRISTOL            0x7905  /* older SATA RAID */
+/* SATA RAID variants — class code 0x0104, AHCI-style path.
+ *
+ * NOTE: only RC_PD_DID_PROMONTORY is in the pci_device_id bind table
+ * (rc_bottom.c).  Bristol/Summit/X570S have no BAR-mapping case yet, so
+ * claiming them just stole the device from other drivers and then failed
+ * probe.  The defines stay here as documentation for the future AHCI
+ * path. */
+#define RC_PD_DID_BRISTOL            0x7905  /* older SATA RAID — NOT claimed (no code path) */
 #define RC_PD_DID_PROMONTORY         0x43BD  /* Promontory SATA RAID */
-#define RC_PD_DID_SUMMIT             0x7916  /* older SATA RAID */
-#define RC_PD_DID_X570S              0x7917  /* X570S-era SATA RAID */
+#define RC_PD_DID_SUMMIT             0x7916  /* older SATA RAID — NOT claimed (no code path) */
+#define RC_PD_DID_X570S              0x7917  /* X570S-era SATA RAID — NOT claimed (no code path) */
 
 /* NVMe RAID variant — class code 0x0108, NVMe command path.
  * Used by TRX50/WRX90 (Threadripper 7000/9000) and by the X870/B850

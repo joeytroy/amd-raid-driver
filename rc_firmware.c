@@ -50,6 +50,14 @@ int rc_parse_firmware_capabilities(struct rc_adapter *adapter)
 	int ret;
 
 	mode = rc_classify_device(adapter->pdev);
+	/* Setting ctrl_mode = NVMe here (before rc_nvme_init_controller runs)
+	 * routes any interrupt on the already-registered vector-0 handler into
+	 * rc_nvme_irq().  That is safe ONLY because rc_nvme_early_init()
+	 * (called from rc_bottom_alloc_adapter, before request_irq) has
+	 * already initialized admin_cq_wait / admin_mutex / auto_reset_work —
+	 * on legacy shared INTx a foreign device's interrupt used to land in
+	 * rc_nvme_irq() against zeroed state and NULL-deref in hard-IRQ
+	 * context. */
 	adapter->ctx.ctrl_mode = mode;
 
 	rc_printk(RC_NOTE,

@@ -45,8 +45,11 @@ static ssize_t rc_config_read(struct file *file, char __user *buf, size_t count,
 
 static ssize_t rc_config_write(struct file *file, const char __user *buf, size_t count, loff_t *ppos)
 {
-    // Configuration commands would be handled here
-    return count;
+    // No configuration commands are implemented yet.  Reject writes
+    // instead of swallowing them and returning success — pretending a
+    // write "worked" misleads userspace tools into believing a config
+    // change was applied.
+    return -EOPNOTSUPP;
 }
 
 static long rc_config_ioctl(struct file *file, unsigned int cmd, unsigned long arg)

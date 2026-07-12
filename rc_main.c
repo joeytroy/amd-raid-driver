@@ -20,9 +20,11 @@ struct rc_global_state rc_state = {
 // Block major number
 int rc_major = 0;
 
-// Module parameters
-static int debug_level = RC_NOTE;
-module_param(debug_level, int, 0644);
+// Module parameters.  rc_debug_level is consumed by the rc_printk macro
+// (rc_linux.h): messages below the threshold are suppressed and each level
+// maps to the matching KERN_* severity.
+int rc_debug_level = RC_NOTE;
+module_param_named(debug_level, rc_debug_level, int, 0644);
 MODULE_PARM_DESC(debug_level, "Debug level (0=debug, 1=info, 2=note, 3=warn, 4=error)");
 
 // Module information
