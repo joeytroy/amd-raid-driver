@@ -14,8 +14,11 @@ set -euo pipefail
 
 SRC_DIR="$(cd "$(dirname "$0")" && pwd)"
 PKG_NAME="rcraid"
-PKG_VERSION="$(awk -F'"' '/^PACKAGE_VERSION=/ {print $2}' "$SRC_DIR/dkms.conf")"
+# The dkms package version tracks the driver version (VERSION file); the
+# repo dkms.conf carries a @PKGVER@ placeholder we substitute at staging
+# time, so each driver release installs into its own dkms tree.
 DRIVER_VERSION="$(cat "$SRC_DIR/VERSION")"
+PKG_VERSION="$DRIVER_VERSION"
 DKMS_SRC="/usr/src/${PKG_NAME}-${PKG_VERSION}"
 
 [ "$(id -u)" -eq 0 ] || { echo "must be root" >&2; exit 1; }
@@ -146,16 +149,30 @@ cp -r \
     "$SRC_DIR"/rc_*.h \
     "$DKMS_SRC/"
 
+# Substitute the package version into the staged dkms.conf.
+sed -i "s/@PKGVER@/$PKG_VERSION/g" "$DKMS_SRC/dkms.conf"
+
 # Bake the source revision into the staged tree — it has no .git, so the
 # Makefile reads .rcraid_rev to stamp the module banner and modinfo.
 if rev=$(git -C "$SRC_DIR" describe --always --dirty 2>/dev/null); then
     echo "$rev" > "$DKMS_SRC/.rcraid_rev"
 fi
 
-# The dkms package version (from dkms.conf) stays fixed across driver updates
-# (the driver version lives in VERSION), so a re-run of this script must not
-# assume a clean slate: skip `add` if the package is already registered, and
-# force build/install so dkms rebuilds from the freshly staged sources instead
+# Upgrade path: retire any OTHER registered rcraid version first, so two
+# driver releases never coexist in the dkms tree (the old module would
+# shadow or race the new one in updates/dkms).
+while read -r oldver; do
+    [ -n "$oldver" ] || continue
+    [ "$oldver" = "$PKG_VERSION" ] && continue
+    echo "==> dkms remove (retiring old version ${PKG_NAME}/${oldver})"
+    dkms remove -m "$PKG_NAME" -v "$oldver" --all 2>&1 | sed 's/^/    /'
+    rm -rf "/usr/src/${PKG_NAME}-${oldver}"
+done < <(dkms status "$PKG_NAME" 2>/dev/null \
+             | sed -n "s#^${PKG_NAME}[/,][ ]*\([^,/:]*\)[,/:].*#\1#p" | sort -u)
+
+# A re-run of this script for the SAME version must not assume a clean
+# slate: skip `add` if the package is already registered, and force
+# build/install so dkms rebuilds from the freshly staged sources instead
 # of silently keeping the previously installed module.
 if [ -n "$(dkms status -m "$PKG_NAME" -v "$PKG_VERSION" 2>/dev/null)" ]; then
     echo "==> dkms add (skipped — ${PKG_NAME}/${PKG_VERSION} already registered)"
@@ -194,6 +211,19 @@ echo "==> reloading udev rules"
 udevadm control --reload-rules
 echo
 
+# On apt-based systems, keep kernel packages out of unattended-upgrades so
+# a kernel update (and the DKMS rebuild + initramfs regeneration it needs)
+# is always deliberate — an unattended one that broke the rcraid build
+# would leave the new kernel unbootable with nobody watching.
+if [ -d /etc/apt/apt.conf.d ]; then
+    echo "==> installing /etc/apt/apt.conf.d/52-rcraid-kernel-hold"
+    install -m 0644 "$SRC_DIR/packaging/apt.conf.d/52-rcraid-kernel-hold" \
+        /etc/apt/apt.conf.d/52-rcraid-kernel-hold
+    echo "    (kernel packages excluded from unattended-upgrades; after a"
+    echo "     deliberate kernel update run scripts/verify-boot-safety.sh)"
+    echo
+fi
+
 # ----------------------------------------------------------------------------
 # 4. Install initramfs hook so the array can serve /, and regenerate the
 #    initramfs for the running kernel.
@@ -215,7 +245,11 @@ if command -v dracut >/dev/null 2>&1; then
 
     echo "==> regenerating initramfs (dracut -f)"
     if ! dracut -f 2>&1 | sed 's/^/    /'; then
-        echo "WARN: dracut failed — boot-from-RAID won't work until you re-run it" >&2
+        echo "ERROR: dracut FAILED — the initramfs does NOT contain rcraid." >&2
+        echo "       Do NOT reboot until 'dracut -f' succeeds (a full /boot" >&2
+        echo "       is the usual cause), then re-run this script or verify" >&2
+        echo "       with scripts/verify-boot-safety.sh." >&2
+        exit 1
     fi
 elif command -v update-initramfs >/dev/null 2>&1; then
     INITRAMFS_GENERATOR="initramfs-tools"
@@ -227,7 +261,11 @@ elif command -v update-initramfs >/dev/null 2>&1; then
 
     echo "==> regenerating initramfs (update-initramfs -u)"
     if ! update-initramfs -u 2>&1 | sed 's/^/    /'; then
-        echo "WARN: update-initramfs failed — boot-from-RAID won't work until you re-run it" >&2
+        echo "ERROR: update-initramfs FAILED — the initramfs does NOT contain" >&2
+        echo "       rcraid.  Do NOT reboot until 'update-initramfs -u'" >&2
+        echo "       succeeds (a full /boot is the usual cause), then re-run" >&2
+        echo "       this script or verify with scripts/verify-boot-safety.sh." >&2
+        exit 1
     fi
 else
     echo "==> no initramfs generator found (dracut / update-initramfs)"
@@ -263,6 +301,12 @@ What's installed:
   modprobe conf  /etc/modprobe.d/rcraid.conf
                  (enable_writes=1, safe_subsys_vendor=$SUBSYSTEM_VENDOR)
   initramfs      ${INITRAMFS_GENERATOR:-<none — boot-from-RAID disabled>}
+$([ -e /etc/apt/apt.conf.d/52-rcraid-kernel-hold ] && echo '  apt hold       /etc/apt/apt.conf.d/52-rcraid-kernel-hold
+                 (kernel packages held back from unattended-upgrades)')
+
+After any kernel update, run scripts/verify-boot-safety.sh BEFORE
+rebooting — it confirms rcraid is built and present in every installed
+kernel's initramfs.
 
 Next: reboot to test the auto-bind path end-to-end.  After reboot:
 

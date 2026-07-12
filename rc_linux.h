@@ -91,9 +91,37 @@ static inline int scsi_add_host(struct Scsi_Host *host, struct device *dev) { re
 #define RC_WARN                      3
 #define RC_ERROR                     4
 
-// Debug macro
-#define rc_printk(level, fmt, ...) \
-    printk(KERN_INFO RC_DRIVER_NAME ": " fmt, ##__VA_ARGS__)
+// Runtime debug threshold (module parameter `debug_level`, rc_main.c).
+// Messages below this level are suppressed.
+extern int rc_debug_level;
+
+// Debug macro.  Honors both the level-to-KERN_* mapping (RC_ERROR really
+// reaches KERN_ERR so `dmesg -l err` and log shippers see it) and the
+// debug_level module parameter (messages below the threshold are dropped).
+// The switch is on a compile-time constant at every call site, so the
+// compiler folds it down to a single printk.
+#define rc_printk(level, fmt, ...)					\
+    do {								\
+        if ((level) >= READ_ONCE(rc_debug_level)) {			\
+            switch (level) {						\
+            case RC_DEBUG:						\
+                printk(KERN_DEBUG RC_DRIVER_NAME ": " fmt, ##__VA_ARGS__); \
+                break;							\
+            case RC_INFO:						\
+                printk(KERN_INFO RC_DRIVER_NAME ": " fmt, ##__VA_ARGS__); \
+                break;							\
+            case RC_NOTE:						\
+                printk(KERN_NOTICE RC_DRIVER_NAME ": " fmt, ##__VA_ARGS__); \
+                break;							\
+            case RC_WARN:						\
+                printk(KERN_WARNING RC_DRIVER_NAME ": " fmt, ##__VA_ARGS__); \
+                break;							\
+            default:							\
+                printk(KERN_ERR RC_DRIVER_NAME ": " fmt, ##__VA_ARGS__); \
+                break;							\
+            }								\
+        }								\
+    } while (0)
 
 // Maximum number of PCI BARs we track
 #define RC_MAX_BARS            PCI_STD_NUM_BARS
@@ -177,6 +205,17 @@ struct rc_nvme_io_queue {
     u16            sq_depth;
     u16            sq_tail;
 
+    // In-flight SQE accounting (guarded by `lock`).  Counts every SQE
+    // submitted-but-not-yet-completed on this queue, regardless of origin:
+    // blk-mq tags, cache fills, prefetches, and boot/reset-time sync
+    // commands all share this SQ.  Every submitter must win a slot via
+    // rc_nvme_sq_reserve() before ringing the doorbell (an NVMe SQ is full
+    // at depth-1 — wrapping the tail over an unconsumed SQE corrupts a
+    // live command silently).  Decremented once per CQE consumed; zeroed
+    // on controller reset (requests ended by drain/timeout without a CQE
+    // would otherwise leak slots on a dead queue).
+    u32            sq_inflight;
+
     void          *cq;            // 16-byte CQE array
     dma_addr_t     cq_dma;
     u16            cq_depth;
@@ -241,6 +280,14 @@ struct rc_nvme_state {
     u16            admin_sq_tail;     // next free admin SQ slot
     u16            admin_cq_head;     // next admin CQ slot to read
     u8             admin_cq_phase;    // phase bit, toggles each wrap
+
+    // Rolling admin CID (guarded by admin_mutex).  The admin path used to
+    // hard-code CID 0, so after an admin timeout the late CQE was consumed
+    // by the NEXT admin command as its own completion (same CID, matching
+    // phase) — wrong status attribution + admin_cq_head desync.  Same
+    // stale-CQE defense as the I/O sync path's sync_seq: each command gets
+    // a fresh CID and the completion consumer drops mismatches.
+    u16            admin_cid_seq;
 
     // Capability snapshot (CAP at BAR0 + 0x00)
     u64            cap;
@@ -534,12 +581,16 @@ void rc_config_cleanup(void);
 #define RC_NVME_CC_MPS_4K		(0u << 7)	/* memory page size = 2^(12+MPS) */
 #define RC_NVME_CC_AMS_RR		(0u << 11)
 #define RC_NVME_CC_SHN_NONE		(0u << 14)
+#define RC_NVME_CC_SHN_NORMAL		(1u << 14)	/* normal shutdown notification */
+#define RC_NVME_CC_SHN_MASK		(3u << 14)
 #define RC_NVME_CC_IOSQES_64		(6u << 16)	/* log2(64) */
 #define RC_NVME_CC_IOCQES_16		(4u << 20)	/* log2(16) */
 
 /* CSTS fields */
 #define RC_NVME_CSTS_RDY		BIT(0)
 #define RC_NVME_CSTS_CFS		BIT(1)		/* controller fatal status */
+#define RC_NVME_CSTS_SHST_MASK		(3u << 2)	/* shutdown status */
+#define RC_NVME_CSTS_SHST_COMPLETE	(2u << 2)	/* shutdown processing complete */
 
 /* AQA helpers (each depth is encoded as count-1, 12 bits each) */
 #define RC_NVME_AQA(sq_depth, cq_depth)	\
@@ -832,6 +883,12 @@ extern int rc_major;
  * its per-member DMA buffers (defined in rc_nvme.c). */
 void rc_volume_teardown(void);
 
+/* Called from PCI remove (and probe error paths) BEFORE the adapter is
+ * freed.  If the adapter is a registered volume member, marks it dead,
+ * drains in-flight I/O, and tears the volume down so nothing keeps a
+ * pointer into memory that is about to be kfree'd (defined in rc_nvme.c). */
+void rc_volume_remove_member(struct rc_adapter *adapter);
+
 /* PCI-ID-based code-path dispatcher (rc_firmware.c). */
 int rc_parse_firmware_capabilities(struct rc_adapter *adapter);
 
@@ -842,6 +899,12 @@ irqreturn_t  rc_hw_interrupt_handler(int irq, void *dev_id);
 int          rc_install_callbacks(struct rc_adapter *adapter, bool fast_path);
 
 /* NVMe controller bring-up + I/O path (rc_nvme.c). */
+/* Initializes the waitqueue / mutex / work-struct members of the NVMe
+ * state.  MUST be called before the adapter's IRQ handler can fire (i.e.
+ * before request_irq in probe): on shared INTx an interrupt from another
+ * device on the line routes into rc_nvme_irq(), which wakes admin_cq_wait
+ * — a NULL deref in hard-IRQ context if the waitqueue is still zeroed. */
+void         rc_nvme_early_init(struct rc_adapter *adapter);
 int          rc_nvme_init_controller(struct rc_adapter *adapter);
 void         rc_nvme_cleanup_controller(struct rc_adapter *adapter);
 int          rc_nvme_reset_controller(struct rc_adapter *adapter);

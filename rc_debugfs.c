@@ -235,10 +235,24 @@ static int rc_debugfs_regs_show(struct seq_file *m, void *v)
 {
     struct rc_adapter *adapter = m->private;
     void __iomem *mmio = adapter->ctx.mmio_base;
+    u32 dump_len;
     u32 i;
 
     seq_printf(m, "Hardware Registers (Adapter %d)\n", adapter->instance);
     seq_printf(m, "==================================\n\n");
+
+    /* MMIO reads against an unmapped BAR, a suspended (D3) device, or a
+     * controller flagged dead can fault or return garbage — refuse
+     * rather than oops when someone cats `registers` at the wrong time. */
+    if (!mmio || !adapter->ctx.mmio_len) {
+        seq_printf(m, "MMIO not mapped — no register dump available\n");
+        return 0;
+    }
+    if (adapter->ctx.ctrl_mode == RC_CTRL_MODE_NVME &&
+        READ_ONCE(adapter->ctx.nvme.dead)) {
+        seq_printf(m, "Controller is dead/suspended — register dump skipped\n");
+        return 0;
+    }
 
     seq_printf(m, "MMIO Base: %p (Physical: 0x%llx, Length: 0x%llx)\n\n",
                mmio,
@@ -249,15 +263,19 @@ static int rc_debugfs_regs_show(struct seq_file *m, void *v)
     seq_printf(m, "%-24s  %-10s  %-10s\n", "Register", "Offset", "Value");
     seq_printf(m, "%-24s  %-10s  %-10s\n", "--------", "------", "-----");
 
-    // Read key registers (adjust offsets based on real hardware)
-    seq_printf(m, "%-24s  0x%-8x  0x%08x\n", "Status", 0x00, readl(mmio + 0x00));
-    seq_printf(m, "%-24s  0x%-8x  0x%08x\n", "Control", 0x04, readl(mmio + 0x04));
-    seq_printf(m, "%-24s  0x%-8x  0x%08x\n", "Interrupt Status", 0x08, readl(mmio + 0x08));
-    seq_printf(m, "%-24s  0x%-8x  0x%08x\n", "Interrupt Mask", 0x0C, readl(mmio + 0x0C));
-    seq_printf(m, "%-24s  0x%-8x  0x%08x\n", "Doorbell", 0x10, readl(mmio + 0x10));
+    // Read key registers (adjust offsets based on real hardware), bounded
+    // by the actual BAR length so a short window can't be over-read.
+    if (adapter->ctx.mmio_len >= 0x14) {
+        seq_printf(m, "%-24s  0x%-8x  0x%08x\n", "Status", 0x00, readl(mmio + 0x00));
+        seq_printf(m, "%-24s  0x%-8x  0x%08x\n", "Control", 0x04, readl(mmio + 0x04));
+        seq_printf(m, "%-24s  0x%-8x  0x%08x\n", "Interrupt Status", 0x08, readl(mmio + 0x08));
+        seq_printf(m, "%-24s  0x%-8x  0x%08x\n", "Interrupt Mask", 0x0C, readl(mmio + 0x0C));
+        seq_printf(m, "%-24s  0x%-8x  0x%08x\n", "Doorbell", 0x10, readl(mmio + 0x10));
+    }
 
-    seq_printf(m, "\nFirst 256 bytes of MMIO (hex dump):\n");
-    for (i = 0; i < 256; i += 16) {
+    dump_len = min_t(u32, 256, (u32)adapter->ctx.mmio_len & ~15u);
+    seq_printf(m, "\nFirst %u bytes of MMIO (hex dump):\n", dump_len);
+    for (i = 0; i < dump_len; i += 16) {
         seq_printf(m, "%04x: %08x %08x %08x %08x\n",
                    i,
                    readl(mmio + i),
@@ -288,9 +306,14 @@ static const struct file_operations rc_debugfs_regs_fops = {
 int rc_debugfs_init(void)
 {
     rc_debugfs_root = debugfs_create_dir("rcraid", NULL);
-    if (!rc_debugfs_root) {
-        rc_printk(RC_WARN, "rc_debugfs_init: failed to create debugfs root\n");
-        return -ENOMEM;
+    /* debugfs_create_dir never returns NULL — errors come back as
+     * ERR_PTR (e.g. -ENODEV with debugfs compiled out). */
+    if (IS_ERR(rc_debugfs_root)) {
+        int err = PTR_ERR(rc_debugfs_root);
+
+        rc_debugfs_root = NULL;
+        rc_printk(RC_WARN, "rc_debugfs_init: failed to create debugfs root (%d)\n", err);
+        return err;
     }
 
     rc_printk(RC_INFO, "rc_debugfs_init: created debugfs root at /sys/kernel/debug/rcraid\n");
@@ -313,8 +336,8 @@ int rc_debugfs_create_adapter(struct rc_adapter *adapter)
 
     snprintf(name, sizeof(name), "adapter%d", adapter->instance);
     adapter_dir = debugfs_create_dir(name, rc_debugfs_root);
-    if (!adapter_dir)
-        return -ENOMEM;
+    if (IS_ERR(adapter_dir))
+        return PTR_ERR(adapter_dir);
 
     adapter->debugfs_dir = adapter_dir;
 

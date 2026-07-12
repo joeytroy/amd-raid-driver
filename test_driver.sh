@@ -356,7 +356,14 @@ else
 fi
 echo
 
-# Test 2.5: Ensure nvme driver is loaded, then unbind devices (except Samsung OS drive)
+# Test 2.5: Ensure nvme driver is loaded, detect the array by subsystem
+# vendor (same logic as the installers), then unbind ONLY array members.
+# Two independent protections replace the old "Samsung" brand heuristic:
+#   1. Only devices whose subsystem_vendor matches the detected array are
+#      unbound, and the same vendor is passed to insmod as
+#      safe_subsys_vendor= so the driver enforces it too.
+#   2. Any PCI device that backs the current root filesystem is never
+#      unbound, whatever its vendor.
 echo -e "${YELLOW}[TEST 2.5]${NC} Managing NVMe driver bindings..."
 echo "Ensuring nvme driver is loaded (needed for OS drive)..."
 if ! lsmod | grep -q "^nvme "; then
@@ -367,43 +374,122 @@ else
 fi
 
 echo
-echo "Unbinding AMD RAID devices from nvme driver (except Samsung OS drive)..."
+echo "Detecting array members by subsystem vendor..."
+declare -A vendor_count
+declare -A vendor_bdfs
+while read -r bdf; do
+    [ -n "$bdf" ] || continue
+    sv=$(cat "/sys/bus/pci/devices/$bdf/subsystem_vendor")
+    vendor_count[$sv]=$((${vendor_count[$sv]:-0} + 1))
+    vendor_bdfs[$sv]="${vendor_bdfs[$sv]:-} $bdf"
+done < <(lspci -d 1022:b000 -D | awk '{print $1}')
+
+SUBSYSTEM_VENDOR=""
+if [ ${#vendor_count[@]} -gt 0 ]; then
+    candidates=()
+    for sv in "${!vendor_count[@]}"; do
+        if [ "${vendor_count[$sv]}" -ge 2 ]; then
+            candidates+=("$sv")
+        fi
+    done
+    if [ ${#candidates[@]} -eq 0 ]; then
+        echo -e "${RED}✗ Found 1022:b000 devices but no subsystem vendor has >= 2${NC}"
+        echo "  (no array detected). Refusing to unbind anything:"
+        for sv in "${!vendor_count[@]}"; do
+            echo "    subsystem_vendor $sv →${vendor_bdfs[$sv]}"
+        done
+        exit 1
+    elif [ ${#candidates[@]} -eq 1 ]; then
+        SUBSYSTEM_VENDOR="${candidates[0]}"
+    else
+        echo "Multiple candidate arrays detected:"
+        i=1
+        for sv in "${candidates[@]}"; do
+            echo "  [$i] subsystem_vendor $sv →${vendor_bdfs[$sv]}"
+            i=$((i + 1))
+        done
+        n=${#candidates[@]}
+        while :; do
+            read -rp "Pick one [1-$n, default 1]: " choice
+            choice="${choice:-1}"
+            if [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le "$n" ]; then
+                break
+            fi
+            echo "  invalid — enter a number between 1 and $n"
+        done
+        SUBSYSTEM_VENDOR="${candidates[$((choice - 1))]}"
+    fi
+    echo -e "${GREEN}  ✓ Array subsystem_vendor: $SUBSYSTEM_VENDOR (members:${vendor_bdfs[$SUBSYSTEM_VENDOR]})${NC}"
+else
+    echo -e "${YELLOW}  ⚠ No 1022:b000 devices found — skipping unbind (non-TRX50 hardware?)${NC}"
+fi
+
+# Resolve the PCI device(s) backing the root filesystem so we can refuse to
+# unbind them under any circumstances (losing the root disk kills the box).
+ROOT_PCI_BDFS=""
+root_src="$(findmnt -no SOURCE / 2>/dev/null || true)"
+if [ -n "$root_src" ] && [ -b "$root_src" ]; then
+    # lsblk -s walks from the source up through every ancestor (partition,
+    # LUKS, LVM, ...) to the underlying whole disk(s).
+    while read -r disk; do
+        [ -n "$disk" ] || continue
+        devpath=$(readlink -f "/sys/block/$disk/device" 2>/dev/null || true)
+        bdf=$(echo "$devpath" | grep -oE '[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-9a-f]' | tail -1 || true)
+        [ -n "$bdf" ] && ROOT_PCI_BDFS="$ROOT_PCI_BDFS $bdf"
+    done < <(lsblk -nrso KNAME,TYPE "$root_src" 2>/dev/null | awk '$2 == "disk" {print $1}' | sort -u)
+fi
+if [ -n "$ROOT_PCI_BDFS" ]; then
+    echo "  Root filesystem ($root_src) backed by PCI device(s):$ROOT_PCI_BDFS"
+fi
+
+echo
 UNBOUND_COUNT=0
 SKIPPED_COUNT=0
-for dev in $(lspci -d 1022:b000 | awk '{print $1}'); do
-    driver=$(readlink -f /sys/bus/pci/devices/0000:$dev/driver 2>/dev/null | xargs basename 2>/dev/null || echo "none")
-    subsystem=$(lspci -s $dev -v 2>/dev/null | grep -i "subsystem" | head -1)
-    
-    # Identify Samsung devices (likely OS drive) - keep bound to nvme
-    if echo "$subsystem" | grep -qi "samsung"; then
-        echo -e "${YELLOW}  ⚠ Skipping Samsung device $dev (OS drive - keeping bound to nvme)${NC}"
-        SKIPPED_COUNT=$((SKIPPED_COUNT + 1))
-        continue
-    fi
-    
-    # For non-Samsung devices, unbind from nvme if bound
-    if [ "$driver" = "nvme" ]; then
-        echo "  Unbinding device $dev from nvme driver..."
-        if echo "0000:$dev" > /sys/bus/pci/drivers/nvme/unbind 2>/dev/null; then
-            echo -e "${GREEN}  ✓ Unbound device $dev from nvme${NC}"
-            UNBOUND_COUNT=$((UNBOUND_COUNT + 1))
-            sleep 0.5  # Give kernel time to process unbind
-        else
-            echo -e "${YELLOW}  ⚠ Failed to unbind device $dev (may be in use)${NC}"
+if [ -n "$SUBSYSTEM_VENDOR" ]; then
+    echo "Unbinding array members (subsystem_vendor $SUBSYSTEM_VENDOR) from nvme..."
+    for bdf in $(lspci -d 1022:b000 -D | awk '{print $1}'); do
+        driver=$(readlink -f "/sys/bus/pci/devices/$bdf/driver" 2>/dev/null | xargs basename 2>/dev/null || echo "none")
+        sv=$(cat "/sys/bus/pci/devices/$bdf/subsystem_vendor")
+
+        # Never touch a device that backs the running root filesystem.
+        case " $ROOT_PCI_BDFS " in
+            *" $bdf "*)
+                echo -e "${YELLOW}  ⚠ Skipping $bdf — it backs the root filesystem (OS drive)${NC}"
+                SKIPPED_COUNT=$((SKIPPED_COUNT + 1))
+                continue
+                ;;
+        esac
+
+        # Only unbind devices that match the array's subsystem vendor.
+        if [ "$sv" != "$SUBSYSTEM_VENDOR" ]; then
+            echo -e "${YELLOW}  ⚠ Skipping $bdf (subsystem_vendor $sv ≠ array $SUBSYSTEM_VENDOR)${NC}"
+            SKIPPED_COUNT=$((SKIPPED_COUNT + 1))
+            continue
         fi
-    elif [ "$driver" = "rcbottom" ]; then
-        echo -e "${GREEN}  ✓ Device $dev already bound to rcbottom driver${NC}"
-    else
-        echo "  Device $dev status: driver=$driver (ready for binding)"
-    fi
-done
+
+        if [ "$driver" = "nvme" ]; then
+            echo "  Unbinding device $bdf from nvme driver..."
+            if echo "$bdf" > /sys/bus/pci/drivers/nvme/unbind 2>/dev/null; then
+                echo -e "${GREEN}  ✓ Unbound device $bdf from nvme${NC}"
+                UNBOUND_COUNT=$((UNBOUND_COUNT + 1))
+                sleep 0.5  # Give kernel time to process unbind
+            else
+                echo -e "${YELLOW}  ⚠ Failed to unbind device $bdf (may be in use)${NC}"
+            fi
+        elif [ "$driver" = "rcbottom" ]; then
+            echo -e "${GREEN}  ✓ Device $bdf already bound to rcbottom driver${NC}"
+        else
+            echo "  Device $bdf status: driver=$driver (ready for binding)"
+        fi
+    done
+fi
 
 echo
 if [ $UNBOUND_COUNT -gt 0 ]; then
     echo -e "${GREEN}✓ Unbound $UNBOUND_COUNT device(s) from nvme driver${NC}"
 fi
 if [ $SKIPPED_COUNT -gt 0 ]; then
-    echo -e "${GREEN}✓ Skipped $SKIPPED_COUNT Samsung device(s) (OS drive protected)${NC}"
+    echo -e "${GREEN}✓ Skipped $SKIPPED_COUNT non-member/OS device(s)${NC}"
 fi
 if [ $UNBOUND_COUNT -eq 0 ] && [ $SKIPPED_COUNT -eq 0 ]; then
     echo -e "${YELLOW}⚠ No devices processed (may already be configured)${NC}"
@@ -415,11 +501,23 @@ echo
 echo -e "${YELLOW}[TEST 3]${NC} Loading driver..."
 if lsmod | grep -q "^${DRIVER_NAME}"; then
     echo -e "${YELLOW}⚠ Driver already loaded, unloading first...${NC}"
-    rmmod "$DRIVER_NAME" 2>/dev/null || true
+    if ! rmmod "$DRIVER_NAME"; then
+        echo -e "${RED}✗ Could not unload the running module (volume in use?)${NC}"
+        echo "  Unmount /dev/rcraid0* and re-run — proceeding to insmod over a"
+        echo "  live module would only confuse the state."
+        exit 1
+    fi
     sleep 1
 fi
 
-if insmod "$DRIVER_MODULE"; then
+# Pass the detected array vendor so the driver's own filter refuses any
+# device that isn't an array member — insmod bypasses modprobe.d, so
+# without an explicit safe_subsys_vendor= the filter would be disabled.
+INSMOD_ARGS=()
+if [ -n "$SUBSYSTEM_VENDOR" ]; then
+    INSMOD_ARGS+=("safe_subsys_vendor=$SUBSYSTEM_VENDOR")
+fi
+if insmod "$DRIVER_MODULE" "${INSMOD_ARGS[@]}"; then
     echo -e "${GREEN}✓ Driver loaded successfully${NC}"
 else
     echo -e "${RED}✗ Failed to load driver${NC}"
@@ -623,8 +721,12 @@ read -p "Unload driver now? (y/N): " -n 1 -r
 echo
 if [[ $REPLY =~ ^[Yy]$ ]]; then
     echo "Unloading driver..."
-    rmmod "$DRIVER_NAME" 2>/dev/null || true
-    echo -e "${GREEN}Driver unloaded${NC}"
+    if rmmod "$DRIVER_NAME"; then
+        echo -e "${GREEN}Driver unloaded${NC}"
+    else
+        echo -e "${YELLOW}⚠ rmmod failed — /dev/rcraid0* is probably mounted/in use.${NC}"
+        echo "  Unmount it and run ./unload.sh"
+    fi
 else
     echo "Driver remains loaded"
 fi

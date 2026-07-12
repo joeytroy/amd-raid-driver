@@ -57,19 +57,18 @@ MODULE_PARM_DESC(allow_foreign_nvme,
  * Status of each path:
  *   0xB000  NVMe RAID Bottom    — fully implemented and validated
  *   0x43BD  Promontory SATA     — claimed, AHCI path is stub
- *   0x7905  older SATA RAID     — claimed, AHCI path is stub
- *   0x7916  older SATA RAID     — claimed, AHCI path is stub
- *   0x7917  X570S-era SATA RAID — claimed, AHCI path is stub
  *
- * Binding all five so modalias matching works for any board that
- * AMD's own driver would handle.  When the AHCI path is built out
- * (see docs/STATUS.md), no PCI-table change will be needed.
+ * The remaining three SATA IDs from rcbottom.inf (0x7905 Bristol,
+ * 0x7916 Summit, 0x7917 X570S) are deliberately NOT claimed: they have
+ * no BAR-mapping case in rc_bottom_map_bars(), so probing them always
+ * failed with "Unknown device ID" — but only AFTER the PCI core had
+ * already matched the ID and thereby kept ahci/generic drivers off the
+ * device.  Claiming a device we then refuse to drive strands the user's
+ * SATA controller with no driver at all.  Re-add the entries (their
+ * defines remain in rc_pci_ids.h) once the AHCI path actually exists.
  *----------------------------------------------------------------------*/
 static const struct pci_device_id rc_bottom_pci_tbl[] = {
-    { PCI_DEVICE(RC_PD_VID_AMD, RC_PD_DID_BRISTOL)          },
     { PCI_DEVICE(RC_PD_VID_AMD, RC_PD_DID_PROMONTORY)       },
-    { PCI_DEVICE(RC_PD_VID_AMD, RC_PD_DID_SUMMIT)           },
-    { PCI_DEVICE(RC_PD_VID_AMD, RC_PD_DID_X570S)            },
     { PCI_DEVICE(RC_PD_VID_AMD, RC_PD_DID_NVME_RAID_BOTTOM) },
     { 0, }
 };
@@ -343,33 +342,69 @@ static struct rc_adapter *rc_bottom_alloc_adapter(struct pci_dev *pdev)
     adapter->irq_mode = RC_IRQ_MODE_NONE;
     adapter->irq_vector = -1;
     adapter->nr_irq_vectors = 0;
+    adapter->instance = -1;    /* not attached yet */
     INIT_LIST_HEAD(&adapter->list_node);
 
     adapter->hw.owner = adapter;
     adapter->hw.pdev = pdev;
 
+    /* Initialize every lock/waitqueue an ISR or debugfs/sysfs reader can
+     * touch BEFORE the IRQ handler is registered and before the sysfs/
+     * debugfs nodes exist.  rc_hw_init used to memset adapter->hw with
+     * interrupts already live and never spin_lock_init'ed these — a
+     * lockdep splat (or worse) the first time debugfs `pending_requests`
+     * was read. */
+    spin_lock_init(&adapter->hw.irq_lock);
+    spin_lock_init(&adapter->hw.pending_lock);
+    spin_lock_init(&adapter->hw.sync_lock);
+
+    /* NVMe-state waitqueue/mutex/work init.  Must precede request_irq:
+     * on shared INTx a foreign interrupt can route into rc_nvme_irq()
+     * before rc_nvme_init_controller runs (see rc_nvme_early_init). */
+    rc_nvme_early_init(adapter);
+
     return adapter;
 }
 
-static void rc_bottom_attach_adapter(struct rc_adapter *adapter)
+/* Claim the first free slot in rc_state.adapters[].  Slots are recycled on
+ * detach (the old scheme handed out num_adapters and never decremented, so
+ * ~11 bind/unbind cycles exhausted the table and later attaches failed
+ * SILENTLY with instance left at 0 — colliding with a real adapter's
+ * debugfs dir).  Returns 0 or -ENOSPC; the caller fails the probe on
+ * -ENOSPC rather than continuing with a bogus instance. */
+static int rc_bottom_attach_adapter(struct rc_adapter *adapter)
 {
+    int i, ret = -ENOSPC;
+
     mutex_lock(&rc_state.lock);
-    if (rc_state.num_adapters < RC_MAX_ADAPTERS) {
-        rc_state.adapters[rc_state.num_adapters] = adapter;
-        adapter->instance = rc_state.num_adapters;
-        rc_state.num_adapters++;
-        list_add_tail(&adapter->list_node, &rc_state.adapter_list);
+    for (i = 0; i < RC_MAX_ADAPTERS; i++) {
+        if (!rc_state.adapters[i]) {
+            rc_state.adapters[i] = adapter;
+            adapter->instance = i;
+            rc_state.num_adapters++;
+            list_add_tail(&adapter->list_node, &rc_state.adapter_list);
+            ret = 0;
+            break;
+        }
     }
     mutex_unlock(&rc_state.lock);
+
+    if (ret)
+        rc_printk(RC_ERROR,
+                  "rc_bottom: all %d adapter slots in use — refusing %s\n",
+                  RC_MAX_ADAPTERS, pci_name(adapter->pdev));
+    return ret;
 }
 
 static void rc_bottom_detach_adapter(struct rc_adapter *adapter)
 {
     mutex_lock(&rc_state.lock);
     if (adapter->instance >= 0 &&
-        adapter->instance < rc_state.num_adapters &&
+        adapter->instance < RC_MAX_ADAPTERS &&
         rc_state.adapters[adapter->instance] == adapter) {
         rc_state.adapters[adapter->instance] = NULL;
+        rc_state.num_adapters--;
+        adapter->instance = -1;
     }
     list_del_init(&adapter->list_node);
     mutex_unlock(&rc_state.lock);
@@ -426,18 +461,31 @@ static int rc_bottom_probe(struct pci_dev *pdev, const struct pci_device_id *id)
     /* Classify the PCI device (sets adapter->ctx.ctrl_mode) and, for
      * NVMe controllers, run the controller boot sequence (rc_nvme.c).
      * For AHCI variants the hardware bring-up will land in rc_hw_init
-     * once the AHCI path is implemented; for now rc_hw_init is a stub. */
+     * once the AHCI path is implemented; for now rc_hw_init is a stub.
+     *
+     * NVMe init failure is FATAL for the probe: a half-initialized NVMe
+     * adapter (admin queue up, some IRQs requested) must not linger with
+     * sysfs/debugfs exported over it.  rc_nvme_cleanup_controller() is
+     * safe against partial init (every unset field skips its cleanup). */
     ret = rc_parse_firmware_capabilities(adapter);
     if (ret) {
+        if (adapter->ctx.ctrl_mode == RC_CTRL_MODE_NVME) {
+            rc_printk(RC_ERROR,
+                      "rc_bottom: NVMe controller init failed (%d) — failing probe\n",
+                      ret);
+            goto err_nvme_cleanup;
+        }
         rc_printk(RC_WARN, "rc_bottom: firmware capability parsing failed (%d)\n", ret);
         /* Continue — non-NVMe paths are stubs and won't do harm. */
     }
 
     ret = rc_hw_init(adapter);
     if (ret)
-        goto err_free_irq;
+        goto err_nvme_cleanup;
 
-    rc_bottom_attach_adapter(adapter);
+    ret = rc_bottom_attach_adapter(adapter);
+    if (ret)
+        goto err_nvme_cleanup;
     pci_set_drvdata(pdev, adapter);
 
     ret = rc_sysfs_create(adapter);
@@ -453,8 +501,16 @@ static int rc_bottom_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 
 err_detach:
     rc_bottom_detach_adapter(adapter);
+    pci_set_drvdata(pdev, NULL);
     rc_hw_cleanup(adapter);
-err_free_irq:
+err_nvme_cleanup:
+    if (adapter->ctx.ctrl_mode == RC_CTRL_MODE_NVME) {
+        /* If NVMe init got far enough to register this adapter as a
+         * volume member, the volume must be dismantled before the
+         * adapter memory goes away (use-after-free otherwise). */
+        rc_volume_remove_member(adapter);
+        rc_nvme_cleanup_controller(adapter);
+    }
     rc_bottom_free_irq(adapter);
 err_release_vectors:
     rc_bottom_release_interrupts(adapter);
@@ -478,6 +534,27 @@ static void rc_bottom_remove(struct pci_dev *pdev)
 
     rc_debugfs_remove_adapter(adapter);
     rc_sysfs_remove(adapter);
+
+    /* Ordering matters from here on:
+     *
+     *  1. rc_volume_remove_member — if this adapter is a registered member
+     *     of the assembled volume, the volume (gendisk, tagset, per-member
+     *     DMA pools) is torn down FIRST.  Freeing the adapter while
+     *     /dev/rcraid0 still routes I/O into its io_queues[] is a
+     *     use-after-free on the hot path (surprise removal, sysfs unbind,
+     *     AER-triggered removal — full rmmod was only safe by init/exit
+     *     ordering luck).
+     *  2. rc_nvme_cleanup_controller — frees per-queue IRQs, deletes the
+     *     I/O queues, disables the controller (CC.EN=0, after a CC.SHN
+     *     shutdown notification), frees admin/IO queue DMA.  Must run
+     *     BEFORE pci_free_irq_vectors: freeing MSI-X vectors with live
+     *     request_irq actions WARNs and leaves the controller enabled
+     *     and DMA-capable over freed queue memory. */
+    if (adapter->ctx.ctrl_mode == RC_CTRL_MODE_NVME) {
+        rc_volume_remove_member(adapter);
+        rc_nvme_cleanup_controller(adapter);
+    }
+
     rc_bottom_detach_adapter(adapter);
     rc_bottom_free_irq(adapter);
     rc_hw_cleanup(adapter);

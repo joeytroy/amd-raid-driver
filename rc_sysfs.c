@@ -28,7 +28,7 @@ static ssize_t adapter_info_show(struct device *dev,
     if (!adapter)
         return -ENODEV;
 
-    return sprintf(buf,
+    return sysfs_emit(buf,
                    "Vendor: 0x%04x\n"
                    "Device: 0x%04x\n"
                    "Subsystem Vendor: 0x%04x\n"
@@ -43,7 +43,8 @@ static ssize_t adapter_info_show(struct device *dev,
                    adapter->subsystem_device,
                    adapter->revision,
                    adapter->instance,
-                   adapter->irq_mode == RC_IRQ_MODE_MSI ? "MSI" : "Legacy",
+                   adapter->irq_mode == RC_IRQ_MODE_MSIX ? "MSI-X" :
+                   adapter->irq_mode == RC_IRQ_MODE_MSI  ? "MSI" : "Legacy",
                    adapter->irq_vector);
 }
 static DEVICE_ATTR_RO(adapter_info);
@@ -62,7 +63,7 @@ static ssize_t queue_stats_show(struct device *dev,
 
     hw = &adapter->hw;
 
-    len += sprintf(buf + len,
+    len += sysfs_emit_at(buf, len,
                    "Command Queue:\n"
                    "  Size: %u\n"
                    "  Head: %u\n"
@@ -108,7 +109,7 @@ static ssize_t doorbell_state_show(struct device *dev,
 
     doorbell = &adapter->ctx.doorbell;
 
-    return sprintf(buf,
+    return sysfs_emit(buf,
                    "Adapter Active: %s\n"
                    "Fast Path Enabled: %s\n"
                    "Queue State: 0x%02x\n"
@@ -140,19 +141,19 @@ static ssize_t bar_mapping_show(struct device *dev,
 
     ctx = &adapter->ctx;
 
-    len += sprintf(buf + len, "Primary MMIO:\n");
-    len += sprintf(buf + len, "  Physical: 0x%llx\n",
+    len += sysfs_emit_at(buf, len, "Primary MMIO:\n");
+    len += sysfs_emit_at(buf, len, "  Physical: 0x%llx\n",
                    (unsigned long long)ctx->mmio_phys);
-    len += sprintf(buf + len, "  Length: 0x%llx\n",
+    len += sysfs_emit_at(buf, len, "  Length: 0x%llx\n",
                    (unsigned long long)ctx->mmio_len);
-    len += sprintf(buf + len, "  Virtual: %p\n\n", ctx->mmio_base);
+    len += sysfs_emit_at(buf, len, "  Virtual: %p\n\n", ctx->mmio_base);
 
-    len += sprintf(buf + len, "BAR Mappings:\n");
+    len += sysfs_emit_at(buf, len, "BAR Mappings:\n");
     for (i = 0; i < RC_MAX_BARS; i++) {
         if (!ctx->bar[i].len)
             continue;
 
-        len += sprintf(buf + len,
+        len += sysfs_emit_at(buf, len,
                        "  BAR%u: phys=0x%llx len=0x%llx flags=0x%x virt=%p\n",
                        i,
                        (unsigned long long)ctx->bar[i].phys,
@@ -176,8 +177,10 @@ static ssize_t reset_store(struct device *dev,
     if (!adapter)
         return -ENODEV;
 
+    /* -EOPNOTSUPP, not the kernel-internal -ENOTSUPP, which must never
+     * leak to userspace. */
     if (adapter->ctx.ctrl_mode != RC_CTRL_MODE_NVME)
-        return -ENOTSUPP;
+        return -EOPNOTSUPP;
 
     /* Accept "1" or "1\n" only — avoid acting on stray writes. */
     if (!((count == 1 && buf[0] == '1') ||
@@ -196,7 +199,7 @@ static ssize_t pending_requests_show(struct device *dev,
     struct pci_dev *pdev = to_pci_dev(dev);
     struct rc_adapter *adapter = pci_get_drvdata(pdev);
     struct rc_hw_queue_context *hw;
-    ssize_t len = 0;
+    unsigned long flags;
     u32 count = 0;
     u32 i;
 
@@ -205,16 +208,16 @@ static ssize_t pending_requests_show(struct device *dev,
 
     hw = &adapter->hw;
 
-    // Count pending requests
+    // Count pending requests under the same lock the writers use.
+    spin_lock_irqsave(&hw->pending_lock, flags);
     for (i = 0; i < RC_MAX_PENDING_REQUESTS; i++) {
         if (hw->pending_reqs[i].rq)
             count++;
     }
+    spin_unlock_irqrestore(&hw->pending_lock, flags);
 
-    len += sprintf(buf, "Pending Requests: %u / %u\n",
-                   count, RC_MAX_PENDING_REQUESTS);
-
-    return len;
+    return sysfs_emit(buf, "Pending Requests: %u / %u\n",
+                      count, RC_MAX_PENDING_REQUESTS);
 }
 static DEVICE_ATTR_RO(pending_requests);
 

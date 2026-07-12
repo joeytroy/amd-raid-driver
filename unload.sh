@@ -22,10 +22,20 @@ if [ "$EUID" -ne 0 ]; then
     exit 1
 fi
 
+# Refuse to unload while the volume is serving mounted filesystems —
+# don't rely on rmmod's EBUSY as the only line of defense.
+MOUNTED=$(findmnt -nro SOURCE,TARGET 2>/dev/null | awk '$1 ~ /^\/dev\/rcraid/' || true)
+if [ -n "$MOUNTED" ]; then
+    echo -e "${RED}✗ rcraid volume(s) are still mounted:${NC}"
+    echo "$MOUNTED" | sed 's/^/    /'
+    echo "Unmount them first, then re-run this script."
+    exit 1
+fi
+
 # Check if module is loaded
 if lsmod | grep -q "^rcraid"; then
     echo -e "${YELLOW}Unloading rcraid module...${NC}"
-    
+
     # Try to unload
     if rmmod rcraid 2>/dev/null; then
         echo -e "${GREEN}✓ Module unloaded successfully${NC}"

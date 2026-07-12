@@ -39,11 +39,18 @@ DKMS. What's live today:
   Abort, tagset drain, and automatic controller reset (manual sysfs reset as
   fallback). See "Error handling and reset (design)" below.
 - **Boot-from-RAID** via dracut / initramfs-tools hooks; DKMS + udev autobind;
-  live-CD install workflow; suspend/resume (S3/S4).
+  live-CD install workflow; suspend/resume (S3/S4). Operational guards:
+  `scripts/verify-boot-safety.sh` (checks every installed kernel's initramfs
+  contains rcraid, on both initramfs-tools and dracut systems) and an apt
+  kernel-hold drop-in installed by both installers so unattended-upgrades
+  never pulls a kernel behind the DKMS rebuild's back.
 
-Not yet: **RAID1 degraded mode** (a member failure still fails the volume —
-the mirror's data survives on both drives but the volume goes down; this is
-the top roadmap item), RAID10/5, hot-plug/rebuild, SMART pass-through,
+Not yet: **RAID1 degraded mode and resync** (a member failure still fails
+the volume — the mirror's data survives on both drives but the volume goes
+down; and nothing tracks or repairs divergence between the copies after a
+half-failed mirror write, so RAID1 currently provides redundancy of data
+at rest, not availability; this is the top roadmap item), RAID10/5,
+hot-plug/rebuild, SMART pass-through,
 multi-volume, Secure Boot signing out of the box, array creation from Linux.
 The prioritized roadmap is in [`IMPLEMENTATION.MD`](IMPLEMENTATION.MD); the
 RE ground truth is in [`REVERSE_ENGINEERING.md`](REVERSE_ENGINEERING.md).

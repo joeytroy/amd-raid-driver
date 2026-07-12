@@ -61,7 +61,8 @@ lspci -nn | grep -iE 'raid|non-volatile'
 
 Do **not** blacklist `nvme` — the kernel still uses it for the Samsung
 OS drive, and `test_driver.sh` relies on `nvme` being available so it
-can unbind only the AMD controller while leaving Samsung alone.
+can unbind only the detected array members while leaving the OS drive
+alone.
 
 ### One-time package install
 
@@ -150,11 +151,16 @@ The build-and-test loop has to run on the bare-metal Kubuntu install.
 
 ### `test_driver.sh` is safe by design
 
-Two things to know:
+Three things to know:
 
-- It unbinds **only** PCI devices matching `1022:b000` (the AMD RAID
-  controller). It can never touch your Samsung OS drive, even if the
-  Samsung-protection branch is irrelevant to your model.
+- It detects the array by **subsystem vendor** (the same logic the
+  installers use — the vendor with ≥ 2 devices behind `1022:b000`) and
+  unbinds **only** devices matching that vendor. The same vendor is
+  passed to `insmod` as `safe_subsys_vendor=`, so the driver itself
+  refuses any non-member device too.
+- Independently of the vendor filter, it resolves which PCI device(s)
+  back the running root filesystem and **refuses to unbind them under
+  any circumstances** — whatever brand your OS drive is.
 - It does no writes against the RAID volume: its checks are read-only,
   and it loads the driver without `enable_writes=1`, so the volume
   itself is read-only for the whole run.
@@ -182,6 +188,22 @@ The Makefile picks up the running kernel's headers automatically. No
 chroot or initramfs gymnastics are needed while the driver is still in
 development (you're loading it manually with `insmod` each time, not
 booting from it).
+
+If the machine **boots from the array** (DKMS install), verify boot
+safety after every kernel update and **before rebooting**:
+
+```bash
+sudo scripts/verify-boot-safety.sh
+```
+
+It checks every installed kernel for headers, a successful DKMS build,
+the module on disk, and — decisively — the module inside that kernel's
+initramfs. It supports both initramfs-tools (Debian/Ubuntu,
+`lsinitramfs`) and dracut (Fedora/RHEL/Arch, `lsinitrd`) layouts, prints
+the exact fix command for any kernel that fails, and exits non-zero if
+any installed kernel would not boot. Note the DKMS installer also drops
+`/etc/apt/apt.conf.d/52-rcraid-kernel-hold` on apt systems so
+unattended-upgrades never installs a kernel behind your back.
 
 ---
 
