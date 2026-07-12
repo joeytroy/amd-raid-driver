@@ -45,7 +45,13 @@ echo "=== verify RAIDCore metadata (driver-validated at bind time) ==="
 # logical sector for the magic only ever worked on synthetic layouts
 # with user_off=0.  Instead, confirm the driver's own validation: it
 # logs one RC_NOTE "RAIDCore" metadata line per member at bind time.
-members=$(dmesg | grep -c "rc_nvme_read_validate_metadata: RAIDCore" || true)
+# Count only lines from the most recent driver load — earlier binds in
+# the same boot (the load/rmmod/tweak/reload workflow) leave stale
+# validation lines in the ring buffer that would inflate the count.
+members=$(dmesg | awk '
+    /rc_init: AMD RAID Driver version/ { n = 0 }
+    /rc_nvme_read_validate_metadata: RAIDCore/ { n++ }
+    END { print n + 0 }')
 if [ "$members" -ge 2 ]; then
     echo "  PASS — driver validated RAIDCore metadata on $members members"
 elif [ "$members" -eq 1 ]; then
