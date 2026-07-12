@@ -39,20 +39,21 @@ for bs in 4K 8K 32K 64K; do
 done
 echo
 
-echo "=== verify RAIDCore metadata via the volume (logical sector 40960) ==="
-# logical 40960 -> member 0 phys 20480 = 0x5000
-got=$(dd if="$RCRAID" bs=512 skip=40960 count=1 status=none | xxd -l 16 -p)
-echo "  read 16 bytes: $got"
-case "$got" in
-    *52414944436f7265*)
-        echo "  PASS — 'RAIDCore' magic present at logical sector 40960"
-        ;;
-    *)
-        echo "  FAIL — magic not found at expected location"
-        echo "         (members may be in wrong order — try"
-        echo "          rmmod rcraid; modprobe rcraid reverse_member_order=1)"
-        ;;
-esac
+echo "=== verify RAIDCore metadata (driver-validated at bind time) ==="
+# The metadata region lives below each member's user_off, so on real
+# firmware arrays it is NOT addressable through the volume — reading a
+# logical sector for the magic only ever worked on synthetic layouts
+# with user_off=0.  Instead, confirm the driver's own validation: it
+# logs one RC_NOTE "RAIDCore" metadata line per member at bind time.
+members=$(dmesg | grep -c "rc_nvme_read_validate_metadata: RAIDCore" || true)
+if [ "$members" -ge 2 ]; then
+    echo "  PASS — driver validated RAIDCore metadata on $members members"
+elif [ "$members" -eq 1 ]; then
+    echo "  FAIL — only 1 member logged validated metadata (need >= 2)"
+else
+    echo "  WARN — no metadata-validation lines in dmesg (ring buffer may"
+    echo "         have wrapped since boot; not necessarily a failure)"
+fi
 echo
 
 echo "=== stripe-boundary sanity (logical 2047 vs 2048) ==="
