@@ -56,13 +56,15 @@ result=$(dmesg | awk '
     END { print seen + 0, n + 0 }')
 seen=${result%% *}
 members=${result##* }
-if [ "$members" -ge 2 ]; then
-    echo "  PASS — driver validated RAIDCore metadata on $members members"
-elif [ "$seen" = "1" ]; then
-    echo "  FAIL — driver loaded but only $members member(s) validated (need >= 2)"
-else
+if [ "$seen" != "1" ]; then
+    # Without the banner there is no reset point, so any count may
+    # include stale lines from earlier loads — don't trust it at all.
     echo "  WARN — no driver-load banner in dmesg (ring buffer may have"
     echo "         wrapped since boot); can't verify metadata validation"
+elif [ "$members" -ge 2 ]; then
+    echo "  PASS — driver validated RAIDCore metadata on $members members"
+else
+    echo "  FAIL — driver loaded but only $members member(s) validated (need >= 2)"
 fi
 echo
 
