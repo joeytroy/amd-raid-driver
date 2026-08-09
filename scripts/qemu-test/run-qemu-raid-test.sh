@@ -36,6 +36,7 @@ LEVEL=raid0
 MEMBERS=2
 SIZE_MIB=256
 WORKDIR=""
+FAIL_MEMBER=0
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -45,9 +46,15 @@ while [ $# -gt 0 ]; do
         --members)  MEMBERS="$2"; shift 2 ;;
         --size-mib) SIZE_MIB="$2"; shift 2 ;;
         --workdir)  WORKDIR="$2"; shift 2 ;;
+        --fail-member) FAIL_MEMBER=1; shift ;;
         *) echo "unknown arg: $1" >&2; exit 2 ;;
     esac
 done
+
+if [ "$FAIL_MEMBER" = 1 ] && [ "$LEVEL" != raid1 ]; then
+    echo "--fail-member requires --level raid1 (RAID0 has no degraded mode)" >&2
+    exit 2
+fi
 [ -n "$KERNEL" ] || KERNEL="/boot/vmlinuz-$KVER"
 
 [ -d "/lib/modules/$KVER/build" ] || {
@@ -167,7 +174,7 @@ timeout --foreground "${RCRAID_QEMU_TIMEOUT:-300}" qemu-system-x86_64 \
     -M q35 -m 2048 -smp 4 "${ACCEL_ARGS[@]}" \
     -kernel "$KERNEL" \
     -initrd "$WORKDIR/initramfs.gz" \
-    -append "console=ttyS0 rdinit=/init expected_sectors=$EXPECTED_SECTORS expected_level=$LEVEL panic=-1" \
+    -append "console=ttyS0 rdinit=/init expected_sectors=$EXPECTED_SECTORS expected_level=$LEVEL fail_member=$FAIL_MEMBER panic=-1" \
     "${DRIVE_ARGS[@]}" \
     -nographic -no-reboot \
     > "$CONSOLE_LOG" 2>&1 || true   # qemu exit code isn't the verdict
@@ -181,7 +188,9 @@ if grep -q "RCRAID-TEST-PASS" "$CONSOLE_LOG"; then
     # hide a lame member).  Prove it from outside: after the VM exits,
     # every member's user-data region must be byte-identical (only the
     # metadata region legitimately differs, by per-member device_id).
-    if [ "$LEVEL" = raid1 ]; then
+    if [ "$LEVEL" = raid1 ] && [ "$FAIL_MEMBER" != 1 ]; then
+        # (Skipped with --fail-member: post-failure writes legitimately
+        # reach only the survivor, so the mirrors are EXPECTED to diverge.)
         UD_OFF="$(echo "$MKMETA_OUT" | awk -F= '/^userdata_offset_sectors=/ {print $2}')"
         UD_BYTES=$((UD_OFF * 512))
         for i in $(seq 1 $((MEMBERS - 1))); do

@@ -165,10 +165,13 @@ For status of work already done, see [`STATUS.md`](STATUS.md).
       and booting from a 2× T700 BIOS RAID1; KDiskMark 20.5 GB/s read /
       11.1 GB/s write on the mirror as rootfs. Full findings in
       STATUS.md's 2026-07-10 log entry.
-      Deliberately NOT included: **degraded mode** — today a member
-      error fails the volume like RAID0 instead of serving from the
-      survivor. That lands with hot-plug / failure handling below (now
-      the top roadmap item).
+      **Degraded mode landed** (issue #51, PR 1): per-member state
+      machine + lock-free live mask; member death (CSTS fatal, timeout,
+      hot-unplug) keeps the volume serving from the survivor; partial
+      mirror-write failure completes OK and degrades the erring member;
+      a recovered controller parks `needs-resync` (never silently
+      rejoins).  Still to come from #51: degraded boot assembly (opt-in
+      module param), member re-add plumbing, and the resync engine.
 
 - [ ] **RAID10** — combination of RAID0 + RAID1. Stripe across
       mirrored pairs. Reuses RAID0 stripe math + RAID1 mirror dispatch.

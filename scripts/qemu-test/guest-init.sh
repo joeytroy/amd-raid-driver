@@ -41,10 +41,12 @@ mark() {
 
 expected_sectors=""
 expected_level=""
+fail_member=0
 for arg in $(cat /proc/cmdline); do
     case "$arg" in
         expected_sectors=*) expected_sectors="${arg#expected_sectors=}" ;;
         expected_level=*)   expected_level="${arg#expected_level=}" ;;
+        fail_member=*)      fail_member="${arg#fail_member=}" ;;
     esac
 done
 [ -n "$expected_sectors" ] || fail "no expected_sectors= on kernel cmdline"
@@ -62,6 +64,13 @@ bind_nvme_functions() {
     for d in /sys/bus/pci/devices/*; do
         [ "$(cat "$d/class")" = "0x010802" ] || continue
         bdf="${d##*/}"
+        # Already ours?  Do NOT unbind+rebind: with degraded mode in the
+        # driver, unbinding a live member is a hot-remove (the volume drops
+        # to degraded and the member can't rejoin without resync) — the
+        # old teardown-and-reassemble behavior this dance relied on is gone.
+        case "$(readlink "$d/driver" 2>/dev/null)" in
+            */rcbottom) found=$((found + 1)); continue ;;
+        esac
         echo rcbottom > "$d/driver_override"
         if [ -e "$d/driver" ]; then
             echo "$bdf" > "$d/driver/unbind" 2>/dev/null
@@ -213,6 +222,70 @@ if [ -n "$MKE2FS" ]; then
     echo "rcraid-test: mke2fs OK, superblock verified on the volume"
 else
     echo "rcraid-test: mke2fs not bundled — skipping sub-page write test"
+fi
+
+# ---------------------------------------------------------------------------
+# RAID1 degraded-mode scenario (fail_member=1): kill one mirror member via
+# sysfs unbind — the same rc_bottom_remove → rc_volume_remove_member path a
+# surprise hot-unplug takes — and prove the volume keeps serving:
+#   1. data written BEFORE the failure is still readable (from the survivor),
+#   2. writes AFTER the failure succeed (degraded write to the survivor only),
+#   3. debugfs reports the volume degraded with the member absent.
+# The host runner skips its mirror-identity check in this mode — post-failure
+# writes legitimately reach only the survivor.
+# ---------------------------------------------------------------------------
+if [ "$fail_member" = "1" ] && [ "$expected_level" = "raid1" ]; then
+    echo "rcraid-test: DEGRADED SCENARIO: pre-failure write"
+    mark "degraded scenario start"
+    dd if=/dev/urandom of=/pattern2 bs=1M count=4 2>/dev/null
+    want2=$(md5sum /pattern2 | cut -d' ' -f1)
+    dd if=/pattern2 of=/dev/rcraid0 bs=1M seek=50 conv=fsync 2>/dev/null \
+        || fail "pre-failure write at 50 MiB"
+
+    # Unbind the LAST rcbottom-bound NVMe function (RAID1 is symmetric —
+    # either member works).
+    victim=""
+    for d in /sys/bus/pci/devices/*; do
+        [ "$(cat "$d/class")" = "0x010802" ] || continue
+        case "$(readlink "$d/driver" 2>/dev/null)" in
+            */rcbottom) victim="${d##*/}" ;;
+        esac
+    done
+    [ -n "$victim" ] || fail "no rcbottom-bound member found to unbind"
+    echo "rcraid-test: unbinding member $victim (simulated hot-unplug)"
+    mark "unbinding $victim"
+    echo "$victim" > "/sys/bus/pci/drivers/rcbottom/unbind" \
+        || fail "unbind of $victim"
+
+    [ -b /dev/rcraid0 ] \
+        || fail "/dev/rcraid0 disappeared after single-member failure"
+
+    echo 3 > /proc/sys/vm/drop_caches
+    got2=$(dd if=/dev/rcraid0 bs=1M skip=50 count=4 2>/dev/null | md5sum | cut -d' ' -f1)
+    [ "$got2" = "$want2" ] \
+        || fail "pre-failure data unreadable from survivor (degraded read broken)"
+    echo "rcraid-test: degraded READ ok (pre-failure data served by survivor)"
+
+    mark "degraded write"
+    dd if=/pattern2 of=/dev/rcraid0 bs=1M seek=60 conv=fsync 2>/dev/null \
+        || fail "degraded write at 60 MiB failed"
+    echo 3 > /proc/sys/vm/drop_caches
+    got2=$(dd if=/dev/rcraid0 bs=1M skip=60 count=4 2>/dev/null | md5sum | cut -d' ' -f1)
+    [ "$got2" = "$want2" ] || fail "degraded write readback mismatch"
+    echo "rcraid-test: degraded WRITE ok"
+
+    mount -t debugfs debugfs /sys/kernel/debug 2>/dev/null
+    if [ -r /sys/kernel/debug/rcraid/volume ]; then
+        echo "rcraid-test: --- debugfs volume state ---"
+        sed 's/^/rcraid-test:   /' /sys/kernel/debug/rcraid/volume
+        grep -q "state: degraded" /sys/kernel/debug/rcraid/volume \
+            || fail "debugfs does not report state: degraded"
+        grep -q "absent" /sys/kernel/debug/rcraid/volume \
+            || fail "debugfs does not show the removed member as absent"
+    else
+        fail "debugfs rcraid/volume not readable"
+    fi
+    echo "rcraid-test: degraded scenario complete"
 fi
 
 echo "RCRAID-TEST-PASS"

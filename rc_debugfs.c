@@ -303,6 +303,18 @@ static const struct file_operations rc_debugfs_regs_fops = {
  * Debugfs initialization & cleanup
  *----------------------------------------------------------------------*/
 
+static int rc_debugfs_volume_open(struct inode *inode, struct file *file)
+{
+    return single_open(file, rc_volume_debugfs_show, inode->i_private);
+}
+
+static const struct file_operations rc_debugfs_volume_fops = {
+    .open = rc_debugfs_volume_open,
+    .read = seq_read,
+    .llseek = seq_lseek,
+    .release = single_release,
+};
+
 int rc_debugfs_init(void)
 {
     rc_debugfs_root = debugfs_create_dir("rcraid", NULL);
@@ -315,6 +327,11 @@ int rc_debugfs_init(void)
         rc_printk(RC_WARN, "rc_debugfs_init: failed to create debugfs root (%d)\n", err);
         return err;
     }
+
+    /* Volume-level state (level, per-member state, degraded/optimal).
+     * Lives at the root — there is at most one volume today. */
+    debugfs_create_file("volume", 0400, rc_debugfs_root, NULL,
+                        &rc_debugfs_volume_fops);
 
     rc_printk(RC_INFO, "rc_debugfs_init: created debugfs root at /sys/kernel/debug/rcraid\n");
     return 0;
