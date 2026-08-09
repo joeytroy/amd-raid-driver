@@ -203,6 +203,8 @@ static u32 rc_volume_nr_hw;
 static void rc_volume_member_readmitted(int slot);
 static int  rc_volume_alloc_member_dma(int slot, u32 nr_hw);
 static void rc_volume_free_member_dma(int slot, struct device *dev);
+static void rc_volume_sysfs_register(void);
+static void rc_volume_sysfs_unregister(void);
 
 /* Slow-path state transition.  Caller holds rc_volume_lock. */
 static void rc_volume_member_set_state(int idx, enum rc_member_state st)
@@ -4638,6 +4640,8 @@ static int rc_volume_create_disk(void)
 	if (ret)
 		goto err_put_disk;
 
+	rc_volume_sysfs_register();
+
 	rc_printk(RC_NOTE,
 		  "rc_volume_create_disk: /dev/%s up, %llu sectors (%llu MiB, %s)\n",
 		  rc_volume_disk->disk_name,
@@ -5025,6 +5029,7 @@ void rc_volume_teardown(void)
 
 	mutex_lock(&rc_volume_lock);
 	if (rc_volume_disk) {
+		rc_volume_sysfs_unregister();
 		del_gendisk(rc_volume_disk);
 		put_disk(rc_volume_disk);
 		rc_volume_disk = NULL;
@@ -5107,6 +5112,154 @@ int rc_volume_debugfs_show(struct seq_file *m, void *unused)
 		seq_puts(m, "state: optimal\n");
 	mutex_unlock(&rc_volume_lock);
 	return 0;
+}
+
+/* ------------------------------------------------------------------ *
+ * Volume-level sysfs: /sys/block/rcraid0/rcraid/{state,members,
+ * resync_progress,fail_member}.  The stable operator surface (debugfs
+ * carries the same data plus internals, but debugfs is not ABI and may
+ * not be mounted).  Group added after add_disk, removed at teardown.
+ * ------------------------------------------------------------------ */
+
+static const char *rc_volume_state_str(void)
+{
+	unsigned int live = (unsigned int)atomic_read(&rc_volume_live_mask);
+	int nlive = hweight32(live);
+
+	if (!rc_volume_disk)
+		return "unassembled";
+	if (nlive == 0)
+		return "failed";
+	if (READ_ONCE(rc_volume_resync_slot) >= 0)
+		return "resyncing";
+	if (nlive < rc_volume_member_count)
+		return rc_volume_raid_level == RC_LDT_RAID1 ? "degraded"
+							    : "failed";
+	return "optimal";
+}
+
+static ssize_t state_show(struct device *dev, struct device_attribute *attr,
+			  char *buf)
+{
+	ssize_t n;
+
+	mutex_lock(&rc_volume_lock);
+	n = sysfs_emit(buf, "%s\n", rc_volume_state_str());
+	mutex_unlock(&rc_volume_lock);
+	return n;
+}
+static DEVICE_ATTR_RO(state);
+
+static ssize_t members_show(struct device *dev, struct device_attribute *attr,
+			    char *buf)
+{
+	ssize_t n = 0;
+	int i;
+
+	mutex_lock(&rc_volume_lock);
+	for (i = 0; i < rc_volume_member_count && i < RC_VOLUME_MAX_MEMBERS;
+	     i++) {
+		struct rc_adapter *a = rc_volume_members[i];
+
+		n += sysfs_emit_at(buf, n, "%d %s %s\n", i,
+				   a ? pci_name(a->pdev) : "absent",
+				   rc_member_state_name(rc_volume_member_state[i]));
+	}
+	mutex_unlock(&rc_volume_lock);
+	return n;
+}
+static DEVICE_ATTR_RO(members);
+
+static ssize_t resync_progress_show(struct device *dev,
+				    struct device_attribute *attr, char *buf)
+{
+	u64 cur, tot;
+	int slot;
+	ssize_t n;
+
+	mutex_lock(&rc_volume_lock);
+	slot = rc_volume_resync_slot;
+	cur = (u64)atomic64_read(&rc_volume_resync_cursor);
+	tot = rc_volume_resync_total;
+	if (slot < 0)
+		n = sysfs_emit(buf, "none\n");
+	else
+		n = sysfs_emit(buf, "member%d %llu/%llu %llu%%\n", slot,
+			       (unsigned long long)cur,
+			       (unsigned long long)tot,
+			       tot ? (unsigned long long)div64_u64(cur * 100,
+								   tot) : 0ULL);
+	mutex_unlock(&rc_volume_lock);
+	return n;
+}
+static DEVICE_ATTR_RO(resync_progress);
+
+/* Operator/testing control: fail a member by slot number.  Same code path
+ * as an ISR-detected death — the volume degrades (RAID1) or fails
+ * (RAID0), and a subsequent manual reset of the member parks it
+ * needs-resync for the engine to pick up. */
+static ssize_t fail_member_store(struct device *dev,
+				 struct device_attribute *attr,
+				 const char *buf, size_t count)
+{
+	int slot, ret;
+
+	ret = kstrtoint(buf, 0, &slot);
+	if (ret)
+		return ret;
+	if (slot < 0 || slot >= rc_volume_member_count ||
+	    slot >= RC_VOLUME_MAX_MEMBERS)
+		return -EINVAL;
+
+	mutex_lock(&rc_volume_lock);
+	if (!rc_volume_members[slot]) {
+		mutex_unlock(&rc_volume_lock);
+		return -ENODEV;
+	}
+	rc_printk(RC_WARN,
+		  "rc_volume: member %d (%s) FAILED by operator via sysfs\n",
+		  slot, pci_name(rc_volume_members[slot]->pdev));
+	mutex_unlock(&rc_volume_lock);
+
+	rc_volume_member_mark_failed(slot);
+	return count;
+}
+static DEVICE_ATTR_WO(fail_member);
+
+static struct attribute *rc_volume_sysfs_attrs[] = {
+	&dev_attr_state.attr,
+	&dev_attr_members.attr,
+	&dev_attr_resync_progress.attr,
+	&dev_attr_fail_member.attr,
+	NULL,
+};
+
+static const struct attribute_group rc_volume_sysfs_group = {
+	.name  = "rcraid",
+	.attrs = rc_volume_sysfs_attrs,
+};
+
+/* Called with rc_volume_lock held, right after add_disk. */
+static void rc_volume_sysfs_register(void)
+{
+	int ret;
+
+	if (!rc_volume_disk)
+		return;
+	ret = device_add_group(disk_to_dev(rc_volume_disk),
+			       &rc_volume_sysfs_group);
+	if (ret)
+		rc_printk(RC_WARN,
+			  "rc_volume: sysfs group creation failed (%d) — /sys/block/%s/rcraid absent\n",
+			  ret, rc_volume_disk->disk_name);
+}
+
+/* Called with rc_volume_lock held, before del_gendisk. */
+static void rc_volume_sysfs_unregister(void)
+{
+	if (rc_volume_disk)
+		device_remove_group(disk_to_dev(rc_volume_disk),
+				    &rc_volume_sysfs_group);
 }
 
 /* PCI-remove hook (also used by probe error paths).  A member adapter is
