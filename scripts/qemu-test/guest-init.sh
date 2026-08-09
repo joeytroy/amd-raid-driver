@@ -327,19 +327,66 @@ if [ "$fail_member" = "1" ] && [ "$expected_level" = "raid1" ]; then
     fi
     echo "rcraid-test: degraded scenario complete"
 
-    # Re-add: rebind the removed member.  It must come back parked
-    # needs-resync — present in the registry but NOT live (its data is
-    # stale), and the volume must stay degraded.
+    # Re-add: rebind the removed member.  The resync engine must pick it
+    # up (needs-resync → resyncing) and copy the survivor over it while
+    # the volume keeps serving.
     echo "rcraid-test: re-adding member $victim"
     mark "re-adding $victim"
     echo "$victim" > /sys/bus/pci/drivers_probe 2>/dev/null
     sleep 1
     sed 's/^/rcraid-test:   /' /sys/kernel/debug/rcraid/volume
-    grep -q "needs-resync\|resyncing" /sys/kernel/debug/rcraid/volume \
-        || fail "re-added member not parked needs-resync/resyncing"
     grep -q "$victim" /sys/kernel/debug/rcraid/volume \
         || fail "re-added member $victim not visible in registry"
-    echo "rcraid-test: re-add parked as expected"
+    grep -q "needs-resync\|resyncing" /sys/kernel/debug/rcraid/volume \
+        || { grep -q "state: optimal" /sys/kernel/debug/rcraid/volume \
+             || fail "re-added member neither resyncing nor already optimal"; }
+
+    # Write MORE data while the resync runs — exercises the exclusion
+    # window + write fan-out to the resyncing member.
+    dd if=/pattern2 of=/dev/rcraid0 bs=1M seek=70 conv=fsync 2>/dev/null \
+        || fail "write during resync failed"
+
+    echo "rcraid-test: waiting for resync to complete"
+    mark "waiting for resync"
+    i=0
+    while ! grep -q "state: optimal" /sys/kernel/debug/rcraid/volume; do
+        i=$((i + 1))
+        [ "$i" -le 240 ] || {
+            sed 's/^/rcraid-test:   /' /sys/kernel/debug/rcraid/volume
+            fail "resync did not complete within 120s"
+        }
+        sleep 0.5
+    done
+    sed 's/^/rcraid-test:   /' /sys/kernel/debug/rcraid/volume
+    echo "rcraid-test: resync complete — volume optimal"
+
+    # The ultimate proof: kill the ORIGINAL survivor and serve everything
+    # from the freshly resynced member.  Data written before the failure,
+    # while degraded, and during the resync must all be there.
+    survivor=""
+    for d in /sys/bus/pci/devices/*; do
+        [ "$(cat "$d/class")" = "0x010802" ] || continue
+        bdf="${d##*/}"
+        [ "$bdf" = "$victim" ] && continue
+        case "$(readlink "$d/driver" 2>/dev/null)" in
+            */rcbottom) survivor="$bdf" ;;
+        esac
+    done
+    [ -n "$survivor" ] || fail "could not identify original survivor"
+    echo "rcraid-test: unbinding ORIGINAL survivor $survivor — resynced member must carry the volume"
+    mark "unbinding survivor $survivor"
+    echo "$survivor" > "/sys/bus/pci/drivers/rcbottom/unbind" \
+        || fail "unbind of survivor $survivor"
+    [ -b /dev/rcraid0 ] || fail "volume gone after survivor removal"
+
+    echo 3 > /proc/sys/vm/drop_caches
+    for seek in 50 60 70; do
+        got2=$(dd if=/dev/rcraid0 bs=1M skip=$seek count=4 2>/dev/null | md5sum | cut -d' ' -f1)
+        [ "$got2" = "$want2" ] \
+            || fail "data at ${seek} MiB wrong when served by the RESYNCED member"
+    done
+    sed 's/^/rcraid-test:   /' /sys/kernel/debug/rcraid/volume
+    echo "rcraid-test: resynced member serves all degraded-era data correctly"
 fi
 
 echo "RCRAID-TEST-PASS"
