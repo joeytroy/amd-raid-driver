@@ -379,6 +379,15 @@ struct rc_nvme_state {
     // latch a genuinely-fried controller would thrash 30 s per timeout
     // forever.
     bool              auto_reset_disabled;
+
+    // S3/S4 bookkeeping: true while this adapter's PM suspend holds a
+    // blk_mq_freeze_queue() reference on the volume queue (freeze is
+    // refcounted, so each member holds its own).  The memflags cookie
+    // returned by blk_mq_freeze_queue must be handed back to
+    // blk_mq_unfreeze_queue on resume.  Only touched from the PM
+    // suspend/resume hooks, which the PM core serializes per device.
+    bool              pm_volume_frozen;
+    unsigned int      pm_freeze_memflags;
 };
 
 // Device context layout (clean-room mirror of the Windows device extension)

@@ -4437,9 +4437,23 @@ err_irq_enabled:
  * path can reuse them.  We just need the controller to forget any
  * in-flight CIDs on its side — disabling CC.EN does that.
  *
+ * Before touching the controller we blk_mq_freeze_queue the volume:
+ * freeze blocks new submitters AND waits for every in-flight request to
+ * complete.  Without the drain, commands outstanding at CC.EN=0 time
+ * lose their completions forever, their bios never end, and the suspend
+ * transition blocks on them indefinitely — a hard hang with the screen
+ * already off (observed in the field with the rootfs on the volume:
+ * journal writeback is almost always in flight when systemd-sleep runs).
+ * Failing the in-flight I/O instead (reset_controller's drain_dead)
+ * would be wrong here — this is healthy I/O, it must land.  If the
+ * controller is genuinely wedged, .timeout fires and fails the stragglers,
+ * so the freeze cannot wait forever.  Freeze is refcounted: each member's
+ * suspend takes one reference (the first does the actual drain, the
+ * second returns immediately) and each member's resume drops one.
+ *
  * Sets nvme->dead so the upper layer fails any blk-mq dispatch that
- * sneaks in between this call and the higher-level blk-mq freeze.
- * Cleared again by rc_nvme_pm_resume_adapter via reset_controller. */
+ * could race the freeze.  Cleared again by rc_nvme_pm_resume_adapter
+ * via reset_controller. */
 int rc_nvme_pm_suspend_adapter(struct rc_adapter *adapter)
 {
 	void __iomem *base = adapter->ctx.mmio_base;
@@ -4457,6 +4471,15 @@ int rc_nvme_pm_suspend_adapter(struct rc_adapter *adapter)
 	rc_printk(RC_NOTE,
 		  "rc_nvme_pm_suspend_adapter: %s quiescing for S3/S4\n",
 		  pci_name(adapter->pdev));
+
+	/* Drain the volume BEFORE taking admin_mutex: a straggler that
+	 * times out during the wait needs auto-reset, which takes the
+	 * mutex itself. */
+	if (rc_volume_disk && !nvme->pm_volume_frozen) {
+		nvme->pm_freeze_memflags =
+			blk_mq_freeze_queue(rc_volume_disk->queue);
+		nvme->pm_volume_frozen = true;
+	}
 
 	/* Serialize against rc_nvme_reset_controller, which can run from
 	 * .timeout → rc_nvme_auto_reset_fn if a request times out mid-PM.
@@ -4503,6 +4526,14 @@ int rc_nvme_pm_suspend_adapter(struct rc_adapter *adapter)
 			  "rc_nvme_pm_suspend_adapter: %s did not become idle in time (%d) — restoring before returning\n",
 			  pci_name(adapter->pdev), ret);
 		(void)rc_nvme_reset_controller(adapter);
+		/* Suspend is aborting; .resume won't fire for this device,
+		 * so drop our freeze reference here or the volume stays
+		 * blocked forever. */
+		if (nvme->pm_volume_frozen) {
+			blk_mq_unfreeze_queue(rc_volume_disk->queue,
+					      nvme->pm_freeze_memflags);
+			nvme->pm_volume_frozen = false;
+		}
 		return ret;
 	}
 	return 0;
@@ -4516,13 +4547,28 @@ int rc_nvme_pm_suspend_adapter(struct rc_adapter *adapter)
  * I/O queues is exactly what reset_controller already does, so we just
  * delegate.  Reusing that path means the recovery code that handles a
  * mid-operation controller wedge is the same as the code that handles
- * S3/S4 resume — fewer codepaths to keep correct. */
+ * S3/S4 resume — fewer codepaths to keep correct.
+ *
+ * Drops the freeze reference the suspend hook took on the volume queue.
+ * Done even when the reset fails: dead stays set in that case, so
+ * unfrozen I/O fails fast with an error instead of blocking every
+ * submitter (rootfs included) in blk_queue_enter forever. */
 int rc_nvme_pm_resume_adapter(struct rc_adapter *adapter)
 {
+	struct rc_nvme_state *nvme = &adapter->ctx.nvme;
+	int ret;
+
 	rc_printk(RC_NOTE,
 		  "rc_nvme_pm_resume_adapter: %s reviving controller\n",
 		  pci_name(adapter->pdev));
-	return rc_nvme_reset_controller(adapter);
+	ret = rc_nvme_reset_controller(adapter);
+
+	if (nvme->pm_volume_frozen) {
+		blk_mq_unfreeze_queue(rc_volume_disk->queue,
+				      nvme->pm_freeze_memflags);
+		nvme->pm_volume_frozen = false;
+	}
+	return ret;
 }
 
 /* Initialize the NVMe-state members that an interrupt handler can touch,
