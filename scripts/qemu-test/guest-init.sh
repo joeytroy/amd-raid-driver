@@ -42,11 +42,13 @@ mark() {
 expected_sectors=""
 expected_level=""
 fail_member=0
+degraded_boot=0
 for arg in $(cat /proc/cmdline); do
     case "$arg" in
         expected_sectors=*) expected_sectors="${arg#expected_sectors=}" ;;
         expected_level=*)   expected_level="${arg#expected_level=}" ;;
         fail_member=*)      fail_member="${arg#fail_member=}" ;;
+        degraded_boot=*)    degraded_boot="${arg#degraded_boot=}" ;;
     esac
 done
 [ -n "$expected_sectors" ] || fail "no expected_sectors= on kernel cmdline"
@@ -78,7 +80,9 @@ bind_nvme_functions() {
         echo "$bdf" > /sys/bus/pci/drivers_probe 2>/dev/null
         found=$((found + 1))
     done
-    [ "$found" -ge 2 ] || fail "found $found NVMe functions, need >= 2"
+    min_found=2
+    [ "$degraded_boot" = "1" ] && min_found=1
+    [ "$found" -ge "$min_found" ] || fail "found $found NVMe functions, need >= $min_found"
 
     # new_id probes synchronously, so the driver symlink tells us whether
     # each function really bound (a failed probe or rejected new_id write
@@ -91,20 +95,27 @@ bind_nvme_functions() {
             *) echo "rcraid-test: WARNING: $(basename "$d") did not bind to rcbottom" ;;
         esac
     done
-    [ "$bound" -ge 2 ] || fail "only $bound of $found NVMe functions bound to rcbottom"
+    [ "$bound" -ge "$min_found" ] || fail "only $bound of $found NVMe functions bound to rcbottom"
 }
 
-echo "rcraid-test: loading rcraid.ko"
-insmod /rcraid.ko enable_writes=1 allow_foreign_nvme=1 || fail "insmod rcraid.ko"
+MODARGS="enable_writes=1 allow_foreign_nvme=1"
+[ "$degraded_boot" = "1" ] && MODARGS="$MODARGS allow_degraded=1"
+
+echo "rcraid-test: loading rcraid.ko ($MODARGS)"
+insmod /rcraid.ko $MODARGS || fail "insmod rcraid.ko"
 
 echo "rcraid-test: binding NVMe-class PCI functions to rcbottom"
 bind_nvme_functions
+
+# Degraded boot waits out the driver's 10 s assemble-fallback delay.
+wait_ticks=100
+[ "$degraded_boot" = "1" ] && wait_ticks=300
 
 echo "rcraid-test: waiting for /dev/rcraid0"
 i=0
 while [ ! -b /dev/rcraid0 ]; do
     i=$((i + 1))
-    [ "$i" -le 100 ] || fail "/dev/rcraid0 did not appear within 10s"
+    [ "$i" -le "$wait_ticks" ] || fail "/dev/rcraid0 did not appear within $((wait_ticks / 10))s"
     sleep 0.1
 done
 
@@ -124,6 +135,35 @@ if [ -n "$expected_level" ]; then
         fail "volume did not assemble as $want_level (decoy generation matched?)"
     fi
     echo "rcraid-test: assembled level verified: $want_level"
+fi
+
+# ---------------------------------------------------------------------------
+# Degraded BOOT scenario (degraded_boot=1): one member was never attached;
+# the volume must have assembled via the allow_degraded fallback delay.
+# Focused checks only (the full battery assumes a healthy mirror):
+# degraded state visible, writes + readback work on the survivor.
+# ---------------------------------------------------------------------------
+if [ "$degraded_boot" = "1" ]; then
+    mark "degraded boot checks"
+    mount -t debugfs debugfs /sys/kernel/debug 2>/dev/null
+    [ -r /sys/kernel/debug/rcraid/volume ] || fail "debugfs rcraid/volume missing"
+    sed 's/^/rcraid-test:   /' /sys/kernel/debug/rcraid/volume
+    grep -q "state: degraded" /sys/kernel/debug/rcraid/volume \
+        || fail "degraded boot did not produce state: degraded"
+    dmesg | grep -q "assembling DEGRADED" \
+        || fail "no 'assembling DEGRADED' log — volume came up some other way?"
+
+    dd if=/dev/urandom of=/pattern bs=1M count=4 2>/dev/null
+    want=$(md5sum /pattern | cut -d' ' -f1)
+    dd if=/pattern of=/dev/rcraid0 bs=1M seek=10 conv=fsync 2>/dev/null \
+        || fail "write on degraded-boot volume"
+    echo 3 > /proc/sys/vm/drop_caches
+    got=$(dd if=/dev/rcraid0 bs=1M skip=10 count=4 2>/dev/null | md5sum | cut -d' ' -f1)
+    [ "$got" = "$want" ] || fail "readback mismatch on degraded-boot volume"
+    echo "rcraid-test: degraded boot: write+readback ok"
+    echo "RCRAID-TEST-PASS"
+    poweroff -f
+    exit 0
 fi
 
 # Round-trip test: 4 MiB of /dev/urandom at three offsets — volume start,
@@ -286,6 +326,20 @@ if [ "$fail_member" = "1" ] && [ "$expected_level" = "raid1" ]; then
         fail "debugfs rcraid/volume not readable"
     fi
     echo "rcraid-test: degraded scenario complete"
+
+    # Re-add: rebind the removed member.  It must come back parked
+    # needs-resync — present in the registry but NOT live (its data is
+    # stale), and the volume must stay degraded.
+    echo "rcraid-test: re-adding member $victim"
+    mark "re-adding $victim"
+    echo "$victim" > /sys/bus/pci/drivers_probe 2>/dev/null
+    sleep 1
+    sed 's/^/rcraid-test:   /' /sys/kernel/debug/rcraid/volume
+    grep -q "needs-resync\|resyncing" /sys/kernel/debug/rcraid/volume \
+        || fail "re-added member not parked needs-resync/resyncing"
+    grep -q "$victim" /sys/kernel/debug/rcraid/volume \
+        || fail "re-added member $victim not visible in registry"
+    echo "rcraid-test: re-add parked as expected"
 fi
 
 echo "RCRAID-TEST-PASS"
