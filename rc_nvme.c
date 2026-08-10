@@ -4610,18 +4610,40 @@ static void rc_volume_assemble_fn(struct work_struct *w)
 		  "rc_volume_assemble_fn: only %d of %u RAID1 members present after %u ms — assembling DEGRADED (allow_degraded=1)\n",
 		  present, expected, RC_VOLUME_ASSEMBLE_DELAY_MS);
 
-	for (i = 0; i < (int)expected; i++)
-		if (!rc_volume_members[i])
-			rc_volume_member_set_state(i, RC_MEMBER_FAILED);
-	/* member_count becomes the SLOT count (== expected) from here on,
-	 * same invariant a runtime hot-removal maintains. */
-	rc_volume_member_count = (int)expected;
+	{
+		int saved_count = rc_volume_member_count;
+		int rc;
 
-	i = rc_volume_create_disk();
-	if (i)
-		rc_printk(RC_ERROR,
-			  "rc_volume_assemble_fn: degraded create_disk failed (%d)\n",
-			  i);
+		for (i = 0; i < (int)expected; i++)
+			if (!rc_volume_members[i])
+				rc_volume_member_set_state(i, RC_MEMBER_FAILED);
+		/* member_count becomes the SLOT count (== expected) from here
+		 * on, same invariant a runtime hot-removal maintains. */
+		rc_volume_member_count = (int)expected;
+
+		rc = rc_volume_create_disk();
+		if (rc) {
+			/* Roll the registry back so a late-arriving member
+			 * (or the next timer shot) can still take the normal
+			 * full-assembly path — leaving count forced to
+			 * `expected` with phantom FAILED slots would block
+			 * regular assembly forever. */
+			rc_printk(RC_ERROR,
+				  "rc_volume_assemble_fn: degraded create_disk failed (%d) — reverting registry for a later attempt\n",
+				  rc);
+			rc_volume_member_count = saved_count;
+			for (i = 0; i < (int)expected; i++) {
+				if (rc_volume_members[i])
+					continue;
+				/* Back to the pre-registration default:
+				 * state LIVE with NO live-mask bit (the bit
+				 * is only ever set when a real member
+				 * registers into the slot). */
+				rc_volume_member_state[i] = RC_MEMBER_LIVE;
+				atomic_andnot(BIT(i), &rc_volume_live_mask);
+			}
+		}
+	}
 out:
 	mutex_unlock(&rc_volume_lock);
 }
@@ -4737,6 +4759,12 @@ void rc_volume_remove_member(struct rc_adapter *adapter)
 	bool keep_volume;
 	int slot = -1;
 	int i;
+
+	/* The degraded-assembly timer walks the registry and can create the
+	 * disk from a member that is mid-removal — cancel it before any
+	 * member departs.  A later registration of a remaining member
+	 * re-arms it. */
+	cancel_delayed_work_sync(&rc_volume_assemble_work);
 
 	mutex_lock(&rc_volume_lock);
 	for (i = 0; i < RC_VOLUME_MAX_MEMBERS; i++)
