@@ -419,8 +419,17 @@ static blk_status_t rc_volume_finish_status(struct request *req)
 		return BLK_STS_IOERR;
 	}
 
-	if ((errs & mask) == mask)
-		return BLK_STS_IOERR;	/* every submitted member errored */
+	if ((errs & mask) == mask) {
+		/* Every submitted member errored — the request fails, and the
+		 * erroring members must ALSO be marked failed (same as the
+		 * READ branch above): a lone survivor that starts failing
+		 * every write would otherwise stay "live" forever, with the
+		 * volume re-dispatching to it instead of being declared
+		 * down. */
+		for_each_set_bit(i, &errs, RC_VOLUME_MAX_MEMBERS)
+			rc_volume_member_mark_failed(i);
+		return BLK_STS_IOERR;
+	}
 
 	for_each_set_bit(i, &errs, RC_VOLUME_MAX_MEMBERS)
 		rc_volume_member_mark_failed(i);
@@ -583,11 +592,29 @@ irqreturn_t rc_nvme_io_queue_irq(int irq, void *dev_id)
 					  q->sync_cid, q->sync_pending);
 			}
 		} else {
+			int slot = READ_ONCE(adapter->ctx.nvme.volume_slot);
+
+			/* A blk-mq-CID CQE on an adapter with NO registry slot
+			 * cannot belong to a live request: either this adapter
+			 * was never a member (its queues never carry volume
+			 * tags), or it was HOT-REMOVED — and the removal path
+			 * drains (synthesizing this member's completion) before
+			 * clearing volume_slot, so this is a late CQE whose
+			 * request side is already settled.  Touching the pdu
+			 * here would bypass the per-member acked gate and
+			 * double-decrement a possibly TAG-REUSED request.
+			 * Consume and drop. */
+			if (slot < 0) {
+				printk_ratelimited(KERN_WARNING
+					"rcraid: %s qid=%u dropping CQE CID=%u — adapter is not a volume member (late completion after removal?)\n",
+					pci_name(adapter->pdev), q->qid, cid);
+				goto cqe_consumed;
+			}
+
 			req = blk_mq_tag_to_rq(tags, cid);
 			if (req) {
 				u16 sc = (status >> 1) & 0x7fff;
-				int slot = READ_ONCE(adapter->ctx.nvme.volume_slot);
-				bool consume = true;
+				bool consume;
 
 				pdu = blk_mq_rq_to_pdu(req);
 				if (sc) {
@@ -604,9 +631,8 @@ irqreturn_t rc_nvme_io_queue_irq(int irq, void *dev_id)
 					 * degraded success. */
 					if (!READ_ONCE(pdu->sc_sct))
 						WRITE_ONCE(pdu->sc_sct, sc);
-					if (slot >= 0)
-						atomic_or(BIT(slot),
-							  &pdu->err_members);
+					atomic_or(BIT(slot),
+						  &pdu->err_members);
 					rc_printk(RC_ERROR,
 						  "rc_nvme_io_queue_irq: %s qid=%u CID=%u op=%u pos=%llu len=%u failed SC/SCT=0x%04x\n",
 						  pci_name(adapter->pdev), q->qid,
@@ -619,7 +645,7 @@ irqreturn_t rc_nvme_io_queue_irq(int irq, void *dev_id)
 				 * already synthesized this member's
 				 * completion (bit set), this is a late CQE —
 				 * do NOT decrement again. */
-				if (slot >= 0) {
+				{
 					int prev = atomic_fetch_or(BIT(slot),
 								   &pdu->acked);
 					consume = !(prev & BIT(slot));
@@ -644,6 +670,7 @@ irqreturn_t rc_nvme_io_queue_irq(int irq, void *dev_id)
 			}
 		}
 
+cqe_consumed:
 		/* One CQE consumed = one SQE slot free (C-4 accounting). */
 		if (q->sq_inflight)
 			q->sq_inflight--;
@@ -3722,6 +3749,22 @@ static blk_status_t rc_volume_queue_rq(struct blk_mq_hw_ctx *hctx,
 	}
 
 	rc_volume_map_lba(pos, &member_idx, &phys_lba);
+	/* rc_volume_fatal() ran lock-free at the top of this function; the
+	 * last live member can die (or be hot-removed, NULLing its slot)
+	 * between that check and the map.  map_lba's mask==0 fallback then
+	 * returns member 0, which may be absent — dereferencing it below
+	 * would oops.  Fail the request cleanly instead. */
+	if (member_idx < 0 || member_idx >= RC_VOLUME_MAX_MEMBERS ||
+	    !rc_volume_members[member_idx]) {
+		printk_ratelimited(KERN_ERR
+			"rcraid: %s: op=%u lba=%llu rejected — mapped member %d is absent (member died mid-dispatch)\n",
+			rc_volume_disk ? rc_volume_disk->disk_name : "?",
+			op, (unsigned long long)pos, member_idx);
+		blk_mq_start_request(req);
+		if (rc_volume_claim_completion(pdu))
+			blk_mq_end_request(req, BLK_STS_IOERR);
+		return BLK_STS_OK;
+	}
 	pdu->member_idx = member_idx;
 	pdu->member_mask = BIT(member_idx);
 	atomic_set(&pdu->members_pending, 1);
