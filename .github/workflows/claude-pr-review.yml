@@ -39,8 +39,16 @@ jobs:
           fetch-depth: 0
 
       - uses: anthropics/claude-code-action@v1
+        # The assert step below is the real gate (verdict comment posted or
+        # the check fails); don't let an action-level refusal (e.g. on PRs
+        # that edit this workflow) hard-fail before the assert's exemption
+        # can apply.
+        continue-on-error: true
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          # One top-level review comment that updates in place on every push
+          # instead of stacking a new comment per commit.
+          use_sticky_comment: true
           prompt: |
             You are reviewing PR #${{ github.event.pull_request.number }}
             in this repository.  The checkout is a detached merge commit,
@@ -81,12 +89,17 @@ jobs:
             `gh pr comment ${{ github.event.pull_request.number }} --body "..."`.
             State what you reviewed and then EITHER a short list of the
             issues you filed as inline comments, OR — if you found nothing
-            — that it looks clean and is good to merge. Do NOT end the
-            review without posting this summary comment: a run that posts
-            nothing is indistinguishable from a review that never ran, and
-            a clean pass with no comment cannot be told apart from a
-            failure. If a tool call is denied, do not retry it in a loop —
-            skip it and proceed to this summary.
+            — that it looks clean and is good to merge.  End the comment
+            with a sign-off line, exactly one of:
+              "✅ Approved" — no significant issues, good to merge, or
+              "⚠️ Issues found" — there are findings to address.
+            The CI gate greps for that sign-off — a review without it
+            fails the check.  Do NOT end the review without posting this
+            summary comment: a run that posts nothing is indistinguishable
+            from a review that never ran, and a clean pass with no comment
+            cannot be told apart from a failure. If a tool call is denied,
+            do not retry it in a loop — skip it and proceed to this
+            summary.
           # --allowedTools REPLACES the action's default allowlist, it does
           # not extend it.  So this list must cover BOTH what the reviewer
           # needs to read the change (Read/Grep/Glob, git/gh inspection) AND
@@ -105,3 +118,37 @@ jobs:
             --model claude-sonnet-5
             --max-turns 40
             --allowedTools "Read,Grep,Glob,Bash(gh pr view:*),Bash(gh pr diff:*),Bash(gh pr comment:*),Bash(git diff:*),Bash(git log:*),Bash(git show:*),Bash(git blame:*),Bash(cat:*),Bash(sed:*),Bash(awk:*),Bash(grep:*),Bash(rg:*),Bash(head:*),Bash(tail:*),Bash(ls:*),Bash(wc:*),Bash(find:*),Bash(shellcheck:*),mcp__github_inline_comment__create_inline_comment"
+
+      # Ported from AlpacaBridge (open-astro): the action exits 0 even when
+      # the agent never manages to post its verdict, so a green check could
+      # exist with no review anywhere.  The verdict comment IS the artifact —
+      # a run that produced no fresh bot comment ending in the sign-off line
+      # must fail the check.
+      - name: Assert the review verdict posted
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # A PR that modifies this very workflow can make the action refuse
+          # to run — such PRs are reviewed by eye; don't leave them
+          # permanently red.
+          if gh pr diff "${{ github.event.pull_request.number }}" \
+              --repo "${{ github.repository }}" --name-only \
+              | grep -qx ".github/workflows/claude-pr-review.yml"; then
+            echo "::warning::This PR modifies the review workflow — passing without a verdict. Review it by eye."
+            exit 0
+          fi
+          # Only the BOT's comments count, and only ones touched during THIS
+          # run — a human writing "Approved" in discussion, or a sticky
+          # comment left over from a previous commit's review, must not
+          # satisfy the gate.
+          started="$(gh run view "$GITHUB_RUN_ID" --repo "${{ github.repository }}" --json createdAt --jq .createdAt)"
+          if gh api "repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/comments" \
+              --paginate \
+              | jq -r --arg since "$started" \
+              '.[] | select(.user.login | test("^(claude|github-actions)(\\[bot\\])?$")) | select(.updated_at >= $since) | .body' \
+              | grep -qE "✅ Approved|⚠️ Issues found"; then
+            echo "Review verdict found."
+          else
+            echo "::error::The review agent finished without posting its verdict comment — failing rather than green-lighting a review that does not exist."
+            exit 1
+          fi
