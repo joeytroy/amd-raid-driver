@@ -39,6 +39,7 @@
 #include <linux/highmem.h>
 #include <linux/scatterlist.h>
 #include <linux/dma-mapping.h>
+#include <linux/seq_file.h>
 
 /* Trivial global volume registry — assumes a single RAID0 volume.  Members
  * are inserted as their metadata validates.  Ordered by PCI BDF so the
@@ -80,6 +81,106 @@ static atomic_t rc_volume_rr_next;
  * size silently corrupts the array on write). */
 static const char *rc_volume_geometry_untrust_reason;
 static DEFINE_MUTEX(rc_volume_lock);
+
+/* Per-member availability state (RAID1 degraded mode, issue #51).
+ *
+ * LIVE          — serving reads and receiving writes.
+ * FAILED        — dead or removed; excluded from all dispatch.
+ * NEEDS_RESYNC  — controller recovered (auto/manual reset) after missing
+ *                 writes, or re-plugged.  Its data is stale; it must NOT
+ *                 rejoin dispatch until a resync copies the survivor over
+ *                 it.  Parked in this state until the resync engine lands.
+ * RESYNCING     — reserved for the resync engine (receives writes, serves
+ *                 no reads).
+ *
+ * rc_volume_member_state[] is the authoritative record, written under
+ * rc_volume_lock (or via WRITE_ONCE from the mark-failed fast path — the
+ * mutex protects compound transitions, not the single store).
+ * rc_volume_live_mask is the lock-free hot-path mirror: bit i set iff
+ * state[i] == LIVE.  Dispatch paths read ONLY the mask; degraded RAID1
+ * keeps serving from whatever bits remain.
+ *
+ * All of this is in-memory only.  The driver never writes RAIDCore
+ * metadata (firmware/BIOS own it), so degraded state does not survive a
+ * module reload — a reload behind a stale mirror re-assembles it as if
+ * in sync.  Documented limitation until on-disk state is decoded. */
+enum rc_member_state {
+	RC_MEMBER_LIVE,
+	RC_MEMBER_FAILED,
+	RC_MEMBER_NEEDS_RESYNC,
+	RC_MEMBER_RESYNCING,
+};
+static enum rc_member_state rc_volume_member_state[RC_VOLUME_MAX_MEMBERS];
+static atomic_t rc_volume_live_mask;
+
+static const char *rc_member_state_name(enum rc_member_state st)
+{
+	switch (st) {
+	case RC_MEMBER_LIVE:         return "live";
+	case RC_MEMBER_FAILED:       return "failed";
+	case RC_MEMBER_NEEDS_RESYNC: return "needs-resync";
+	case RC_MEMBER_RESYNCING:    return "resyncing";
+	}
+	return "?";
+}
+
+/* Deferred degrade work: after a member is marked failed from IRQ/hot-path
+ * context, in-flight fan-out requests waiting on it must be drained
+ * (rc_volume_drain_dead sleeps — H-1 controller disable), and auto-reset
+ * should be considered.  Runs in process context. */
+static void rc_volume_degrade_fn(struct work_struct *w);
+static DECLARE_WORK(rc_volume_degrade_work, rc_volume_degrade_fn);
+
+/* Slow-path state transition.  Caller holds rc_volume_lock. */
+static void rc_volume_member_set_state(int idx, enum rc_member_state st)
+{
+	enum rc_member_state old = READ_ONCE(rc_volume_member_state[idx]);
+
+	/* No early-out on old == st: the zero-initialized state array reads
+	 * as LIVE before any member registers, so the first LIVE transition
+	 * must still sync the mask bit.  READ_ONCE/WRITE_ONCE because
+	 * rc_volume_member_mark_failed() stores this element lock-free from
+	 * ISR context concurrently with lock-holding accessors. */
+	WRITE_ONCE(rc_volume_member_state[idx], st);
+	if (st == RC_MEMBER_LIVE)
+		atomic_or(BIT(idx), &rc_volume_live_mask);
+	else
+		atomic_andnot(BIT(idx), &rc_volume_live_mask);
+	if (old == st)
+		return;
+	rc_printk(RC_NOTE,
+		  "rc_volume: member %d (%s) state %s -> %s (live_mask=0x%x)\n",
+		  idx,
+		  rc_volume_members[idx] ?
+			pci_name(rc_volume_members[idx]->pdev) : "absent",
+		  rc_member_state_name(old), rc_member_state_name(st),
+		  atomic_read(&rc_volume_live_mask));
+}
+
+/* Fail a member from any context (ISR, timeout, queue_rq).  Clearing the
+ * live bit is the load-bearing effect — it is what stops new dispatches —
+ * and happens immediately; the state-array store is a single WRITE_ONCE
+ * (the mutex only guards compound transitions).  Schedules the degrade
+ * work to drain in-flight I/O waiting on this member. */
+static void rc_volume_member_mark_failed(int idx)
+{
+	int prev = atomic_fetch_andnot(BIT(idx), &rc_volume_live_mask);
+
+	if (!(prev & BIT(idx)))
+		return;		/* already not live */
+	WRITE_ONCE(rc_volume_member_state[idx], RC_MEMBER_FAILED);
+	rc_printk(RC_ERROR,
+		  "rc_volume: member %d (%s) FAILED — %s (live_mask=0x%x)\n",
+		  idx,
+		  rc_volume_members[idx] ?
+			pci_name(rc_volume_members[idx]->pdev) : "absent",
+		  rc_volume_raid_level == RC_LDT_RAID1 &&
+		  atomic_read(&rc_volume_live_mask) ?
+			"continuing degraded on surviving mirror" :
+			"volume can no longer serve I/O",
+		  atomic_read(&rc_volume_live_mask));
+	schedule_work(&rc_volume_degrade_work);
+}
 
 /* Conservatively hard-code expected member count = 2 (the user's RAID0).
  * A real driver would read this from the metadata; we haven't decoded
@@ -224,7 +325,36 @@ struct rc_volume_pdu {
 	u8                 hctx_idx;       /* hctx the request was queued on;
 					    * .timeout uses it to derive the
 					    * NVMe SQID for Abort */
+	/* Bit i set = this request was submitted to member i.  Set by every
+	 * dispatch path (single-member: BIT(idx); fan-outs: snapshot of the
+	 * members actually submitted to).  Timeout/drain involvement checks
+	 * and the completion accounting below key off this — NOT off the
+	 * global member list, which can change (degrade) while the request
+	 * is in flight. */
+	unsigned int       member_mask;
+	/* Per-member completion accounting for degraded RAID1.
+	 *
+	 * acked: bit i set = member i's completion has been CONSUMED for
+	 * this request — either its CQE arrived (ISR) or the drain path
+	 * synthesized a dead-member completion.  Both paths claim the bit
+	 * with atomic_fetch_or and only decrement members_pending when the
+	 * bit was previously clear, making the decrement exactly-once per
+	 * (request, member) no matter how ISR and drain interleave.
+	 *
+	 * err_members: bit i set = member i completed this request with an
+	 * error (real NVMe status or the dead sentinel).  Lets the finish
+	 * path distinguish "one mirror failed, the other has the data"
+	 * (degraded success) from "everyone failed" (I/O error). */
+	atomic_t           acked;
+	atomic_t           err_members;
 	atomic_t           members_pending;
+	/* Bounded .timeout re-arm count: how many times the EH handler has
+	 * returned BLK_EH_RESET_TIMER for this request while waiting on a
+	 * member that looks alive.  Once exhausted, the still-silent members
+	 * are declared dead — a controller can drop a command without ever
+	 * asserting CSTS.CFS, and waiting forever would hang the request
+	 * (and its tag, and its submitter) with no recovery path. */
+	u8                 eh_retries;
 	/* Single-completion claim.  Multiple actors can race to finish one
 	 * request — the ISR (batched direct-end fast path), the dead-member
 	 * drain, the .timeout handler, and queue_rq's own inline error/hit
@@ -255,6 +385,61 @@ struct rc_volume_pdu {
 static inline bool rc_volume_claim_completion(struct rc_volume_pdu *pdu)
 {
 	return atomic_cmpxchg(&pdu->completed, 0, 1) == 0;
+}
+
+/* Decide the blk status for a request whose last member completion just
+ * landed.  Shared by the ISR's inline-end fast path and the softirq
+ * .complete handler so the degraded-RAID1 policy lives in one place:
+ *
+ *   - RAID1 fan-out (WRITE/DISCARD/FLUSH) where only a SUBSET of the
+ *     members errored: the data is durable on the member(s) that
+ *     succeeded — mark the erroring members failed (degrading the
+ *     volume) and complete the request OK.  Failing it would punish the
+ *     upper layers for a redundancy the array just spent a mirror to
+ *     provide.
+ *   - RAID1 READ error: the picked member failed the read; mark it
+ *     failed so subsequent reads route to the survivor.  This request
+ *     still errors (retry-on-survivor is a follow-up).
+ *   - Everything else keeps today's semantics: any error fails the
+ *     request. */
+static blk_status_t rc_volume_finish_status(struct request *req)
+{
+	struct rc_volume_pdu *pdu = blk_mq_rq_to_pdu(req);
+	unsigned long errs = (unsigned long)(unsigned int)atomic_read(&pdu->err_members);
+	unsigned int mask = pdu->member_mask;
+	int i;
+
+	if (!READ_ONCE(pdu->sc_sct))
+		return BLK_STS_OK;
+
+	if (rc_volume_raid_level != RC_LDT_RAID1 || !mask || !errs)
+		return BLK_STS_IOERR;
+
+	if (pdu->op == REQ_OP_READ) {
+		for_each_set_bit(i, &errs, RC_VOLUME_MAX_MEMBERS)
+			rc_volume_member_mark_failed(i);
+		return BLK_STS_IOERR;
+	}
+
+	if ((errs & mask) == mask) {
+		/* Every submitted member errored — the request fails, and the
+		 * erroring members must ALSO be marked failed (same as the
+		 * READ branch above): a lone survivor that starts failing
+		 * every write would otherwise stay "live" forever, with the
+		 * volume re-dispatching to it instead of being declared
+		 * down. */
+		for_each_set_bit(i, &errs, RC_VOLUME_MAX_MEMBERS)
+			rc_volume_member_mark_failed(i);
+		return BLK_STS_IOERR;
+	}
+
+	for_each_set_bit(i, &errs, RC_VOLUME_MAX_MEMBERS)
+		rc_volume_member_mark_failed(i);
+	printk_ratelimited(KERN_WARNING
+		"rcraid: %s: op=%u lba=%llu completed degraded (err_members=0x%lx of 0x%x) — data durable on surviving mirror\n",
+		rc_volume_disk ? rc_volume_disk->disk_name : "?",
+		pdu->op, (unsigned long long)blk_rq_pos(req), errs, mask);
+	return BLK_STS_OK;
 }
 
 /* Sentinel value stored into pdu->sc_sct by the drain path so .complete
@@ -409,9 +594,30 @@ irqreturn_t rc_nvme_io_queue_irq(int irq, void *dev_id)
 					  q->sync_cid, q->sync_pending);
 			}
 		} else {
+			int slot = READ_ONCE(adapter->ctx.nvme.volume_slot);
+
+			/* A blk-mq-CID CQE on an adapter with NO registry slot
+			 * cannot belong to a live request: either this adapter
+			 * was never a member (its queues never carry volume
+			 * tags), or it was HOT-REMOVED — and the removal path
+			 * drains (synthesizing this member's completion) before
+			 * clearing volume_slot, so this is a late CQE whose
+			 * request side is already settled.  Touching the pdu
+			 * here would bypass the per-member acked gate and
+			 * double-decrement a possibly TAG-REUSED request.
+			 * Consume and drop. */
+			if (slot < 0) {
+				printk_ratelimited(KERN_WARNING
+					"rcraid: %s qid=%u dropping CQE CID=%u — adapter is not a volume member (late completion after removal?)\n",
+					pci_name(adapter->pdev), q->qid, cid);
+				goto cqe_consumed;
+			}
+
 			req = blk_mq_tag_to_rq(tags, cid);
 			if (req) {
 				u16 sc = (status >> 1) & 0x7fff;
+				bool consume;
+
 				pdu = blk_mq_rq_to_pdu(req);
 				if (sc) {
 					/* First-error-wins, single aligned
@@ -420,9 +626,15 @@ irqreturn_t rc_nvme_io_queue_irq(int irq, void *dev_id)
 					 * store is atomic so the field holds
 					 * ONE of the members' statuses (never
 					 * a torn mix), and error-vs-success
-					 * is always preserved. */
+					 * is always preserved.  err_members
+					 * additionally records WHICH members
+					 * errored, so the finish path can
+					 * treat a partial mirror failure as
+					 * degraded success. */
 					if (!READ_ONCE(pdu->sc_sct))
 						WRITE_ONCE(pdu->sc_sct, sc);
+					atomic_or(BIT(slot),
+						  &pdu->err_members);
 					rc_printk(RC_ERROR,
 						  "rc_nvme_io_queue_irq: %s qid=%u CID=%u op=%u pos=%llu len=%u failed SC/SCT=0x%04x\n",
 						  pci_name(adapter->pdev), q->qid,
@@ -430,7 +642,18 @@ irqreturn_t rc_nvme_io_queue_irq(int irq, void *dev_id)
 						  (u64)blk_rq_pos(req),
 						  blk_rq_sectors(req), sc);
 				}
-				if (atomic_dec_and_test(&pdu->members_pending) &&
+				/* Exactly-once completion consumption per
+				 * (request, member): if the drain path
+				 * already synthesized this member's
+				 * completion (bit set), this is a late CQE —
+				 * do NOT decrement again. */
+				{
+					int prev = atomic_fetch_or(BIT(slot),
+								   &pdu->acked);
+					consume = !(prev & BIT(slot));
+				}
+				if (consume &&
+				    atomic_dec_and_test(&pdu->members_pending) &&
 				    rc_volume_claim_completion(pdu)) {
 					/* Try to defer to local batch; fall back
 					 * to the softirq path if the batch is full.
@@ -449,6 +672,7 @@ irqreturn_t rc_nvme_io_queue_irq(int irq, void *dev_id)
 			}
 		}
 
+cqe_consumed:
 		/* One CQE consumed = one SQE slot free (C-4 accounting). */
 		if (q->sq_inflight)
 			q->sq_inflight--;
@@ -477,10 +701,7 @@ irqreturn_t rc_nvme_io_queue_irq(int irq, void *dev_id)
 			struct request *req = done_reqs[i];
 			struct rc_volume_pdu *pdu = blk_mq_rq_to_pdu(req);
 			rc_volume_unmap_request_sg(pdu);
-			if (pdu->sc_sct)
-				blk_mq_end_request(req, BLK_STS_IOERR);
-			else
-				blk_mq_end_request(req, BLK_STS_OK);
+			blk_mq_end_request(req, rc_volume_finish_status(req));
 		}
 	}
 	return IRQ_HANDLED;
@@ -2029,8 +2250,31 @@ static void rc_volume_map_lba(u64 logical_lba, int *out_member, u64 *out_phys)
 	u64 phys_stripe;
 
 	if (rc_volume_raid_level == RC_LDT_RAID1) {
-		member_idx = (u32)((u32)atomic_inc_return(&rc_volume_rr_next) %
-				   (u32)nmembers);
+		/* Round-robin over the LIVE members only.  The mask read is
+		 * deliberately lock-free (hot path); a member failing between
+		 * this pick and submission is handled by the drain path like
+		 * any other in-flight death.  mask==0 cannot reach here —
+		 * queue_rq fast-fails via rc_volume_fatal first — but fall
+		 * back to member 0 defensively rather than div-by-zero. */
+		unsigned long mask =
+			(unsigned long)(unsigned int)atomic_read(&rc_volume_live_mask);
+		unsigned int nlive = hweight_long(mask);
+
+		if (unlikely(!nlive)) {
+			member_idx = 0;
+		} else {
+			u32 n = (u32)atomic_inc_return(&rc_volume_rr_next) %
+				nlive;
+			unsigned int b;
+
+			member_idx = 0;
+			for_each_set_bit(b, &mask, RC_VOLUME_MAX_MEMBERS) {
+				if (!n--) {
+					member_idx = b;
+					break;
+				}
+			}
+		}
 		*out_member = (int)member_idx;
 		*out_phys   = logical_lba +
 			      rc_volume_member_phys_offset[member_idx];
@@ -2346,6 +2590,21 @@ static void rc_volume_register_member(struct rc_adapter *adapter)
 		}
 	}
 
+	/* A live volume never accepts (re-)registrations.  A member slot can
+	 * be empty here only because that member failed or was hot-removed
+	 * while the volume kept serving degraded — its data missed every
+	 * write since, so joining it straight into dispatch would serve
+	 * stale blocks to half the reads.  Proper re-admission requires the
+	 * resync engine (issue #51 follow-up); until then a re-plugged
+	 * member stays out and the volume stays degraded. */
+	if (rc_volume_disk) {
+		rc_printk(RC_WARN,
+			  "rc_volume_register_member: %s probed while /dev/rcraid0 is live — re-add requires resync support, member NOT joined (volume stays %s)\n",
+			  pci_name(adapter->pdev),
+			  atomic_read(&rc_volume_live_mask) ? "degraded" : "failed");
+		goto out;
+	}
+
 	if (have_ld) {
 		pos = nvme->ld_my_position;
 		if (pos < 0 || pos >= (int)expected) {
@@ -2364,6 +2623,8 @@ static void rc_volume_register_member(struct rc_adapter *adapter)
 		rc_volume_members[pos] = adapter;
 		rc_volume_member_phys_offset[pos] = nvme->ld_userdata_offset;
 		rc_volume_member_count++;
+		nvme->volume_slot = pos;
+		rc_volume_member_set_state(pos, RC_MEMBER_LIVE);
 	} else {
 		/* Legacy BDF-sorted insertion.  The member order and phys
 		 * offsets here are a guess (no on-disk LD to read them from),
@@ -2384,6 +2645,14 @@ static void rc_volume_register_member(struct rc_adapter *adapter)
 		rc_volume_members[pos] = adapter;
 		rc_volume_member_phys_offset[pos] = 0;
 		rc_volume_member_count++;
+		/* The insertion shifted slots — rebuild every member's cached
+		 * slot index and (re)assert LIVE state for all of them.  Only
+		 * reachable pre-disk (assembly time), so no I/O is in flight
+		 * against the old indices. */
+		for (i = 0; i < rc_volume_member_count; i++) {
+			rc_volume_members[i]->ctx.nvme.volume_slot = i;
+			rc_volume_member_set_state(i, RC_MEMBER_LIVE);
+		}
 	}
 
 	rc_printk(RC_INFO,
@@ -2469,6 +2738,15 @@ static void rc_volume_unmap_request_sg(struct rc_volume_pdu *pdu)
 			    m < RC_VOLUME_MAX_MEMBERS; m++) {
 			if (!pdu->ms_nents[m])
 				continue;
+			/* NULL slot = the member was hot-removed while this
+			 * request was in flight (remove_member freezes the
+			 * queue before NULLing, so this is belt-and-braces).
+			 * Its IOMMU domain is being torn down with the
+			 * device — skip the unmap rather than deref NULL. */
+			if (!rc_volume_members[m]) {
+				pdu->ms_nents[m] = 0;
+				continue;
+			}
 			dma_dev = &rc_volume_members[m]->pdev->dev;
 			dma_unmap_sg(dma_dev, pdu->ms_sg[m], pdu->ms_nents[m],
 				     rc_volume_dma_dir(pdu->op));
@@ -2480,7 +2758,8 @@ static void rc_volume_unmap_request_sg(struct rc_volume_pdu *pdu)
 
 	if (!pdu->nents)
 		return;
-	if (pdu->member_idx < 0 || pdu->member_idx >= rc_volume_member_count) {
+	if (pdu->member_idx < 0 || pdu->member_idx >= rc_volume_member_count ||
+	    !rc_volume_members[pdu->member_idx]) {
 		pdu->nents = 0;
 		return;
 	}
@@ -2633,17 +2912,34 @@ static void rc_volume_build_discard_sqe(struct rc_nvme_sqe *cmd, unsigned int hc
 	cmd->cdw11 = cpu_to_le32(RC_NVME_DSM_AD); /* Deallocate */
 }
 
-/* Returns true if any member adapter has been flagged dead.  Hot-path check
- * called from rc_volume_queue_rq; if true the RAID0 volume is unusable and
- * every incoming request fast-fails. */
-static inline bool rc_volume_any_member_dead(void)
+/* Hot-path availability check, called from rc_volume_queue_rq.
+ *
+ * First folds any freshly-set `dead` flags into the member state machine
+ * (the flag writers — ISR CSTS check, timeout, PM, reset — don't know
+ * about volume state; this is the single sync point).  Then:
+ *
+ *   RAID0: any non-live member makes the volume unusable — every stripe
+ *          crosses every member.
+ *   RAID1: the volume is fatal only when NO live member remains; a
+ *          surviving mirror keeps serving (degraded mode). */
+static inline bool rc_volume_fatal(void)
 {
 	int i;
 
-	for (i = 0; i < rc_volume_member_count; i++)
-		if (READ_ONCE(rc_volume_members[i]->ctx.nvme.dead))
-			return true;
-	return false;
+	for (i = 0; i < rc_volume_member_count && i < RC_VOLUME_MAX_MEMBERS;
+	     i++) {
+		struct rc_adapter *m = rc_volume_members[i];
+
+		if (m && READ_ONCE(m->ctx.nvme.dead) &&
+		    (atomic_read(&rc_volume_live_mask) & BIT(i)))
+			rc_volume_member_mark_failed(i);
+	}
+
+	if (rc_volume_raid_level == RC_LDT_RAID1)
+		return atomic_read(&rc_volume_live_mask) == 0;
+
+	return atomic_read(&rc_volume_live_mask) !=
+	       (int)(BIT(rc_volume_member_count) - 1);
 }
 
 /* blk-mq request handler.  chunk_sectors=stripe_sectors in queue_limits
@@ -2870,6 +3166,10 @@ static blk_status_t rc_volume_dispatch_multi_stripe(
 	}
 
 	pdu->member_idx = -1;	/* multi-member — no single member to attribute */
+	pdu->member_mask = 0;
+	for (m = 0; m < nm; m++)
+		if (pdu->ms_nents[m])
+			pdu->member_mask |= BIT(m);
 	atomic_set(&pdu->members_pending, members_with_data);
 
 	/* Build every member's SQE BEFORE starting/submitting anything, so a
@@ -3002,6 +3302,10 @@ static blk_status_t rc_volume_dispatch_multi_stripe_discard(
 	 * completion.  Use member_idx=-1 + members_pending=N so the ISR's
 	 * atomic_dec_and_test completes only on the last member's DSM. */
 	pdu->member_idx = -1;
+	pdu->member_mask = 0;
+	for (m = 0; m < nm; m++)
+		if (member_has_data[m])
+			pdu->member_mask |= BIT(m);
 	atomic_set(&pdu->members_pending, members_with_data);
 
 	blk_mq_start_request(req);
@@ -3050,12 +3354,29 @@ static blk_status_t rc_volume_dispatch_mirror(
 {
 	const int nm = rc_volume_member_count;
 	u32 tag = req->tag;
+	unsigned long mask;
 	int m;
 
 	if (nm <= 0 || nm > RC_VOLUME_MAX_MEMBERS) {
 		rc_printk(RC_ERROR,
 			  "rc_volume_dispatch_mirror: bad volume state (members=%d) — pos=%llu len=%u rejected\n",
 			  nm, (u64)pos, nr_sectors);
+		return BLK_STS_IOERR;
+	}
+
+	/* Snapshot the live mask ONCE and use it for the whole dispatch —
+	 * sg build, dma_map, SQE reservation, submit, and the pending
+	 * count must all agree on the same member set even if a member
+	 * fails concurrently.  A member dying after this snapshot is the
+	 * in-flight-death case the drain path already handles; a member
+	 * dying before it is simply skipped (degraded write to the
+	 * survivor only, which is the whole point). */
+	mask = (unsigned long)(unsigned int)atomic_read(&rc_volume_live_mask) &
+	       (BIT(nm) - 1);
+	if (!mask) {
+		rc_printk(RC_ERROR,
+			  "rc_volume_dispatch_mirror: no live member — pos=%llu len=%u rejected\n",
+			  (u64)pos, nr_sectors);
 		return BLK_STS_IOERR;
 	}
 
@@ -3111,10 +3432,14 @@ static blk_status_t rc_volume_dispatch_mirror(
 
 		pdu->ms_active = true;
 		for (m = 0; m < nm; m++) {
-			struct device *dma_dev =
-				&rc_volume_members[m]->pdev->dev;
-			int mapped = dma_map_sg(dma_dev, pdu->ms_sg[m], used,
-						DMA_TO_DEVICE);
+			struct device *dma_dev;
+			int mapped;
+
+			if (!(mask & BIT(m)))
+				continue;	/* ms_nents stays 0 → skipped */
+			dma_dev = &rc_volume_members[m]->pdev->dev;
+			mapped = dma_map_sg(dma_dev, pdu->ms_sg[m], used,
+					    DMA_TO_DEVICE);
 
 			if (mapped == 0) {
 				rc_printk(RC_ERROR,
@@ -3122,6 +3447,8 @@ static blk_status_t rc_volume_dispatch_mirror(
 					  m, (u64)pos, nr_sectors);
 				pdu->ms_nents[m] = 0;
 				for (--m; m >= 0; m--) {
+					if (!pdu->ms_nents[m])
+						continue;
 					dma_dev = &rc_volume_members[m]->pdev->dev;
 					dma_unmap_sg(dma_dev, pdu->ms_sg[m],
 						     pdu->ms_nents[m],
@@ -3138,20 +3465,24 @@ static blk_status_t rc_volume_dispatch_mirror(
 	 * memset, so unmap no-ops; the DSM range lives in the per-tag PRP
 	 * buffer, one per (hctx, member, tag). */
 
-	/* One SQE per member — reserve them all or requeue (C-4).  Runs
-	 * before blk_mq_start_request so BLK_STS_DEV_RESOURCE is a clean
-	 * "try again" for blk-mq. */
+	/* One SQE per LIVE member — reserve them all or requeue (C-4).
+	 * Runs before blk_mq_start_request so BLK_STS_DEV_RESOURCE is a
+	 * clean "try again" for blk-mq. */
 	for (m = 0; m < nm; m++) {
+		if (!(mask & BIT(m)))
+			continue;
 		if (!rc_nvme_sq_reserve(rc_volume_members[m]->ctx.nvme.io_queues[hctx->queue_num], 1)) {
 			while (m-- > 0)
-				rc_nvme_sq_unreserve(rc_volume_members[m]->ctx.nvme.io_queues[hctx->queue_num], 1);
+				if (mask & BIT(m))
+					rc_nvme_sq_unreserve(rc_volume_members[m]->ctx.nvme.io_queues[hctx->queue_num], 1);
 			rc_volume_unmap_request_sg(pdu);
 			return BLK_STS_DEV_RESOURCE;
 		}
 	}
 
-	pdu->member_idx = -1;	/* multi-member — timeout/drain treat as all */
-	atomic_set(&pdu->members_pending, nm);
+	pdu->member_idx = -1;	/* multi-member — see member_mask */
+	pdu->member_mask = (unsigned int)mask;
+	atomic_set(&pdu->members_pending, hweight_long(mask));
 
 	/* Build all SQEs before starting/submitting so a PRP-expressibility
 	 * failure can still cleanly reject the request. */
@@ -3161,6 +3492,8 @@ static blk_status_t rc_volume_dispatch_mirror(
 		for (m = 0; m < nm; m++) {
 			u64 phys = (u64)pos + rc_volume_member_phys_offset[m];
 
+			if (!(mask & BIT(m)))
+				continue;
 			if (op == REQ_OP_WRITE) {
 				if (rc_volume_build_io_sqe(&cmds[m],
 						hctx->queue_num, m, tag,
@@ -3172,7 +3505,8 @@ static blk_status_t rc_volume_dispatch_mirror(
 					int u;
 
 					for (u = 0; u < nm; u++)
-						rc_nvme_sq_unreserve(rc_volume_members[u]->ctx.nvme.io_queues[hctx->queue_num], 1);
+						if (mask & BIT(u))
+							rc_nvme_sq_unreserve(rc_volume_members[u]->ctx.nvme.io_queues[hctx->queue_num], 1);
 					rc_volume_unmap_request_sg(pdu);
 					return BLK_STS_IOERR;
 				}
@@ -3185,8 +3519,9 @@ static blk_status_t rc_volume_dispatch_mirror(
 
 		blk_mq_start_request(req);
 		for (m = 0; m < nm; m++)
-			rc_nvme_io_submit(rc_volume_members[m]->ctx.nvme.io_queues[hctx->queue_num],
-					  &cmds[m]);
+			if (mask & BIT(m))
+				rc_nvme_io_submit(rc_volume_members[m]->ctx.nvme.io_queues[hctx->queue_num],
+						  &cmds[m]);
 	}
 
 	return BLK_STS_OK;
@@ -3213,21 +3548,24 @@ static blk_status_t rc_volume_queue_rq(struct blk_mq_hw_ctx *hctx,
 	pdu->ms_active = false;
 	memset(pdu->ms_nents, 0, sizeof(pdu->ms_nents));
 	atomic_set(&pdu->completed, 0);
+	pdu->member_mask = 0;
+	pdu->eh_retries = 0;
+	atomic_set(&pdu->acked, 0);
+	atomic_set(&pdu->err_members, 0);
 	pdu->hctx_idx = (u8)(hctx->queue_num < RC_VOLUME_MAX_HCTX ?
 			     hctx->queue_num : 0xff);
 
-	/* If any member adapter has been flagged dead (by the ISR's CSTS
-	 * check, by a prior timeout, or by drain), the RAID0 volume can't
-	 * serve I/O.  Fail every incoming request rather than wedging more
-	 * CIDs against a controller we no longer trust. */
-	if (rc_volume_any_member_dead()) {
-		/* NO DEGRADED MODE (yet): one dead member fails the whole
-		 * volume — including RAID1, which therefore provides
-		 * redundancy of data at rest but not availability.  Say so
-		 * explicitly instead of failing I/O silently. */
+	/* Fold freshly-set dead flags into the member state machine and
+	 * check availability.  RAID0 fails on any dead member (every stripe
+	 * needs every member); RAID1 keeps serving degraded from the
+	 * surviving mirror and only fast-fails once no live member is left. */
+	if (rc_volume_fatal()) {
 		printk_ratelimited(KERN_ERR
-			"rcraid: %s: failing I/O — a member controller is dead and the driver has no degraded mode (all I/O fails until reset/reload)\n",
-			rc_volume_disk ? rc_volume_disk->disk_name : "?");
+			"rcraid: %s: failing I/O — %s (all I/O fails until reset/reload)\n",
+			rc_volume_disk ? rc_volume_disk->disk_name : "?",
+			rc_volume_raid_level == RC_LDT_RAID1 ?
+				"no live mirror member remains" :
+				"a member controller is dead and RAID0 has no degraded mode");
 		blk_mq_start_request(req);
 		if (rc_volume_claim_completion(pdu)) {
 			blk_mq_end_request(req, BLK_STS_IOERR);
@@ -3251,19 +3589,43 @@ static blk_status_t rc_volume_queue_rq(struct blk_mq_hw_ctx *hctx,
 	 * completes on the last ack — that is the correct and optimal shape.
 	 * fsync cost is NVMe flush latency (physics), not a driver defect. */
 	if (op == REQ_OP_FLUSH) {
-		/* Reserve one SQE per member queue before starting; on a
-		 * full SQ hand the request back to blk-mq for a retry
+		/* Snapshot the live mask once for the whole fan-out (same
+		 * contract as dispatch_mirror).  For RAID0 this is always
+		 * every member — a non-live RAID0 member fast-failed above.
+		 * For degraded RAID1 the flush goes to the survivor(s) only:
+		 * the failed mirror is stale by definition, its cache state
+		 * is irrelevant. */
+		unsigned long fmask =
+			(unsigned long)(unsigned int)atomic_read(&rc_volume_live_mask) &
+			(BIT(rc_volume_member_count) - 1);
+
+		if (!fmask) {
+			printk_ratelimited(KERN_ERR
+				"rcraid: %s: FLUSH rejected — no live member to flush\n",
+				rc_volume_disk ? rc_volume_disk->disk_name : "?");
+			blk_mq_start_request(req);
+			if (rc_volume_claim_completion(pdu))
+				blk_mq_end_request(req, BLK_STS_IOERR);
+			return BLK_STS_OK;
+		}
+
+		/* Reserve one SQE per live member queue before starting; on
+		 * a full SQ hand the request back to blk-mq for a retry
 		 * instead of overrunning the ring (C-4). */
 		for (i = 0; i < rc_volume_member_count; i++) {
+			if (!(fmask & BIT(i)))
+				continue;
 			if (!rc_nvme_sq_reserve(rc_volume_members[i]->ctx.nvme.io_queues[hctx->queue_num], 1)) {
 				while (i-- > 0)
-					rc_nvme_sq_unreserve(rc_volume_members[i]->ctx.nvme.io_queues[hctx->queue_num], 1);
+					if (fmask & BIT(i))
+						rc_nvme_sq_unreserve(rc_volume_members[i]->ctx.nvme.io_queues[hctx->queue_num], 1);
 				return BLK_STS_DEV_RESOURCE;
 			}
 		}
 
-		atomic_set(&pdu->members_pending, rc_volume_member_count);
+		atomic_set(&pdu->members_pending, hweight_long(fmask));
 		pdu->member_idx = -1;
+		pdu->member_mask = (unsigned int)fmask;
 		rc_volume_build_flush_sqe(&cmd, tag);
 
 		blk_mq_start_request(req);
@@ -3271,8 +3633,9 @@ static blk_status_t rc_volume_queue_rq(struct blk_mq_hw_ctx *hctx,
 		 * land on the same hctx so blk_mq_tag_to_rq's tags[hctx_idx]
 		 * lookup resolves to the right request. */
 		for (i = 0; i < rc_volume_member_count; i++)
-			rc_nvme_io_submit(rc_volume_members[i]->ctx.nvme.io_queues[hctx->queue_num],
-					  &cmd);
+			if (fmask & BIT(i))
+				rc_nvme_io_submit(rc_volume_members[i]->ctx.nvme.io_queues[hctx->queue_num],
+						  &cmd);
 		return BLK_STS_OK;
 	}
 
@@ -3388,7 +3751,24 @@ static blk_status_t rc_volume_queue_rq(struct blk_mq_hw_ctx *hctx,
 	}
 
 	rc_volume_map_lba(pos, &member_idx, &phys_lba);
+	/* rc_volume_fatal() ran lock-free at the top of this function; the
+	 * last live member can die (or be hot-removed, NULLing its slot)
+	 * between that check and the map.  map_lba's mask==0 fallback then
+	 * returns member 0, which may be absent — dereferencing it below
+	 * would oops.  Fail the request cleanly instead. */
+	if (member_idx < 0 || member_idx >= RC_VOLUME_MAX_MEMBERS ||
+	    !rc_volume_members[member_idx]) {
+		printk_ratelimited(KERN_ERR
+			"rcraid: %s: op=%u lba=%llu rejected — mapped member %d is absent (member died mid-dispatch)\n",
+			rc_volume_disk ? rc_volume_disk->disk_name : "?",
+			op, (unsigned long long)pos, member_idx);
+		blk_mq_start_request(req);
+		if (rc_volume_claim_completion(pdu))
+			blk_mq_end_request(req, BLK_STS_IOERR);
+		return BLK_STS_OK;
+	}
 	pdu->member_idx = member_idx;
+	pdu->member_mask = BIT(member_idx);
 	atomic_set(&pdu->members_pending, 1);
 
 	if (op == REQ_OP_DISCARD) {
@@ -3453,8 +3833,17 @@ static blk_status_t rc_volume_queue_rq(struct blk_mq_hw_ctx *hctx,
 static void rc_volume_complete(struct request *req)
 {
 	struct rc_volume_pdu *pdu = blk_mq_rq_to_pdu(req);
+	blk_status_t st;
 
 	rc_volume_unmap_request_sg(pdu);
+
+	/* Degraded-RAID1 policy (partial mirror failure = success + degrade)
+	 * lives in rc_volume_finish_status, shared with the ISR fast path. */
+	st = rc_volume_finish_status(req);
+	if (st == BLK_STS_OK) {
+		blk_mq_end_request(req, BLK_STS_OK);
+		return;
+	}
 
 	if (pdu->sc_sct) {
 		/* pdu->sc_sct holds CQE.status >> 1, so:
@@ -3538,17 +3927,14 @@ static void rc_nvme_disable_dead_controller(struct rc_adapter *adapter)
 	}
 }
 
-/* Does this request need `member` to complete?  FLUSH and every
- * multi-member dispatch (member_idx == -1: RAID0 multi-stripe R/W, RAID0
- * multi-member discard, RAID1 mirror write/discard) involve all members —
- * for a multi-stripe request that only touched a subset this is
- * conservative, but a volume with any dead member is failing those
- * requests anyway.  Single-member requests involve exactly member_idx. */
+/* Does this request need `member` to complete?  Every dispatch path
+ * records the members it actually submitted to in pdu->member_mask, so
+ * involvement is an exact bit test — no more "member_idx==-1 means
+ * everyone" conservatism.  A zero mask (request failed before any
+ * submission) involves nobody. */
 static bool rc_volume_req_involves(const struct rc_volume_pdu *pdu, int member)
 {
-	if (pdu->op == REQ_OP_FLUSH || pdu->member_idx < 0)
-		return true;
-	return pdu->member_idx == member;
+	return (pdu->member_mask & BIT(member)) != 0;
 }
 
 /* blk_mq_tagset_busy_iter callback.  For each in-flight request, decide
@@ -3560,26 +3946,44 @@ static bool rc_volume_drain_iter(struct request *req, void *priv)
 {
 	struct rc_volume_drain_ctx *ctx = priv;
 	struct rc_volume_pdu *pdu = blk_mq_rq_to_pdu(req);
-	bool kill = false;
+	unsigned long involved = pdu->member_mask & ctx->dead_mask;
+	bool last = false;
 	int i;
 
-	for (i = 0; i < rc_volume_member_count && i < RC_VOLUME_MAX_MEMBERS;
-	     i++) {
-		if ((ctx->dead_mask & BIT(i)) &&
-		    rc_volume_req_involves(pdu, i)) {
-			kill = true;
-			break;
-		}
+	if (!involved)
+		return true;
+
+	/* Synthesize a completion for each dead involved member whose real
+	 * CQE was never consumed.  The acked bitmap makes the
+	 * members_pending decrement exactly-once per (request, member)
+	 * regardless of how this interleaves with the ISR: whoever sets the
+	 * bit first owns that member's decrement, and a late CQE from a
+	 * revived controller (queues are zeroed on reset, but belt and
+	 * braces) finds the bit already set and backs off.
+	 *
+	 * A request whose OTHER members are alive is NOT force-failed
+	 * anymore: their ACKs (or these synthesized ones) drive
+	 * members_pending to zero, and rc_volume_finish_status turns a
+	 * partial mirror failure into a degraded success. */
+	for_each_set_bit(i, &involved, RC_VOLUME_MAX_MEMBERS) {
+		int prev = atomic_fetch_or(BIT(i), &pdu->acked);
+
+		if (prev & BIT(i))
+			continue;	/* CQE already consumed for this member */
+		atomic_or(BIT(i), &pdu->err_members);
+		if (!READ_ONCE(pdu->sc_sct))
+			WRITE_ONCE(pdu->sc_sct, RC_VOLUME_SC_DEAD);
+		if (atomic_dec_and_test(&pdu->members_pending))
+			last = true;
 	}
 
-	if (kill && !blk_mq_request_completed(req) &&
+	if (last && !blk_mq_request_completed(req) &&
 	    rc_volume_claim_completion(pdu)) {
 		/* The claim is what makes this safe against the ISR's
 		 * direct-end fast path, which bypasses the
 		 * blk_mq_complete_request state machine entirely — the
 		 * completed-state check alone leaves a double-completion
 		 * window there. */
-		WRITE_ONCE(pdu->sc_sct, RC_VOLUME_SC_DEAD);
 		blk_mq_complete_request(req);
 	}
 	return true;
@@ -3605,8 +4009,9 @@ static void rc_volume_schedule_auto_reset_for_req(struct rc_volume_pdu *pdu)
 {
 	int i;
 
-	for (i = 0; i < rc_volume_member_count; i++)
-		if (rc_volume_req_involves(pdu, i))
+	for (i = 0; i < rc_volume_member_count && i < RC_VOLUME_MAX_MEMBERS;
+	     i++)
+		if (rc_volume_req_involves(pdu, i) && rc_volume_members[i])
 			rc_nvme_schedule_auto_reset(rc_volume_members[i]);
 }
 
@@ -3619,18 +4024,46 @@ static void rc_volume_drain_dead(void)
 
 	if (!rc_volume_disk)
 		return;
-	for (i = 0; i < rc_volume_member_count; i++)
-		if (READ_ONCE(rc_volume_members[i]->ctx.nvme.dead))
+	for (i = 0; i < rc_volume_member_count && i < RC_VOLUME_MAX_MEMBERS;
+	     i++) {
+		struct rc_adapter *m = rc_volume_members[i];
+
+		/* A NULL slot is a hot-removed member — gone, and by
+		 * definition unable to complete anything: treat as dead so
+		 * in-flight requests still waiting on it get synthesized
+		 * completions. */
+		if (!m || READ_ONCE(m->ctx.nvme.dead))
 			ctx.dead_mask |= BIT(i);
+	}
 	if (!ctx.dead_mask)
 		return;
 	/* H-1: quiesce the dead controllers' DMA engines BEFORE ending
 	 * requests — ending a request unmaps its scatterlist, and a still-
 	 * enabled controller may still be working the command. */
-	for (i = 0; i < rc_volume_member_count; i++)
-		if (ctx.dead_mask & BIT(i))
+	for (i = 0; i < rc_volume_member_count && i < RC_VOLUME_MAX_MEMBERS;
+	     i++)
+		if ((ctx.dead_mask & BIT(i)) && rc_volume_members[i])
 			rc_nvme_disable_dead_controller(rc_volume_members[i]);
 	blk_mq_tagset_busy_iter(&rc_volume_tagset, rc_volume_drain_iter, &ctx);
+}
+
+/* Deferred degrade handler (scheduled by rc_volume_member_mark_failed from
+ * IRQ/hot-path context).  Drains in-flight requests waiting on the failed
+ * member(s) — without this they'd sit until the 30 s blk-mq timeout — and
+ * kicks auto-reset for any dead controller so a transient wedge can come
+ * back (as NEEDS_RESYNC, not silently live). */
+static void rc_volume_degrade_fn(struct work_struct *w)
+{
+	int i;
+
+	rc_volume_drain_dead();
+	for (i = 0; i < rc_volume_member_count && i < RC_VOLUME_MAX_MEMBERS;
+	     i++) {
+		struct rc_adapter *m = rc_volume_members[i];
+
+		if (m && READ_ONCE(m->ctx.nvme.dead))
+			rc_nvme_schedule_auto_reset(m);
+	}
 }
 
 /* blk-mq .timeout callback.  Fires at the default 30 s when a request's
@@ -3651,15 +4084,21 @@ static enum blk_eh_timer_return rc_volume_timeout(struct request *req)
 {
 	struct rc_volume_pdu *pdu = blk_mq_rq_to_pdu(req);
 	bool any_dead = false;
+	unsigned long waiting;
 	int i;
 
 	if (blk_mq_request_completed(req))
 		return BLK_EH_DONE;
 
-	for (i = 0; i < rc_volume_member_count; i++)
-		if (rc_volume_req_involves(pdu, i) &&
+	for (i = 0; i < rc_volume_member_count && i < RC_VOLUME_MAX_MEMBERS;
+	     i++) {
+		if (!rc_volume_req_involves(pdu, i))
+			continue;
+		/* A NULL slot (hot-removed member) can never complete. */
+		if (!rc_volume_members[i] ||
 		    rc_nvme_check_dead(rc_volume_members[i]))
 			any_dead = true;
+	}
 
 	if (any_dead) {
 		rc_printk(RC_ERROR,
@@ -3667,12 +4106,38 @@ static enum blk_eh_timer_return rc_volume_timeout(struct request *req)
 			  req->tag, pdu->op);
 		rc_volume_drain_dead();
 		rc_volume_schedule_auto_reset_for_req(pdu);
-		if (!blk_mq_request_completed(req) &&
-		    rc_volume_claim_completion(pdu)) {
-			/* Drain should have caught it; if it didn't (e.g.,
-			 * member_idx out of range for some reason) the
-			 * direct end path bypasses .complete, so unmap here.
-			 * A lost claim means the drain or ISR owns it. */
+		if (blk_mq_request_completed(req))
+			return BLK_EH_DONE;
+		/* Members still owed a completion after the drain LOOK alive
+		 * (the drain synthesized every confirmed-dead one) — their
+		 * CQEs are probably coming.  Give them the timer back instead
+		 * of force-failing a request that will complete degraded-OK —
+		 * but only a bounded number of times: a controller can drop a
+		 * command without ever asserting CSTS.CFS, and re-arming
+		 * forever would hang the request with no recovery.  After two
+		 * full extra timeout periods the silent member is treated as
+		 * dead and the drain finishes the request. */
+		waiting = pdu->member_mask &
+			  ~(unsigned long)(unsigned int)atomic_read(&pdu->acked);
+		if (waiting) {
+			if (pdu->eh_retries < 2) {
+				pdu->eh_retries++;
+				return BLK_EH_RESET_TIMER;
+			}
+			rc_printk(RC_ERROR,
+				  "rc_volume_timeout: tag=%u members 0x%lx never completed across %u timeout periods without asserting CFS — declaring dead\n",
+				  req->tag, waiting, pdu->eh_retries + 1u);
+			for_each_set_bit(i, &waiting, RC_VOLUME_MAX_MEMBERS)
+				if (rc_volume_members[i])
+					WRITE_ONCE(rc_volume_members[i]->ctx.nvme.dead,
+						   true);
+			rc_volume_drain_dead();
+			rc_volume_schedule_auto_reset_for_req(pdu);
+			if (blk_mq_request_completed(req))
+				return BLK_EH_DONE;
+		}
+		if (rc_volume_claim_completion(pdu)) {
+			/* Safety net — drain should have completed it. */
 			rc_volume_unmap_request_sg(pdu);
 			blk_mq_end_request(req, BLK_STS_IOERR);
 		}
@@ -3690,8 +4155,10 @@ static enum blk_eh_timer_return rc_volume_timeout(struct request *req)
 		u16 sqid = (pdu->hctx_idx < RC_VOLUME_MAX_HCTX)
 				? (u16)(pdu->hctx_idx + 1) : RC_NVME_IO_QID;
 
-		for (i = 0; i < rc_volume_member_count; i++)
-			if (rc_volume_req_involves(pdu, i))
+		for (i = 0; i < rc_volume_member_count &&
+			    i < RC_VOLUME_MAX_MEMBERS; i++)
+			if (rc_volume_req_involves(pdu, i) &&
+			    rc_volume_members[i])
 				(void)rc_nvme_abort(rc_volume_members[i],
 						    sqid, (u16)req->tag);
 	}
@@ -3699,9 +4166,21 @@ static enum blk_eh_timer_return rc_volume_timeout(struct request *req)
 	if (blk_mq_request_completed(req))
 		return BLK_EH_DONE;
 
-	for (i = 0; i < rc_volume_member_count; i++)
-		if (rc_volume_req_involves(pdu, i))
-			WRITE_ONCE(rc_volume_members[i]->ctx.nvme.dead, true);
+	/* Only the members that never ACKed this request are stuck — a
+	 * member whose CQE already arrived is demonstrably alive, and on a
+	 * RAID1 fan-out killing BOTH mirrors for one stuck command would
+	 * throw away the availability degraded mode exists to provide. */
+	{
+		unsigned long stuck = pdu->member_mask &
+			~(unsigned long)(unsigned int)atomic_read(&pdu->acked);
+
+		if (!stuck)
+			stuck = pdu->member_mask;	/* defensive */
+		for_each_set_bit(i, &stuck, RC_VOLUME_MAX_MEMBERS)
+			if (rc_volume_members[i])
+				WRITE_ONCE(rc_volume_members[i]->ctx.nvme.dead,
+					   true);
+	}
 	rc_volume_drain_dead();
 	rc_volume_schedule_auto_reset_for_req(pdu);
 	if (!blk_mq_request_completed(req) &&
@@ -3728,7 +4207,10 @@ static enum blk_eh_timer_return rc_volume_timeout(struct request *req)
  * locality), not correctness. */
 static void rc_volume_map_queues(struct blk_mq_tag_set *set)
 {
-	if (rc_volume_member_count > 0) {
+	/* member 0 can be NULL after a RAID1 hot-removal; map_queues can
+	 * re-run on CPU hotplug, so fall back to the generic mapping then
+	 * (worst case is lost completion locality, not correctness). */
+	if (rc_volume_member_count > 0 && rc_volume_members[0]) {
 		struct device *dev = &rc_volume_members[0]->pdev->dev;
 		blk_mq_map_hw_queues(&set->map[HCTX_TYPE_DEFAULT], dev, 1);
 	} else {
@@ -4026,6 +4508,10 @@ void rc_volume_teardown(void)
 {
 	int i;
 
+	/* The degrade work walks the registry — let any queued run finish
+	 * before the registry (and the adapters it points at) go away. */
+	flush_work(&rc_volume_degrade_work);
+
 	mutex_lock(&rc_volume_lock);
 	if (rc_volume_disk) {
 		del_gendisk(rc_volume_disk);
@@ -4052,46 +4538,168 @@ void rc_volume_teardown(void)
 		}
 		rc_volume_members[i] = NULL;
 		rc_volume_member_phys_offset[i] = 0;
+		WRITE_ONCE(rc_volume_member_state[i], RC_MEMBER_LIVE);
 	}
+	atomic_set(&rc_volume_live_mask, 0);
 	rc_volume_member_count = 0;
 	rc_volume_stripe_sectors = 0;
 	mutex_unlock(&rc_volume_lock);
+}
+
+/* debugfs `rcraid/volume` — volume-level state for operators and the QEMU
+ * failure-injection rig.  Pure readers only (no dead-flag folding here;
+ * the hot path owns state transitions). */
+int rc_volume_debugfs_show(struct seq_file *m, void *unused)
+{
+	unsigned int live;
+	int nlive = 0;
+	int i;
+
+	mutex_lock(&rc_volume_lock);
+	live = (unsigned int)atomic_read(&rc_volume_live_mask);
+
+	seq_printf(m, "volume: %s\n",
+		   rc_volume_disk ? rc_volume_disk->disk_name : "none");
+	seq_printf(m, "level: %s\n",
+		   rc_volume_raid_level == RC_LDT_RAID1 ? "raid1" :
+		   rc_volume_raid_level == RC_LDT_RAID0 ? "raid0" : "unknown");
+	seq_printf(m, "members: %d\n", rc_volume_member_count);
+	seq_printf(m, "live_mask: 0x%x\n", live);
+
+	for (i = 0; i < rc_volume_member_count && i < RC_VOLUME_MAX_MEMBERS;
+	     i++) {
+		struct rc_adapter *a = rc_volume_members[i];
+
+		if (live & BIT(i))
+			nlive++;
+		seq_printf(m, "member%d: %s %s%s\n", i,
+			   a ? pci_name(a->pdev) : "absent",
+			   rc_member_state_name(READ_ONCE(rc_volume_member_state[i])),
+			   (a && READ_ONCE(a->ctx.nvme.dead)) ? " (dead)" : "");
+	}
+
+	if (!rc_volume_disk)
+		seq_puts(m, "state: unassembled\n");
+	else if (nlive == 0)
+		seq_puts(m, "state: failed\n");
+	else if (nlive < rc_volume_member_count &&
+		 rc_volume_raid_level == RC_LDT_RAID1)
+		seq_puts(m, "state: degraded\n");
+	else if (nlive < rc_volume_member_count)
+		seq_puts(m, "state: failed\n");
+	else
+		seq_puts(m, "state: optimal\n");
+	mutex_unlock(&rc_volume_lock);
+	return 0;
 }
 
 /* PCI-remove hook (also used by probe error paths).  A member adapter is
  * about to be kfree'd; if it is registered in rc_volume_members[] the
  * assembled volume still dereferences it on every I/O — surprise-remove
  * or sysfs unbind of one member with /dev/rcraid0 mounted was a
- * use-after-free on the hot path.  There is no per-member detach (no
- * degraded mode), so the whole volume is torn down: mark the departing
- * member dead, fail the in-flight I/O cleanly (drain disables the dead
- * controller first, per H-1), then dismantle the gendisk + DMA pools.
- * No-op when the adapter never registered. */
+ * use-after-free on the hot path.
+ *
+ * RAID1 with a surviving live mirror: per-member detach — mark the slot
+ * FAILED, drain I/O waiting on it, freeze the queue to flush lingering
+ * completions, NULL the slot, and keep the volume serving degraded.
+ *
+ * Everything else (RAID0, last mirror): the whole volume is torn down —
+ * mark the departing member dead, fail the in-flight I/O cleanly (drain
+ * disables the dead controller first, per H-1), then dismantle the
+ * gendisk + DMA pools.  No-op when the adapter never registered. */
 void rc_volume_remove_member(struct rc_adapter *adapter)
 {
-	bool member = false;
+	bool keep_volume;
+	int slot = -1;
 	int i;
 
 	mutex_lock(&rc_volume_lock);
 	for (i = 0; i < RC_VOLUME_MAX_MEMBERS; i++)
 		if (rc_volume_members[i] == adapter)
-			member = true;
+			slot = i;
+	/* RAID1 with another live member keeps serving degraded; everything
+	 * else (RAID0, last mirror, pre-disk assembly) tears down as
+	 * before.  Decided under the lock so a concurrent removal of the
+	 * other member can't leave both paths thinking a survivor exists. */
+	keep_volume = slot >= 0 && rc_volume_disk &&
+		      rc_volume_raid_level == RC_LDT_RAID1 &&
+		      (atomic_read(&rc_volume_live_mask) & ~BIT(slot) &
+		       (BIT(rc_volume_member_count) - 1)) != 0;
+	if (keep_volume)
+		rc_volume_member_set_state(slot, RC_MEMBER_FAILED);
 	mutex_unlock(&rc_volume_lock);
 
-	if (!member)
+	if (slot < 0)
 		return;
 
+	if (!keep_volume) {
+		rc_printk(RC_WARN,
+			  "rc_volume_remove_member: %s is a live volume member with no RAID1 survivor — tearing down /dev/rcraid0 before releasing the adapter\n",
+			  pci_name(adapter->pdev));
+
+		/* Fail fast: no new dispatches reach this adapter, and every
+		 * in-flight request touching it is ended before the teardown
+		 * (del_gendisk would otherwise wait forever on requests whose
+		 * CQEs can no longer arrive). */
+		WRITE_ONCE(adapter->ctx.nvme.dead, true);
+		rc_volume_drain_dead();
+		rc_volume_teardown();
+		return;
+	}
+
 	rc_printk(RC_WARN,
-		  "rc_volume_remove_member: %s is a live volume member — tearing down /dev/rcraid0 before releasing the adapter (no degraded mode)\n",
+		  "rc_volume_remove_member: %s removed — RAID1 volume continues DEGRADED on the surviving mirror\n",
 		  pci_name(adapter->pdev));
 
-	/* Fail fast: no new dispatches reach this adapter, and every
-	 * in-flight request touching it is ended before the teardown
-	 * (del_gendisk would otherwise wait forever on requests whose
-	 * CQEs can no longer arrive). */
+	/* Order matters: dead + drain BEFORE the slot is NULLed (the drain
+	 * disables the departing controller and synthesizes completions for
+	 * requests waiting on it — both need the pointer), and the slot is
+	 * NULLed BEFORE our caller frees the adapter (after that, every
+	 * registry consumer must see NULL, not a dangling pointer).
+	 * Gendisk, tagset, and the volume-lifetime PRP pool stay intact —
+	 * a NULL slot is simply never dispatched to. */
 	WRITE_ONCE(adapter->ctx.nvme.dead, true);
 	rc_volume_drain_dead();
-	rc_volume_teardown();
+
+	/* Freeze waits for every in-flight request to fully END (drain only
+	 * initiated their completion) — after this, no .complete/unmap path
+	 * can still hold the departing member's device pointer.  Then the
+	 * slot can be NULLed and the adapter freed safely. */
+	{
+		unsigned int memflags =
+			blk_mq_freeze_queue(rc_volume_disk->queue);
+		u32 t, h;
+
+		mutex_lock(&rc_volume_lock);
+		rc_volume_members[slot] = NULL;
+		adapter->ctx.nvme.volume_slot = -1;
+		/* Free this member's PRP-pool pages NOW, while its device
+		 * (and IOMMU domain) still exists — the volume-teardown path
+		 * can't dma_free_coherent against a departed device, and the
+		 * freeze above guarantees nothing references them anymore.
+		 * The NULL slot is never dispatched to, so the holes are
+		 * harmless until a future re-add reallocates them. */
+		for (h = 0; h < RC_VOLUME_MAX_HCTX; h++) {
+			for (t = 0; t < RC_VOLUME_QUEUE_DEPTH; t++) {
+				if (!rc_volume_prp_va[h][slot][t])
+					continue;
+				dma_free_coherent(&adapter->pdev->dev,
+						  PAGE_SIZE,
+						  rc_volume_prp_va[h][slot][t],
+						  rc_volume_prp_pa[h][slot][t]);
+				rc_volume_prp_va[h][slot][t] = NULL;
+				rc_volume_prp_pa[h][slot][t] = 0;
+			}
+		}
+		mutex_unlock(&rc_volume_lock);
+		blk_mq_unfreeze_queue(rc_volume_disk->queue, memflags);
+	}
+
+	/* The degrade work (scheduled by mark_failed / set_state paths) may
+	 * have snapshot the old pointer — let any in-flight run finish
+	 * before the caller kfree's the adapter. */
+	flush_work(&rc_volume_degrade_work);
+	cancel_work_sync(&adapter->ctx.nvme.auto_reset_work);
 }
 
 /* Counterpart to create_io_queues; called from cleanup_controller and
@@ -4404,6 +5012,45 @@ int rc_nvme_reset_controller(struct rc_adapter *adapter)
 	if (rc_volume_disk)
 		blk_mq_unquiesce_queue(rc_volume_disk->queue);
 
+	/* Rejoin policy for a recovered member (CORRECTNESS-CRITICAL for
+	 * RAID1): while this member was FAILED the volume kept accepting
+	 * writes on the survivor, so this member's data is STALE.  Clearing
+	 * `dead` must NOT put it back into dispatch — a rejoined stale
+	 * mirror serves old data to half the reads.  Park it in
+	 * NEEDS_RESYNC; the resync engine (follow-up to #51) makes that
+	 * state actionable.
+	 *
+	 * RAID0 is the opposite: with any member down the volume failed
+	 * EVERY request (no partial writes possible), so nothing diverged —
+	 * restore LIVE and the volume resumes, which is the pre-degraded-
+	 * mode recovery behavior. */
+	{
+		/* Single READ_ONCE snapshot: rc_volume_remove_member() writes
+		 * volume_slot = -1 under rc_volume_lock while this function can
+		 * be running from auto_reset_work, so a plain double-read could
+		 * see >= 0 in the branch and -1 in the index.  Re-validate the
+		 * slot still belongs to THIS adapter under the lock — a
+		 * concurrent remove + re-register could have reassigned it. */
+		int slot = READ_ONCE(nvme->volume_slot);
+
+		mutex_lock(&rc_volume_lock);
+		if (slot >= 0 && slot < RC_VOLUME_MAX_MEMBERS &&
+		    rc_volume_members[slot] == adapter &&
+		    READ_ONCE(rc_volume_member_state[slot]) == RC_MEMBER_FAILED) {
+			if (rc_volume_raid_level == RC_LDT_RAID1) {
+				rc_volume_member_set_state(slot,
+						RC_MEMBER_NEEDS_RESYNC);
+				rc_printk(RC_WARN,
+					  "rc_nvme_reset_controller: %s recovered but STALE (missed writes while failed) — parked needs-resync, not rejoining until resync support lands\n",
+					  pci_name(adapter->pdev));
+			} else {
+				rc_volume_member_set_state(slot,
+						RC_MEMBER_LIVE);
+			}
+		}
+		mutex_unlock(&rc_volume_lock);
+	}
+
 	rc_printk(RC_NOTE,
 		  "rc_nvme_reset_controller: %s back online\n",
 		  pci_name(adapter->pdev));
@@ -4540,6 +5187,8 @@ void rc_nvme_early_init(struct rc_adapter *adapter)
 	init_waitqueue_head(&nvme->admin_cq_wait);
 	mutex_init(&nvme->admin_mutex);
 	INIT_WORK(&nvme->auto_reset_work, rc_nvme_auto_reset_fn);
+	/* 0 is a valid registry slot — not-a-member must be explicit. */
+	nvme->volume_slot = -1;
 }
 
 int rc_nvme_init_controller(struct rc_adapter *adapter)

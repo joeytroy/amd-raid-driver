@@ -151,12 +151,18 @@ jobs:
   # when the runner exposes /dev/kvm, TCG otherwise.
   # ---------------------------------------------------------------------------
   qemu-rig:
-    name: qemu-rig (${{ matrix.level }})
+    name: qemu-rig (${{ matrix.scenario }})
     runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
-        level: [raid0, raid1]
+        include:
+          - { scenario: raid0,          level: raid0, extra: "" }
+          - { scenario: raid1,          level: raid1, extra: "" }
+          # Degraded mode: unbind one mirror member mid-run (simulated
+          # hot-unplug); the guest asserts the volume keeps serving reads
+          # AND writes from the survivor and reports "degraded" in debugfs.
+          - { scenario: raid1-degraded, level: raid1, extra: "--fail-member" }
     steps:
       - uses: actions/checkout@v4
 
@@ -184,7 +190,8 @@ jobs:
           echo "target kernel: $KVER"
           sudo install -m 644 "/boot/vmlinuz-$KVER" ./vmlinuz
           scripts/qemu-test/run-qemu-raid-test.sh \
-            --kver "$KVER" --kernel ./vmlinuz --level "${{ matrix.level }}"
+            --kver "$KVER" --kernel ./vmlinuz --level "${{ matrix.level }}" \
+            ${{ matrix.extra }}
 
   # ---------------------------------------------------------------------------
   # SPDX license tag — every driver source must declare GPL-2.0-only on line 1.

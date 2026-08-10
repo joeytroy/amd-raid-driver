@@ -379,6 +379,14 @@ struct rc_nvme_state {
     // latch a genuinely-fried controller would thrash 30 s per timeout
     // forever.
     bool              auto_reset_disabled;
+
+    // This adapter's slot in rc_volume_members[], or -1 when not a
+    // registered member.  Cached here so the per-queue ISR can attribute
+    // a CQE to a member bit (pdu->err_members / pdu->acked) without
+    // scanning the registry on every completion.  Written once under
+    // rc_volume_lock at register time, cleared at remove; read lock-free
+    // from IRQ context.
+    int               volume_slot;
 };
 
 // Device context layout (clean-room mirror of the Windows device extension)
@@ -887,6 +895,8 @@ void rc_volume_teardown(void);
  * drains in-flight I/O, and tears the volume down so nothing keeps a
  * pointer into memory that is about to be kfree'd (defined in rc_nvme.c). */
 void rc_volume_remove_member(struct rc_adapter *adapter);
+struct seq_file;
+int  rc_volume_debugfs_show(struct seq_file *m, void *unused);
 
 /* PCI-ID-based code-path dispatcher (rc_firmware.c). */
 int rc_parse_firmware_capabilities(struct rc_adapter *adapter);
