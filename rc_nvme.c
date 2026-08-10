@@ -5077,9 +5077,16 @@ void rc_volume_teardown(void)
 	/* Stop a running resync before the members it reads/writes go away. */
 	rc_volume_resync_stop();
 
+	/* Remove the sysfs group BEFORE taking rc_volume_lock: kernfs
+	 * removal blocks until in-flight ->show()/->store() callbacks
+	 * return, and those callbacks take rc_volume_lock — removing under
+	 * the lock is an ABBA deadlock with any concurrent attribute read.
+	 * The disk pointer is stable here (only this function clears it,
+	 * and module exit runs once). */
+	rc_volume_sysfs_unregister();
+
 	mutex_lock(&rc_volume_lock);
 	if (rc_volume_disk) {
-		rc_volume_sysfs_unregister();
 		del_gendisk(rc_volume_disk);
 		put_disk(rc_volume_disk);
 		rc_volume_disk = NULL;
@@ -5257,11 +5264,15 @@ static ssize_t fail_member_store(struct device *dev,
 	ret = kstrtoint(buf, 0, &slot);
 	if (ret)
 		return ret;
-	if (slot < 0 || slot >= rc_volume_member_count ||
-	    slot >= RC_VOLUME_MAX_MEMBERS)
+	if (slot < 0 || slot >= RC_VOLUME_MAX_MEMBERS)
 		return -EINVAL;
 
 	mutex_lock(&rc_volume_lock);
+	/* member_count is lock-protected state — bounds-check it here. */
+	if (slot >= rc_volume_member_count) {
+		mutex_unlock(&rc_volume_lock);
+		return -EINVAL;
+	}
 	if (!rc_volume_members[slot]) {
 		mutex_unlock(&rc_volume_lock);
 		return -ENODEV;
