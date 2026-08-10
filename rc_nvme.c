@@ -346,6 +346,13 @@ struct rc_volume_pdu {
 	atomic_t           acked;
 	atomic_t           err_members;
 	atomic_t           members_pending;
+	/* Bounded .timeout re-arm count: how many times the EH handler has
+	 * returned BLK_EH_RESET_TIMER for this request while waiting on a
+	 * member that looks alive.  Once exhausted, the still-silent members
+	 * are declared dead — a controller can drop a command without ever
+	 * asserting CSTS.CFS, and waiting forever would hang the request
+	 * (and its tag, and its submitter) with no recovery path. */
+	u8                 eh_retries;
 	/* Single-completion claim.  Multiple actors can race to finish one
 	 * request — the ISR (batched direct-end fast path), the dead-member
 	 * drain, the .timeout handler, and queue_rq's own inline error/hit
@@ -3513,6 +3520,7 @@ static blk_status_t rc_volume_queue_rq(struct blk_mq_hw_ctx *hctx,
 	memset(pdu->ms_nents, 0, sizeof(pdu->ms_nents));
 	atomic_set(&pdu->completed, 0);
 	pdu->member_mask = 0;
+	pdu->eh_retries = 0;
 	atomic_set(&pdu->acked, 0);
 	atomic_set(&pdu->err_members, 0);
 	pdu->hctx_idx = (u8)(hctx->queue_num < RC_VOLUME_MAX_HCTX ?
@@ -4052,14 +4060,34 @@ static enum blk_eh_timer_return rc_volume_timeout(struct request *req)
 		rc_volume_schedule_auto_reset_for_req(pdu);
 		if (blk_mq_request_completed(req))
 			return BLK_EH_DONE;
-		/* Members still owed a completion after the drain are ALIVE
-		 * (the drain synthesized every dead one) — their CQEs are
-		 * coming.  Give them the timer back instead of force-failing
-		 * a request that will complete degraded-OK. */
+		/* Members still owed a completion after the drain LOOK alive
+		 * (the drain synthesized every confirmed-dead one) — their
+		 * CQEs are probably coming.  Give them the timer back instead
+		 * of force-failing a request that will complete degraded-OK —
+		 * but only a bounded number of times: a controller can drop a
+		 * command without ever asserting CSTS.CFS, and re-arming
+		 * forever would hang the request with no recovery.  After two
+		 * full extra timeout periods the silent member is treated as
+		 * dead and the drain finishes the request. */
 		waiting = pdu->member_mask &
 			  ~(unsigned long)(unsigned int)atomic_read(&pdu->acked);
-		if (waiting)
-			return BLK_EH_RESET_TIMER;
+		if (waiting) {
+			if (pdu->eh_retries < 2) {
+				pdu->eh_retries++;
+				return BLK_EH_RESET_TIMER;
+			}
+			rc_printk(RC_ERROR,
+				  "rc_volume_timeout: tag=%u members 0x%lx never completed across %u timeout periods without asserting CFS — declaring dead\n",
+				  req->tag, waiting, pdu->eh_retries + 1u);
+			for_each_set_bit(i, &waiting, RC_VOLUME_MAX_MEMBERS)
+				if (rc_volume_members[i])
+					WRITE_ONCE(rc_volume_members[i]->ctx.nvme.dead,
+						   true);
+			rc_volume_drain_dead();
+			rc_volume_schedule_auto_reset_for_req(pdu);
+			if (blk_mq_request_completed(req))
+				return BLK_EH_DONE;
+		}
 		if (rc_volume_claim_completion(pdu)) {
 			/* Safety net — drain should have completed it. */
 			rc_volume_unmap_request_sg(pdu);
