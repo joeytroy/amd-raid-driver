@@ -134,12 +134,14 @@ static DECLARE_WORK(rc_volume_degrade_work, rc_volume_degrade_fn);
 /* Slow-path state transition.  Caller holds rc_volume_lock. */
 static void rc_volume_member_set_state(int idx, enum rc_member_state st)
 {
-	enum rc_member_state old = rc_volume_member_state[idx];
+	enum rc_member_state old = READ_ONCE(rc_volume_member_state[idx]);
 
 	/* No early-out on old == st: the zero-initialized state array reads
 	 * as LIVE before any member registers, so the first LIVE transition
-	 * must still sync the mask bit. */
-	rc_volume_member_state[idx] = st;
+	 * must still sync the mask bit.  READ_ONCE/WRITE_ONCE because
+	 * rc_volume_member_mark_failed() stores this element lock-free from
+	 * ISR context concurrently with lock-holding accessors. */
+	WRITE_ONCE(rc_volume_member_state[idx], st);
 	if (st == RC_MEMBER_LIVE)
 		atomic_or(BIT(idx), &rc_volume_live_mask);
 	else
@@ -4536,7 +4538,7 @@ void rc_volume_teardown(void)
 		}
 		rc_volume_members[i] = NULL;
 		rc_volume_member_phys_offset[i] = 0;
-		rc_volume_member_state[i] = RC_MEMBER_LIVE;
+		WRITE_ONCE(rc_volume_member_state[i], RC_MEMBER_LIVE);
 	}
 	atomic_set(&rc_volume_live_mask, 0);
 	rc_volume_member_count = 0;
@@ -4572,7 +4574,7 @@ int rc_volume_debugfs_show(struct seq_file *m, void *unused)
 			nlive++;
 		seq_printf(m, "member%d: %s %s%s\n", i,
 			   a ? pci_name(a->pdev) : "absent",
-			   rc_member_state_name(rc_volume_member_state[i]),
+			   rc_member_state_name(READ_ONCE(rc_volume_member_state[i])),
 			   (a && READ_ONCE(a->ctx.nvme.dead)) ? " (dead)" : "");
 	}
 
@@ -5022,11 +5024,19 @@ int rc_nvme_reset_controller(struct rc_adapter *adapter)
 	 * EVERY request (no partial writes possible), so nothing diverged —
 	 * restore LIVE and the volume resumes, which is the pre-degraded-
 	 * mode recovery behavior. */
-	if (nvme->volume_slot >= 0) {
-		int slot = nvme->volume_slot;
+	{
+		/* Single READ_ONCE snapshot: rc_volume_remove_member() writes
+		 * volume_slot = -1 under rc_volume_lock while this function can
+		 * be running from auto_reset_work, so a plain double-read could
+		 * see >= 0 in the branch and -1 in the index.  Re-validate the
+		 * slot still belongs to THIS adapter under the lock — a
+		 * concurrent remove + re-register could have reassigned it. */
+		int slot = READ_ONCE(nvme->volume_slot);
 
 		mutex_lock(&rc_volume_lock);
-		if (rc_volume_member_state[slot] == RC_MEMBER_FAILED) {
+		if (slot >= 0 && slot < RC_VOLUME_MAX_MEMBERS &&
+		    rc_volume_members[slot] == adapter &&
+		    READ_ONCE(rc_volume_member_state[slot]) == RC_MEMBER_FAILED) {
 			if (rc_volume_raid_level == RC_LDT_RAID1) {
 				rc_volume_member_set_state(slot,
 						RC_MEMBER_NEEDS_RESYNC);
