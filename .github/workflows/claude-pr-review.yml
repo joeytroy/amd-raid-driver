@@ -116,7 +116,9 @@ jobs:
           # OWNER/COLLABORATOR/MEMBER PRs on a non-elevated token.
           claude_args: |
             --model claude-sonnet-5
-            --max-turns 40
+            # 80: large driver PRs (e.g. the #51 RAID1 stack) exhaust 40
+            # turns before the mandatory verdict comment gets posted.
+            --max-turns 80
             --allowedTools "Read,Grep,Glob,Bash(gh pr view:*),Bash(gh pr diff:*),Bash(gh pr comment:*),Bash(git diff:*),Bash(git log:*),Bash(git show:*),Bash(git blame:*),Bash(cat:*),Bash(sed:*),Bash(awk:*),Bash(grep:*),Bash(rg:*),Bash(head:*),Bash(tail:*),Bash(ls:*),Bash(wc:*),Bash(find:*),Bash(shellcheck:*),mcp__github_inline_comment__create_inline_comment"
 
       # Ported from AlpacaBridge (open-astro): the action exits 0 even when
