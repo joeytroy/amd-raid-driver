@@ -3571,6 +3571,9 @@ static blk_status_t rc_volume_queue_rq(struct blk_mq_hw_ctx *hctx,
 			(BIT(rc_volume_member_count) - 1);
 
 		if (!fmask) {
+			printk_ratelimited(KERN_ERR
+				"rcraid: %s: FLUSH rejected — no live member to flush\n",
+				rc_volume_disk ? rc_volume_disk->disk_name : "?");
 			blk_mq_start_request(req);
 			if (rc_volume_claim_completion(pdu))
 				blk_mq_end_request(req, BLK_STS_IOERR);
