@@ -443,6 +443,13 @@ struct rc_volume_pdu {
 	 * rc_volume_unmap_request_sg. */
 	bool               wgen_counted;
 	u8                 wgen;
+	/* Bounded .timeout re-arm count: how many times the EH handler has
+	 * returned BLK_EH_RESET_TIMER for this request while waiting on a
+	 * member that looks alive.  Once exhausted, the still-silent members
+	 * are declared dead — a controller can drop a command without ever
+	 * asserting CSTS.CFS, and waiting forever would hang the request
+	 * (and its tag, and its submitter) with no recovery path. */
+	u8                 eh_retries;
 	/* Single-completion claim.  Multiple actors can race to finish one
 	 * request — the ISR (batched direct-end fast path), the dead-member
 	 * drain, the .timeout handler, and queue_rq's own inline error/hit
@@ -3712,6 +3719,7 @@ static blk_status_t rc_volume_queue_rq(struct blk_mq_hw_ctx *hctx,
 	atomic_set(&pdu->completed, 0);
 	pdu->member_mask = 0;
 	pdu->wgen_counted = false;
+	pdu->eh_retries = 0;
 	atomic_set(&pdu->acked, 0);
 	atomic_set(&pdu->err_members, 0);
 	pdu->hctx_idx = (u8)(hctx->queue_num < RC_VOLUME_MAX_HCTX ?
@@ -4253,14 +4261,34 @@ static enum blk_eh_timer_return rc_volume_timeout(struct request *req)
 		rc_volume_schedule_auto_reset_for_req(pdu);
 		if (blk_mq_request_completed(req))
 			return BLK_EH_DONE;
-		/* Members still owed a completion after the drain are ALIVE
-		 * (the drain synthesized every dead one) — their CQEs are
-		 * coming.  Give them the timer back instead of force-failing
-		 * a request that will complete degraded-OK. */
+		/* Members still owed a completion after the drain LOOK alive
+		 * (the drain synthesized every confirmed-dead one) — their
+		 * CQEs are probably coming.  Give them the timer back instead
+		 * of force-failing a request that will complete degraded-OK —
+		 * but only a bounded number of times: a controller can drop a
+		 * command without ever asserting CSTS.CFS, and re-arming
+		 * forever would hang the request with no recovery.  After two
+		 * full extra timeout periods the silent member is treated as
+		 * dead and the drain finishes the request. */
 		waiting = pdu->member_mask &
 			  ~(unsigned long)(unsigned int)atomic_read(&pdu->acked);
-		if (waiting)
-			return BLK_EH_RESET_TIMER;
+		if (waiting) {
+			if (pdu->eh_retries < 2) {
+				pdu->eh_retries++;
+				return BLK_EH_RESET_TIMER;
+			}
+			rc_printk(RC_ERROR,
+				  "rc_volume_timeout: tag=%u members 0x%lx never completed across %u timeout periods without asserting CFS — declaring dead\n",
+				  req->tag, waiting, pdu->eh_retries + 1u);
+			for_each_set_bit(i, &waiting, RC_VOLUME_MAX_MEMBERS)
+				if (rc_volume_members[i])
+					WRITE_ONCE(rc_volume_members[i]->ctx.nvme.dead,
+						   true);
+			rc_volume_drain_dead();
+			rc_volume_schedule_auto_reset_for_req(pdu);
+			if (blk_mq_request_completed(req))
+				return BLK_EH_DONE;
+		}
 		if (rc_volume_claim_completion(pdu)) {
 			/* Safety net — drain should have completed it. */
 			rc_volume_unmap_request_sg(pdu);
@@ -4698,18 +4726,40 @@ static void rc_volume_assemble_fn(struct work_struct *w)
 		  "rc_volume_assemble_fn: only %d of %u RAID1 members present after %u ms — assembling DEGRADED (allow_degraded=1)\n",
 		  present, expected, RC_VOLUME_ASSEMBLE_DELAY_MS);
 
-	for (i = 0; i < (int)expected; i++)
-		if (!rc_volume_members[i])
-			rc_volume_member_set_state(i, RC_MEMBER_FAILED);
-	/* member_count becomes the SLOT count (== expected) from here on,
-	 * same invariant a runtime hot-removal maintains. */
-	rc_volume_member_count = (int)expected;
+	{
+		int saved_count = rc_volume_member_count;
+		int rc;
 
-	i = rc_volume_create_disk();
-	if (i)
-		rc_printk(RC_ERROR,
-			  "rc_volume_assemble_fn: degraded create_disk failed (%d)\n",
-			  i);
+		for (i = 0; i < (int)expected; i++)
+			if (!rc_volume_members[i])
+				rc_volume_member_set_state(i, RC_MEMBER_FAILED);
+		/* member_count becomes the SLOT count (== expected) from here
+		 * on, same invariant a runtime hot-removal maintains. */
+		rc_volume_member_count = (int)expected;
+
+		rc = rc_volume_create_disk();
+		if (rc) {
+			/* Roll the registry back so a late-arriving member
+			 * (or the next timer shot) can still take the normal
+			 * full-assembly path — leaving count forced to
+			 * `expected` with phantom FAILED slots would block
+			 * regular assembly forever. */
+			rc_printk(RC_ERROR,
+				  "rc_volume_assemble_fn: degraded create_disk failed (%d) — reverting registry for a later attempt\n",
+				  rc);
+			rc_volume_member_count = saved_count;
+			for (i = 0; i < (int)expected; i++) {
+				if (rc_volume_members[i])
+					continue;
+				/* Back to the pre-registration default:
+				 * state LIVE with NO live-mask bit (the bit
+				 * is only ever set when a real member
+				 * registers into the slot). */
+				rc_volume_member_state[i] = RC_MEMBER_LIVE;
+				atomic_andnot(BIT(i), &rc_volume_live_mask);
+			}
+		}
+	}
 out:
 	mutex_unlock(&rc_volume_lock);
 }
@@ -5281,6 +5331,12 @@ void rc_volume_remove_member(struct rc_adapter *adapter)
 	bool keep_volume;
 	int slot = -1;
 	int i;
+
+	/* The degraded-assembly timer walks the registry and can create the
+	 * disk from a member that is mid-removal — cancel it before any
+	 * member departs.  A later registration of a remaining member
+	 * re-arms it. */
+	cancel_delayed_work_sync(&rc_volume_assemble_work);
 
 	/* A running resync holds pointers to (up to) two members and issues
 	 * sync commands against them — stop it before ANY member departs.
