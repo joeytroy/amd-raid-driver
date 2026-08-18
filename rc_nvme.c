@@ -3126,8 +3126,15 @@ static inline bool rc_volume_fatal(void)
 	     i++) {
 		struct rc_adapter *m = rc_volume_members[i];
 
+		/* A RESYNCING member is write-eligible but never live, so
+		 * gate on the state as well as the live bit: a resync target
+		 * whose controller dies must be failed by this fast path too,
+		 * not left in write_mask stalling every new write behind the
+		 * 30s blk-mq timeout. */
 		if (m && READ_ONCE(m->ctx.nvme.dead) &&
-		    (atomic_read(&rc_volume_live_mask) & BIT(i)))
+		    ((atomic_read(&rc_volume_live_mask) & BIT(i)) ||
+		     READ_ONCE(rc_volume_member_state[i]) ==
+		     RC_MEMBER_RESYNCING))
 			rc_volume_member_mark_failed(i);
 	}
 
