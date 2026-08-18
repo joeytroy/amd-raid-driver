@@ -27,6 +27,12 @@ on:
 permissions:
   contents: read
 
+# A new push to the same PR/branch supersedes the previous run — cancel it
+# instead of letting two runs fight over the QEMU-capable runner slots.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   # ---------------------------------------------------------------------------
   # Build the module against more than one kernel.  Using two runner images
