@@ -250,17 +250,34 @@ static void rc_volume_member_mark_failed(int idx)
 	prev = atomic_fetch_andnot(BIT(idx), &rc_volume_live_mask);
 
 	if (!(prev & BIT(idx))) {
-		/* Not live — but a RESYNCING member failing must still drop
-		 * out of the write fan-out and revert to plain FAILED.
-		 * cmpxchg: the resync thread's completion path promotes
-		 * RESYNCING → LIVE concurrently (also by cmpxchg); if it won,
-		 * this member is live again and this failure event is stale —
-		 * a real fault will error a subsequent I/O and re-enter via
-		 * the live path below. */
-		if (cmpxchg(&rc_volume_member_state[idx],
-			    RC_MEMBER_RESYNCING, RC_MEMBER_FAILED) ==
-		    RC_MEMBER_RESYNCING)
-			schedule_work(&rc_volume_degrade_work);
+		/* Not live per the mask — but the failure must still land if
+		 * the STATE says RESYNCING (drop out of the write fan-out)
+		 * or LIVE (the resync completion, or set_state's own
+		 * store-state-then-sync-mask gap, promoted the member
+		 * concurrently: the mask bit lagging the state must not let
+		 * a genuine failure be swallowed).  cmpxchg loop so whichever
+		 * transition raced us is failed exactly once; the mask
+		 * andnots below are re-applied because the completion path
+		 * publishes its mask bits around its own cmpxchg. */
+		enum rc_member_state old =
+			READ_ONCE(rc_volume_member_state[idx]);
+
+		while (old == RC_MEMBER_RESYNCING || old == RC_MEMBER_LIVE) {
+			enum rc_member_state got =
+				cmpxchg(&rc_volume_member_state[idx], old,
+					RC_MEMBER_FAILED);
+			if (got == old) {
+				atomic_andnot(BIT(idx), &rc_volume_write_mask);
+				atomic_andnot(BIT(idx), &rc_volume_live_mask);
+				rc_printk(RC_ERROR,
+					  "rc_volume: member %d FAILED while %s (live_mask=0x%x)\n",
+					  idx, rc_member_state_name(old),
+					  atomic_read(&rc_volume_live_mask));
+				schedule_work(&rc_volume_degrade_work);
+				break;
+			}
+			old = got;
+		}
 		return;
 	}
 	WRITE_ONCE(rc_volume_member_state[idx], RC_MEMBER_FAILED);
@@ -2734,6 +2751,18 @@ static void rc_volume_register_member(struct rc_adapter *adapter)
 				  nvme->nr_io_queues, rc_volume_nr_hw);
 			goto out;
 		}
+		/* A smaller replacement drive would pass every check above
+		 * and only fail deep into the resync copy, when a chunk
+		 * write lands past its LBA range — reject the capacity
+		 * mismatch up front with a diagnosable message instead. */
+		if (nvme->ld_userdata_size < get_capacity(rc_volume_disk)) {
+			rc_printk(RC_WARN,
+				  "rc_volume_register_member: %s re-add rejected — capacity mismatch: member user-data %llu sectors < volume %llu sectors\n",
+				  pci_name(adapter->pdev),
+				  (unsigned long long)nvme->ld_userdata_size,
+				  (unsigned long long)get_capacity(rc_volume_disk));
+			goto out;
+		}
 		/* Install the pointer BEFORE the DMA alloc — the helper
 		 * resolves the device through the registry slot.  Not yet
 		 * visible to dispatch: the live bit stays clear throughout. */
@@ -5078,14 +5107,24 @@ done:
 	 * routing I/O to a dead member).  If mark_failed wins, it already
 	 * cleared the mask bits and scheduled the degrade work — losing the
 	 * cmpxchg means there is nothing left for us to do. */
-	if (ret == 0 &&
-	    cmpxchg(&rc_volume_member_state[target], RC_MEMBER_RESYNCING,
-		    RC_MEMBER_LIVE) == RC_MEMBER_RESYNCING) {
-		/* State is LIVE first, masks second: a mark_failed landing
-		 * between the two sees LIVE and takes its normal live-member
-		 * path, which clears these same bits after us. */
+	if (ret == 0) {
+		/* Masks first, state second, and revert the masks if the
+		 * cmpxchg loses: whichever way a concurrent lock-free
+		 * mark_failed() interleaves, exactly one side's bookkeeping
+		 * survives.  mark_failed's not-live branch retries against
+		 * LIVE, so a promotion it raced still gets failed rather
+		 * than swallowed. */
 		atomic_or(BIT(target), &rc_volume_write_mask);
 		atomic_or(BIT(target), &rc_volume_live_mask);
+		if (cmpxchg(&rc_volume_member_state[target],
+			    RC_MEMBER_RESYNCING, RC_MEMBER_LIVE) !=
+		    RC_MEMBER_RESYNCING) {
+			/* A failure won the race — undo our mask bits (its
+			 * andnots may have preceded our ors). */
+			atomic_andnot(BIT(target), &rc_volume_write_mask);
+			atomic_andnot(BIT(target), &rc_volume_live_mask);
+			goto completion_settled;
+		}
 		rc_printk(RC_NOTE,
 			  "rc_volume_resync: member %d resynced (%llu MiB) — volume OPTIMAL\n",
 			  target,
@@ -5100,6 +5139,7 @@ done:
 			  target, (unsigned long long)cursor,
 			  (unsigned long long)rc_volume_resync_total);
 	}
+completion_settled:
 	rc_volume_resync_slot = -1;
 	rc_volume_resync_done = true;
 	mutex_unlock(&rc_volume_lock);
@@ -5436,9 +5476,12 @@ static ssize_t fail_member_store(struct device *dev,
 	rc_printk(RC_WARN,
 		  "rc_volume: member %d (%s) FAILED by operator via sysfs\n",
 		  slot, pci_name(rc_volume_members[slot]->pdev));
-	mutex_unlock(&rc_volume_lock);
-
+	/* Fail under the lock: mark_failed itself is lock-free (ISR-safe),
+	 * so holding rc_volume_lock is allowed — and it keeps validate+fail
+	 * atomic against a concurrent remove + re-add reusing this slot for
+	 * a different adapter (failing the wrong, freshly re-added member). */
 	rc_volume_member_mark_failed(slot);
+	mutex_unlock(&rc_volume_lock);
 	return count;
 }
 static DEVICE_ATTR_WO(fail_member);
