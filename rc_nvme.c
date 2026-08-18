@@ -5021,14 +5021,12 @@ done:
 	rc_volume_resync_done = true;
 	mutex_unlock(&rc_volume_lock);
 
-	/* Wait for kthread_stop so the task_struct reference the starter
-	 * took stays valid however the exit races a stopper. */
-	set_current_state(TASK_INTERRUPTIBLE);
-	while (!kthread_should_stop()) {
-		schedule();
-		set_current_state(TASK_INTERRUPTIBLE);
-	}
-	__set_current_state(TASK_RUNNING);
+	/* Exit outright — no parking for kthread_stop().  The starter holds
+	 * a task_struct reference, so the reapers' kthread_stop() is safe
+	 * after this return: on an already-exited kthread it just collects
+	 * the exit code without blocking.  Parking here instead would leave
+	 * a blocked rcraid-resync thread lingering after every successful
+	 * resync until an unrelated readmit/remove/teardown reaped it. */
 	return ret;
 }
 
@@ -5043,7 +5041,7 @@ static void rc_volume_resync_reap_locked(void)
 		return;
 	rc_volume_resync_thread = NULL;
 	rc_volume_resync_done = false;
-	kthread_stop(t);	/* thread already parked in its exit loop */
+	kthread_stop(t);	/* thread already exited; collects exit code */
 	put_task_struct(t);
 }
 
