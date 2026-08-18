@@ -140,6 +140,7 @@ static atomic_t rc_volume_write_mask;
  * ------------------------------------------------------------------ */
 #define RC_RESYNC_XFER_SECTORS	256u		/* 128 KiB per copy op */
 #define RC_RESYNC_XFER_BYTES	(RC_RESYNC_XFER_SECTORS * 512u)
+#define RC_RESYNC_MAX_RETRIES	10		/* per chunk, transient errors */
 #define RC_RESYNC_WINDOW_NONE	(~0ULL)
 
 static struct task_struct *rc_volume_resync_thread;	/* under rc_volume_lock */
@@ -250,13 +251,16 @@ static void rc_volume_member_mark_failed(int idx)
 
 	if (!(prev & BIT(idx))) {
 		/* Not live — but a RESYNCING member failing must still drop
-		 * out of the write fan-out and revert to plain FAILED. */
-		if (READ_ONCE(rc_volume_member_state[idx]) ==
-		    RC_MEMBER_RESYNCING) {
-			WRITE_ONCE(rc_volume_member_state[idx],
-				   RC_MEMBER_FAILED);
+		 * out of the write fan-out and revert to plain FAILED.
+		 * cmpxchg: the resync thread's completion path promotes
+		 * RESYNCING → LIVE concurrently (also by cmpxchg); if it won,
+		 * this member is live again and this failure event is stale —
+		 * a real fault will error a subsequent I/O and re-enter via
+		 * the live path below. */
+		if (cmpxchg(&rc_volume_member_state[idx],
+			    RC_MEMBER_RESYNCING, RC_MEMBER_FAILED) ==
+		    RC_MEMBER_RESYNCING)
 			schedule_work(&rc_volume_degrade_work);
-		}
 		return;
 	}
 	WRITE_ONCE(rc_volume_member_state[idx], RC_MEMBER_FAILED);
@@ -4872,13 +4876,18 @@ static int rc_volume_resync_fn(void *arg)
 	struct rc_adapter *tgt, *srv;
 	int srv_slot = -1;
 	int ret = -EIO;
+	int retries = 0;
 	unsigned int order = get_order(RC_RESYNC_XFER_BYTES);
 
 	total = rc_volume_resync_total;
 
 	buf = (void *)__get_free_pages(GFP_KERNEL, order);
-	if (!buf)
+	if (!buf) {
+		rc_printk(RC_ERROR,
+			  "rc_volume_resync: failed to allocate %u-byte copy buffer (order %u) — aborting\n",
+			  RC_RESYNC_XFER_BYTES, order);
 		goto done;
+	}
 
 	rc_printk(RC_NOTE,
 		  "rc_volume_resync: starting — member %d, %llu sectors (%llu MiB)\n",
@@ -4921,15 +4930,23 @@ static int rc_volume_resync_fn(void *arg)
 			list_va[0] = dma_alloc_coherent(&srv->pdev->dev,
 							PAGE_SIZE, &list_pa[0],
 							GFP_KERNEL);
-			if (!list_va[0])
+			if (!list_va[0]) {
+				rc_printk(RC_ERROR,
+					  "rc_volume_resync: PRP-list page alloc failed for survivor %s — aborting\n",
+					  pci_name(srv->pdev));
 				goto done;
+			}
 		}
 		if (!list_va[1]) {
 			list_va[1] = dma_alloc_coherent(&tgt->pdev->dev,
 							PAGE_SIZE, &list_pa[1],
 							GFP_KERNEL);
-			if (!list_va[1])
+			if (!list_va[1]) {
+				rc_printk(RC_ERROR,
+					  "rc_volume_resync: PRP-list page alloc failed for target %s — aborting\n",
+					  pci_name(tgt->pdev));
 				goto done;
+			}
 		}
 
 		/* Publish the exclusion window, flip the write generation,
@@ -4949,14 +4966,34 @@ static int rc_volume_resync_fn(void *arg)
 		/* Copy: survivor → buffer → target. */
 		dma = dma_map_single(&srv->pdev->dev, buf, bytes,
 				     DMA_FROM_DEVICE);
-		if (dma_mapping_error(&srv->pdev->dev, dma))
+		if (dma_mapping_error(&srv->pdev->dev, dma)) {
+			rc_printk(RC_ERROR,
+				  "rc_volume_resync: DMA map failed on survivor %s at lba %llu — aborting\n",
+				  pci_name(srv->pdev),
+				  (unsigned long long)cursor);
 			goto done;
+		}
 		err = rc_volume_resync_rw(srv, RC_NVME_NVM_OP_READ,
 					  cursor + rc_volume_member_phys_offset[srv_slot],
 					  nlb, bytes, dma,
 					  list_va[0], list_pa[0]);
 		dma_unmap_single(&srv->pdev->dev, dma, bytes, DMA_FROM_DEVICE);
 		if (err) {
+			/* -EBUSY (shared SQ momentarily full) and -ETIMEDOUT
+			 * are expected transients under concurrent blk-mq
+			 * write traffic on the same queue — retry the chunk
+			 * instead of abandoning the whole resync to a manual
+			 * re-plug. */
+			if ((err == -EBUSY || err == -ETIMEDOUT) &&
+			    ++retries <= RC_RESYNC_MAX_RETRIES) {
+				rc_printk(RC_WARN,
+					  "rc_volume_resync: transient read error (%d) from survivor %d at lba %llu — retry %d/%d\n",
+					  err, srv_slot,
+					  (unsigned long long)cursor,
+					  retries, RC_RESYNC_MAX_RETRIES);
+				msleep(20);
+				continue;
+			}
 			rc_printk(RC_ERROR,
 				  "rc_volume_resync: read from survivor %d failed (%d) at lba %llu — aborting\n",
 				  srv_slot, err, (unsigned long long)cursor);
@@ -4965,20 +5002,36 @@ static int rc_volume_resync_fn(void *arg)
 
 		dma = dma_map_single(&tgt->pdev->dev, buf, bytes,
 				     DMA_TO_DEVICE);
-		if (dma_mapping_error(&tgt->pdev->dev, dma))
+		if (dma_mapping_error(&tgt->pdev->dev, dma)) {
+			rc_printk(RC_ERROR,
+				  "rc_volume_resync: DMA map failed on target %s at lba %llu — aborting\n",
+				  pci_name(tgt->pdev),
+				  (unsigned long long)cursor);
 			goto done;
+		}
 		err = rc_volume_resync_rw(tgt, RC_NVME_NVM_OP_WRITE,
 					  cursor + rc_volume_member_phys_offset[target],
 					  nlb, bytes, dma,
 					  list_va[1], list_pa[1]);
 		dma_unmap_single(&tgt->pdev->dev, dma, bytes, DMA_TO_DEVICE);
 		if (err) {
+			if ((err == -EBUSY || err == -ETIMEDOUT) &&
+			    ++retries <= RC_RESYNC_MAX_RETRIES) {
+				rc_printk(RC_WARN,
+					  "rc_volume_resync: transient write error (%d) to target %d at lba %llu — retry %d/%d\n",
+					  err, target,
+					  (unsigned long long)cursor,
+					  retries, RC_RESYNC_MAX_RETRIES);
+				msleep(20);
+				continue;
+			}
 			rc_printk(RC_ERROR,
 				  "rc_volume_resync: write to target %d failed (%d) at lba %llu — aborting\n",
 				  target, err, (unsigned long long)cursor);
 			goto done;
 		}
 
+		retries = 0;
 		cursor += nlb;
 		atomic64_set(&rc_volume_resync_cursor, cursor);
 
@@ -5003,15 +5056,30 @@ done:
 				  PAGE_SIZE, list_va[1], list_pa[1]);
 
 	mutex_lock(&rc_volume_lock);
+	/* cmpxchg, not check-then-set: rc_volume_member_mark_failed() writes
+	 * this state element lock-free from ISR context, and a FAILED it
+	 * installs in the window between a plain check and store must not be
+	 * clobbered back to LIVE (the volume would report optimal while
+	 * routing I/O to a dead member).  If mark_failed wins, it already
+	 * cleared the mask bits and scheduled the degrade work — losing the
+	 * cmpxchg means there is nothing left for us to do. */
 	if (ret == 0 &&
-	    rc_volume_member_state[target] == RC_MEMBER_RESYNCING) {
-		rc_volume_member_set_state(target, RC_MEMBER_LIVE);
+	    cmpxchg(&rc_volume_member_state[target], RC_MEMBER_RESYNCING,
+		    RC_MEMBER_LIVE) == RC_MEMBER_RESYNCING) {
+		/* State is LIVE first, masks second: a mark_failed landing
+		 * between the two sees LIVE and takes its normal live-member
+		 * path, which clears these same bits after us. */
+		atomic_or(BIT(target), &rc_volume_write_mask);
+		atomic_or(BIT(target), &rc_volume_live_mask);
 		rc_printk(RC_NOTE,
 			  "rc_volume_resync: member %d resynced (%llu MiB) — volume OPTIMAL\n",
 			  target,
 			  (unsigned long long)(rc_volume_resync_total >> 11));
-	} else if (rc_volume_member_state[target] == RC_MEMBER_RESYNCING) {
-		rc_volume_member_set_state(target, RC_MEMBER_NEEDS_RESYNC);
+	} else if (ret != 0 &&
+		   cmpxchg(&rc_volume_member_state[target],
+			   RC_MEMBER_RESYNCING, RC_MEMBER_NEEDS_RESYNC) ==
+		   RC_MEMBER_RESYNCING) {
+		atomic_andnot(BIT(target), &rc_volume_write_mask);
 		rc_printk(RC_WARN,
 			  "rc_volume_resync: member %d resync aborted at %llu/%llu sectors — parked needs-resync\n",
 			  target, (unsigned long long)cursor,
@@ -5162,6 +5230,13 @@ void rc_volume_teardown(void)
 	atomic_set(&rc_volume_write_mask, 0);
 	atomic64_set(&rc_volume_resync_window, RC_RESYNC_WINDOW_NONE);
 	atomic64_set(&rc_volume_resync_cursor, 0);
+	/* Symmetry/defense-in-depth: the queue is drained here so these are
+	 * already 0 in any correct execution, but a count leaked across a
+	 * teardown/reassemble cycle would hang the next volume's resync in
+	 * its generation-drain loop with no diagnostic. */
+	atomic_set(&rc_volume_wgen, 0);
+	atomic_set(&rc_volume_wgen_count[0], 0);
+	atomic_set(&rc_volume_wgen_count[1], 0);
 	rc_volume_resync_total = 0;
 	rc_volume_resync_slot = -1;
 	rc_volume_member_count = 0;
