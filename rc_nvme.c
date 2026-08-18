@@ -3699,11 +3699,26 @@ static blk_status_t rc_volume_dispatch_mirror(
 		 * DEV_RESOURCE hands them back to blk-mq for a retry after
 		 * the window has moved on. */
 		{
-			int g = atomic_read(&rc_volume_wgen) & 1;
+			int g;
 			u64 wstart;
 
-			atomic_inc(&rc_volume_wgen_count[g]);
-			smp_mb__after_atomic();
+			/* Seqlock-style retry: the bucket we count into must
+			 * be the generation live AT increment time.  Without
+			 * the re-check, a task preempted between reading wgen
+			 * and incrementing the counter for long enough to
+			 * span a generation flip (2-bucket parity can even
+			 * wrap back to the same g) would land its count in a
+			 * bucket the resync thread already drained — letting
+			 * a chunk copy proceed without waiting for this
+			 * write. */
+			for (;;) {
+				g = atomic_read(&rc_volume_wgen) & 1;
+				atomic_inc(&rc_volume_wgen_count[g]);
+				smp_mb__after_atomic();
+				if ((atomic_read(&rc_volume_wgen) & 1) == g)
+					break;
+				atomic_dec(&rc_volume_wgen_count[g]);
+			}
 			wstart = (u64)atomic64_read(&rc_volume_resync_window);
 			if (wstart != RC_RESYNC_WINDOW_NONE &&
 			    (u64)pos < wstart + RC_RESYNC_XFER_SECTORS &&
