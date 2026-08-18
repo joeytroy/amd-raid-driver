@@ -325,6 +325,17 @@ if [ "$fail_member" = "1" ] && [ "$expected_level" = "raid1" ]; then
     else
         fail "debugfs rcraid/volume not readable"
     fi
+
+    # Stable sysfs surface must agree with debugfs.
+    SYSV=/sys/block/rcraid0/rcraid
+    [ -d "$SYSV" ] || fail "sysfs group $SYSV missing"
+    [ "$(cat $SYSV/state)" = "degraded" ] \
+        || fail "sysfs state is '$(cat $SYSV/state)', expected degraded"
+    grep -q "absent failed" "$SYSV/members" \
+        || fail "sysfs members does not show the removed member absent+failed"
+    [ "$(cat $SYSV/resync_progress)" = "none" ] \
+        || fail "sysfs resync_progress not 'none' while merely degraded"
+    echo "rcraid-test: sysfs state/members/resync_progress agree"
     echo "rcraid-test: degraded scenario complete"
 
     # Re-add: rebind the removed member.  The resync engine must pick it
@@ -358,7 +369,9 @@ if [ "$fail_member" = "1" ] && [ "$expected_level" = "raid1" ]; then
         sleep 0.5
     done
     sed 's/^/rcraid-test:   /' /sys/kernel/debug/rcraid/volume
-    echo "rcraid-test: resync complete — volume optimal"
+    [ "$(cat $SYSV/state)" = "optimal" ] \
+        || fail "sysfs state is '$(cat $SYSV/state)' after resync, expected optimal"
+    echo "rcraid-test: resync complete — volume optimal (sysfs agrees)"
 
     # The ultimate proof: kill the ORIGINAL survivor and serve everything
     # from the freshly resynced member.  Data written before the failure,

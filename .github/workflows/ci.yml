@@ -159,10 +159,14 @@ jobs:
         include:
           - { scenario: raid0,          level: raid0, extra: "" }
           - { scenario: raid1,          level: raid1, extra: "" }
-          # Degraded mode: unbind one mirror member mid-run (simulated
-          # hot-unplug); the guest asserts the volume keeps serving reads
-          # AND writes from the survivor and reports "degraded" in debugfs.
+          # Failover round-trip: unbind one mirror member mid-run
+          # (simulated hot-unplug), serve degraded, re-add it, resync,
+          # then kill the ORIGINAL survivor and verify every byte from
+          # the resynced member.  Sysfs/debugfs state asserted throughout.
           - { scenario: raid1-degraded, level: raid1, extra: "--fail-member" }
+          # Degraded BOOT: one member never attached; allow_degraded=1
+          # assembles the volume degraded after the fallback delay.
+          - { scenario: raid1-degraded-boot, level: raid1, extra: "--omit-member" }
     steps:
       - uses: actions/checkout@v4
 
