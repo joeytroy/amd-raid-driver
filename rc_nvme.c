@@ -5188,6 +5188,13 @@ static void rc_volume_member_readmitted(int slot)
 	}
 	get_task_struct(t);
 	rc_volume_resync_thread = t;
+	/* Clear any stale done-flag: rc_volume_resync_stop() NULLs the
+	 * thread pointer before kthread_stop(), so the stopped thread's
+	 * exit path re-set done = true after the stopper cleared it, and
+	 * reap_locked() above skips the reset when the pointer is NULL.
+	 * Left stale, the next reap would kthread_stop() THIS live thread
+	 * mid-copy as if it had finished. */
+	rc_volume_resync_done = false;
 }
 
 /* Tear down everything rc_volume_create_disk allocated.  Called from
@@ -5504,6 +5511,22 @@ void rc_volume_remove_member(struct rc_adapter *adapter)
 	bool keep_volume;
 	int slot = -1;
 	int i;
+
+	/* Bail before disturbing anything if this adapter never registered
+	 * as a member (foreign NVMe device under allow_foreign_nvme, or a
+	 * probe failure before registration).  This path runs for EVERY
+	 * NVMe-mode adapter removal; unconditionally stopping the resync
+	 * here let churn on an unrelated device abort an in-progress
+	 * rebuild — with no automatic restart, stranding the volume
+	 * degraded. */
+	mutex_lock(&rc_volume_lock);
+	for (i = 0; i < RC_VOLUME_MAX_MEMBERS; i++)
+		if (rc_volume_members[i] == adapter)
+			slot = i;
+	mutex_unlock(&rc_volume_lock);
+	if (slot < 0)
+		return;
+	slot = -1;
 
 	/* The degraded-assembly timer walks the registry and can create the
 	 * disk from a member that is mid-removal — cancel it before any

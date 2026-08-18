@@ -25,6 +25,7 @@ fail() {
     cat /proc/interrupts
     echo "rcraid-test: --- last dmesg lines ---"
     dmesg | tail -n 150
+    dmesg -n 1 2>/dev/null  # quiet kernel console so the marker cannot be split mid-line
     echo "RCRAID-TEST-FAIL"
     poweroff -f
     # Backstop: if poweroff somehow doesn't halt PID 1, do NOT return to
@@ -161,6 +162,7 @@ if [ "$degraded_boot" = "1" ]; then
     got=$(dd if=/dev/rcraid0 bs=1M skip=10 count=4 2>/dev/null | md5sum | cut -d' ' -f1)
     [ "$got" = "$want" ] || fail "readback mismatch on degraded-boot volume"
     echo "rcraid-test: degraded boot: write+readback ok"
+    dmesg -n 1 2>/dev/null  # quiet kernel console so the marker cannot be split mid-line
     echo "RCRAID-TEST-PASS"
     poweroff -f
     exit 0
@@ -402,5 +404,6 @@ if [ "$fail_member" = "1" ] && [ "$expected_level" = "raid1" ]; then
     echo "rcraid-test: resynced member serves all degraded-era data correctly"
 fi
 
+dmesg -n 1 2>/dev/null  # quiet kernel console so the marker cannot be split mid-line
 echo "RCRAID-TEST-PASS"
 poweroff -f
