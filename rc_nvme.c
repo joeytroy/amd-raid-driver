@@ -5064,9 +5064,19 @@ static void rc_volume_member_readmitted(int slot)
 /* Tear down everything rc_volume_create_disk allocated.  Called from
  * rc_exit().  Safe to call when the disk was never created (state is
  * initialised to NULL/0). */
+/* Serializes whole-teardown against whole-teardown (two members surprise-
+ * removed at once, or hot-unplug racing rc_exit).  Without it, one caller
+ * can del_gendisk/put_disk the disk while the other is still inside
+ * device_remove_group() on it.  NOT rc_volume_lock, so the sysfs show/
+ * store handlers (which take rc_volume_lock) can still drain during
+ * kernfs removal. */
+static DEFINE_MUTEX(rc_volume_teardown_lock);
+
 void rc_volume_teardown(void)
 {
 	int i;
+
+	mutex_lock(&rc_volume_teardown_lock);
 
 	/* The degrade work walks the registry — let any queued run finish
 	 * before the registry (and the adapters it points at) go away.  The
@@ -5081,8 +5091,10 @@ void rc_volume_teardown(void)
 	 * removal blocks until in-flight ->show()/->store() callbacks
 	 * return, and those callbacks take rc_volume_lock — removing under
 	 * the lock is an ABBA deadlock with any concurrent attribute read.
-	 * The disk pointer is stable here (only this function clears it,
-	 * and module exit runs once). */
+	 * Concurrent teardown callers are serialized by
+	 * rc_volume_teardown_lock (held above), and the unregister itself is
+	 * idempotent via rc_volume_sysfs_up, so the group is removed exactly
+	 * once and the disk outlives the removal. */
 	rc_volume_sysfs_unregister();
 
 	mutex_lock(&rc_volume_lock);
@@ -5109,6 +5121,7 @@ void rc_volume_teardown(void)
 	rc_volume_member_count = 0;
 	rc_volume_stripe_sectors = 0;
 	mutex_unlock(&rc_volume_lock);
+	mutex_unlock(&rc_volume_teardown_lock);
 }
 
 /* debugfs `rcraid/volume` — volume-level state for operators and the QEMU
@@ -5300,6 +5313,15 @@ static const struct attribute_group rc_volume_sysfs_group = {
 	.attrs = rc_volume_sysfs_attrs,
 };
 
+/* Guards the register/unregister pair so device_remove_group() fires
+ * exactly once.  Deliberately NOT rc_volume_lock: unregister must run
+ * outside that lock (kernfs removal drains ->show()/->store() callbacks
+ * which take it), yet concurrent rc_volume_teardown() callers — two
+ * members surprise-removed at once, or hot-unplug racing rc_exit() —
+ * would otherwise both see rc_volume_disk non-NULL and double-remove
+ * the group (kernfs WARNs on the second call). */
+static atomic_t rc_volume_sysfs_up = ATOMIC_INIT(0);
+
 /* Called with rc_volume_lock held, right after add_disk. */
 static void rc_volume_sysfs_register(void)
 {
@@ -5313,14 +5335,18 @@ static void rc_volume_sysfs_register(void)
 		rc_printk(RC_WARN,
 			  "rc_volume: sysfs group creation failed (%d) — /sys/block/%s/rcraid absent\n",
 			  ret, rc_volume_disk->disk_name);
+	else
+		atomic_set(&rc_volume_sysfs_up, 1);
 }
 
-/* Called with rc_volume_lock held, before del_gendisk. */
+/* Called WITHOUT rc_volume_lock (see rc_volume_teardown).  Idempotent:
+ * only the caller that wins the flag actually removes the group. */
 static void rc_volume_sysfs_unregister(void)
 {
-	if (rc_volume_disk)
-		device_remove_group(disk_to_dev(rc_volume_disk),
-				    &rc_volume_sysfs_group);
+	if (atomic_cmpxchg(&rc_volume_sysfs_up, 1, 0) != 1)
+		return;
+	device_remove_group(disk_to_dev(rc_volume_disk),
+			    &rc_volume_sysfs_group);
 }
 
 /* PCI-remove hook (also used by probe error paths).  A member adapter is
