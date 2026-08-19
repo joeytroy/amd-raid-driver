@@ -57,6 +57,10 @@ DEVTYPE_VOLUME = 0x1BF6
 DEVTYPE_RAID1 = 0x1BF7   # explicit RAID1 encoding some firmware may use
 DEVTYPE_SINGLE = 0x1BF9
 
+# Driver parity: rc_nvme.c RC_VOLUME_MAX_MEMBERS — LD records claiming
+# more members are rejected outright, like the driver's tag scan.
+MAX_MEMBERS = 8
+
 # RC_LogicalDevice field offsets (rc_linux.h RC_LD_*_OFFSET)
 LD_ELEMENTOFFSET = 0x04
 LD_DEVICETYPE = 0x0C
@@ -228,7 +232,7 @@ def parse_member(path):
             cand_eo = struct.unpack_from("<I", gen,
                                          off + LD_ELEMENTOFFSET)[0]
             cand_n = struct.unpack_from("<I", gen, off + LD_DEVICES)[0]
-            belongs = (0 < cand_n <= 64 and
+            belongs = (0 < cand_n <= MAX_MEMBERS and
                        cand_eo + cand_n * LE_BYTES <= pkt and any(
                            struct.unpack_from(
                                "<Q", gen,
@@ -248,6 +252,9 @@ def parse_member(path):
 
     elem_off = struct.unpack_from("<I", ld_blob, LD_ELEMENTOFFSET)[0]
     devices = struct.unpack_from("<I", ld_blob, LD_DEVICES)[0]
+    if not 0 < devices <= MAX_MEMBERS:
+        raise ValueError(f"LD record claims {devices} members "
+                         f"(driver cap {MAX_MEMBERS})")
     if elem_off + devices * LE_BYTES > len(ld_blob):
         raise ValueError("element array overruns LD record")
     elements = []
