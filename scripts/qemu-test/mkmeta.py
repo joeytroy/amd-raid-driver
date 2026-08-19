@@ -69,6 +69,9 @@ DEVTYPE_VOLUME = 0x1BF6
 # counts, element array = the disk's own DeviceID).  The driver must never
 # assemble one of these as a volume.
 DEVTYPE_SINGLE = 0x1BF9
+# Explicit RAID1 DeviceType (rc_linux.h RC_LDT_RAID1) — kept in case some
+# firmware uses it; --devtype-raid1 emits it for parser-parity testing.
+DEVTYPE_RAID1 = 0x1BF7
 LEVELS = ("raid0", "raid1", "raid5", "raid10")
 
 # RC_LogicalDevice field offsets (rc_linux.h RC_LD_*_OFFSET)
@@ -161,6 +164,12 @@ def counts_for(level: str, members: int):
         return members, 1
     if level == "raid1":
         return 1, 2
+    if level == "raid10":
+        # Observed on X399 firmware (issue #57): devices=4, 2x2.
+        # Elements are ordered PAIR-MAJOR: [p0m0, p0m1, p1m0, p1m1] —
+        # position // SecondCount = stripe column, position % SecondCount
+        # = mirror leg.  rcassemble.py mirrors this assumption.
+        return members // 2, 2
     raise ValueError(level)
 
 
@@ -189,20 +198,26 @@ def build_raw_disk_ld(device_id: int, disk_sectors: int) -> bytes:
 
 
 def build_ld_record(level: str, device_ids, capacity: int,
-                    user_size: int, chunk_index: int) -> bytes:
+                    user_size: int, chunk_index: int,
+                    raw_chunk_sectors: int = 0,
+                    devtype: int = DEVTYPE_VOLUME,
+                    counts_override=None) -> bytes:
     n = len(device_ids)
-    first, second = counts_for(level, n)
+    first, second = counts_override or counts_for(level, n)
     size = ELEM_ARRAY_OFFSET + n * LE_BYTES
     ld = bytearray(size)
     struct.pack_into("<I", ld, 0x00, DST_LOGICAL_DEVICE)
     struct.pack_into("<I", ld, LD_ELEMENTOFFSET, ELEM_ARRAY_OFFSET)
-    struct.pack_into("<I", ld, LD_DEVICETYPE, DEVTYPE_VOLUME)
+    struct.pack_into("<I", ld, LD_DEVICETYPE, devtype)
     struct.pack_into("<Q", ld, LD_CAPACITY, capacity)
     struct.pack_into("<I", ld, LD_DEVICES, n)
     struct.pack_into("<I", ld, LD_FIRSTCOUNT, first)
     struct.pack_into("<I", ld, LD_SECONDCOUNT, second)
     struct.pack_into("<I", ld, LD_PACKETSIZE, size)
-    struct.pack_into("<I", ld, LD_CHUNKSIZE, 0)    # 0 → chunk_index encoding
+    # 0 → chunk_index encoding (RAIDXpert2-style); non-0 → raw sector
+    # count used verbatim, taking precedence (BIOS-native RAID0 style —
+    # see rc_volume_chunk_sectors_for).
+    struct.pack_into("<I", ld, LD_CHUNKSIZE, raw_chunk_sectors)
     # Real RAID1 records carry a chunk_index too (observed =3 on hardware)
     # even though mirrors don't stripe; the driver must ignore it for RAID1.
     struct.pack_into("<I", ld, LD_CHUNKINDEX, chunk_index)
@@ -242,14 +257,38 @@ def main():
     ap.add_argument("--chunk-index", type=int, default=3,
                     help="RAID0 stripe encoding: 3=256KiB, 2=128KiB, 0/1=64KiB"
                          " (default 3, matching the hardware dev box)")
+    ap.add_argument("--raw-chunk-sectors", type=int, default=0,
+                    help="write a non-zero RC_LogicalDevice.ChunkSize "
+                         "(sectors), which parsers must use VERBATIM in "
+                         "preference to --chunk-index (BIOS-native RAID0 "
+                         "style); 0 (default) = chunk-index encoding")
+    ap.add_argument("--foreign-ld", action="store_true",
+                    help="also write a volume LD for an UNRELATED array "
+                         "(different DeviceIDs) into the generation — "
+                         "parsers must pick the record owning the member, "
+                         "not fail on multiple LDs")
+    ap.add_argument("--record-padding", type=int, default=0,
+                    help="insert N zero bytes (multiple of 4) before and "
+                         "between generation records — real firmware pads; "
+                         "parsers must tag-scan, not assume packing")
+    ap.add_argument("--devtype-raid1", action="store_true",
+                    help="write the volume LD with the explicit RAID1 "
+                         "DeviceType 0x1BF7 instead of 0x1BF6 (some "
+                         "firmware may use it; parsers must accept it)")
+    ap.add_argument("--counts", metavar="FIRSTxSECOND",
+                    help="override FirstCount/SecondCount (e.g. 2x1) — "
+                         "for negative tests of inconsistent geometry")
     ap.add_argument("images", nargs="+", help="member image files (in position order)")
     args = ap.parse_args()
 
-    if args.level != "raid0" and args.level != "raid1":
-        sys.exit(f"mkmeta: {args.level} metadata is untested — the driver "
+    if args.level == "raid5":
+        sys.exit("mkmeta: raid5 metadata is untested — the driver "
                  "has no dispatch for it yet; add support here alongside")
     if args.level == "raid1" and len(args.images) != 2:
         sys.exit("mkmeta: raid1 wants exactly 2 members")
+    if args.level == "raid10" and (len(args.images) < 4 or
+                                   len(args.images) % 2):
+        sys.exit("mkmeta: raid10 wants an even member count >= 4")
     if len(args.images) < 2:
         sys.exit("mkmeta: need at least 2 member images")
 
@@ -259,7 +298,8 @@ def main():
         # > 3 as "not understood" and falls back to 64 KiB —
         # self-inconsistent metadata.  Refuse instead.
         sys.exit("mkmeta: --chunk-index must be 0-3")
-    chunk_sectors = CHUNK_INDEX_SECTORS[args.chunk_index]
+    chunk_sectors = (args.raw_chunk_sectors or
+                     CHUNK_INDEX_SECTORS[args.chunk_index])
 
     sizes = []
     for img in args.images:
@@ -278,6 +318,8 @@ def main():
     user_size = (min_sectors - USERDATA_START) // chunk_sectors * chunk_sectors
     if args.level == "raid0":
         capacity = user_size * len(args.images)
+    elif args.level == "raid10":
+        capacity = user_size * (len(args.images) // 2)
     else:  # raid1
         capacity = user_size
 
@@ -290,9 +332,28 @@ def main():
     # assembles a bogus 1-member volume (wrong capacity and level → the
     # guest checks fail).
     raw_ld = build_raw_disk_ld(device_ids[0], min_sectors)
+    counts_override = None
+    if args.counts:
+        counts_override = tuple(int(x) for x in args.counts.split("x"))
     active_ld = build_ld_record(args.level, device_ids, capacity,
-                                user_size, args.chunk_index)
-    active_gen = build_generation(ACTIVE_GEN_TS, raw_ld + active_ld)
+                                user_size, args.chunk_index,
+                                args.raw_chunk_sectors,
+                                DEVTYPE_RAID1 if args.devtype_raid1
+                                else DEVTYPE_VOLUME,
+                                counts_override)
+    pad = bytes(args.record_padding)
+    records = pad + raw_ld + pad
+    if args.foreign_ld:
+        # An LD for a DIFFERENT array on the same controller: unrelated
+        # DeviceIDs, placed BEFORE our record so a parser without a
+        # membership filter trips over it first.
+        foreign_ids = [0x52435445535446AA + i for i in range(2)]
+        records += build_ld_record("raid1" if args.level != "raid1"
+                                   else "raid0",
+                                   foreign_ids, user_size, user_size, 1)
+        records += pad
+    records += active_ld
+    active_gen = build_generation(ACTIVE_GEN_TS, records)
 
     # Decoy generation: a dead config for the OPPOSITE level with the same
     # DeviceIDs and a capacity that can't match the active one.  Sits at

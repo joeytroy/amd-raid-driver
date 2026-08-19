@@ -251,6 +251,20 @@ jobs:
   # Severity: warning and up (the tree is warning-clean; style-level chatter
   # stays advisory via local runs).
   # ---------------------------------------------------------------------------
+  # ---------------------------------------------------------------------------
+  # rcassemble — userspace read-only assembly tool (scripts/rcassemble.py).
+  # Pure userspace: synthetic member images + loop devices + dm; exercises
+  # raid0/raid1/raid10 parse, geometry, assembly, degraded raid10, and
+  # rejection paths.  No kernel module involved.
+  # ---------------------------------------------------------------------------
+  rcassemble:
+    name: rcassemble (userspace)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run assemble-test.sh
+        run: sudo bash scripts/qemu-test/assemble-test.sh
+
   shellcheck:
     name: shellcheck
     runs-on: ubuntu-24.04
