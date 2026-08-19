@@ -45,11 +45,17 @@ DKMS. What's live today:
   kernel-hold drop-in installed by both installers so unattended-upgrades
   never pulls a kernel behind the DKMS rebuild's back.
 
-Not yet: **RAID1 degraded mode and resync** (a member failure still fails
-the volume — the mirror's data survives on both drives but the volume goes
-down; and nothing tracks or repairs divergence between the copies after a
-half-failed mirror write, so RAID1 currently provides redundancy of data
-at rest, not availability; this is the top roadmap item), RAID10/5,
+RAID1 **degraded mode, degraded boot (opt-in `allow_degraded=1`), and
+resync** now work: a member failure or hot-unplug keeps the volume
+serving from the survivor; a re-added member is rebuilt from the
+survivor online (write fan-out to the resync target + moving exclusion
+window keep concurrent writes coherent); volume state is exposed in
+`/sys/block/rcraid0/rcraid/` and debugfs.  Verified by the QEMU rig's
+`--fail-member` round-trip (fail → degraded writes → re-add → resync →
+kill the original survivor → checksums intact) and `--omit-member`
+degraded-boot scenarios.
+Not yet: **persistent degraded state** (in-memory only — a reload
+re-assembles as if in sync; needs config-ring writer RE), RAID10/5,
 hot-plug/rebuild, SMART pass-through,
 multi-volume, Secure Boot signing out of the box, array creation from Linux.
 The prioritized roadmap is in [`IMPLEMENTATION.MD`](IMPLEMENTATION.MD); the

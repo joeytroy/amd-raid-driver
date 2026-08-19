@@ -27,6 +27,12 @@ on:
 permissions:
   contents: read
 
+# A new push to the same PR/branch supersedes the previous run — cancel it
+# instead of letting two runs fight over the QEMU-capable runner slots.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   # ---------------------------------------------------------------------------
   # Build the module against more than one kernel.  Using two runner images
@@ -151,12 +157,22 @@ jobs:
   # when the runner exposes /dev/kvm, TCG otherwise.
   # ---------------------------------------------------------------------------
   qemu-rig:
-    name: qemu-rig (${{ matrix.level }})
+    name: qemu-rig (${{ matrix.scenario }})
     runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
-        level: [raid0, raid1]
+        include:
+          - { scenario: raid0,          level: raid0, extra: "" }
+          - { scenario: raid1,          level: raid1, extra: "" }
+          # Failover round-trip: unbind one mirror member mid-run
+          # (simulated hot-unplug), serve degraded, re-add it, resync,
+          # then kill the ORIGINAL survivor and verify every byte from
+          # the resynced member.  Sysfs/debugfs state asserted throughout.
+          - { scenario: raid1-degraded, level: raid1, extra: "--fail-member" }
+          # Degraded BOOT: one member never attached; allow_degraded=1
+          # assembles the volume degraded after the fallback delay.
+          - { scenario: raid1-degraded-boot, level: raid1, extra: "--omit-member" }
     steps:
       - uses: actions/checkout@v4
 
@@ -184,7 +200,8 @@ jobs:
           echo "target kernel: $KVER"
           sudo install -m 644 "/boot/vmlinuz-$KVER" ./vmlinuz
           scripts/qemu-test/run-qemu-raid-test.sh \
-            --kver "$KVER" --kernel ./vmlinuz --level "${{ matrix.level }}"
+            --kver "$KVER" --kernel ./vmlinuz --level "${{ matrix.level }}" \
+            ${{ matrix.extra }}
 
   # ---------------------------------------------------------------------------
   # SPDX license tag — every driver source must declare GPL-2.0-only on line 1.

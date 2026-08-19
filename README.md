@@ -56,9 +56,12 @@ NVMe RAID controller as PCI `1022:B000`, which is fully implemented here.
 | `1022:B000` | NVMe RAID Bottom (TRX50, WRX90, X870/X670, B850/B650, …) | ✅ **RAID0 + RAID1 read/write, boot-from-array validated** |
 | `1022:43BD` `7905` `7916` `7917` | SATA RAID (Promontory / older) | ⚙️ Claimed but stubbed — not yet implemented |
 
-> **Heads-up for RAID1 users:** degraded mode is **not implemented yet** —
-> a member failure downs the volume (your data stays safe on both drives,
-> but availability goes with it). Details under
+> **Heads-up for RAID1 users:** degraded mode and resync work — a member
+> failure (or hot-unplug) keeps the volume serving from the surviving
+> mirror, and a re-added member is rebuilt from the survivor while the
+> volume stays online. Degraded state is **in-memory only** (a
+> reboot/reload re-assembles the array as if in sync), so rebuild before
+> rebooting if the mirrors diverged. Details under
 > [Not yet supported](#not-yet-supported).
 
 ---
@@ -284,16 +287,16 @@ Full setup, troubleshooting, and the Secure-Boot / signing details are in
 
 ## Not yet supported
 
-- **RAID1 degraded mode / resync / rebuild** — ⚠️ **know this before
-  trusting the mirror**: today a member failure fails the whole volume
-  (same behavior as RAID0) instead of serving from the surviving mirror.
-  Your data is still duplicated on both drives — nothing is lost — but
-  the volume goes down until the array is healthy again. There is also
-  **no resync**: nothing tracks or repairs divergence between the copies
-  (e.g. after a write that failed on one mirror mid-flight), so RAID1
-  today provides redundancy of data at rest, not availability.
-  Degraded-mode operation, dirty-region tracking/resync, hot-plug
-  handling, and background rebuild are the next roadmap items.
+- **Persistent degraded state** — ⚠️ **know this before trusting the
+  mirror**: degraded mode, opt-in degraded boot (`allow_degraded=1`),
+  and resync all work (state in `/sys/block/rcraid0/rcraid/` and
+  `/sys/kernel/debug/rcraid/volume`), but degraded/resync state is
+  **in-memory only** — the driver never writes the firmware-owned
+  RAIDCore metadata. A reboot or module reload re-assembles the array
+  as if in sync, so if the mirrors have actually diverged (a member
+  failed and writes continued), let the resync finish — or rebuild the
+  array — before rebooting. On-disk state tracking requires further
+  reverse engineering of the config-ring writer and is a roadmap item.
 - **RAID10** — roadmap. **RAID5** — not planned (AMD only supports it on
   3rd-gen Threadripper).
 - **SATA RAID** — the `43BD / 7905 / 7916 / 7917` controllers are claimed

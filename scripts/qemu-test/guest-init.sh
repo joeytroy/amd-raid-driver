@@ -25,6 +25,7 @@ fail() {
     cat /proc/interrupts
     echo "rcraid-test: --- last dmesg lines ---"
     dmesg | tail -n 150
+    dmesg -n 1 2>/dev/null  # quiet kernel console so the marker cannot be split mid-line
     echo "RCRAID-TEST-FAIL"
     poweroff -f
     # Backstop: if poweroff somehow doesn't halt PID 1, do NOT return to
@@ -41,10 +42,14 @@ mark() {
 
 expected_sectors=""
 expected_level=""
+fail_member=0
+degraded_boot=0
 for arg in $(cat /proc/cmdline); do
     case "$arg" in
         expected_sectors=*) expected_sectors="${arg#expected_sectors=}" ;;
         expected_level=*)   expected_level="${arg#expected_level=}" ;;
+        fail_member=*)      fail_member="${arg#fail_member=}" ;;
+        degraded_boot=*)    degraded_boot="${arg#degraded_boot=}" ;;
     esac
 done
 [ -n "$expected_sectors" ] || fail "no expected_sectors= on kernel cmdline"
@@ -62,6 +67,13 @@ bind_nvme_functions() {
     for d in /sys/bus/pci/devices/*; do
         [ "$(cat "$d/class")" = "0x010802" ] || continue
         bdf="${d##*/}"
+        # Already ours?  Do NOT unbind+rebind: with degraded mode in the
+        # driver, unbinding a live member is a hot-remove (the volume drops
+        # to degraded and the member can't rejoin without resync) — the
+        # old teardown-and-reassemble behavior this dance relied on is gone.
+        case "$(readlink "$d/driver" 2>/dev/null)" in
+            */rcbottom) found=$((found + 1)); continue ;;
+        esac
         echo rcbottom > "$d/driver_override"
         if [ -e "$d/driver" ]; then
             echo "$bdf" > "$d/driver/unbind" 2>/dev/null
@@ -69,7 +81,9 @@ bind_nvme_functions() {
         echo "$bdf" > /sys/bus/pci/drivers_probe 2>/dev/null
         found=$((found + 1))
     done
-    [ "$found" -ge 2 ] || fail "found $found NVMe functions, need >= 2"
+    min_found=2
+    [ "$degraded_boot" = "1" ] && min_found=1
+    [ "$found" -ge "$min_found" ] || fail "found $found NVMe functions, need >= $min_found"
 
     # new_id probes synchronously, so the driver symlink tells us whether
     # each function really bound (a failed probe or rejected new_id write
@@ -82,20 +96,27 @@ bind_nvme_functions() {
             *) echo "rcraid-test: WARNING: $(basename "$d") did not bind to rcbottom" ;;
         esac
     done
-    [ "$bound" -ge 2 ] || fail "only $bound of $found NVMe functions bound to rcbottom"
+    [ "$bound" -ge "$min_found" ] || fail "only $bound of $found NVMe functions bound to rcbottom"
 }
 
-echo "rcraid-test: loading rcraid.ko"
-insmod /rcraid.ko enable_writes=1 allow_foreign_nvme=1 || fail "insmod rcraid.ko"
+MODARGS="enable_writes=1 allow_foreign_nvme=1"
+[ "$degraded_boot" = "1" ] && MODARGS="$MODARGS allow_degraded=1"
+
+echo "rcraid-test: loading rcraid.ko ($MODARGS)"
+insmod /rcraid.ko $MODARGS || fail "insmod rcraid.ko"
 
 echo "rcraid-test: binding NVMe-class PCI functions to rcbottom"
 bind_nvme_functions
+
+# Degraded boot waits out the driver's 10 s assemble-fallback delay.
+wait_ticks=100
+[ "$degraded_boot" = "1" ] && wait_ticks=300
 
 echo "rcraid-test: waiting for /dev/rcraid0"
 i=0
 while [ ! -b /dev/rcraid0 ]; do
     i=$((i + 1))
-    [ "$i" -le 100 ] || fail "/dev/rcraid0 did not appear within 10s"
+    [ "$i" -le "$wait_ticks" ] || fail "/dev/rcraid0 did not appear within $((wait_ticks / 10))s"
     sleep 0.1
 done
 
@@ -115,6 +136,36 @@ if [ -n "$expected_level" ]; then
         fail "volume did not assemble as $want_level (decoy generation matched?)"
     fi
     echo "rcraid-test: assembled level verified: $want_level"
+fi
+
+# ---------------------------------------------------------------------------
+# Degraded BOOT scenario (degraded_boot=1): one member was never attached;
+# the volume must have assembled via the allow_degraded fallback delay.
+# Focused checks only (the full battery assumes a healthy mirror):
+# degraded state visible, writes + readback work on the survivor.
+# ---------------------------------------------------------------------------
+if [ "$degraded_boot" = "1" ]; then
+    mark "degraded boot checks"
+    mount -t debugfs debugfs /sys/kernel/debug 2>/dev/null
+    [ -r /sys/kernel/debug/rcraid/volume ] || fail "debugfs rcraid/volume missing"
+    sed 's/^/rcraid-test:   /' /sys/kernel/debug/rcraid/volume
+    grep -q "state: degraded" /sys/kernel/debug/rcraid/volume \
+        || fail "degraded boot did not produce state: degraded"
+    dmesg | grep -q "assembling DEGRADED" \
+        || fail "no 'assembling DEGRADED' log — volume came up some other way?"
+
+    dd if=/dev/urandom of=/pattern bs=1M count=4 2>/dev/null
+    want=$(md5sum /pattern | cut -d' ' -f1)
+    dd if=/pattern of=/dev/rcraid0 bs=1M seek=10 conv=fsync 2>/dev/null \
+        || fail "write on degraded-boot volume"
+    echo 3 > /proc/sys/vm/drop_caches
+    got=$(dd if=/dev/rcraid0 bs=1M skip=10 count=4 2>/dev/null | md5sum | cut -d' ' -f1)
+    [ "$got" = "$want" ] || fail "readback mismatch on degraded-boot volume"
+    echo "rcraid-test: degraded boot: write+readback ok"
+    dmesg -n 1 2>/dev/null  # quiet kernel console so the marker cannot be split mid-line
+    echo "RCRAID-TEST-PASS"
+    poweroff -f
+    exit 0
 fi
 
 # Round-trip test: 4 MiB of /dev/urandom at three offsets — volume start,
@@ -215,5 +266,144 @@ else
     echo "rcraid-test: mke2fs not bundled — skipping sub-page write test"
 fi
 
+# ---------------------------------------------------------------------------
+# RAID1 degraded-mode scenario (fail_member=1): kill one mirror member via
+# sysfs unbind — the same rc_bottom_remove → rc_volume_remove_member path a
+# surprise hot-unplug takes — and prove the volume keeps serving:
+#   1. data written BEFORE the failure is still readable (from the survivor),
+#   2. writes AFTER the failure succeed (degraded write to the survivor only),
+#   3. debugfs reports the volume degraded with the member absent.
+# The host runner skips its mirror-identity check in this mode — post-failure
+# writes legitimately reach only the survivor.
+# ---------------------------------------------------------------------------
+if [ "$fail_member" = "1" ] && [ "$expected_level" = "raid1" ]; then
+    echo "rcraid-test: DEGRADED SCENARIO: pre-failure write"
+    mark "degraded scenario start"
+    dd if=/dev/urandom of=/pattern2 bs=1M count=4 2>/dev/null
+    want2=$(md5sum /pattern2 | cut -d' ' -f1)
+    dd if=/pattern2 of=/dev/rcraid0 bs=1M seek=50 conv=fsync 2>/dev/null \
+        || fail "pre-failure write at 50 MiB"
+
+    # Unbind the LAST rcbottom-bound NVMe function (RAID1 is symmetric —
+    # either member works).
+    victim=""
+    for d in /sys/bus/pci/devices/*; do
+        [ "$(cat "$d/class")" = "0x010802" ] || continue
+        case "$(readlink "$d/driver" 2>/dev/null)" in
+            */rcbottom) victim="${d##*/}" ;;
+        esac
+    done
+    [ -n "$victim" ] || fail "no rcbottom-bound member found to unbind"
+    echo "rcraid-test: unbinding member $victim (simulated hot-unplug)"
+    mark "unbinding $victim"
+    echo "$victim" > "/sys/bus/pci/drivers/rcbottom/unbind" \
+        || fail "unbind of $victim"
+
+    [ -b /dev/rcraid0 ] \
+        || fail "/dev/rcraid0 disappeared after single-member failure"
+
+    echo 3 > /proc/sys/vm/drop_caches
+    got2=$(dd if=/dev/rcraid0 bs=1M skip=50 count=4 2>/dev/null | md5sum | cut -d' ' -f1)
+    [ "$got2" = "$want2" ] \
+        || fail "pre-failure data unreadable from survivor (degraded read broken)"
+    echo "rcraid-test: degraded READ ok (pre-failure data served by survivor)"
+
+    mark "degraded write"
+    dd if=/pattern2 of=/dev/rcraid0 bs=1M seek=60 conv=fsync 2>/dev/null \
+        || fail "degraded write at 60 MiB failed"
+    echo 3 > /proc/sys/vm/drop_caches
+    got2=$(dd if=/dev/rcraid0 bs=1M skip=60 count=4 2>/dev/null | md5sum | cut -d' ' -f1)
+    [ "$got2" = "$want2" ] || fail "degraded write readback mismatch"
+    echo "rcraid-test: degraded WRITE ok"
+
+    mount -t debugfs debugfs /sys/kernel/debug 2>/dev/null
+    if [ -r /sys/kernel/debug/rcraid/volume ]; then
+        echo "rcraid-test: --- debugfs volume state ---"
+        sed 's/^/rcraid-test:   /' /sys/kernel/debug/rcraid/volume
+        grep -q "state: degraded" /sys/kernel/debug/rcraid/volume \
+            || fail "debugfs does not report state: degraded"
+        grep -q "absent" /sys/kernel/debug/rcraid/volume \
+            || fail "debugfs does not show the removed member as absent"
+    else
+        fail "debugfs rcraid/volume not readable"
+    fi
+
+    # Stable sysfs surface must agree with debugfs.
+    SYSV=/sys/block/rcraid0/rcraid
+    [ -d "$SYSV" ] || fail "sysfs group $SYSV missing"
+    [ "$(cat $SYSV/state)" = "degraded" ] \
+        || fail "sysfs state is '$(cat $SYSV/state)', expected degraded"
+    grep -q "absent failed" "$SYSV/members" \
+        || fail "sysfs members does not show the removed member absent+failed"
+    [ "$(cat $SYSV/resync_progress)" = "none" ] \
+        || fail "sysfs resync_progress not 'none' while merely degraded"
+    echo "rcraid-test: sysfs state/members/resync_progress agree"
+    echo "rcraid-test: degraded scenario complete"
+
+    # Re-add: rebind the removed member.  The resync engine must pick it
+    # up (needs-resync → resyncing) and copy the survivor over it while
+    # the volume keeps serving.
+    echo "rcraid-test: re-adding member $victim"
+    mark "re-adding $victim"
+    echo "$victim" > /sys/bus/pci/drivers_probe 2>/dev/null
+    sleep 1
+    sed 's/^/rcraid-test:   /' /sys/kernel/debug/rcraid/volume
+    grep -q "$victim" /sys/kernel/debug/rcraid/volume \
+        || fail "re-added member $victim not visible in registry"
+    grep -q "needs-resync\|resyncing" /sys/kernel/debug/rcraid/volume \
+        || { grep -q "state: optimal" /sys/kernel/debug/rcraid/volume \
+             || fail "re-added member neither resyncing nor already optimal"; }
+
+    # Write MORE data while the resync runs — exercises the exclusion
+    # window + write fan-out to the resyncing member.
+    dd if=/pattern2 of=/dev/rcraid0 bs=1M seek=70 conv=fsync 2>/dev/null \
+        || fail "write during resync failed"
+
+    echo "rcraid-test: waiting for resync to complete"
+    mark "waiting for resync"
+    i=0
+    while ! grep -q "state: optimal" /sys/kernel/debug/rcraid/volume; do
+        i=$((i + 1))
+        [ "$i" -le 240 ] || {
+            sed 's/^/rcraid-test:   /' /sys/kernel/debug/rcraid/volume
+            fail "resync did not complete within 120s"
+        }
+        sleep 0.5
+    done
+    sed 's/^/rcraid-test:   /' /sys/kernel/debug/rcraid/volume
+    [ "$(cat $SYSV/state)" = "optimal" ] \
+        || fail "sysfs state is '$(cat $SYSV/state)' after resync, expected optimal"
+    echo "rcraid-test: resync complete — volume optimal (sysfs agrees)"
+
+    # The ultimate proof: kill the ORIGINAL survivor and serve everything
+    # from the freshly resynced member.  Data written before the failure,
+    # while degraded, and during the resync must all be there.
+    survivor=""
+    for d in /sys/bus/pci/devices/*; do
+        [ "$(cat "$d/class")" = "0x010802" ] || continue
+        bdf="${d##*/}"
+        [ "$bdf" = "$victim" ] && continue
+        case "$(readlink "$d/driver" 2>/dev/null)" in
+            */rcbottom) survivor="$bdf" ;;
+        esac
+    done
+    [ -n "$survivor" ] || fail "could not identify original survivor"
+    echo "rcraid-test: unbinding ORIGINAL survivor $survivor — resynced member must carry the volume"
+    mark "unbinding survivor $survivor"
+    echo "$survivor" > "/sys/bus/pci/drivers/rcbottom/unbind" \
+        || fail "unbind of survivor $survivor"
+    [ -b /dev/rcraid0 ] || fail "volume gone after survivor removal"
+
+    echo 3 > /proc/sys/vm/drop_caches
+    for seek in 50 60 70; do
+        got2=$(dd if=/dev/rcraid0 bs=1M skip=$seek count=4 2>/dev/null | md5sum | cut -d' ' -f1)
+        [ "$got2" = "$want2" ] \
+            || fail "data at ${seek} MiB wrong when served by the RESYNCED member"
+    done
+    sed 's/^/rcraid-test:   /' /sys/kernel/debug/rcraid/volume
+    echo "rcraid-test: resynced member serves all degraded-era data correctly"
+fi
+
+dmesg -n 1 2>/dev/null  # quiet kernel console so the marker cannot be split mid-line
 echo "RCRAID-TEST-PASS"
 poweroff -f
