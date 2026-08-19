@@ -80,6 +80,15 @@ COMMIT_GEN_TS = 0x10
 
 GEN_HEADER_BYTES = 0x200
 
+# Absolute sanity caps for untrusted on-disk sizes.  Config rings and
+# generations are small (mkmeta.py writes a 2048-sector ring; real
+# firmware is the same order of magnitude) — cap well above any real
+# value but far below anything that could balloon a read: the checksum
+# is a reversible XOR, so corrupt/crafted metadata can pass it, and
+# ring_size/gen_len are raw u32s.
+RING_SIZE_MAX = 1 << 16        # sectors (32 MiB)
+GEN_LEN_MAX = 1 << 24          # bytes (16 MiB)
+
 # chunk_index encoding (rc_volume_chunk_sectors_for): only 2 and 3 are
 # explicit, everything else means 128 sectors.
 CHUNK_INDEX_SECTORS = {3: 512, 2: 256}
@@ -145,9 +154,15 @@ def parse_member(path):
         gen_lba = struct.unpack_from("<I", commit, COMMIT_GEN_LBA)[0]
         gen_len = struct.unpack_from("<I", commit, COMMIT_GEN_LEN)[0]
         gen_ts = struct.unpack_from("<Q", commit, COMMIT_GEN_TS)[0]
+        if ring_size > RING_SIZE_MAX:
+            raise ValueError(f"implausible ConfigRingSize {ring_size} "
+                             f"sectors (cap {RING_SIZE_MAX})")
         if gen_len == 0 or gen_len % SECTOR:
             raise ValueError(f"committed generation length {gen_len} "
                              "is zero or not sector-aligned")
+        if gen_len > GEN_LEN_MAX:
+            raise ValueError(f"implausible generation length {gen_len} "
+                             f"bytes (cap {GEN_LEN_MAX})")
         if not ring_lba <= gen_lba < ring_lba + ring_size:
             raise ValueError(f"committed generation LBA {gen_lba:#x} "
                              "outside the config ring")
@@ -177,6 +192,8 @@ def parse_member(path):
         dst = struct.unpack_from("<I", gen, off)[0]
         if dst != DST_LOGICAL_DEVICE:
             break
+        if off + LD_PACKETSIZE + 4 > len(gen):
+            raise ValueError(f"truncated LD record header at +{off:#x}")
         pkt = struct.unpack_from("<I", gen, off + LD_PACKETSIZE)[0]
         if pkt < LD_CHUNKINDEX + 4 or off + pkt > len(gen):
             raise ValueError(f"LD record at +{off:#x} has bad "
@@ -323,8 +340,12 @@ def check_not_in_use(path):
     if os.path.isdir(holders) and os.listdir(holders):
         raise ValueError(f"{path} is held by {os.listdir(holders)} — "
                          "refusing to assemble over an in-use member")
+    real = os.path.realpath(path)
     with open("/proc/mounts") as f:
-        if any(line.split()[0] == path for line in f):
+        # realpath BOTH sides: the member may be passed via a symlink
+        # (/dev/disk/by-id/...) while /proc/mounts records /dev/sdX, or
+        # vice versa.
+        if any(os.path.realpath(line.split()[0]) == real for line in f):
             raise ValueError(f"{path} is mounted — refusing")
 
 
