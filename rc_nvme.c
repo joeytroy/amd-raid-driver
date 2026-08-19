@@ -6154,6 +6154,16 @@ int rc_nvme_pm_suspend_adapter(struct rc_adapter *adapter)
 		nvme->pm_volume_frozen = true;
 	}
 
+	/* A straggler that timed out DURING the freeze wait has already
+	 * queued auto_reset_work — and its bail-out check (!dead) won't
+	 * help, because this function is about to set dead for the whole
+	 * suspend.  Left alone it would re-enable the controller (CC.EN,
+	 * IRQs, dead=false) concurrently with or after the D3 transition,
+	 * undoing the quiesce.  The freeze has completed, so no further
+	 * timeouts can queue it again; cancel before taking admin_mutex
+	 * (safe: the mutex isn't held, so a running reset can finish). */
+	cancel_work_sync(&nvme->auto_reset_work);
+
 	/* Serialize against rc_nvme_reset_controller, which can run from
 	 * .timeout → rc_nvme_auto_reset_fn if a request times out mid-PM.
 	 * Both paths drive CC.EN and INTMS; without this mutex they can
@@ -6236,11 +6246,15 @@ int rc_nvme_pm_resume_adapter(struct rc_adapter *adapter)
 		  pci_name(adapter->pdev));
 	ret = rc_nvme_reset_controller(adapter);
 
-	if (nvme->pm_volume_frozen) {
+	/* NULL guard like every other rc_volume_disk touch point: a volume
+	 * teardown (module unload race, hibernate freeze/thaw sequences)
+	 * can run between the suspend that took the reference and this
+	 * resume; dereferencing here would oops inside PM resume. */
+	if (nvme->pm_volume_frozen && rc_volume_disk) {
 		blk_mq_unfreeze_queue(rc_volume_disk->queue,
 				      nvme->pm_freeze_memflags);
-		nvme->pm_volume_frozen = false;
 	}
+	nvme->pm_volume_frozen = false;
 	return ret;
 }
 
