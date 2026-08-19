@@ -54,6 +54,7 @@ RAIDCORE_VERSION = 0x00030000
 
 DST_LOGICAL_DEVICE = 0x25BD
 DEVTYPE_VOLUME = 0x1BF6
+DEVTYPE_RAID1 = 0x1BF7   # explicit RAID1 encoding some firmware may use
 DEVTYPE_SINGLE = 0x1BF9
 
 # RC_LogicalDevice field offsets (rc_linux.h RC_LD_*_OFFSET)
@@ -199,7 +200,10 @@ def parse_member(path):
             raise ValueError(f"LD record at +{off:#x} has bad "
                              f"PacketSize {pkt}")
         devtype = struct.unpack_from("<I", gen, off + LD_DEVICETYPE)[0]
-        if devtype == DEVTYPE_VOLUME:
+        # 0x1BF7 is the explicit RAID1 DeviceType the driver's
+        # rc_ld_level_from() also accepts ("kept in case some firmware
+        # uses it") — treat it as a volume record like the driver does.
+        if devtype in (DEVTYPE_VOLUME, DEVTYPE_RAID1):
             if ld_blob is not None:
                 raise ValueError("multiple volume LD records in the "
                                  "committed generation")
@@ -265,7 +269,13 @@ def derive_geometry(members):
     if first * second != devices:
         raise ValueError(f"FirstCount {first} x SecondCount {second} != "
                          f"devices {devices}")
-    if second == 1:
+    devtype = struct.unpack_from("<I", ld, LD_DEVICETYPE)[0]
+    if devtype == DEVTYPE_RAID1:
+        # Explicit RAID1 DeviceType: same sanity as the driver.
+        if devices != 2:
+            raise ValueError(f"0x1BF7 RAID1 LD with devices={devices}")
+        level = "raid1"
+    elif second == 1:
         level = "raid0"
     elif second == 2 and first == 1:
         level = "raid1"
@@ -273,6 +283,13 @@ def derive_geometry(members):
         level = "raid10"
     else:
         raise ValueError(f"unsupported geometry {first}x{second}")
+    if level == "raid1":
+        # Match rc_volume_chunk_sectors_for(): mirrors don't stripe, so
+        # the on-disk chunk fields (real RAID1 metadata carries a
+        # chunk_index anyway) must not apply — force 512 so --parse-only
+        # reports what the driver would actually use.  The dm table for
+        # raid1 never consumes this value.
+        chunk_sectors = 512
 
     positions = [None] * devices
     for m in members:
