@@ -380,13 +380,16 @@ struct rc_nvme_state {
     // forever.
     bool              auto_reset_disabled;
 
-    // S3/S4 bookkeeping: true while this adapter's PM suspend holds a
-    // blk_mq_freeze_queue() reference on the volume queue (freeze is
-    // refcounted, so each member holds its own).  The memflags cookie
-    // returned by blk_mq_freeze_queue must be handed back to
-    // blk_mq_unfreeze_queue on resume.  Only touched from the PM
-    // suspend/resume hooks, which the PM core serializes per device.
-    bool              pm_volume_frozen;
+    // S3/S4 bookkeeping: the exact gendisk this adapter's PM suspend
+    // froze, pinned via get_device() for the WHOLE frozen window, or
+    // NULL when no freeze is held.  Unfreeze must target this pointer,
+    // never the global rc_volume_disk — the volume can be torn down and
+    // REASSEMBLED (fresh gendisk + tagset) while a member is suspended,
+    // and unfreezing the new queue would corrupt its freeze depth.  The
+    // memflags cookie pairs the freeze-time memalloc_noio_save with the
+    // unfreeze-time restore.  Only touched from the PM suspend/resume
+    // hooks, which the PM core serializes per device.
+    struct gendisk   *pm_frozen_disk;
     unsigned int      pm_freeze_memflags;
 
     // This adapter's slot in rc_volume_members[], or -1 when not a

@@ -6160,31 +6160,28 @@ int rc_nvme_pm_suspend_adapter(struct rc_adapter *adapter)
 	 * the gendisk (and its queue) alive even if teardown wins the
 	 * race; freezing a dying queue is safe (refcounted, del_gendisk
 	 * does its own freeze/unfreeze). */
-	{
-		struct gendisk *disk = NULL;
-
-		mutex_lock(&rc_volume_lock);
-		if (rc_volume_disk && !nvme->pm_volume_frozen) {
-			disk = rc_volume_disk;
-			get_device(disk_to_dev(disk));
-			/* START the freeze while still under the lock: the
-			 * pin only keeps the gendisk/queue memory alive, not
-			 * the driver-owned rc_volume_tagset, which teardown
-			 * (same lock) frees unconditionally.  With the
-			 * freeze already started inside the locked region,
-			 * teardown can never interleave between pin and
-			 * freeze.  blk_freeze_queue_start is non-blocking;
-			 * only the drain wait runs outside the lock. */
-			blk_freeze_queue_start(disk->queue);
-			nvme->pm_freeze_memflags = memalloc_noio_save();
-			nvme->pm_volume_frozen = true;
-		}
-		mutex_unlock(&rc_volume_lock);
-		if (disk) {
-			blk_mq_freeze_queue_wait(disk->queue);
-			put_device(disk_to_dev(disk));
-		}
+	mutex_lock(&rc_volume_lock);
+	if (rc_volume_disk && !nvme->pm_frozen_disk) {
+		/* Pin the disk for the WHOLE frozen window (released only
+		 * at unfreeze), and START the freeze while still under the
+		 * lock: the pin keeps the gendisk/queue memory alive, but
+		 * not the driver-owned rc_volume_tagset, which teardown
+		 * (same lock) frees unconditionally — with the freeze
+		 * already started inside the locked region, teardown can
+		 * never interleave between pin and freeze.
+		 * blk_freeze_queue_start is non-blocking; only the drain
+		 * wait runs outside the lock (it can last the full
+		 * timeout/eh_retries budget on a wedged member, and holding
+		 * the global mutex that long would stall teardown, sysfs,
+		 * and resync administration system-wide). */
+		nvme->pm_frozen_disk = rc_volume_disk;
+		get_device(disk_to_dev(nvme->pm_frozen_disk));
+		blk_freeze_queue_start(nvme->pm_frozen_disk->queue);
+		nvme->pm_freeze_memflags = memalloc_noio_save();
 	}
+	mutex_unlock(&rc_volume_lock);
+	if (nvme->pm_frozen_disk)
+		blk_mq_freeze_queue_wait(nvme->pm_frozen_disk->queue);
 
 	/* A straggler that timed out DURING the freeze wait has already
 	 * queued auto_reset_work — and its bail-out check (!dead) won't
@@ -6244,19 +6241,14 @@ int rc_nvme_pm_suspend_adapter(struct rc_adapter *adapter)
 		/* Suspend is aborting; .resume won't fire for this device,
 		 * so drop our freeze reference here or the volume stays
 		 * blocked forever. */
-		if (nvme->pm_volume_frozen) {
-			/* Under rc_volume_lock like the freeze site: guards
-			 * both against a stale pointer and against teardown
-			 * freeing the queue between check and unfreeze. */
-			mutex_lock(&rc_volume_lock);
-			if (rc_volume_disk)
-				blk_mq_unfreeze_queue(rc_volume_disk->queue,
-						      nvme->pm_freeze_memflags);
-			else
-				memalloc_noio_restore(
-					nvme->pm_freeze_memflags);
-			nvme->pm_volume_frozen = false;
-			mutex_unlock(&rc_volume_lock);
+		if (nvme->pm_frozen_disk) {
+			/* Unfreeze via the pinned pointer, NOT the global —
+			 * the volume may have been torn down and reassembled
+			 * (fresh queue we never froze) during wait_csts. */
+			blk_mq_unfreeze_queue(nvme->pm_frozen_disk->queue,
+					      nvme->pm_freeze_memflags);
+			put_device(disk_to_dev(nvme->pm_frozen_disk));
+			nvme->pm_frozen_disk = NULL;
 		}
 		return ret;
 	}
@@ -6287,25 +6279,18 @@ int rc_nvme_pm_resume_adapter(struct rc_adapter *adapter)
 		  pci_name(adapter->pdev));
 	ret = rc_nvme_reset_controller(adapter);
 
-	/* Under rc_volume_lock, like the suspend-side freeze: a volume
-	 * teardown (last-member hot-unplug while suspended, module unload,
-	 * hibernate freeze/thaw sequences) can run in the long window this
-	 * freeze reference is held across — the lock closes both the stale-
-	 * NULL case and the free-between-check-and-unfreeze TOCTOU. */
-	mutex_lock(&rc_volume_lock);
-	if (nvme->pm_volume_frozen) {
-		if (rc_volume_disk)
-			blk_mq_unfreeze_queue(rc_volume_disk->queue,
-					      nvme->pm_freeze_memflags);
-		else
-			/* Disk torn down while suspended: the queue is gone
-			 * (nothing to unfreeze) but the NOIO allocation
-			 * state saved at freeze time must still be
-			 * restored. */
-			memalloc_noio_restore(nvme->pm_freeze_memflags);
-		nvme->pm_volume_frozen = false;
+	/* Unfreeze via the pinned pointer, never the global rc_volume_disk:
+	 * a teardown + REASSEMBLY while this member was suspended leaves
+	 * the global pointing at a fresh queue this adapter never froze —
+	 * unfreezing that one would corrupt its freeze depth.  The pin
+	 * keeps our (possibly dying) queue valid; unfreezing a dying queue
+	 * is safe, and the pinned reference is dropped after. */
+	if (nvme->pm_frozen_disk) {
+		blk_mq_unfreeze_queue(nvme->pm_frozen_disk->queue,
+				      nvme->pm_freeze_memflags);
+		put_device(disk_to_dev(nvme->pm_frozen_disk));
+		nvme->pm_frozen_disk = NULL;
 	}
-	mutex_unlock(&rc_volume_lock);
 	return ret;
 }
 
