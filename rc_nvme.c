@@ -6213,8 +6213,12 @@ int rc_nvme_pm_suspend_adapter(struct rc_adapter *adapter)
 		 * so drop our freeze reference here or the volume stays
 		 * blocked forever. */
 		if (nvme->pm_volume_frozen) {
-			blk_mq_unfreeze_queue(rc_volume_disk->queue,
-					      nvme->pm_freeze_memflags);
+			/* Same NULL guard as the resume path: a concurrent
+			 * volume teardown can clear rc_volume_disk while the
+			 * wait_csts retry window held our freeze reference. */
+			if (rc_volume_disk)
+				blk_mq_unfreeze_queue(rc_volume_disk->queue,
+						      nvme->pm_freeze_memflags);
 			nvme->pm_volume_frozen = false;
 		}
 		return ret;
