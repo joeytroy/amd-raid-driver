@@ -164,6 +164,12 @@ def parse_member(path):
         if gen_len > GEN_LEN_MAX:
             raise ValueError(f"implausible generation length {gen_len} "
                              f"bytes (cap {GEN_LEN_MAX})")
+        # The driver's rc_volume_read_commit() also rejects gen_ts == 0:
+        # a zeroed ring slot's header would otherwise satisfy the
+        # 0 == 0 linkage check below.
+        if gen_ts == 0:
+            raise ValueError("commit block names a zero generation "
+                             "timestamp")
         if not ring_lba <= gen_lba < ring_lba + ring_size:
             raise ValueError(f"committed generation LBA {gen_lba:#x} "
                              "outside the config ring")
@@ -254,13 +260,14 @@ def derive_geometry(members):
         chunk_sectors = ld_chunk
     else:
         chunk_sectors = CHUNK_INDEX_SECTORS.get(chunk_index, 128)
-    # Plausibility bounds, mirroring the driver's chunk validation: a
-    # stripe size must be a power of two within [16, 65536] sectors —
-    # anything else is corrupt/implausible metadata (and dm-stripe
-    # documents a power-of-two requirement).  Reject cleanly here
-    # rather than letting dmsetup fail cryptically.
+    # Plausibility bounds, mirroring the driver's chunk validation in
+    # rc_volume_register_member(): a stripe size must be a power of two
+    # within [16, 2048] sectors (2048 = RC_VOLUME_DATA_BYTES / 512, the
+    # driver's exact cap) — anything else is corrupt/implausible
+    # metadata (and dm-stripe documents a power-of-two requirement).
+    # Reject cleanly here rather than letting dmsetup fail cryptically.
     if (second == 1 or first > 1):  # striped levels actually use it
-        if (chunk_sectors < 16 or chunk_sectors > 65536 or
+        if (chunk_sectors < 16 or chunk_sectors > 2048 or
                 chunk_sectors & (chunk_sectors - 1)):
             raise ValueError(f"implausible stripe chunk size "
                              f"{chunk_sectors} sectors (raw ChunkSize "
