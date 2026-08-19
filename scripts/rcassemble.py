@@ -232,7 +232,10 @@ def parse_member(path):
             cand_eo = struct.unpack_from("<I", gen,
                                          off + LD_ELEMENTOFFSET)[0]
             cand_n = struct.unpack_from("<I", gen, off + LD_DEVICES)[0]
-            belongs = (0 < cand_n <= MAX_MEMBERS and
+            # devices >= 2, matching the driver's belt-and-braces
+            # floor: a raw single-disk LD with an unexpected volume
+            # DeviceType must never be accepted as a 1-member "volume".
+            belongs = (2 <= cand_n <= MAX_MEMBERS and
                        cand_eo + cand_n * LE_BYTES <= pkt and any(
                            struct.unpack_from(
                                "<Q", gen,
@@ -252,7 +255,7 @@ def parse_member(path):
 
     elem_off = struct.unpack_from("<I", ld_blob, LD_ELEMENTOFFSET)[0]
     devices = struct.unpack_from("<I", ld_blob, LD_DEVICES)[0]
-    if not 0 < devices <= MAX_MEMBERS:
+    if not 2 <= devices <= MAX_MEMBERS:
         raise ValueError(f"LD record claims {devices} members "
                          f"(driver cap {MAX_MEMBERS})")
     if elem_off + devices * LE_BYTES > len(ld_blob):
