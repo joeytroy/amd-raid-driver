@@ -193,7 +193,20 @@ timeout --foreground "${RCRAID_QEMU_TIMEOUT:-300}" qemu-system-x86_64 \
 # ----------------------------------------------------------------------------
 # 5. Verdict comes from the guest's marker line.
 # ----------------------------------------------------------------------------
-if grep -q "RCRAID-TEST-PASS" "$CONSOLE_LOG"; then
+# The guest's marker can be split mid-line by an interleaved kernel printk
+# on the shared serial console (e.g. "RCRAID-TE[  2.9] reboot: Power down\n
+# ST-PASS").  Normalize before matching: strip "[timestamp] ..." kernel
+# interjections to end-of-line, then drop newlines so a split marker
+# re-joins.  FAIL is matched the same way and wins over PASS.
+CONSOLE_FLAT="$(sed 's/\[ *[0-9][0-9]*\.[0-9]*\].*$//' "$CONSOLE_LOG" | tr -d '\r\n')"
+if printf '%s' "$CONSOLE_FLAT" | grep -q "RCRAID-TEST-FAIL"; then
+    verdict_pass=0
+elif printf '%s' "$CONSOLE_FLAT" | grep -q "RCRAID-TEST-PASS"; then
+    verdict_pass=1
+else
+    verdict_pass=0
+fi
+if [ "$verdict_pass" = 1 ]; then
     # RAID1: the guest's readback proves the volume serves data, but not
     # that every mirror got it (round-robin reads could probabilistically
     # hide a lame member).  Prove it from outside: after the VM exits,

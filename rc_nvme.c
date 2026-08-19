@@ -227,6 +227,22 @@ static void rc_volume_member_set_state(int idx, enum rc_member_state st)
 		atomic_or(BIT(idx), &rc_volume_write_mask);
 	else
 		atomic_andnot(BIT(idx), &rc_volume_write_mask);
+	/* mark_failed() may have installed FAILED between the state store
+	 * above and the mask ORs — its own mask-clears would then predate
+	 * our ORs (no-ops), leaving zombie mask bits on a FAILED member
+	 * that every subsequent write would fan out to.  Re-check and honor
+	 * the failure; if mark_failed's cmpxchg instead lands after this
+	 * read, its success path clears the masks itself, so every
+	 * interleaving ends with FAILED + clear bits. */
+	if (st == RC_MEMBER_LIVE || st == RC_MEMBER_RESYNCING) {
+		smp_mb__after_atomic();
+		if (READ_ONCE(rc_volume_member_state[idx]) ==
+		    RC_MEMBER_FAILED) {
+			atomic_andnot(BIT(idx), &rc_volume_live_mask);
+			atomic_andnot(BIT(idx), &rc_volume_write_mask);
+			return;
+		}
+	}
 	if (old == st)
 		return;
 	rc_printk(RC_NOTE,
