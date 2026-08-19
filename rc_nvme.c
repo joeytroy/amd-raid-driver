@@ -112,6 +112,52 @@ enum rc_member_state {
 };
 static enum rc_member_state rc_volume_member_state[RC_VOLUME_MAX_MEMBERS];
 static atomic_t rc_volume_live_mask;
+/* Write-fan-out mask: live members PLUS members currently resyncing.  A
+ * resyncing member receives every application write (so blocks behind
+ * the resync cursor stay current) but serves no reads (its data is not
+ * yet trustworthy).  live_mask ⊆ write_mask always. */
+static atomic_t rc_volume_write_mask;
+
+/* ------------------------------------------------------------------ *
+ * Resync engine state (issue #51 part 3).
+ *
+ * One resync at a time (a 2-way mirror has at most one stale member).
+ * The kthread copies the survivor over the target in
+ * RC_RESYNC_XFER_SECTORS chunks.  Concurrent application writes fan out
+ * to the target too (write_mask), so the only ordering hazard is:
+ *   resync READ (old data) → app WRITE lands on target → resync WRITE
+ *   overwrites it with the old data.
+ * Closed by a moving exclusion window + write-generation drain:
+ *   - writes overlapping [window, window+XFER) return DEV_RESOURCE
+ *     (blk-mq retries; the window moves on within milliseconds);
+ *   - before copying a chunk the thread publishes the window, flips the
+ *     write generation, and waits for all writes counted under the OLD
+ *     generation to complete — those may have checked the window before
+ *     it was published.  Writers increment their generation counter
+ *     BEFORE checking the window, so every write is either (a) counted
+ *     in the old generation and drained here, or (b) checked the window
+ *     after publication and bounced.  See rc_volume_dispatch_mirror.
+ * ------------------------------------------------------------------ */
+#define RC_RESYNC_XFER_SECTORS	256u		/* 128 KiB per copy op */
+#define RC_RESYNC_XFER_BYTES	(RC_RESYNC_XFER_SECTORS * 512u)
+#define RC_RESYNC_MAX_RETRIES	10		/* per chunk, transient errors */
+#define RC_RESYNC_WINDOW_NONE	(~0ULL)
+
+static struct task_struct *rc_volume_resync_thread;	/* under rc_volume_lock */
+static bool rc_volume_resync_done;	/* thread finished, awaiting reap */
+static bool rc_volume_tearing_down;	/* under rc_volume_lock: no new resyncs */
+static int  rc_volume_resync_slot = -1;	/* target slot, -1 = idle */
+static atomic64_t rc_volume_resync_cursor;	/* progress, logical sectors */
+static u64  rc_volume_resync_total;
+static atomic64_t rc_volume_resync_window = ATOMIC64_INIT(RC_RESYNC_WINDOW_NONE);
+static atomic_t rc_volume_wgen;
+static atomic_t rc_volume_wgen_count[2];
+
+/* Throttle between copy chunks (0 = full speed).  Runtime-tunable. */
+static unsigned int rc_volume_resync_delay_ms;
+module_param_named(resync_delay_ms, rc_volume_resync_delay_ms, uint, 0644);
+MODULE_PARM_DESC(resync_delay_ms,
+		 "Delay in ms between 128 KiB resync copy chunks (0 = full speed).");
 
 static const char *rc_member_state_name(enum rc_member_state st)
 {
@@ -131,6 +177,37 @@ static const char *rc_member_state_name(enum rc_member_state st)
 static void rc_volume_degrade_fn(struct work_struct *w);
 static DECLARE_WORK(rc_volume_degrade_work, rc_volume_degrade_fn);
 
+/* Degraded assembly (issue #51 part 2, opt-in).  With this set, a RAID1
+ * volume whose member set is still incomplete RC_VOLUME_ASSEMBLE_DELAY_MS
+ * after the last member registered assembles anyway — the missing slot
+ * is marked failed/absent and the volume comes up degraded.  Off by
+ * default: auto-assembling half a mirror risks silent split-brain if the
+ * "missing" member reappears later (in-memory state can't tell which
+ * half is newer), so booting a broken mirror is an explicit choice. */
+static int rc_volume_allow_degraded;
+module_param_named(allow_degraded, rc_volume_allow_degraded, int, 0444);
+MODULE_PARM_DESC(allow_degraded,
+		 "If non-zero, assemble a RAID1 volume degraded when a member is missing at load time (default 0). Risk: if the missing member later reappears with diverged data, nothing detects it.");
+
+#define RC_VOLUME_ASSEMBLE_DELAY_MS	10000
+
+static void rc_volume_assemble_fn(struct work_struct *w);
+static DECLARE_DELAYED_WORK(rc_volume_assemble_work, rc_volume_assemble_fn);
+
+/* nr_hw_queues the tagset was created with — the constraint a re-added
+ * member must satisfy (each hctx routes to io_queues[hctx] on every
+ * member).  Set once in rc_volume_create_disk. */
+static u32 rc_volume_nr_hw;
+
+/* Hook: `slot` just re-entered the registry parked in NEEDS_RESYNC (hot
+ * re-plug or recovered controller).  The resync engine starts the
+ * rebuild from here.  Caller holds rc_volume_lock. */
+static void rc_volume_member_readmitted(int slot);
+static int  rc_volume_alloc_member_dma(int slot, u32 nr_hw);
+static void rc_volume_free_member_dma(int slot, struct device *dev);
+static void rc_volume_sysfs_register(void);
+static void rc_volume_sysfs_unregister(void);
+
 /* Slow-path state transition.  Caller holds rc_volume_lock. */
 static void rc_volume_member_set_state(int idx, enum rc_member_state st)
 {
@@ -146,6 +223,26 @@ static void rc_volume_member_set_state(int idx, enum rc_member_state st)
 		atomic_or(BIT(idx), &rc_volume_live_mask);
 	else
 		atomic_andnot(BIT(idx), &rc_volume_live_mask);
+	if (st == RC_MEMBER_LIVE || st == RC_MEMBER_RESYNCING)
+		atomic_or(BIT(idx), &rc_volume_write_mask);
+	else
+		atomic_andnot(BIT(idx), &rc_volume_write_mask);
+	/* mark_failed() may have installed FAILED between the state store
+	 * above and the mask ORs — its own mask-clears would then predate
+	 * our ORs (no-ops), leaving zombie mask bits on a FAILED member
+	 * that every subsequent write would fan out to.  Re-check and honor
+	 * the failure; if mark_failed's cmpxchg instead lands after this
+	 * read, its success path clears the masks itself, so every
+	 * interleaving ends with FAILED + clear bits. */
+	if (st == RC_MEMBER_LIVE || st == RC_MEMBER_RESYNCING) {
+		smp_mb__after_atomic();
+		if (READ_ONCE(rc_volume_member_state[idx]) ==
+		    RC_MEMBER_FAILED) {
+			atomic_andnot(BIT(idx), &rc_volume_live_mask);
+			atomic_andnot(BIT(idx), &rc_volume_write_mask);
+			return;
+		}
+	}
 	if (old == st)
 		return;
 	rc_printk(RC_NOTE,
@@ -164,10 +261,42 @@ static void rc_volume_member_set_state(int idx, enum rc_member_state st)
  * work to drain in-flight I/O waiting on this member. */
 static void rc_volume_member_mark_failed(int idx)
 {
-	int prev = atomic_fetch_andnot(BIT(idx), &rc_volume_live_mask);
+	int prev;
 
-	if (!(prev & BIT(idx)))
-		return;		/* already not live */
+	atomic_andnot(BIT(idx), &rc_volume_write_mask);
+	prev = atomic_fetch_andnot(BIT(idx), &rc_volume_live_mask);
+
+	if (!(prev & BIT(idx))) {
+		/* Not live per the mask — but the failure must still land if
+		 * the STATE says RESYNCING (drop out of the write fan-out)
+		 * or LIVE (the resync completion, or set_state's own
+		 * store-state-then-sync-mask gap, promoted the member
+		 * concurrently: the mask bit lagging the state must not let
+		 * a genuine failure be swallowed).  cmpxchg loop so whichever
+		 * transition raced us is failed exactly once; the mask
+		 * andnots below are re-applied because the completion path
+		 * publishes its mask bits around its own cmpxchg. */
+		enum rc_member_state old =
+			READ_ONCE(rc_volume_member_state[idx]);
+
+		while (old == RC_MEMBER_RESYNCING || old == RC_MEMBER_LIVE) {
+			enum rc_member_state got =
+				cmpxchg(&rc_volume_member_state[idx], old,
+					RC_MEMBER_FAILED);
+			if (got == old) {
+				atomic_andnot(BIT(idx), &rc_volume_write_mask);
+				atomic_andnot(BIT(idx), &rc_volume_live_mask);
+				rc_printk(RC_ERROR,
+					  "rc_volume: member %d FAILED while %s (live_mask=0x%x)\n",
+					  idx, rc_member_state_name(old),
+					  atomic_read(&rc_volume_live_mask));
+				schedule_work(&rc_volume_degrade_work);
+				break;
+			}
+			old = got;
+		}
+		return;
+	}
 	WRITE_ONCE(rc_volume_member_state[idx], RC_MEMBER_FAILED);
 	rc_printk(RC_ERROR,
 		  "rc_volume: member %d (%s) FAILED — %s (live_mask=0x%x)\n",
@@ -348,6 +477,12 @@ struct rc_volume_pdu {
 	atomic_t           acked;
 	atomic_t           err_members;
 	atomic_t           members_pending;
+	/* Resync write-generation accounting: set when this request was
+	 * counted in rc_volume_wgen_count[wgen] (RAID1 write/discard fan-out
+	 * only).  Decremented exactly once at completion via
+	 * rc_volume_unmap_request_sg. */
+	bool               wgen_counted;
+	u8                 wgen;
 	/* Bounded .timeout re-arm count: how many times the EH handler has
 	 * returned BLK_EH_RESET_TIMER for this request while waiting on a
 	 * member that looks alive.  Once exhausted, the still-silent members
@@ -2590,18 +2725,80 @@ static void rc_volume_register_member(struct rc_adapter *adapter)
 		}
 	}
 
-	/* A live volume never accepts (re-)registrations.  A member slot can
-	 * be empty here only because that member failed or was hot-removed
-	 * while the volume kept serving degraded — its data missed every
-	 * write since, so joining it straight into dispatch would serve
-	 * stale blocks to half the reads.  Proper re-admission requires the
-	 * resync engine (issue #51 follow-up); until then a re-plugged
-	 * member stays out and the volume stays degraded. */
+	/* Registration against a LIVE volume is a member RE-ADD.  The slot
+	 * can be empty here only because that member failed or was
+	 * hot-removed while the volume kept serving degraded — its data
+	 * missed every write since, so it must NOT go straight into
+	 * dispatch (a rejoined stale mirror serves old blocks to half the
+	 * reads).  Install it parked in NEEDS_RESYNC: the pointer, slot,
+	 * and DMA pool come back, but no live bit — only a completed
+	 * resync (or, until the engine lands, a rebuilt array) flips it. */
 	if (rc_volume_disk) {
-		rc_printk(RC_WARN,
-			  "rc_volume_register_member: %s probed while /dev/rcraid0 is live — re-add requires resync support, member NOT joined (volume stays %s)\n",
-			  pci_name(adapter->pdev),
-			  atomic_read(&rc_volume_live_mask) ? "degraded" : "failed");
+		if (!have_ld) {
+			rc_printk(RC_WARN,
+				  "rc_volume_register_member: %s probed while /dev/rcraid0 is live but has no parseable LD — not re-admitting via the legacy fallback\n",
+				  pci_name(adapter->pdev));
+			goto out;
+		}
+		if (rc_volume_raid_level != RC_LDT_RAID1) {
+			rc_printk(RC_WARN,
+				  "rc_volume_register_member: %s probed while a RAID0 volume is live — re-add is a RAID1 concept, ignoring\n",
+				  pci_name(adapter->pdev));
+			goto out;
+		}
+		pos = nvme->ld_my_position;
+		if (pos < 0 || pos >= (int)expected ||
+		    pos >= RC_VOLUME_MAX_MEMBERS) {
+			rc_printk(RC_WARN,
+				  "rc_volume_register_member: %s re-add LD position %d out of range [0,%u) — ignoring\n",
+				  pci_name(adapter->pdev), pos, expected);
+			goto out;
+		}
+		if (rc_volume_members[pos]) {
+			rc_printk(RC_WARN,
+				  "rc_volume_register_member: %s re-add position %d still occupied by %s — ignoring\n",
+				  pci_name(adapter->pdev), pos,
+				  pci_name(rc_volume_members[pos]->pdev));
+			goto out;
+		}
+		if (nvme->nr_io_queues < rc_volume_nr_hw) {
+			rc_printk(RC_WARN,
+				  "rc_volume_register_member: %s re-add rejected — grants %u I/O queues, volume tagset needs %u\n",
+				  pci_name(adapter->pdev),
+				  nvme->nr_io_queues, rc_volume_nr_hw);
+			goto out;
+		}
+		/* A smaller replacement drive would pass every check above
+		 * and only fail deep into the resync copy, when a chunk
+		 * write lands past its LBA range — reject the capacity
+		 * mismatch up front with a diagnosable message instead. */
+		if (nvme->ld_userdata_size < get_capacity(rc_volume_disk)) {
+			rc_printk(RC_WARN,
+				  "rc_volume_register_member: %s re-add rejected — capacity mismatch: member user-data %llu sectors < volume %llu sectors\n",
+				  pci_name(adapter->pdev),
+				  (unsigned long long)nvme->ld_userdata_size,
+				  (unsigned long long)get_capacity(rc_volume_disk));
+			goto out;
+		}
+		/* Install the pointer BEFORE the DMA alloc — the helper
+		 * resolves the device through the registry slot.  Not yet
+		 * visible to dispatch: the live bit stays clear throughout. */
+		rc_volume_members[pos] = adapter;
+		if (rc_volume_alloc_member_dma(pos, rc_volume_nr_hw)) {
+			rc_volume_free_member_dma(pos, &adapter->pdev->dev);
+			rc_volume_members[pos] = NULL;
+			rc_printk(RC_ERROR,
+				  "rc_volume_register_member: %s re-add DMA pool allocation failed — ignoring\n",
+				  pci_name(adapter->pdev));
+			goto out;
+		}
+		rc_volume_member_phys_offset[pos] = nvme->ld_userdata_offset;
+		nvme->volume_slot = pos;
+		rc_volume_member_set_state(pos, RC_MEMBER_NEEDS_RESYNC);
+		rc_printk(RC_NOTE,
+			  "rc_volume_register_member: %s RE-ADMITTED at pos %d — parked needs-resync (stale until resynced), volume stays degraded\n",
+			  pci_name(adapter->pdev), pos);
+		rc_volume_member_readmitted(pos);
 		goto out;
 	}
 
@@ -2680,6 +2877,14 @@ static void rc_volume_register_member(struct rc_adapter *adapter)
 					  rc);
 		}
 	}
+
+	/* Degraded assembly (opt-in): (re)arm the fallback timer on every
+	 * registration while the volume is still incomplete.  If no further
+	 * member shows up before it fires, the worker assembles degraded. */
+	if (!rc_volume_disk && rc_volume_allow_degraded &&
+	    rc_volume_raid_level == RC_LDT_RAID1)
+		mod_delayed_work(system_wq, &rc_volume_assemble_work,
+				 msecs_to_jiffies(RC_VOLUME_ASSEMBLE_DELAY_MS));
 out:
 	mutex_unlock(&rc_volume_lock);
 }
@@ -2732,6 +2937,14 @@ static void rc_volume_unmap_request_sg(struct rc_volume_pdu *pdu)
 {
 	struct device *dma_dev;
 	int m;
+
+	/* Every completion path funnels through here exactly once (the
+	 * completion claim guarantees a single completer), so this is the
+	 * one place the write-generation count comes back down. */
+	if (pdu->wgen_counted) {
+		pdu->wgen_counted = false;
+		atomic_dec(&rc_volume_wgen_count[pdu->wgen & 1]);
+	}
 
 	if (pdu->ms_active) {
 		for (m = 0; m < rc_volume_member_count &&
@@ -2930,8 +3143,15 @@ static inline bool rc_volume_fatal(void)
 	     i++) {
 		struct rc_adapter *m = rc_volume_members[i];
 
+		/* A RESYNCING member is write-eligible but never live, so
+		 * gate on the state as well as the live bit: a resync target
+		 * whose controller dies must be failed by this fast path too,
+		 * not left in write_mask stalling every new write behind the
+		 * 30s blk-mq timeout. */
 		if (m && READ_ONCE(m->ctx.nvme.dead) &&
-		    (atomic_read(&rc_volume_live_mask) & BIT(i)))
+		    ((atomic_read(&rc_volume_live_mask) & BIT(i)) ||
+		     READ_ONCE(rc_volume_member_state[i]) ==
+		     RC_MEMBER_RESYNCING))
 			rc_volume_member_mark_failed(i);
 	}
 
@@ -3364,14 +3584,17 @@ static blk_status_t rc_volume_dispatch_mirror(
 		return BLK_STS_IOERR;
 	}
 
-	/* Snapshot the live mask ONCE and use it for the whole dispatch —
+	/* Snapshot the WRITE mask ONCE and use it for the whole dispatch —
 	 * sg build, dma_map, SQE reservation, submit, and the pending
 	 * count must all agree on the same member set even if a member
 	 * fails concurrently.  A member dying after this snapshot is the
 	 * in-flight-death case the drain path already handles; a member
 	 * dying before it is simply skipped (degraded write to the
-	 * survivor only, which is the whole point). */
-	mask = (unsigned long)(unsigned int)atomic_read(&rc_volume_live_mask) &
+	 * survivor only, which is the whole point).  The write mask also
+	 * covers a RESYNCING member: it takes every application write so
+	 * already-copied regions stay current while the resync cursor
+	 * sweeps. */
+	mask = (unsigned long)(unsigned int)atomic_read(&rc_volume_write_mask) &
 	       (BIT(nm) - 1);
 	if (!mask) {
 		rc_printk(RC_ERROR,
@@ -3517,6 +3740,60 @@ static blk_status_t rc_volume_dispatch_mirror(
 			}
 		}
 
+		/* Resync coordination — MUST be the last thing before
+		 * blk_mq_start_request (nothing may fail after the count).
+		 *
+		 * Order matters: count into the current write generation
+		 * FIRST, then check the exclusion window.  The resync thread
+		 * publishes the window, flips the generation, and drains the
+		 * old generation's counter — so every write either lands in
+		 * the drained generation or observes the published window
+		 * here and bounces.  Bounced requests were never started;
+		 * DEV_RESOURCE hands them back to blk-mq for a retry after
+		 * the window has moved on. */
+		{
+			int g;
+			u64 wstart;
+
+			/* Seqlock-style retry: the bucket we count into must
+			 * be the generation live AT increment time.  Without
+			 * the re-check, a task preempted between reading wgen
+			 * and incrementing the counter for long enough to
+			 * span a generation flip (2-bucket parity can even
+			 * wrap back to the same g) would land its count in a
+			 * bucket the resync thread already drained — letting
+			 * a chunk copy proceed without waiting for this
+			 * write. */
+			for (;;) {
+				g = atomic_read(&rc_volume_wgen) & 1;
+				atomic_inc(&rc_volume_wgen_count[g]);
+				smp_mb__after_atomic();
+				if ((atomic_read(&rc_volume_wgen) & 1) == g)
+					break;
+				atomic_dec(&rc_volume_wgen_count[g]);
+			}
+			/* Pairs with the resync thread's smp_mb() between
+			 * publishing the window and flipping the generation:
+			 * having observed the flipped generation above, the
+			 * window read below must not be satisfied by an
+			 * older cached value (message-passing gap on
+			 * non-TSO architectures). */
+			smp_rmb();
+			wstart = (u64)atomic64_read(&rc_volume_resync_window);
+			if (wstart != RC_RESYNC_WINDOW_NONE &&
+			    (u64)pos < wstart + RC_RESYNC_XFER_SECTORS &&
+			    (u64)pos + nr_sectors > wstart) {
+				atomic_dec(&rc_volume_wgen_count[g]);
+				for (m = 0; m < nm; m++)
+					if (mask & BIT(m))
+						rc_nvme_sq_unreserve(rc_volume_members[m]->ctx.nvme.io_queues[hctx->queue_num], 1);
+				rc_volume_unmap_request_sg(pdu);
+				return BLK_STS_DEV_RESOURCE;
+			}
+			pdu->wgen = (u8)g;
+			pdu->wgen_counted = true;
+		}
+
 		blk_mq_start_request(req);
 		for (m = 0; m < nm; m++)
 			if (mask & BIT(m))
@@ -3549,6 +3826,7 @@ static blk_status_t rc_volume_queue_rq(struct blk_mq_hw_ctx *hctx,
 	memset(pdu->ms_nents, 0, sizeof(pdu->ms_nents));
 	atomic_set(&pdu->completed, 0);
 	pdu->member_mask = 0;
+	pdu->wgen_counted = false;
 	pdu->eh_retries = 0;
 	atomic_set(&pdu->acked, 0);
 	atomic_set(&pdu->err_members, 0);
@@ -3595,8 +3873,10 @@ static blk_status_t rc_volume_queue_rq(struct blk_mq_hw_ctx *hctx,
 		 * For degraded RAID1 the flush goes to the survivor(s) only:
 		 * the failed mirror is stale by definition, its cache state
 		 * is irrelevant. */
+		/* Write mask, not live mask: a RESYNCING member is receiving
+		 * writes, so an fsync must flush ITS volatile cache too. */
 		unsigned long fmask =
-			(unsigned long)(unsigned int)atomic_read(&rc_volume_live_mask) &
+			(unsigned long)(unsigned int)atomic_read(&rc_volume_write_mask) &
 			(BIT(rc_volume_member_count) - 1);
 
 		if (!fmask) {
@@ -4229,26 +4509,82 @@ static const struct block_device_operations rc_volume_bops = {
 	.owner = THIS_MODULE,
 };
 
-/* Allocate the gendisk + tagset, set up sizes, expose /dev/rcraid0. */
+/* Allocate (or free) one member's slice of the per-tag PRP/DSM pool.
+ * Factored out of create_disk so member re-add can rebuild the slice a
+ * hot-removal freed: the buffers hold per-member IOVAs, so they can only
+ * exist while the owning device does. */
+static int rc_volume_alloc_member_dma(int slot, u32 nr_hw)
+{
+	struct device *dev = &rc_volume_members[slot]->pdev->dev;
+	u32 h, t;
+
+	for (h = 0; h < nr_hw; h++) {
+		for (t = 0; t < RC_VOLUME_QUEUE_DEPTH; t++) {
+			rc_volume_prp_va[h][slot][t] =
+				dma_alloc_coherent(dev, PAGE_SIZE,
+						   &rc_volume_prp_pa[h][slot][t],
+						   GFP_KERNEL);
+			if (!rc_volume_prp_va[h][slot][t])
+				return -ENOMEM;
+		}
+	}
+	return 0;
+}
+
+static void rc_volume_free_member_dma(int slot, struct device *dev)
+{
+	u32 h, t;
+
+	for (h = 0; h < RC_VOLUME_MAX_HCTX; h++) {
+		for (t = 0; t < RC_VOLUME_QUEUE_DEPTH; t++) {
+			if (!rc_volume_prp_va[h][slot][t])
+				continue;
+			dma_free_coherent(dev, PAGE_SIZE,
+					  rc_volume_prp_va[h][slot][t],
+					  rc_volume_prp_pa[h][slot][t]);
+			rc_volume_prp_va[h][slot][t] = NULL;
+			rc_volume_prp_pa[h][slot][t] = 0;
+		}
+	}
+}
+
+/* Allocate the gendisk + tagset, set up sizes, expose /dev/rcraid0.
+ * Tolerates NULL (absent) slots for degraded RAID1 assembly — every
+ * per-member computation runs over the PRESENT members. */
 static int rc_volume_create_disk(void)
 {
-	struct rc_adapter *m0 = rc_volume_members[0];
+	struct rc_adapter *m0 = NULL;
 	u64 total_sectors;
 	int i, ret;
 	u32 nr_hw, h;
 
-	/* nr_hw_queues = min(member->nr_io_queues) across all members.  Each
-	 * hctx i routes to io_queues[i] on every member, so we can't ask
-	 * blk-mq for more hctxs than the smallest member supports.  All
+	for (i = 0; i < rc_volume_member_count && i < RC_VOLUME_MAX_MEMBERS;
+	     i++) {
+		if (rc_volume_members[i]) {
+			m0 = rc_volume_members[i];
+			break;
+		}
+	}
+	if (!m0)
+		return -ENODEV;
+
+	/* nr_hw_queues = min(member->nr_io_queues) across present members.
+	 * Each hctx i routes to io_queues[i] on every member, so we can't
+	 * ask blk-mq for more hctxs than the smallest member supports.  All
 	 * T700s grant 128 (we cap at RC_NVME_IO_QUEUE_TARGET=4) so this
 	 * just resolves to 4 in practice, but the min is a future-proofing
 	 * safety net.  Computed up front because it dimensions the PRP pool
 	 * allocated just below.  Clamped to RC_VOLUME_MAX_HCTX so the [hctx]
 	 * index into that pool (and every other per-hctx array) is always in
-	 * bounds. */
+	 * bounds.  A member re-added later must support >= this many queues
+	 * (checked at readmit) — the tagset is never resized. */
 	nr_hw = m0->ctx.nvme.nr_io_queues;
-	for (i = 1; i < rc_volume_member_count; i++) {
-		u32 m = rc_volume_members[i]->ctx.nvme.nr_io_queues;
+	for (i = 0; i < rc_volume_member_count; i++) {
+		u32 m;
+
+		if (!rc_volume_members[i])
+			continue;
+		m = rc_volume_members[i]->ctx.nvme.nr_io_queues;
 		if (m < nr_hw)
 			nr_hw = m;
 	}
@@ -4256,6 +4592,7 @@ static int rc_volume_create_disk(void)
 		nr_hw = 1;
 	if (nr_hw > RC_VOLUME_MAX_HCTX)
 		nr_hw = RC_VOLUME_MAX_HCTX;
+	rc_volume_nr_hw = nr_hw;
 
 	/* Per-hctx, per-member, per-tag PRP-list / DSM buffer (PAGE_SIZE each).
 	 * The hctx dimension is mandatory — req->tag is unique only within a
@@ -4264,22 +4601,12 @@ static int rc_volume_create_disk(void)
 	 * the top of this file for the full corruption rationale).  Only the
 	 * live nr_hw × member_count × queue_depth subset is allocated; the rest
 	 * stay NULL and are skipped by the free paths. */
-	for (h = 0; h < nr_hw; h++) {
-		for (i = 0; i < rc_volume_member_count; i++) {
-			struct device *dev = &rc_volume_members[i]->pdev->dev;
-			u32 t;
-
-			for (t = 0; t < RC_VOLUME_QUEUE_DEPTH; t++) {
-				rc_volume_prp_va[h][i][t] =
-					dma_alloc_coherent(dev, PAGE_SIZE,
-							   &rc_volume_prp_pa[h][i][t],
-							   GFP_KERNEL);
-				if (!rc_volume_prp_va[h][i][t]) {
-					ret = -ENOMEM;
-					goto err_free_dma;
-				}
-			}
-		}
+	for (i = 0; i < rc_volume_member_count; i++) {
+		if (!rc_volume_members[i])
+			continue;
+		ret = rc_volume_alloc_member_dma(i, nr_hw);
+		if (ret)
+			goto err_free_dma;
 	}
 
 	{
@@ -4292,6 +4619,8 @@ static int rc_volume_create_disk(void)
 		u32 depth = RC_VOLUME_QUEUE_DEPTH;
 
 		for (i = 0; i < rc_volume_member_count; i++) {
+			if (!rc_volume_members[i])
+				continue;
 			for (h = 0; h < nr_hw; h++) {
 				struct rc_nvme_io_queue *q =
 					rc_volume_members[i]->ctx.nvme.io_queues[h];
@@ -4466,6 +4795,8 @@ static int rc_volume_create_disk(void)
 	if (ret)
 		goto err_put_disk;
 
+	rc_volume_sysfs_register();
+
 	rc_printk(RC_NOTE,
 		  "rc_volume_create_disk: /dev/%s up, %llu sectors (%llu MiB, %s)\n",
 		  rc_volume_disk->disk_name,
@@ -4482,35 +4813,517 @@ err_put_disk:
 err_free_tagset:
 	blk_mq_free_tag_set(&rc_volume_tagset);
 err_free_dma:
-	for (i = 0; i < rc_volume_member_count; i++) {
-		struct device *dev = &rc_volume_members[i]->pdev->dev;
-		u32 t;
+	for (i = 0; i < rc_volume_member_count; i++)
+		if (rc_volume_members[i])
+			rc_volume_free_member_dma(i,
+				&rc_volume_members[i]->pdev->dev);
+	return ret;
+}
 
-		for (h = 0; h < RC_VOLUME_MAX_HCTX; h++) {
-			for (t = 0; t < RC_VOLUME_QUEUE_DEPTH; t++) {
-				if (rc_volume_prp_va[h][i][t]) {
-					dma_free_coherent(dev, PAGE_SIZE,
-							  rc_volume_prp_va[h][i][t],
-							  rc_volume_prp_pa[h][i][t]);
-					rc_volume_prp_va[h][i][t] = NULL;
-					rc_volume_prp_pa[h][i][t] = 0;
-				}
+/* Delayed degraded-assembly worker (allow_degraded=1).  Armed/re-armed by
+ * every member registration; fires RC_VOLUME_ASSEMBLE_DELAY_MS after the
+ * LAST registration.  If the volume still hasn't assembled because a
+ * RAID1 member never showed up, mark the empty slot(s) failed/absent and
+ * bring the volume up degraded. */
+static void rc_volume_assemble_fn(struct work_struct *w)
+{
+	int i, present = 0;
+	u32 expected;
+
+	mutex_lock(&rc_volume_lock);
+	expected = rc_volume_expected_members;
+	if (rc_volume_disk || !expected || expected > RC_VOLUME_MAX_MEMBERS)
+		goto out;
+	if (rc_volume_raid_level != RC_LDT_RAID1)
+		goto out;	/* RAID0 can't run without every member */
+	if (rc_volume_geometry_untrust_reason) {
+		rc_printk(RC_WARN,
+			  "rc_volume_assemble_fn: not assembling degraded — geometry untrusted: %s\n",
+			  rc_volume_geometry_untrust_reason);
+		goto out;
+	}
+
+	for (i = 0; i < (int)expected; i++)
+		if (rc_volume_members[i])
+			present++;
+	if (!present || present >= (int)expected)
+		goto out;	/* nothing here, or complete (normal path) */
+
+	rc_printk(RC_WARN,
+		  "rc_volume_assemble_fn: only %d of %u RAID1 members present after %u ms — assembling DEGRADED (allow_degraded=1)\n",
+		  present, expected, RC_VOLUME_ASSEMBLE_DELAY_MS);
+
+	{
+		int saved_count = rc_volume_member_count;
+		int rc;
+
+		for (i = 0; i < (int)expected; i++)
+			if (!rc_volume_members[i])
+				rc_volume_member_set_state(i, RC_MEMBER_FAILED);
+		/* member_count becomes the SLOT count (== expected) from here
+		 * on, same invariant a runtime hot-removal maintains. */
+		rc_volume_member_count = (int)expected;
+
+		rc = rc_volume_create_disk();
+		if (rc) {
+			/* Roll the registry back so a late-arriving member
+			 * (or the next timer shot) can still take the normal
+			 * full-assembly path — leaving count forced to
+			 * `expected` with phantom FAILED slots would block
+			 * regular assembly forever. */
+			rc_printk(RC_ERROR,
+				  "rc_volume_assemble_fn: degraded create_disk failed (%d) — reverting registry for a later attempt\n",
+				  rc);
+			rc_volume_member_count = saved_count;
+			for (i = 0; i < (int)expected; i++) {
+				if (rc_volume_members[i])
+					continue;
+				/* Back to the pre-registration default:
+				 * state LIVE with NO live-mask bit (the bit
+				 * is only ever set when a real member
+				 * registers into the slot). */
+				rc_volume_member_state[i] = RC_MEMBER_LIVE;
+				atomic_andnot(BIT(i), &rc_volume_live_mask);
 			}
 		}
 	}
+out:
+	mutex_unlock(&rc_volume_lock);
+}
+
+/* One synchronous NVMe READ/WRITE of up to RC_RESYNC_XFER_BYTES against
+ * one member, using the boot/reset-time sync-command machinery (reserved
+ * CID range, single-consumer CQE handshake — safe on a queue shared with
+ * live blk-mq traffic).  `data` is the DMA address of a physically
+ * contiguous buffer on this member's IOMMU domain; `prp_va/prp_pa` is a
+ * per-member coherent page for the PRP list (>2-page transfers). */
+static int rc_volume_resync_rw(struct rc_adapter *m, u8 opc, u64 slba,
+			       u32 nlb, u32 bytes, dma_addr_t data,
+			       __le64 *prp_va, dma_addr_t prp_pa)
+{
+	struct rc_nvme_sqe cmd;
+	u32 pages = DIV_ROUND_UP(bytes, (u32)PAGE_SIZE);
+	u32 i;
+
+	memset(&cmd, 0, sizeof(cmd));
+	cmd.opc   = opc;
+	cmd.nsid  = cpu_to_le32(1);
+	cmd.prp1  = cpu_to_le64(data);
+	if (pages == 2) {
+		cmd.prp2 = cpu_to_le64(data + PAGE_SIZE);
+	} else if (pages > 2) {
+		for (i = 1; i < pages; i++)
+			prp_va[i - 1] = cpu_to_le64(data + (u64)i * PAGE_SIZE);
+		cmd.prp2 = cpu_to_le64(prp_pa);
+	}
+	cmd.cdw10 = cpu_to_le32((u32)(slba & 0xffffffff));
+	cmd.cdw11 = cpu_to_le32((u32)(slba >> 32));
+	cmd.cdw12 = cpu_to_le32(nlb - 1);
+
+	return rc_nvme_io_cmd_sync(m, &cmd);
+}
+
+/* Pick the read source for the resync: the first LIVE member that is not
+ * the target.  Returns slot or -1. */
+static int rc_volume_resync_pick_survivor(int target)
+{
+	unsigned long live =
+		(unsigned long)(unsigned int)atomic_read(&rc_volume_live_mask);
+	int i;
+
+	for_each_set_bit(i, &live, RC_VOLUME_MAX_MEMBERS)
+		if (i != target && rc_volume_members[i])
+			return i;
+	return -1;
+}
+
+/* The resync kthread: full copy survivor → target over the volume's
+ * logical LBA space (RAID1 mapping is identity + per-member phys offset,
+ * so this copies exactly the user-data region and never touches the
+ * firmware-owned metadata below UserDataOffset). */
+static int rc_volume_resync_fn(void *arg)
+{
+	int target = (int)(long)arg;
+	u64 total, cursor = 0;
+	void *buf = NULL;
+	__le64 *list_va[2] = { NULL, NULL };
+	dma_addr_t list_pa[2] = { 0, 0 };
+	struct rc_adapter *tgt, *srv;
+	int srv_slot = -1;
+	int ret = -EIO;
+	int retries = 0;
+	unsigned int order = get_order(RC_RESYNC_XFER_BYTES);
+
+	total = rc_volume_resync_total;
+
+	buf = (void *)__get_free_pages(GFP_KERNEL, order);
+	if (!buf) {
+		rc_printk(RC_ERROR,
+			  "rc_volume_resync: failed to allocate %u-byte copy buffer (order %u) — aborting\n",
+			  RC_RESYNC_XFER_BYTES, order);
+		goto done;
+	}
+
+	rc_printk(RC_NOTE,
+		  "rc_volume_resync: starting — member %d, %llu sectors (%llu MiB)\n",
+		  target, (unsigned long long)total,
+		  (unsigned long long)(total >> 11));
+
+	while (cursor < total) {
+		u32 nlb = (u32)min_t(u64, RC_RESYNC_XFER_SECTORS,
+				     total - cursor);
+		u32 bytes = nlb * 512u;
+		dma_addr_t dma;
+		int old_gen, err;
+
+		if (kthread_should_stop())
+			goto done;
+
+		/* Both endpoints must still be usable.  The target must
+		 * still be RESYNCING (a failure path may have demoted it);
+		 * the survivor must still be live. */
+		tgt = rc_volume_members[target];
+		if (!tgt || READ_ONCE(rc_volume_member_state[target]) !=
+			    RC_MEMBER_RESYNCING) {
+			rc_printk(RC_ERROR,
+				  "rc_volume_resync: target member %d went away/failed at %llu/%llu — aborting\n",
+				  target, (unsigned long long)cursor,
+				  (unsigned long long)total);
+			goto done;
+		}
+		srv_slot = rc_volume_resync_pick_survivor(target);
+		if (srv_slot < 0) {
+			rc_printk(RC_ERROR,
+				  "rc_volume_resync: no live survivor to read from — aborting\n");
+			goto done;
+		}
+		srv = rc_volume_members[srv_slot];
+
+		/* Lazily allocate the per-member PRP-list pages the first
+		 * time each endpoint is known (they are per-IOMMU-domain). */
+		if (!list_va[0]) {
+			list_va[0] = dma_alloc_coherent(&srv->pdev->dev,
+							PAGE_SIZE, &list_pa[0],
+							GFP_KERNEL);
+			if (!list_va[0]) {
+				rc_printk(RC_ERROR,
+					  "rc_volume_resync: PRP-list page alloc failed for survivor %s — aborting\n",
+					  pci_name(srv->pdev));
+				goto done;
+			}
+		}
+		if (!list_va[1]) {
+			list_va[1] = dma_alloc_coherent(&tgt->pdev->dev,
+							PAGE_SIZE, &list_pa[1],
+							GFP_KERNEL);
+			if (!list_va[1]) {
+				rc_printk(RC_ERROR,
+					  "rc_volume_resync: PRP-list page alloc failed for target %s — aborting\n",
+					  pci_name(tgt->pdev));
+				goto done;
+			}
+		}
+
+		/* Publish the exclusion window, flip the write generation,
+		 * and drain writes counted under the old generation — they
+		 * may have checked the window before publication.  After
+		 * the drain, no application write overlapping this chunk is
+		 * in flight, and none can start until the window moves. */
+		atomic64_set(&rc_volume_resync_window, cursor);
+		smp_mb();
+		old_gen = atomic_fetch_inc(&rc_volume_wgen) & 1;
+		while (atomic_read(&rc_volume_wgen_count[old_gen])) {
+			if (kthread_should_stop())
+				goto done;
+			usleep_range(100, 500);
+		}
+
+		/* Copy: survivor → buffer → target. */
+		dma = dma_map_single(&srv->pdev->dev, buf, bytes,
+				     DMA_FROM_DEVICE);
+		if (dma_mapping_error(&srv->pdev->dev, dma)) {
+			rc_printk(RC_ERROR,
+				  "rc_volume_resync: DMA map failed on survivor %s at lba %llu — aborting\n",
+				  pci_name(srv->pdev),
+				  (unsigned long long)cursor);
+			goto done;
+		}
+		err = rc_volume_resync_rw(srv, RC_NVME_NVM_OP_READ,
+					  cursor + rc_volume_member_phys_offset[srv_slot],
+					  nlb, bytes, dma,
+					  list_va[0], list_pa[0]);
+		dma_unmap_single(&srv->pdev->dev, dma, bytes, DMA_FROM_DEVICE);
+		if (err) {
+			/* -EBUSY (shared SQ momentarily full) and -ETIMEDOUT
+			 * are expected transients under concurrent blk-mq
+			 * write traffic on the same queue — retry the chunk
+			 * instead of abandoning the whole resync to a manual
+			 * re-plug. */
+			if ((err == -EBUSY || err == -ETIMEDOUT) &&
+			    ++retries <= RC_RESYNC_MAX_RETRIES) {
+				rc_printk(RC_WARN,
+					  "rc_volume_resync: transient read error (%d) from survivor %d at lba %llu — retry %d/%d\n",
+					  err, srv_slot,
+					  (unsigned long long)cursor,
+					  retries, RC_RESYNC_MAX_RETRIES);
+				msleep(20);
+				continue;
+			}
+			rc_printk(RC_ERROR,
+				  "rc_volume_resync: read from survivor %d failed (%d) at lba %llu — aborting\n",
+				  srv_slot, err, (unsigned long long)cursor);
+			goto done;
+		}
+
+		dma = dma_map_single(&tgt->pdev->dev, buf, bytes,
+				     DMA_TO_DEVICE);
+		if (dma_mapping_error(&tgt->pdev->dev, dma)) {
+			rc_printk(RC_ERROR,
+				  "rc_volume_resync: DMA map failed on target %s at lba %llu — aborting\n",
+				  pci_name(tgt->pdev),
+				  (unsigned long long)cursor);
+			goto done;
+		}
+		err = rc_volume_resync_rw(tgt, RC_NVME_NVM_OP_WRITE,
+					  cursor + rc_volume_member_phys_offset[target],
+					  nlb, bytes, dma,
+					  list_va[1], list_pa[1]);
+		dma_unmap_single(&tgt->pdev->dev, dma, bytes, DMA_TO_DEVICE);
+		if (err) {
+			if ((err == -EBUSY || err == -ETIMEDOUT) &&
+			    ++retries <= RC_RESYNC_MAX_RETRIES) {
+				rc_printk(RC_WARN,
+					  "rc_volume_resync: transient write error (%d) to target %d at lba %llu — retry %d/%d\n",
+					  err, target,
+					  (unsigned long long)cursor,
+					  retries, RC_RESYNC_MAX_RETRIES);
+				msleep(20);
+				continue;
+			}
+			rc_printk(RC_ERROR,
+				  "rc_volume_resync: write to target %d failed (%d) at lba %llu — aborting\n",
+				  target, err, (unsigned long long)cursor);
+			goto done;
+		}
+
+		retries = 0;
+		cursor += nlb;
+		atomic64_set(&rc_volume_resync_cursor, cursor);
+
+		if (rc_volume_resync_delay_ms)
+			msleep(rc_volume_resync_delay_ms);
+		cond_resched();
+	}
+	ret = 0;
+
+done:
+	atomic64_set(&rc_volume_resync_window, RC_RESYNC_WINDOW_NONE);
+	if (buf)
+		free_pages((unsigned long)buf, order);
+	/* Free the PRP-list pages while the endpoints still exist.  The
+	 * stop paths (remove_member/teardown) kthread_stop() BEFORE
+	 * releasing either adapter, so these devices are valid here. */
+	if (list_va[0] && srv_slot >= 0 && rc_volume_members[srv_slot])
+		dma_free_coherent(&rc_volume_members[srv_slot]->pdev->dev,
+				  PAGE_SIZE, list_va[0], list_pa[0]);
+	if (list_va[1] && rc_volume_members[target])
+		dma_free_coherent(&rc_volume_members[target]->pdev->dev,
+				  PAGE_SIZE, list_va[1], list_pa[1]);
+
+	mutex_lock(&rc_volume_lock);
+	/* cmpxchg, not check-then-set: rc_volume_member_mark_failed() writes
+	 * this state element lock-free from ISR context, and a FAILED it
+	 * installs in the window between a plain check and store must not be
+	 * clobbered back to LIVE (the volume would report optimal while
+	 * routing I/O to a dead member).  If mark_failed wins, it already
+	 * cleared the mask bits and scheduled the degrade work — losing the
+	 * cmpxchg means there is nothing left for us to do. */
+	if (ret == 0) {
+		/* Masks first, state second, and revert the masks if the
+		 * cmpxchg loses: whichever way a concurrent lock-free
+		 * mark_failed() interleaves, exactly one side's bookkeeping
+		 * survives.  mark_failed's not-live branch retries against
+		 * LIVE, so a promotion it raced still gets failed rather
+		 * than swallowed. */
+		atomic_or(BIT(target), &rc_volume_write_mask);
+		atomic_or(BIT(target), &rc_volume_live_mask);
+		if (cmpxchg(&rc_volume_member_state[target],
+			    RC_MEMBER_RESYNCING, RC_MEMBER_LIVE) !=
+		    RC_MEMBER_RESYNCING) {
+			/* A failure won the race — undo our mask bits (its
+			 * andnots may have preceded our ors). */
+			atomic_andnot(BIT(target), &rc_volume_write_mask);
+			atomic_andnot(BIT(target), &rc_volume_live_mask);
+			goto completion_settled;
+		}
+		rc_printk(RC_NOTE,
+			  "rc_volume_resync: member %d resynced (%llu MiB) — volume OPTIMAL\n",
+			  target,
+			  (unsigned long long)(rc_volume_resync_total >> 11));
+	} else if (ret != 0 &&
+		   cmpxchg(&rc_volume_member_state[target],
+			   RC_MEMBER_RESYNCING, RC_MEMBER_NEEDS_RESYNC) ==
+		   RC_MEMBER_RESYNCING) {
+		atomic_andnot(BIT(target), &rc_volume_write_mask);
+		rc_printk(RC_WARN,
+			  "rc_volume_resync: member %d resync aborted at %llu/%llu sectors — parked needs-resync\n",
+			  target, (unsigned long long)cursor,
+			  (unsigned long long)rc_volume_resync_total);
+	}
+completion_settled:
+	rc_volume_resync_slot = -1;
+	rc_volume_resync_done = true;
+	mutex_unlock(&rc_volume_lock);
+
+	/* Exit outright — no parking for kthread_stop().  The starter holds
+	 * a task_struct reference, so the reapers' kthread_stop() is safe
+	 * after this return: on an already-exited kthread it just collects
+	 * the exit code without blocking.  Parking here instead would leave
+	 * a blocked rcraid-resync thread lingering after every successful
+	 * resync until an unrelated readmit/remove/teardown reaped it. */
 	return ret;
+}
+
+/* Reap a finished (or running) resync thread.  Caller must NOT hold
+ * rc_volume_lock if the thread may still be running (its exit path takes
+ * the lock).  With the lock held, only reap when rc_volume_resync_done. */
+static void rc_volume_resync_reap_locked(void)
+{
+	struct task_struct *t = rc_volume_resync_thread;
+
+	if (!t || !rc_volume_resync_done)
+		return;
+	rc_volume_resync_thread = NULL;
+	rc_volume_resync_done = false;
+	kthread_stop(t);	/* thread already exited; collects exit code */
+	put_task_struct(t);
+}
+
+/* Stop a possibly-RUNNING resync.  Never called with rc_volume_lock held. */
+static void rc_volume_resync_stop(void)
+{
+	struct task_struct *t;
+
+	mutex_lock(&rc_volume_lock);
+	t = rc_volume_resync_thread;
+	rc_volume_resync_thread = NULL;
+	rc_volume_resync_done = false;
+	mutex_unlock(&rc_volume_lock);
+	if (t) {
+		kthread_stop(t);
+		put_task_struct(t);
+	}
+}
+
+/* A member just entered NEEDS_RESYNC (re-plug or recovered controller):
+ * start the rebuild.  Caller holds rc_volume_lock. */
+static void rc_volume_member_readmitted(int slot)
+{
+	struct task_struct *t;
+
+	/* A teardown in progress dropped rc_volume_lock for the kernfs
+	 * unregister — it already stopped the resync it knew about and will
+	 * not look again, so spawning one now would orphan a kthread against
+	 * adapters whose queues are about to be freed. */
+	if (rc_volume_tearing_down) {
+		rc_printk(RC_WARN,
+			  "rc_volume: member %d needs resync but the volume is tearing down — leaving parked\n",
+			  slot);
+		return;
+	}
+
+	rc_volume_resync_reap_locked();
+
+	if (rc_volume_resync_thread) {
+		rc_printk(RC_WARN,
+			  "rc_volume: member %d needs resync but a resync is already running — leaving parked\n",
+			  slot);
+		return;
+	}
+	if (!rc_volume_disk || get_disk_ro(rc_volume_disk)) {
+		rc_printk(RC_WARN,
+			  "rc_volume: member %d needs resync but the volume is %s — leaving parked\n",
+			  slot, rc_volume_disk ? "read-only" : "absent");
+		return;
+	}
+	if (rc_volume_resync_pick_survivor(slot) < 0) {
+		rc_printk(RC_ERROR,
+			  "rc_volume: member %d needs resync but no live survivor exists — leaving parked\n",
+			  slot);
+		return;
+	}
+
+	rc_volume_member_set_state(slot, RC_MEMBER_RESYNCING);
+	rc_volume_resync_slot = slot;
+	rc_volume_resync_total = get_capacity(rc_volume_disk);
+	atomic64_set(&rc_volume_resync_cursor, 0);
+
+	t = kthread_run(rc_volume_resync_fn, (void *)(long)slot,
+			"rcraid-resync");
+	if (IS_ERR(t)) {
+		rc_printk(RC_ERROR,
+			  "rc_volume: failed to start resync thread (%ld)\n",
+			  PTR_ERR(t));
+		rc_volume_member_set_state(slot, RC_MEMBER_NEEDS_RESYNC);
+		rc_volume_resync_slot = -1;
+		return;
+	}
+	get_task_struct(t);
+	rc_volume_resync_thread = t;
+	/* Clear any stale done-flag: rc_volume_resync_stop() NULLs the
+	 * thread pointer before kthread_stop(), so the stopped thread's
+	 * exit path re-set done = true after the stopper cleared it, and
+	 * reap_locked() above skips the reset when the pointer is NULL.
+	 * Left stale, the next reap would kthread_stop() THIS live thread
+	 * mid-copy as if it had finished. */
+	rc_volume_resync_done = false;
 }
 
 /* Tear down everything rc_volume_create_disk allocated.  Called from
  * rc_exit().  Safe to call when the disk was never created (state is
  * initialised to NULL/0). */
+/* Serializes whole-teardown against whole-teardown (two members surprise-
+ * removed at once, or hot-unplug racing rc_exit).  Without it, one caller
+ * can del_gendisk/put_disk the disk while the other is still inside
+ * device_remove_group() on it.  NOT rc_volume_lock, so the sysfs show/
+ * store handlers (which take rc_volume_lock) can still drain during
+ * kernfs removal. */
+static DEFINE_MUTEX(rc_volume_teardown_lock);
+
 void rc_volume_teardown(void)
 {
 	int i;
 
+	mutex_lock(&rc_volume_teardown_lock);
+
+	/* Block NEW resyncs before stopping the current one: once the lock
+	 * is dropped for rc_volume_sysfs_unregister() below, a per-adapter
+	 * auto_reset_work queued earlier can still run and would otherwise
+	 * call rc_volume_member_readmitted() and spawn a fresh resync
+	 * kthread this function never learns about — which then races the
+	 * adapters' own queue teardown (use-after-free). */
+	mutex_lock(&rc_volume_lock);
+	rc_volume_tearing_down = true;
+	mutex_unlock(&rc_volume_lock);
+
 	/* The degrade work walks the registry — let any queued run finish
-	 * before the registry (and the adapters it points at) go away. */
+	 * before the registry (and the adapters it points at) go away.  The
+	 * delayed degraded-assembly work must likewise not fire into a
+	 * dismantled registry. */
 	flush_work(&rc_volume_degrade_work);
+	cancel_delayed_work_sync(&rc_volume_assemble_work);
+	/* Stop a running resync before the members it reads/writes go away. */
+	rc_volume_resync_stop();
+
+	/* Remove the sysfs group BEFORE taking rc_volume_lock: kernfs
+	 * removal blocks until in-flight ->show()/->store() callbacks
+	 * return, and those callbacks take rc_volume_lock — removing under
+	 * the lock is an ABBA deadlock with any concurrent attribute read.
+	 * Concurrent teardown callers are serialized by
+	 * rc_volume_teardown_lock (held above), and the unregister itself is
+	 * idempotent via rc_volume_sysfs_up, so the group is removed exactly
+	 * once and the disk outlives the removal. */
+	rc_volume_sysfs_unregister();
 
 	mutex_lock(&rc_volume_lock);
 	if (rc_volume_disk) {
@@ -4520,30 +5333,33 @@ void rc_volume_teardown(void)
 		blk_mq_free_tag_set(&rc_volume_tagset);
 	}
 	for (i = 0; i < RC_VOLUME_MAX_MEMBERS; i++) {
-		if (rc_volume_members[i]) {
-			struct device *dev = &rc_volume_members[i]->pdev->dev;
-			u32 t, h;
-
-			for (h = 0; h < RC_VOLUME_MAX_HCTX; h++) {
-				for (t = 0; t < RC_VOLUME_QUEUE_DEPTH; t++) {
-					if (rc_volume_prp_va[h][i][t]) {
-						dma_free_coherent(dev, PAGE_SIZE,
-								  rc_volume_prp_va[h][i][t],
-								  rc_volume_prp_pa[h][i][t]);
-						rc_volume_prp_va[h][i][t] = NULL;
-						rc_volume_prp_pa[h][i][t] = 0;
-					}
-				}
-			}
-		}
+		if (rc_volume_members[i])
+			rc_volume_free_member_dma(i,
+				&rc_volume_members[i]->pdev->dev);
 		rc_volume_members[i] = NULL;
 		rc_volume_member_phys_offset[i] = 0;
 		WRITE_ONCE(rc_volume_member_state[i], RC_MEMBER_LIVE);
 	}
 	atomic_set(&rc_volume_live_mask, 0);
+	atomic_set(&rc_volume_write_mask, 0);
+	atomic64_set(&rc_volume_resync_window, RC_RESYNC_WINDOW_NONE);
+	atomic64_set(&rc_volume_resync_cursor, 0);
+	/* Symmetry/defense-in-depth: the queue is drained here so these are
+	 * already 0 in any correct execution, but a count leaked across a
+	 * teardown/reassemble cycle would hang the next volume's resync in
+	 * its generation-drain loop with no diagnostic. */
+	atomic_set(&rc_volume_wgen, 0);
+	atomic_set(&rc_volume_wgen_count[0], 0);
+	atomic_set(&rc_volume_wgen_count[1], 0);
+	rc_volume_resync_total = 0;
+	rc_volume_resync_slot = -1;
 	rc_volume_member_count = 0;
 	rc_volume_stripe_sectors = 0;
+	/* Re-open resyncs: this path also runs for a mid-runtime last-member
+	 * removal, and a later re-probe must be able to rebuild. */
+	rc_volume_tearing_down = false;
 	mutex_unlock(&rc_volume_lock);
+	mutex_unlock(&rc_volume_teardown_lock);
 }
 
 /* debugfs `rcraid/volume` — volume-level state for operators and the QEMU
@@ -4578,10 +5394,23 @@ int rc_volume_debugfs_show(struct seq_file *m, void *unused)
 			   (a && READ_ONCE(a->ctx.nvme.dead)) ? " (dead)" : "");
 	}
 
+	if (rc_volume_resync_slot >= 0) {
+		u64 cur = (u64)atomic64_read(&rc_volume_resync_cursor);
+		u64 tot = rc_volume_resync_total;
+
+		seq_printf(m, "resync: member%d %llu/%llu sectors (%llu%%)\n",
+			   rc_volume_resync_slot,
+			   (unsigned long long)cur, (unsigned long long)tot,
+			   tot ? (unsigned long long)div64_u64(cur * 100, tot)
+			       : 0ULL);
+	}
+
 	if (!rc_volume_disk)
 		seq_puts(m, "state: unassembled\n");
 	else if (nlive == 0)
 		seq_puts(m, "state: failed\n");
+	else if (rc_volume_resync_slot >= 0)
+		seq_puts(m, "state: resyncing\n");
 	else if (nlive < rc_volume_member_count &&
 		 rc_volume_raid_level == RC_LDT_RAID1)
 		seq_puts(m, "state: degraded\n");
@@ -4591,6 +5420,174 @@ int rc_volume_debugfs_show(struct seq_file *m, void *unused)
 		seq_puts(m, "state: optimal\n");
 	mutex_unlock(&rc_volume_lock);
 	return 0;
+}
+
+/* ------------------------------------------------------------------ *
+ * Volume-level sysfs: /sys/block/rcraid0/rcraid/{state,members,
+ * resync_progress,fail_member}.  The stable operator surface (debugfs
+ * carries the same data plus internals, but debugfs is not ABI and may
+ * not be mounted).  Group added after add_disk, removed at teardown.
+ * ------------------------------------------------------------------ */
+
+static const char *rc_volume_state_str(void)
+{
+	unsigned int live = (unsigned int)atomic_read(&rc_volume_live_mask);
+	int nlive = hweight32(live);
+
+	if (!rc_volume_disk)
+		return "unassembled";
+	if (nlive == 0)
+		return "failed";
+	if (READ_ONCE(rc_volume_resync_slot) >= 0)
+		return "resyncing";
+	if (nlive < rc_volume_member_count)
+		return rc_volume_raid_level == RC_LDT_RAID1 ? "degraded"
+							    : "failed";
+	return "optimal";
+}
+
+static ssize_t state_show(struct device *dev, struct device_attribute *attr,
+			  char *buf)
+{
+	ssize_t n;
+
+	mutex_lock(&rc_volume_lock);
+	n = sysfs_emit(buf, "%s\n", rc_volume_state_str());
+	mutex_unlock(&rc_volume_lock);
+	return n;
+}
+static DEVICE_ATTR_RO(state);
+
+static ssize_t members_show(struct device *dev, struct device_attribute *attr,
+			    char *buf)
+{
+	ssize_t n = 0;
+	int i;
+
+	mutex_lock(&rc_volume_lock);
+	for (i = 0; i < rc_volume_member_count && i < RC_VOLUME_MAX_MEMBERS;
+	     i++) {
+		struct rc_adapter *a = rc_volume_members[i];
+
+		n += sysfs_emit_at(buf, n, "%d %s %s\n", i,
+				   a ? pci_name(a->pdev) : "absent",
+				   rc_member_state_name(rc_volume_member_state[i]));
+	}
+	mutex_unlock(&rc_volume_lock);
+	return n;
+}
+static DEVICE_ATTR_RO(members);
+
+static ssize_t resync_progress_show(struct device *dev,
+				    struct device_attribute *attr, char *buf)
+{
+	u64 cur, tot;
+	int slot;
+	ssize_t n;
+
+	mutex_lock(&rc_volume_lock);
+	slot = rc_volume_resync_slot;
+	cur = (u64)atomic64_read(&rc_volume_resync_cursor);
+	tot = rc_volume_resync_total;
+	if (slot < 0)
+		n = sysfs_emit(buf, "none\n");
+	else
+		n = sysfs_emit(buf, "member%d %llu/%llu %llu%%\n", slot,
+			       (unsigned long long)cur,
+			       (unsigned long long)tot,
+			       tot ? (unsigned long long)div64_u64(cur * 100,
+								   tot) : 0ULL);
+	mutex_unlock(&rc_volume_lock);
+	return n;
+}
+static DEVICE_ATTR_RO(resync_progress);
+
+/* Operator/testing control: fail a member by slot number.  Same code path
+ * as an ISR-detected death — the volume degrades (RAID1) or fails
+ * (RAID0), and a subsequent manual reset of the member parks it
+ * needs-resync for the engine to pick up. */
+static ssize_t fail_member_store(struct device *dev,
+				 struct device_attribute *attr,
+				 const char *buf, size_t count)
+{
+	int slot, ret;
+
+	ret = kstrtoint(buf, 0, &slot);
+	if (ret)
+		return ret;
+	if (slot < 0 || slot >= RC_VOLUME_MAX_MEMBERS)
+		return -EINVAL;
+
+	mutex_lock(&rc_volume_lock);
+	/* member_count is lock-protected state — bounds-check it here. */
+	if (slot >= rc_volume_member_count) {
+		mutex_unlock(&rc_volume_lock);
+		return -EINVAL;
+	}
+	if (!rc_volume_members[slot]) {
+		mutex_unlock(&rc_volume_lock);
+		return -ENODEV;
+	}
+	rc_printk(RC_WARN,
+		  "rc_volume: member %d (%s) FAILED by operator via sysfs\n",
+		  slot, pci_name(rc_volume_members[slot]->pdev));
+	/* Fail under the lock: mark_failed itself is lock-free (ISR-safe),
+	 * so holding rc_volume_lock is allowed — and it keeps validate+fail
+	 * atomic against a concurrent remove + re-add reusing this slot for
+	 * a different adapter (failing the wrong, freshly re-added member). */
+	rc_volume_member_mark_failed(slot);
+	mutex_unlock(&rc_volume_lock);
+	return count;
+}
+static DEVICE_ATTR_WO(fail_member);
+
+static struct attribute *rc_volume_sysfs_attrs[] = {
+	&dev_attr_state.attr,
+	&dev_attr_members.attr,
+	&dev_attr_resync_progress.attr,
+	&dev_attr_fail_member.attr,
+	NULL,
+};
+
+static const struct attribute_group rc_volume_sysfs_group = {
+	.name  = "rcraid",
+	.attrs = rc_volume_sysfs_attrs,
+};
+
+/* Guards the register/unregister pair so device_remove_group() fires
+ * exactly once.  Deliberately NOT rc_volume_lock: unregister must run
+ * outside that lock (kernfs removal drains ->show()/->store() callbacks
+ * which take it), yet concurrent rc_volume_teardown() callers — two
+ * members surprise-removed at once, or hot-unplug racing rc_exit() —
+ * would otherwise both see rc_volume_disk non-NULL and double-remove
+ * the group (kernfs WARNs on the second call). */
+static atomic_t rc_volume_sysfs_up = ATOMIC_INIT(0);
+
+/* Called with rc_volume_lock held, right after add_disk. */
+static void rc_volume_sysfs_register(void)
+{
+	int ret;
+
+	if (!rc_volume_disk)
+		return;
+	ret = device_add_group(disk_to_dev(rc_volume_disk),
+			       &rc_volume_sysfs_group);
+	if (ret)
+		rc_printk(RC_WARN,
+			  "rc_volume: sysfs group creation failed (%d) — /sys/block/%s/rcraid absent\n",
+			  ret, rc_volume_disk->disk_name);
+	else
+		atomic_set(&rc_volume_sysfs_up, 1);
+}
+
+/* Called WITHOUT rc_volume_lock (see rc_volume_teardown).  Idempotent:
+ * only the caller that wins the flag actually removes the group. */
+static void rc_volume_sysfs_unregister(void)
+{
+	if (atomic_cmpxchg(&rc_volume_sysfs_up, 1, 0) != 1)
+		return;
+	device_remove_group(disk_to_dev(rc_volume_disk),
+			    &rc_volume_sysfs_group);
 }
 
 /* PCI-remove hook (also used by probe error paths).  A member adapter is
@@ -4612,6 +5609,46 @@ void rc_volume_remove_member(struct rc_adapter *adapter)
 	bool keep_volume;
 	int slot = -1;
 	int i;
+
+	/* Bail before disturbing anything if this adapter never registered
+	 * as a member (foreign NVMe device under allow_foreign_nvme, or a
+	 * probe failure before registration).  This path runs for EVERY
+	 * NVMe-mode adapter removal; unconditionally stopping the resync
+	 * here let churn on an unrelated device abort an in-progress
+	 * rebuild — with no automatic restart, stranding the volume
+	 * degraded. */
+	mutex_lock(&rc_volume_lock);
+	for (i = 0; i < RC_VOLUME_MAX_MEMBERS; i++)
+		if (rc_volume_members[i] == adapter)
+			slot = i;
+	mutex_unlock(&rc_volume_lock);
+	if (slot < 0) {
+		/* Not currently registered — but an adapter that WAS a
+		 * member (volume_slot still set: e.g. the registry was
+		 * cleared by a concurrent teardown) may still be referenced
+		 * by a resync kthread's cached pointers.  Stop it before our
+		 * caller frees this adapter's I/O queues out from under it.
+		 * Never-registered foreign devices (volume_slot -1) skip
+		 * this, so unrelated churn still can't abort a rebuild. */
+		if (READ_ONCE(adapter->ctx.nvme.volume_slot) >= 0)
+			rc_volume_resync_stop();
+		return;
+	}
+	slot = -1;
+
+	/* The degraded-assembly timer walks the registry and can create the
+	 * disk from a member that is mid-removal — cancel it before any
+	 * member departs.  A later registration of a remaining member
+	 * re-arms it. */
+	cancel_delayed_work_sync(&rc_volume_assemble_work);
+
+	/* A running resync holds pointers to (up to) two members and issues
+	 * sync commands against them — stop it before ANY member departs.
+	 * Cheap no-op when no resync is active.  If the departing member
+	 * was the resync target, its state reverts to needs-resync (or is
+	 * overwritten to failed below); a future re-add restarts the copy
+	 * from scratch. */
+	rc_volume_resync_stop();
 
 	mutex_lock(&rc_volume_lock);
 	for (i = 0; i < RC_VOLUME_MAX_MEMBERS; i++)
@@ -4668,7 +5705,6 @@ void rc_volume_remove_member(struct rc_adapter *adapter)
 	{
 		unsigned int memflags =
 			blk_mq_freeze_queue(rc_volume_disk->queue);
-		u32 t, h;
 
 		mutex_lock(&rc_volume_lock);
 		rc_volume_members[slot] = NULL;
@@ -4677,20 +5713,9 @@ void rc_volume_remove_member(struct rc_adapter *adapter)
 		 * (and IOMMU domain) still exists — the volume-teardown path
 		 * can't dma_free_coherent against a departed device, and the
 		 * freeze above guarantees nothing references them anymore.
-		 * The NULL slot is never dispatched to, so the holes are
-		 * harmless until a future re-add reallocates them. */
-		for (h = 0; h < RC_VOLUME_MAX_HCTX; h++) {
-			for (t = 0; t < RC_VOLUME_QUEUE_DEPTH; t++) {
-				if (!rc_volume_prp_va[h][slot][t])
-					continue;
-				dma_free_coherent(&adapter->pdev->dev,
-						  PAGE_SIZE,
-						  rc_volume_prp_va[h][slot][t],
-						  rc_volume_prp_pa[h][slot][t]);
-				rc_volume_prp_va[h][slot][t] = NULL;
-				rc_volume_prp_pa[h][slot][t] = 0;
-			}
-		}
+		 * The NULL slot is never dispatched to; a re-add reallocates
+		 * the slice via rc_volume_alloc_member_dma. */
+		rc_volume_free_member_dma(slot, &adapter->pdev->dev);
 		mutex_unlock(&rc_volume_lock);
 		blk_mq_unfreeze_queue(rc_volume_disk->queue, memflags);
 	}
@@ -5041,8 +6066,9 @@ int rc_nvme_reset_controller(struct rc_adapter *adapter)
 				rc_volume_member_set_state(slot,
 						RC_MEMBER_NEEDS_RESYNC);
 				rc_printk(RC_WARN,
-					  "rc_nvme_reset_controller: %s recovered but STALE (missed writes while failed) — parked needs-resync, not rejoining until resync support lands\n",
+					  "rc_nvme_reset_controller: %s recovered but STALE (missed writes while failed) — parked needs-resync\n",
 					  pci_name(adapter->pdev));
+				rc_volume_member_readmitted(slot);
 			} else {
 				rc_volume_member_set_state(slot,
 						RC_MEMBER_LIVE);
