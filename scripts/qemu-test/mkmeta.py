@@ -262,6 +262,10 @@ def main():
                          "(sectors), which parsers must use VERBATIM in "
                          "preference to --chunk-index (BIOS-native RAID0 "
                          "style); 0 (default) = chunk-index encoding")
+    ap.add_argument("--record-padding", type=int, default=0,
+                    help="insert N zero bytes (multiple of 4) before and "
+                         "between generation records — real firmware pads; "
+                         "parsers must tag-scan, not assume packing")
     ap.add_argument("--devtype-raid1", action="store_true",
                     help="write the volume LD with the explicit RAID1 "
                          "DeviceType 0x1BF7 instead of 0x1BF6 (some "
@@ -332,7 +336,9 @@ def main():
                                 DEVTYPE_RAID1 if args.devtype_raid1
                                 else DEVTYPE_VOLUME,
                                 counts_override)
-    active_gen = build_generation(ACTIVE_GEN_TS, raw_ld + active_ld)
+    pad = bytes(args.record_padding)
+    active_gen = build_generation(ACTIVE_GEN_TS,
+                                  pad + raw_ld + pad + active_ld)
 
     # Decoy generation: a dead config for the OPPOSITE level with the same
     # DeviceIDs and a capacity that can't match the active one.  Sits at

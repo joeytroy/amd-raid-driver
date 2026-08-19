@@ -163,6 +163,9 @@ run_level raid0 2
 # garbles readback.
 run_level raid0 2 --raw-chunk-sectors 1024 --chunk-index 3
 run_level raid1 2
+# Padded generation records: real firmware pads/interleaves — the parser
+# must tag-scan like the driver, not assume records are packed at +0x200.
+run_level raid1 2 --record-padding 64
 run_level raid10 4
 
 # Degraded raid10: drop one leg of each pair — must still assemble and

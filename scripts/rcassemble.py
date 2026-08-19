@@ -193,31 +193,39 @@ def parse_member(path):
                 f"generation timestamp {hdr_ts:#x} does not match commit "
                 f"block {gen_ts:#x} (dead/torn generation?)")
 
+    # Tolerant 4-byte tag scan, exactly like the driver's
+    # rc_volume_parse_logical_device(): real firmware pads/interleaves
+    # records, so never assume the first record sits at +0x200, never
+    # jump by PacketSize, and never abort on a non-matching tag — step 4
+    # bytes at a time and consider every RC_DST_LOGICAL_DEVICE hit.
+    # Candidates that don't look like a plausible record (truncated, bad
+    # PacketSize, unknown DeviceType — e.g. a tag byte-pattern occurring
+    # inside some other structure) are skipped, not fatal, matching the
+    # driver's ignore-and-continue behaviour.
     ld_blob = None
     off = GEN_HEADER_BYTES
     while off + 4 <= len(gen):
         dst = struct.unpack_from("<I", gen, off)[0]
         if dst != DST_LOGICAL_DEVICE:
-            break
-        if off + LD_PACKETSIZE + 4 > len(gen):
-            raise ValueError(f"truncated LD record header at +{off:#x}")
+            off += 4
+            continue
+        if off + LD_CHUNKINDEX + 4 > len(gen):
+            off += 4
+            continue
         pkt = struct.unpack_from("<I", gen, off + LD_PACKETSIZE)[0]
-        if pkt < LD_CHUNKINDEX + 4 or off + pkt > len(gen):
-            raise ValueError(f"LD record at +{off:#x} has bad "
-                             f"PacketSize {pkt}")
         devtype = struct.unpack_from("<I", gen, off + LD_DEVICETYPE)[0]
         # 0x1BF7 is the explicit RAID1 DeviceType the driver's
         # rc_ld_level_from() also accepts ("kept in case some firmware
         # uses it") — treat it as a volume record like the driver does.
-        if devtype in (DEVTYPE_VOLUME, DEVTYPE_RAID1):
-            if ld_blob is not None:
-                raise ValueError("multiple volume LD records in the "
-                                 "committed generation")
-            ld_blob = bytes(gen[off:off + pkt])
-        elif devtype != DEVTYPE_SINGLE:
-            raise ValueError(f"unknown LD DeviceType {devtype:#x}")
-        # DEVTYPE_SINGLE (raw disk record): skipped, never assembled.
-        off += pkt
+        # DEVTYPE_SINGLE (raw disk record) is skipped, never assembled.
+        if (devtype in (DEVTYPE_VOLUME, DEVTYPE_RAID1) and
+                LD_CHUNKINDEX + 4 <= pkt <= len(gen) - off):
+            blob = bytes(gen[off:off + pkt])
+            if ld_blob is not None and blob != ld_blob:
+                raise ValueError("multiple distinct volume LD records "
+                                 "in the committed generation")
+            ld_blob = blob
+        off += 4
     if ld_blob is None:
         raise ValueError("no volume LD (0x1BF6) in committed generation")
 
