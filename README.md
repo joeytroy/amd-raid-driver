@@ -244,7 +244,29 @@ module and that the module is actually inside that kernel's initramfs
 (both initramfs-tools and dracut systems are supported), and tells you
 the exact fix command for any kernel that would fail to boot.
 
-### 🅒 Build and load by hand (dev iteration / one-off)
+### 🅓 Read-only assembly WITHOUT the driver (SATA arrays, recovery, RAID10)
+
+`scripts/rcassemble.py` parses the RAIDCore metadata in userspace and
+assembles the array **read-only** via device-mapper — no kernel module.
+Use it for cases the driver deliberately does not cover: **SATA members**
+(the driver binds NVMe-class PCI functions only; SATA sits behind stock
+`ahci` — metadata confirmed byte-accurate on X399 SATA RAID10, see #57),
+**data recovery** on a machine without the driver, and **RAID10**
+(read-only; the driver has no RAID10 dispatch yet).
+
+```bash
+sudo python3 scripts/rcassemble.py --parse-only /dev/sd[b-e]   # inspect
+sudo python3 scripts/rcassemble.py --name rcvol /dev/sd[b-e]   # assemble
+mount -o ro /dev/mapper/rcvol1 /mnt                            # partitions via kpartx
+```
+
+It validates the same chain the driver does (checksum, commit block,
+generation timestamp linkage, dead-generation skip, raw-disk-LD skip),
+never writes to members, and always creates the dm device read-only.
+Tested in CI against synthetic raid0/raid1/raid10 arrays
+(`scripts/qemu-test/assemble-test.sh`).
+
+### 🅔 Build and load by hand (dev iteration / one-off)
 
 <details>
 <summary>Manual unbind / insmod steps</summary>

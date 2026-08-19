@@ -60,3 +60,4 @@ dmesg.log
 /dd/
 .ghidra_workspace/
 .*.d
+__pycache__/

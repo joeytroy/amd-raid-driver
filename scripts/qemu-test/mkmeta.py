@@ -161,6 +161,12 @@ def counts_for(level: str, members: int):
         return members, 1
     if level == "raid1":
         return 1, 2
+    if level == "raid10":
+        # Observed on X399 firmware (issue #57): devices=4, 2x2.
+        # Elements are ordered PAIR-MAJOR: [p0m0, p0m1, p1m0, p1m1] —
+        # position // SecondCount = stripe column, position % SecondCount
+        # = mirror leg.  rcassemble.py mirrors this assumption.
+        return members // 2, 2
     raise ValueError(level)
 
 
@@ -245,11 +251,14 @@ def main():
     ap.add_argument("images", nargs="+", help="member image files (in position order)")
     args = ap.parse_args()
 
-    if args.level != "raid0" and args.level != "raid1":
-        sys.exit(f"mkmeta: {args.level} metadata is untested — the driver "
+    if args.level == "raid5":
+        sys.exit("mkmeta: raid5 metadata is untested — the driver "
                  "has no dispatch for it yet; add support here alongside")
     if args.level == "raid1" and len(args.images) != 2:
         sys.exit("mkmeta: raid1 wants exactly 2 members")
+    if args.level == "raid10" and (len(args.images) < 4 or
+                                   len(args.images) % 2):
+        sys.exit("mkmeta: raid10 wants an even member count >= 4")
     if len(args.images) < 2:
         sys.exit("mkmeta: need at least 2 member images")
 
@@ -278,6 +287,8 @@ def main():
     user_size = (min_sectors - USERDATA_START) // chunk_sectors * chunk_sectors
     if args.level == "raid0":
         capacity = user_size * len(args.images)
+    elif args.level == "raid10":
+        capacity = user_size * (len(args.images) // 2)
     else:  # raid1
         capacity = user_size
 
