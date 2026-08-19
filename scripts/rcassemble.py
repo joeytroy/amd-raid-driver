@@ -368,6 +368,21 @@ def pick_legs(level, second, positions, elements):
     return columns
 
 
+def dm_dev_ref(path):
+    """Device reference for a dm table.  The dm-ioctl parser tokenizes
+    on whitespace, so paths are unsafe in general: for block devices use
+    major:minor (dm accepts it and it cannot contain whitespace); for
+    plain files (image paths in --dry-run output) keep the path but
+    refuse whitespace outright."""
+    st = os.stat(path)
+    if stat.S_ISBLK(st.st_mode):
+        return f"{os.major(st.st_rdev)}:{os.minor(st.st_rdev)}"
+    if any(c.isspace() for c in path):
+        raise ValueError(f"member path {path!r} contains whitespace — "
+                         "unrepresentable in a dm table")
+    return path
+
+
 def dm_table(level, capacity, chunk_sectors, positions, elements):
     if level == "raid0":
         missing = [i for i, m in enumerate(positions) if m is None]
@@ -376,15 +391,15 @@ def dm_table(level, capacity, chunk_sectors, positions, elements):
                              f"positions {missing}")
         devs = [(positions[i], elements[i][1])
                 for i in range(len(positions))]
-        legs = " ".join(f"{m.path} {off}" for m, off in devs)
+        legs = " ".join(f"{dm_dev_ref(m.path)} {off}" for m, off in devs)
         return (f"0 {capacity} striped {len(devs)} {chunk_sectors} {legs}",
                 [m for m, _ in devs])
     if level == "raid1":
         (m, off), = pick_legs(level, 2, positions, elements)
-        return f"0 {capacity} linear {m.path} {off}", [m]
+        return f"0 {capacity} linear {dm_dev_ref(m.path)} {off}", [m]
     # raid10: stripe across one leg per pair
     cols = pick_legs(level, 2, positions, elements)
-    legs = " ".join(f"{m.path} {off}" for m, off in cols)
+    legs = " ".join(f"{dm_dev_ref(m.path)} {off}" for m, off in cols)
     return (f"0 {capacity} striped {len(cols)} {chunk_sectors} {legs}",
             [m for m, _ in cols])
 
