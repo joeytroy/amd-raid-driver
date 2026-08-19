@@ -145,6 +145,7 @@ static atomic_t rc_volume_write_mask;
 
 static struct task_struct *rc_volume_resync_thread;	/* under rc_volume_lock */
 static bool rc_volume_resync_done;	/* thread finished, awaiting reap */
+static bool rc_volume_tearing_down;	/* under rc_volume_lock: no new resyncs */
 static int  rc_volume_resync_slot = -1;	/* target slot, -1 = idle */
 static atomic64_t rc_volume_resync_cursor;	/* progress, logical sectors */
 static u64  rc_volume_resync_total;
@@ -3755,6 +3756,13 @@ static blk_status_t rc_volume_dispatch_mirror(
 					break;
 				atomic_dec(&rc_volume_wgen_count[g]);
 			}
+			/* Pairs with the resync thread's smp_mb() between
+			 * publishing the window and flipping the generation:
+			 * having observed the flipped generation above, the
+			 * window read below must not be satisfied by an
+			 * older cached value (message-passing gap on
+			 * non-TSO architectures). */
+			smp_rmb();
 			wstart = (u64)atomic64_read(&rc_volume_resync_window);
 			if (wstart != RC_RESYNC_WINDOW_NONE &&
 			    (u64)pos < wstart + RC_RESYNC_XFER_SECTORS &&
@@ -5197,6 +5205,17 @@ static void rc_volume_member_readmitted(int slot)
 {
 	struct task_struct *t;
 
+	/* A teardown in progress dropped rc_volume_lock for the kernfs
+	 * unregister — it already stopped the resync it knew about and will
+	 * not look again, so spawning one now would orphan a kthread against
+	 * adapters whose queues are about to be freed. */
+	if (rc_volume_tearing_down) {
+		rc_printk(RC_WARN,
+			  "rc_volume: member %d needs resync but the volume is tearing down — leaving parked\n",
+			  slot);
+		return;
+	}
+
 	rc_volume_resync_reap_locked();
 
 	if (rc_volume_resync_thread) {
@@ -5261,6 +5280,16 @@ void rc_volume_teardown(void)
 
 	mutex_lock(&rc_volume_teardown_lock);
 
+	/* Block NEW resyncs before stopping the current one: once the lock
+	 * is dropped for rc_volume_sysfs_unregister() below, a per-adapter
+	 * auto_reset_work queued earlier can still run and would otherwise
+	 * call rc_volume_member_readmitted() and spawn a fresh resync
+	 * kthread this function never learns about — which then races the
+	 * adapters' own queue teardown (use-after-free). */
+	mutex_lock(&rc_volume_lock);
+	rc_volume_tearing_down = true;
+	mutex_unlock(&rc_volume_lock);
+
 	/* The degrade work walks the registry — let any queued run finish
 	 * before the registry (and the adapters it points at) go away.  The
 	 * delayed degraded-assembly work must likewise not fire into a
@@ -5310,6 +5339,9 @@ void rc_volume_teardown(void)
 	rc_volume_resync_slot = -1;
 	rc_volume_member_count = 0;
 	rc_volume_stripe_sectors = 0;
+	/* Re-open resyncs: this path also runs for a mid-runtime last-member
+	 * removal, and a later re-probe must be able to rebuild. */
+	rc_volume_tearing_down = false;
 	mutex_unlock(&rc_volume_lock);
 	mutex_unlock(&rc_volume_teardown_lock);
 }
@@ -5574,8 +5606,18 @@ void rc_volume_remove_member(struct rc_adapter *adapter)
 		if (rc_volume_members[i] == adapter)
 			slot = i;
 	mutex_unlock(&rc_volume_lock);
-	if (slot < 0)
+	if (slot < 0) {
+		/* Not currently registered — but an adapter that WAS a
+		 * member (volume_slot still set: e.g. the registry was
+		 * cleared by a concurrent teardown) may still be referenced
+		 * by a resync kthread's cached pointers.  Stop it before our
+		 * caller frees this adapter's I/O queues out from under it.
+		 * Never-registered foreign devices (volume_slot -1) skip
+		 * this, so unrelated churn still can't abort a rebuild. */
+		if (READ_ONCE(adapter->ctx.nvme.volume_slot) >= 0)
+			rc_volume_resync_stop();
 		return;
+	}
 	slot = -1;
 
 	/* The degraded-assembly timer walks the registry and can create the
