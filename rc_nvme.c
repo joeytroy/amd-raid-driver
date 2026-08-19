@@ -6148,20 +6148,33 @@ int rc_nvme_pm_suspend_adapter(struct rc_adapter *adapter)
 	/* Drain the volume BEFORE taking admin_mutex: a straggler that
 	 * times out during the wait needs auto-reset, which takes the
 	 * mutex itself. */
-	/* Under rc_volume_lock: rc_volume_teardown() del_gendisk/put_disk/
-	 * NULLs rc_volume_disk under the same lock, so the disk cannot be
-	 * freed between the check and the freeze (the plain NULL check had
-	 * a TOCTOU gap).  Holding the lock across the freeze wait is safe:
-	 * dispatch and completion are lock-free, and the drain that a
-	 * concurrent auto-reset performs runs before its rejoin block takes
-	 * this lock. */
-	mutex_lock(&rc_volume_lock);
-	if (rc_volume_disk && !nvme->pm_volume_frozen) {
-		nvme->pm_freeze_memflags =
-			blk_mq_freeze_queue(rc_volume_disk->queue);
-		nvme->pm_volume_frozen = true;
+	/* Pin-then-freeze: snapshot rc_volume_disk and take a device
+	 * reference under rc_volume_lock (teardown del_gendisk/put_disk/
+	 * NULLs the pointer under the same lock, so the pin closes the
+	 * free-between-check-and-freeze TOCTOU) — but run the freeze wait
+	 * itself OUTSIDE the lock.  The drain can last up to the full
+	 * timeout/eh_retries budget (~90s) on a wedged member, and holding
+	 * the global mutex that long would stall teardown, sysfs, and
+	 * resync administration system-wide.  The pinned reference keeps
+	 * the gendisk (and its queue) alive even if teardown wins the
+	 * race; freezing a dying queue is safe (refcounted, del_gendisk
+	 * does its own freeze/unfreeze). */
+	{
+		struct gendisk *disk = NULL;
+
+		mutex_lock(&rc_volume_lock);
+		if (rc_volume_disk && !nvme->pm_volume_frozen) {
+			disk = rc_volume_disk;
+			get_device(disk_to_dev(disk));
+		}
+		mutex_unlock(&rc_volume_lock);
+		if (disk) {
+			nvme->pm_freeze_memflags =
+				blk_mq_freeze_queue(disk->queue);
+			nvme->pm_volume_frozen = true;
+			put_device(disk_to_dev(disk));
+		}
 	}
-	mutex_unlock(&rc_volume_lock);
 
 	/* A straggler that timed out DURING the freeze wait has already
 	 * queued auto_reset_work — and its bail-out check (!dead) won't
