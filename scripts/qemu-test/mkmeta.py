@@ -195,7 +195,8 @@ def build_raw_disk_ld(device_id: int, disk_sectors: int) -> bytes:
 
 
 def build_ld_record(level: str, device_ids, capacity: int,
-                    user_size: int, chunk_index: int) -> bytes:
+                    user_size: int, chunk_index: int,
+                    raw_chunk_sectors: int = 0) -> bytes:
     n = len(device_ids)
     first, second = counts_for(level, n)
     size = ELEM_ARRAY_OFFSET + n * LE_BYTES
@@ -208,7 +209,10 @@ def build_ld_record(level: str, device_ids, capacity: int,
     struct.pack_into("<I", ld, LD_FIRSTCOUNT, first)
     struct.pack_into("<I", ld, LD_SECONDCOUNT, second)
     struct.pack_into("<I", ld, LD_PACKETSIZE, size)
-    struct.pack_into("<I", ld, LD_CHUNKSIZE, 0)    # 0 → chunk_index encoding
+    # 0 → chunk_index encoding (RAIDXpert2-style); non-0 → raw sector
+    # count used verbatim, taking precedence (BIOS-native RAID0 style —
+    # see rc_volume_chunk_sectors_for).
+    struct.pack_into("<I", ld, LD_CHUNKSIZE, raw_chunk_sectors)
     # Real RAID1 records carry a chunk_index too (observed =3 on hardware)
     # even though mirrors don't stripe; the driver must ignore it for RAID1.
     struct.pack_into("<I", ld, LD_CHUNKINDEX, chunk_index)
@@ -248,6 +252,11 @@ def main():
     ap.add_argument("--chunk-index", type=int, default=3,
                     help="RAID0 stripe encoding: 3=256KiB, 2=128KiB, 0/1=64KiB"
                          " (default 3, matching the hardware dev box)")
+    ap.add_argument("--raw-chunk-sectors", type=int, default=0,
+                    help="write a non-zero RC_LogicalDevice.ChunkSize "
+                         "(sectors), which parsers must use VERBATIM in "
+                         "preference to --chunk-index (BIOS-native RAID0 "
+                         "style); 0 (default) = chunk-index encoding")
     ap.add_argument("images", nargs="+", help="member image files (in position order)")
     args = ap.parse_args()
 
@@ -268,7 +277,8 @@ def main():
         # > 3 as "not understood" and falls back to 64 KiB —
         # self-inconsistent metadata.  Refuse instead.
         sys.exit("mkmeta: --chunk-index must be 0-3")
-    chunk_sectors = CHUNK_INDEX_SECTORS[args.chunk_index]
+    chunk_sectors = (args.raw_chunk_sectors or
+                     CHUNK_INDEX_SECTORS[args.chunk_index])
 
     sizes = []
     for img in args.images:
@@ -302,7 +312,8 @@ def main():
     # guest checks fail).
     raw_ld = build_raw_disk_ld(device_ids[0], min_sectors)
     active_ld = build_ld_record(args.level, device_ids, capacity,
-                                user_size, args.chunk_index)
+                                user_size, args.chunk_index,
+                                args.raw_chunk_sectors)
     active_gen = build_generation(ACTIVE_GEN_TS, raw_ld + active_ld)
 
     # Decoy generation: a dead config for the OPPOSITE level with the same

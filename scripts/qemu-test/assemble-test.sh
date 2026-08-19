@@ -109,12 +109,13 @@ write_pattern() { # level chunk_sectors user_size_sectors
     done
 }
 
-run_level() { # level member_count
+run_level() { # level member_count [extra mkmeta args...]
     local level=$1 count=$2
-    echo "== $level ($count members)"
+    shift 2
+    echo "== $level ($count members)${*:+ [$*]}"
     make_images "$count"
     local out
-    out="$(python3 "$MKMETA" --level "$level" "${IMAGES[@]}")"
+    out="$(python3 "$MKMETA" --level "$level" "$@" "${IMAGES[@]}")"
     local chunk user_size cap
     chunk="$(sed -n 's/.*chunk_sectors=\([0-9]*\).*/\1/p' <<<"$out" | head -1)"
     user_size="$(sed -n 's/.*user_size=\([0-9]*\).*/\1/p' <<<"$out" | head -1)"
@@ -156,6 +157,10 @@ run_level() { # level member_count
 }
 
 run_level raid0 2
+# BIOS-native style: raw ChunkSize (384 sectors — representable by NO
+# chunk_index) plus a deliberately misleading chunk_index=3 (512).  The
+# raw field must take precedence; getting this wrong garbles readback.
+run_level raid0 2 --raw-chunk-sectors 384 --chunk-index 3
 run_level raid1 2
 run_level raid10 4
 

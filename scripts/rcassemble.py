@@ -64,6 +64,7 @@ LD_DEVICES = 0x68
 LD_FIRSTCOUNT = 0x6C
 LD_SECONDCOUNT = 0x70
 LD_PACKETSIZE = 0x90
+LD_CHUNKSIZE = 0xAC
 LD_CHUNKINDEX = 0x110
 
 # RC_LogicalElement_LE (64 bytes each)
@@ -213,8 +214,16 @@ def derive_geometry(members):
     first = struct.unpack_from("<I", ld, LD_FIRSTCOUNT)[0]
     second = struct.unpack_from("<I", ld, LD_SECONDCOUNT)[0]
     capacity = struct.unpack_from("<Q", ld, LD_CAPACITY)[0]
+    # Same precedence as rc_volume_chunk_sectors_for(): the raw ChunkSize
+    # field (sectors, used verbatim when non-zero — BIOS-native RAID0
+    # arrays carry it) beats the ChunkIndex encoding (RAIDXpert2-created
+    # arrays store 0 here and encode the size in the index).
+    ld_chunk = struct.unpack_from("<I", ld, LD_CHUNKSIZE)[0]
     chunk_index = struct.unpack_from("<I", ld, LD_CHUNKINDEX)[0]
-    chunk_sectors = CHUNK_INDEX_SECTORS.get(chunk_index, 128)
+    if ld_chunk:
+        chunk_sectors = ld_chunk
+    else:
+        chunk_sectors = CHUNK_INDEX_SECTORS.get(chunk_index, 128)
 
     if first * second != devices:
         raise ValueError(f"FirstCount {first} x SecondCount {second} != "
