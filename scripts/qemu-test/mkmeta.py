@@ -262,6 +262,11 @@ def main():
                          "(sectors), which parsers must use VERBATIM in "
                          "preference to --chunk-index (BIOS-native RAID0 "
                          "style); 0 (default) = chunk-index encoding")
+    ap.add_argument("--foreign-ld", action="store_true",
+                    help="also write a volume LD for an UNRELATED array "
+                         "(different DeviceIDs) into the generation — "
+                         "parsers must pick the record owning the member, "
+                         "not fail on multiple LDs")
     ap.add_argument("--record-padding", type=int, default=0,
                     help="insert N zero bytes (multiple of 4) before and "
                          "between generation records — real firmware pads; "
@@ -337,8 +342,18 @@ def main():
                                 else DEVTYPE_VOLUME,
                                 counts_override)
     pad = bytes(args.record_padding)
-    active_gen = build_generation(ACTIVE_GEN_TS,
-                                  pad + raw_ld + pad + active_ld)
+    records = pad + raw_ld + pad
+    if args.foreign_ld:
+        # An LD for a DIFFERENT array on the same controller: unrelated
+        # DeviceIDs, placed BEFORE our record so a parser without a
+        # membership filter trips over it first.
+        foreign_ids = [0x52435445535446AA + i for i in range(2)]
+        records += build_ld_record("raid1" if args.level != "raid1"
+                                   else "raid0",
+                                   foreign_ids, user_size, user_size, 1)
+        records += pad
+    records += active_ld
+    active_gen = build_generation(ACTIVE_GEN_TS, records)
 
     # Decoy generation: a dead config for the OPPOSITE level with the same
     # DeviceIDs and a capacity that can't match the active one.  Sits at

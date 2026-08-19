@@ -220,11 +220,28 @@ def parse_member(path):
         # DEVTYPE_SINGLE (raw disk record) is skipped, never assembled.
         if (devtype in (DEVTYPE_VOLUME, DEVTYPE_RAID1) and
                 LD_CHUNKINDEX + 4 <= pkt <= len(gen) - off):
-            blob = bytes(gen[off:off + pkt])
-            if ld_blob is not None and blob != ld_blob:
-                raise ValueError("multiple distinct volume LD records "
-                                 "in the committed generation")
-            ld_blob = blob
+            # Membership filter, like the driver's my_pos check: a
+            # generation legitimately carries one LD per configured
+            # array on the controller — only a candidate whose element
+            # array names THIS member's DeviceID is ours; others (other
+            # arrays) are silently skipped, not ambiguity.
+            cand_eo = struct.unpack_from("<I", gen,
+                                         off + LD_ELEMENTOFFSET)[0]
+            cand_n = struct.unpack_from("<I", gen, off + LD_DEVICES)[0]
+            belongs = (0 < cand_n <= 64 and
+                       cand_eo + cand_n * LE_BYTES <= pkt and any(
+                           struct.unpack_from(
+                               "<Q", gen,
+                               off + cand_eo + j * LE_BYTES +
+                               LE_DEVICEID)[0] == device_id
+                           for j in range(cand_n)))
+            if belongs:
+                blob = bytes(gen[off:off + pkt])
+                if ld_blob is not None and blob != ld_blob:
+                    raise ValueError(
+                        "multiple distinct volume LD records owning "
+                        "this member in the committed generation")
+                ld_blob = blob
         off += 4
     if ld_blob is None:
         raise ValueError("no volume LD (0x1BF6) in committed generation")

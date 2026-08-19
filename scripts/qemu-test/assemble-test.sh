@@ -166,6 +166,10 @@ run_level raid1 2
 # Padded generation records: real firmware pads/interleaves — the parser
 # must tag-scan like the driver, not assume records are packed at +0x200.
 run_level raid1 2 --record-padding 64
+# Two arrays on one controller: an unrelated array's LD sits in the same
+# generation BEFORE ours — the parser must pick the record owning the
+# member (driver's my_pos filter), not fail on "multiple LDs".
+run_level raid1 2 --foreign-ld
 run_level raid10 4
 
 # Degraded raid10: drop one leg of each pair — must still assemble and
