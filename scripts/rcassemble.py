@@ -151,6 +151,15 @@ def parse_member(path):
         if not ring_lba <= gen_lba < ring_lba + ring_size:
             raise ValueError(f"committed generation LBA {gen_lba:#x} "
                              "outside the config ring")
+        # Bound the WHOLE extent inside the ring, like the driver's
+        # rc_volume_read_commit(): the commit block is not checksummed,
+        # and an unbounded u32 length would otherwise let corrupt
+        # metadata trigger a multi-GiB read (raw MemoryError traceback
+        # instead of a clean rejection).
+        if gen_lba + gen_len // SECTOR > ring_lba + ring_size:
+            raise ValueError(
+                f"committed generation extent [{gen_lba:#x} +{gen_len}B] "
+                "overruns the config ring")
 
         gen = read_at(f, gen_lba, gen_len)
         # The header timestamp must match the commit block — this is the
@@ -224,6 +233,17 @@ def derive_geometry(members):
         chunk_sectors = ld_chunk
     else:
         chunk_sectors = CHUNK_INDEX_SECTORS.get(chunk_index, 128)
+    # Plausibility bounds, mirroring the driver's chunk validation: a
+    # stripe size must be a power of two within [16, 65536] sectors —
+    # anything else is corrupt/implausible metadata (and dm-stripe
+    # documents a power-of-two requirement).  Reject cleanly here
+    # rather than letting dmsetup fail cryptically.
+    if (second == 1 or first > 1):  # striped levels actually use it
+        if (chunk_sectors < 16 or chunk_sectors > 65536 or
+                chunk_sectors & (chunk_sectors - 1)):
+            raise ValueError(f"implausible stripe chunk size "
+                             f"{chunk_sectors} sectors (raw ChunkSize "
+                             f"{ld_chunk}, chunk_index {chunk_index})")
 
     if first * second != devices:
         raise ValueError(f"FirstCount {first} x SecondCount {second} != "

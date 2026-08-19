@@ -157,10 +157,11 @@ run_level() { # level member_count [extra mkmeta args...]
 }
 
 run_level raid0 2
-# BIOS-native style: raw ChunkSize (384 sectors — representable by NO
-# chunk_index) plus a deliberately misleading chunk_index=3 (512).  The
-# raw field must take precedence; getting this wrong garbles readback.
-run_level raid0 2 --raw-chunk-sectors 384 --chunk-index 3
+# BIOS-native style: raw ChunkSize (1024 sectors — a power of two that
+# NO chunk_index encodes) plus a deliberately misleading chunk_index=3
+# (512).  The raw field must take precedence; getting this wrong
+# garbles readback.
+run_level raid0 2 --raw-chunk-sectors 1024 --chunk-index 3
 run_level raid1 2
 run_level raid10 4
 
@@ -182,6 +183,17 @@ if python3 "$RCASSEMBLE" --dry-run "${IMAGES[0]}" "${IMAGES[1]}" \
     fail "raid10 with a whole pair missing was not refused"
 fi
 echo "   raid10 whole-pair-missing correctly refused"
+
+# Non-power-of-two raw ChunkSize (384) must be rejected as implausible
+# metadata (the driver applies the same plausibility check, and
+# dm-stripe documents a power-of-two requirement).
+make_images 2
+python3 "$MKMETA" --level raid0 --raw-chunk-sectors 384 \
+    "${IMAGES[@]}" >/dev/null
+if python3 "$RCASSEMBLE" --parse-only "${IMAGES[@]}" >/dev/null 2>&1; then
+    fail "non-power-of-two raw ChunkSize was not rejected"
+fi
+echo "   non-power-of-two chunk rejection ok"
 
 # Corrupt the metadata checksum on one member: parse must fail.
 printf '\x00\x11\x22\x33' | dd of="${IMAGES[0]}" bs=1 \
