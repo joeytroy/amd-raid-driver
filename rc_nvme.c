@@ -36,6 +36,7 @@
 #include <linux/unaligned.h>
 #include <linux/blkdev.h>
 #include <linux/blk-mq.h>
+#include <linux/sched/mm.h>
 #include <linux/highmem.h>
 #include <linux/scatterlist.h>
 #include <linux/dma-mapping.h>
@@ -6166,12 +6167,21 @@ int rc_nvme_pm_suspend_adapter(struct rc_adapter *adapter)
 		if (rc_volume_disk && !nvme->pm_volume_frozen) {
 			disk = rc_volume_disk;
 			get_device(disk_to_dev(disk));
+			/* START the freeze while still under the lock: the
+			 * pin only keeps the gendisk/queue memory alive, not
+			 * the driver-owned rc_volume_tagset, which teardown
+			 * (same lock) frees unconditionally.  With the
+			 * freeze already started inside the locked region,
+			 * teardown can never interleave between pin and
+			 * freeze.  blk_freeze_queue_start is non-blocking;
+			 * only the drain wait runs outside the lock. */
+			blk_freeze_queue_start(disk->queue);
+			nvme->pm_freeze_memflags = memalloc_noio_save();
+			nvme->pm_volume_frozen = true;
 		}
 		mutex_unlock(&rc_volume_lock);
 		if (disk) {
-			nvme->pm_freeze_memflags =
-				blk_mq_freeze_queue(disk->queue);
-			nvme->pm_volume_frozen = true;
+			blk_mq_freeze_queue_wait(disk->queue);
 			put_device(disk_to_dev(disk));
 		}
 	}
@@ -6242,6 +6252,9 @@ int rc_nvme_pm_suspend_adapter(struct rc_adapter *adapter)
 			if (rc_volume_disk)
 				blk_mq_unfreeze_queue(rc_volume_disk->queue,
 						      nvme->pm_freeze_memflags);
+			else
+				memalloc_noio_restore(
+					nvme->pm_freeze_memflags);
 			nvme->pm_volume_frozen = false;
 			mutex_unlock(&rc_volume_lock);
 		}
@@ -6280,11 +6293,18 @@ int rc_nvme_pm_resume_adapter(struct rc_adapter *adapter)
 	 * freeze reference is held across — the lock closes both the stale-
 	 * NULL case and the free-between-check-and-unfreeze TOCTOU. */
 	mutex_lock(&rc_volume_lock);
-	if (nvme->pm_volume_frozen && rc_volume_disk) {
-		blk_mq_unfreeze_queue(rc_volume_disk->queue,
-				      nvme->pm_freeze_memflags);
+	if (nvme->pm_volume_frozen) {
+		if (rc_volume_disk)
+			blk_mq_unfreeze_queue(rc_volume_disk->queue,
+					      nvme->pm_freeze_memflags);
+		else
+			/* Disk torn down while suspended: the queue is gone
+			 * (nothing to unfreeze) but the NOIO allocation
+			 * state saved at freeze time must still be
+			 * restored. */
+			memalloc_noio_restore(nvme->pm_freeze_memflags);
+		nvme->pm_volume_frozen = false;
 	}
-	nvme->pm_volume_frozen = false;
 	mutex_unlock(&rc_volume_lock);
 	return ret;
 }
