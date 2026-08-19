@@ -6148,11 +6148,20 @@ int rc_nvme_pm_suspend_adapter(struct rc_adapter *adapter)
 	/* Drain the volume BEFORE taking admin_mutex: a straggler that
 	 * times out during the wait needs auto-reset, which takes the
 	 * mutex itself. */
+	/* Under rc_volume_lock: rc_volume_teardown() del_gendisk/put_disk/
+	 * NULLs rc_volume_disk under the same lock, so the disk cannot be
+	 * freed between the check and the freeze (the plain NULL check had
+	 * a TOCTOU gap).  Holding the lock across the freeze wait is safe:
+	 * dispatch and completion are lock-free, and the drain that a
+	 * concurrent auto-reset performs runs before its rejoin block takes
+	 * this lock. */
+	mutex_lock(&rc_volume_lock);
 	if (rc_volume_disk && !nvme->pm_volume_frozen) {
 		nvme->pm_freeze_memflags =
 			blk_mq_freeze_queue(rc_volume_disk->queue);
 		nvme->pm_volume_frozen = true;
 	}
+	mutex_unlock(&rc_volume_lock);
 
 	/* A straggler that timed out DURING the freeze wait has already
 	 * queued auto_reset_work — and its bail-out check (!dead) won't
@@ -6213,13 +6222,15 @@ int rc_nvme_pm_suspend_adapter(struct rc_adapter *adapter)
 		 * so drop our freeze reference here or the volume stays
 		 * blocked forever. */
 		if (nvme->pm_volume_frozen) {
-			/* Same NULL guard as the resume path: a concurrent
-			 * volume teardown can clear rc_volume_disk while the
-			 * wait_csts retry window held our freeze reference. */
+			/* Under rc_volume_lock like the freeze site: guards
+			 * both against a stale pointer and against teardown
+			 * freeing the queue between check and unfreeze. */
+			mutex_lock(&rc_volume_lock);
 			if (rc_volume_disk)
 				blk_mq_unfreeze_queue(rc_volume_disk->queue,
 						      nvme->pm_freeze_memflags);
 			nvme->pm_volume_frozen = false;
+			mutex_unlock(&rc_volume_lock);
 		}
 		return ret;
 	}
@@ -6250,15 +6261,18 @@ int rc_nvme_pm_resume_adapter(struct rc_adapter *adapter)
 		  pci_name(adapter->pdev));
 	ret = rc_nvme_reset_controller(adapter);
 
-	/* NULL guard like every other rc_volume_disk touch point: a volume
-	 * teardown (module unload race, hibernate freeze/thaw sequences)
-	 * can run between the suspend that took the reference and this
-	 * resume; dereferencing here would oops inside PM resume. */
+	/* Under rc_volume_lock, like the suspend-side freeze: a volume
+	 * teardown (last-member hot-unplug while suspended, module unload,
+	 * hibernate freeze/thaw sequences) can run in the long window this
+	 * freeze reference is held across — the lock closes both the stale-
+	 * NULL case and the free-between-check-and-unfreeze TOCTOU. */
+	mutex_lock(&rc_volume_lock);
 	if (nvme->pm_volume_frozen && rc_volume_disk) {
 		blk_mq_unfreeze_queue(rc_volume_disk->queue,
 				      nvme->pm_freeze_memflags);
 	}
 	nvme->pm_volume_frozen = false;
+	mutex_unlock(&rc_volume_lock);
 	return ret;
 }
 
