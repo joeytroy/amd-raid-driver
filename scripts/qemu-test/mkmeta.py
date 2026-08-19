@@ -69,6 +69,9 @@ DEVTYPE_VOLUME = 0x1BF6
 # counts, element array = the disk's own DeviceID).  The driver must never
 # assemble one of these as a volume.
 DEVTYPE_SINGLE = 0x1BF9
+# Explicit RAID1 DeviceType (rc_linux.h RC_LDT_RAID1) — kept in case some
+# firmware uses it; --devtype-raid1 emits it for parser-parity testing.
+DEVTYPE_RAID1 = 0x1BF7
 LEVELS = ("raid0", "raid1", "raid5", "raid10")
 
 # RC_LogicalDevice field offsets (rc_linux.h RC_LD_*_OFFSET)
@@ -196,14 +199,16 @@ def build_raw_disk_ld(device_id: int, disk_sectors: int) -> bytes:
 
 def build_ld_record(level: str, device_ids, capacity: int,
                     user_size: int, chunk_index: int,
-                    raw_chunk_sectors: int = 0) -> bytes:
+                    raw_chunk_sectors: int = 0,
+                    devtype: int = DEVTYPE_VOLUME,
+                    counts_override=None) -> bytes:
     n = len(device_ids)
-    first, second = counts_for(level, n)
+    first, second = counts_override or counts_for(level, n)
     size = ELEM_ARRAY_OFFSET + n * LE_BYTES
     ld = bytearray(size)
     struct.pack_into("<I", ld, 0x00, DST_LOGICAL_DEVICE)
     struct.pack_into("<I", ld, LD_ELEMENTOFFSET, ELEM_ARRAY_OFFSET)
-    struct.pack_into("<I", ld, LD_DEVICETYPE, DEVTYPE_VOLUME)
+    struct.pack_into("<I", ld, LD_DEVICETYPE, devtype)
     struct.pack_into("<Q", ld, LD_CAPACITY, capacity)
     struct.pack_into("<I", ld, LD_DEVICES, n)
     struct.pack_into("<I", ld, LD_FIRSTCOUNT, first)
@@ -257,6 +262,13 @@ def main():
                          "(sectors), which parsers must use VERBATIM in "
                          "preference to --chunk-index (BIOS-native RAID0 "
                          "style); 0 (default) = chunk-index encoding")
+    ap.add_argument("--devtype-raid1", action="store_true",
+                    help="write the volume LD with the explicit RAID1 "
+                         "DeviceType 0x1BF7 instead of 0x1BF6 (some "
+                         "firmware may use it; parsers must accept it)")
+    ap.add_argument("--counts", metavar="FIRSTxSECOND",
+                    help="override FirstCount/SecondCount (e.g. 2x1) — "
+                         "for negative tests of inconsistent geometry")
     ap.add_argument("images", nargs="+", help="member image files (in position order)")
     args = ap.parse_args()
 
@@ -311,9 +323,15 @@ def main():
     # assembles a bogus 1-member volume (wrong capacity and level → the
     # guest checks fail).
     raw_ld = build_raw_disk_ld(device_ids[0], min_sectors)
+    counts_override = None
+    if args.counts:
+        counts_override = tuple(int(x) for x in args.counts.split("x"))
     active_ld = build_ld_record(args.level, device_ids, capacity,
                                 user_size, args.chunk_index,
-                                args.raw_chunk_sectors)
+                                args.raw_chunk_sectors,
+                                DEVTYPE_RAID1 if args.devtype_raid1
+                                else DEVTYPE_VOLUME,
+                                counts_override)
     active_gen = build_generation(ACTIVE_GEN_TS, raw_ld + active_ld)
 
     # Decoy generation: a dead config for the OPPOSITE level with the same

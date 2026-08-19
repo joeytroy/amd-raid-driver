@@ -266,14 +266,23 @@ def derive_geometry(members):
                              f"{chunk_sectors} sectors (raw ChunkSize "
                              f"{ld_chunk}, chunk_index {chunk_index})")
 
-    if first * second != devices:
+    devtype = struct.unpack_from("<I", ld, LD_DEVICETYPE)[0]
+    # The counts product must match devices — except for an explicit
+    # 0x1BF7 RAID1 record, where the driver tolerates absent (0) counts;
+    # that branch applies its own full consistency check below.
+    if devtype != DEVTYPE_RAID1 and first * second != devices:
         raise ValueError(f"FirstCount {first} x SecondCount {second} != "
                          f"devices {devices}")
-    devtype = struct.unpack_from("<I", ld, LD_DEVICETYPE)[0]
     if devtype == DEVTYPE_RAID1:
-        # Explicit RAID1 DeviceType: same sanity as the driver.
-        if devices != 2:
-            raise ValueError(f"0x1BF7 RAID1 LD with devices={devices}")
+        # Explicit RAID1 DeviceType: mirror rc_ld_level_from() exactly —
+        # counts must be absent (0) or consistent with a 2-way mirror.
+        # Accepting e.g. first=2/second=1 here would silently present one
+        # stripe column of a striped layout as a complete mirror.
+        if devices != 2 or not (not first or not second or
+                                (first == 1 and second == 2)):
+            raise ValueError(f"0x1BF7 RAID1 LD with inconsistent "
+                             f"geometry devices={devices} first={first} "
+                             f"second={second}")
         level = "raid1"
     elif second == 1:
         level = "raid0"

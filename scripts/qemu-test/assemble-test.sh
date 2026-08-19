@@ -195,6 +195,24 @@ if python3 "$RCASSEMBLE" --parse-only "${IMAGES[@]}" >/dev/null 2>&1; then
 fi
 echo "   non-power-of-two chunk rejection ok"
 
+# Explicit RAID1 DeviceType (0x1BF7): must parse as raid1 (driver
+# parity — rc_ld_level_from accepts it)...
+make_images 2
+python3 "$MKMETA" --level raid1 --devtype-raid1 "${IMAGES[@]}" >/dev/null
+python3 "$RCASSEMBLE" --parse-only "${IMAGES[@]}" | grep -q "level=raid1" \
+    || fail "0x1BF7 RAID1 LD not accepted as raid1"
+echo "   explicit 0x1BF7 RAID1 accepted ok"
+
+# ...but 0x1BF7 with striped-shaped counts (2x1) must be REJECTED, like
+# the driver — accepting it would present one stripe column as a mirror.
+make_images 2
+python3 "$MKMETA" --level raid1 --devtype-raid1 --counts 2x1 \
+    "${IMAGES[@]}" >/dev/null
+if python3 "$RCASSEMBLE" --parse-only "${IMAGES[@]}" >/dev/null 2>&1; then
+    fail "0x1BF7 with inconsistent counts (2x1) was not rejected"
+fi
+echo "   0x1BF7 inconsistent-counts rejection ok"
+
 # Corrupt the metadata checksum on one member: parse must fail.
 printf '\x00\x11\x22\x33' | dd of="${IMAGES[0]}" bs=1 \
     seek=$((0x5000 * 512)) conv=notrunc status=none
