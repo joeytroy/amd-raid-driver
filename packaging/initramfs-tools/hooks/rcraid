@@ -19,8 +19,14 @@ manual_add_modules rcraid
 
 # Bind helper — gets the device from nvme to rcbottom inside initramfs.
 copy_exec /usr/sbin/rcraid-bind /usr/sbin
+# rcraid-bind --disk (X399) reads the RAIDCore block with dd before binding;
+# busybox provides readlink/basename but not every image ships its dd.
+copy_exec /bin/dd /bin
 
 # udev rule + modprobe drop-in.
 mkdir -p "$DESTDIR/etc/udev/rules.d" "$DESTDIR/etc/modprobe.d"
 cp /etc/udev/rules.d/50-rcraid.rules "$DESTDIR/etc/udev/rules.d/50-rcraid.rules"
+# by-uuid links for /dev/rcraid0pN, so root=UUID= resolves to the array.
+cp /etc/udev/rules.d/61-rcraid-storage.rules \
+   "$DESTDIR/etc/udev/rules.d/61-rcraid-storage.rules"
 cp /etc/modprobe.d/rcraid.conf       "$DESTDIR/etc/modprobe.d/rcraid.conf"

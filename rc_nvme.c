@@ -2427,6 +2427,11 @@ static void rc_volume_map_lba(u64 logical_lba, int *out_member, u64 *out_phys)
 		    + rc_volume_member_phys_offset[member_idx];
 }
 
+/* Volume-level expected member count.  Set from the on-disk LD's Devices
+ * field the first time a member registers; subsequent members must agree.
+ * Zero means "no LD seen yet". */
+static u32 rc_volume_expected_members;
+
 /* Read one LBA from the assembled RAID0 volume. */
 static int rc_volume_read_lba(u64 logical_lba, dma_addr_t buf_dma)
 {
@@ -2434,7 +2439,8 @@ static int rc_volume_read_lba(u64 logical_lba, dma_addr_t buf_dma)
 	u64 phys_lba;
 	struct rc_adapter *adapter;
 
-	if (rc_volume_member_count != RC_VOLUME_EXPECTED_MEMBERS ||
+	if (!rc_volume_expected_members ||
+	    (u32)rc_volume_member_count != rc_volume_expected_members ||
 	    !rc_volume_stripe_sectors)
 		return -ENODEV;
 
@@ -2510,11 +2516,6 @@ out:
 		}
 	}
 }
-
-/* Volume-level expected member count.  Set from the on-disk LD's Devices
- * field the first time a member registers; subsequent members must agree.
- * Zero means "no LD seen yet". */
-static u32 rc_volume_expected_members;
 
 /* Stripe size for the assembled volume in sectors.
  *

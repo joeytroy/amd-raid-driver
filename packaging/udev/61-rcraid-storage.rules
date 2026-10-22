@@ -1,0 +1,30 @@
+# SPDX-License-Identifier: GPL-2.0-only
+#
+# Persistent-storage links for the rcraid array — installed by the rcraid
+# installers.
+#
+# systemd's 60-persistent-storage.rules only probes block devices whose
+# kernel name is on a fixed whitelist (sd*, nvme*, vd*, ...), and rcraid* is
+# not on it.  Without this rule /dev/rcraid0pN gets no ID_FS_* properties and
+# no /dev/disk/by-{uuid,partuuid,label,partlabel} links, so a root=UUID=...
+# cmdline or a UUID= fstab entry on the array waits forever at boot.
+#
+# Numbered 61 so later rules keyed on ID_FS_TYPE (64-btrfs.rules,
+# 69-dm-lvm.rules, ...) see the probe results.
+
+ACTION=="remove", GOTO="rcraid_storage_end"
+SUBSYSTEM!="block", GOTO="rcraid_storage_end"
+KERNEL!="rcraid*", GOTO="rcraid_storage_end"
+
+IMPORT{builtin}="blkid"
+
+ENV{ID_FS_USAGE}=="filesystem|other|crypto", ENV{ID_FS_UUID_ENC}=="?*", \
+  SYMLINK+="disk/by-uuid/$env{ID_FS_UUID_ENC}"
+ENV{ID_FS_USAGE}=="filesystem|other", ENV{ID_FS_LABEL_ENC}=="?*", \
+  SYMLINK+="disk/by-label/$env{ID_FS_LABEL_ENC}"
+ENV{ID_PART_ENTRY_UUID}=="?*", \
+  SYMLINK+="disk/by-partuuid/$env{ID_PART_ENTRY_UUID}"
+ENV{ID_PART_ENTRY_NAME}=="?*", \
+  SYMLINK+="disk/by-partlabel/$env{ID_PART_ENTRY_NAME}"
+
+LABEL="rcraid_storage_end"

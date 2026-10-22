@@ -32,6 +32,12 @@ whatever you have on the controller) untouched, and iterate on
   makes the controller expose itself as `1022:B000`. If you switched
   BIOS to AHCI, the underlying drives appear as raw NVMe / SATA and
   this driver is not relevant.
+  **X399 (1st/2nd-gen Threadripper) exception:** there is no `1022:B000`
+  device even in RAID mode — the members keep their own NVMe IDs and
+  stay on `nvme` until rcraid takes them over. The installers recognise
+  them by the RAIDCore metadata RAIDXpert2 writes at LBA `0x5000`, and
+  only drives carrying it are ever touched. See
+  [X399 notes](#x399-1st2nd-gen-threadripper).
 - The Crucial NVMe drives (or whatever you have in the RAID array)
   configured into a RAID volume from the BIOS RAID utility. Don't
   reconfigure the volume during driver development — losing the
@@ -262,6 +268,26 @@ why disabling Secure Boot remains the supported path.
 
 Check that BIOS is in **RAID mode**, not AHCI. In AHCI mode the
 controller doesn't expose itself as `1022:B000` at all.
+
+### X399 (1st/2nd-gen Threadripper)
+
+X399 never shows a `1022:B000` device. With NVMe RAID enabled in BIOS
+and an array created in RAIDXpert2, every member still appears under
+its own vendor/device ID and is first claimed by the stock `nvme`
+driver. That is expected:
+
+- `install-livecd.sh` and `install-dkms.sh` fall back to reading LBA
+  `0x5000` of every NVMe namespace and treat drives with the `RAIDCore`
+  metadata block as members (mixed vendors are fine).
+- The generated udev rule pins those PCI addresses; at boot
+  `rcraid-bind --disk` re-checks the metadata on each namespace before
+  moving the drive from `nvme` to `rcbottom`, so a different drive moved
+  into a member's slot is left alone.
+- The driver is loaded with `allow_foreign_nvme=1` instead of
+  `safe_subsys_vendor=`.
+
+**Re-run the installer after moving, adding or replacing array drives**
+— the rule matches PCI addresses recorded at install time.
 
 ### Build fails on Debian-family kernels newer than 6.8
 

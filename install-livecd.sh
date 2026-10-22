@@ -97,69 +97,22 @@ case "$FAMILY" in
         ;;
     fedora)
         dnf install -y \
-            gcc make "kernel-devel-$(uname -r)" "kernel-headers-$(uname -r)" \
+            gcc make "kernel-devel-$(uname -r)" \
             dkms pciutils \
             | sed 's/^/    /'
         ;;
 esac
 echo
 
-# Auto-detect array members by subsystem_vendor (the AMD chipset shadows every
-# downstream NVMe as 1022:b000, including the live USB stick on some boards,
-# so we filter by subsys vendor).  Heuristic: pick the vendor with >= 2
-# devices; if there's a tie, ask the user.
+# Auto-detect array members: by subsystem_vendor on 1022:b000 platforms (the
+# AMD chipset shadows every downstream NVMe as 1022:b000, including the live
+# USB stick on some boards), by RAIDCore metadata on X399 (members keep their
+# native NVMe IDs).  See scripts/lib/members.sh.
 echo "==> [2/8] detecting array members"
-declare -A vendor_count
-declare -A vendor_bdfs
-while read -r bdf; do
-    [ -n "$bdf" ] || continue
-    sv=$(cat "/sys/bus/pci/devices/$bdf/subsystem_vendor")
-    vendor_count[$sv]=$((${vendor_count[$sv]:-0} + 1))
-    vendor_bdfs[$sv]="${vendor_bdfs[$sv]:-} $bdf"
-done < <(lspci -d 1022:b000 -D | awk '{print $1}')
-
-if [ ${#vendor_count[@]} -eq 0 ]; then
-    echo "No PCI 1022:b000 devices found." >&2
-    echo "Make sure your BIOS is in RAID mode and the array is created." >&2
-    exit 1
-fi
-
-candidates=()
-for sv in "${!vendor_count[@]}"; do
-    if [ "${vendor_count[$sv]}" -ge 2 ]; then
-        candidates+=("$sv")
-    fi
-done
-
-if [ ${#candidates[@]} -eq 0 ]; then
-    echo "Found 1022:b000 devices but no vendor has >= 2 (no array detected):" >&2
-    for sv in "${!vendor_count[@]}"; do
-        echo "  subsystem_vendor $sv → ${vendor_bdfs[$sv]}" >&2
-    done
-    exit 1
-elif [ ${#candidates[@]} -eq 1 ]; then
-    SUBSYSTEM_VENDOR="${candidates[0]}"
-else
-    echo "Multiple candidate arrays detected:"
-    i=1
-    for sv in "${candidates[@]}"; do
-        echo "  [$i] subsystem_vendor $sv → ${vendor_bdfs[$sv]# }"
-        i=$((i + 1))
-    done
-    n=${#candidates[@]}
-    while :; do
-        read -rp "Pick one [1-$n, default 1]: " choice
-        choice="${choice:-1}"
-        if [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le "$n" ]; then
-            break
-        fi
-        echo "  invalid — enter a number between 1 and $n"
-    done
-    SUBSYSTEM_VENDOR="${candidates[$((choice - 1))]}"
-fi
-MEMBER_BDFS="${vendor_bdfs[$SUBSYSTEM_VENDOR]# }"
-echo "    members: $MEMBER_BDFS"
-echo "    subsystem_vendor: $SUBSYSTEM_VENDOR"
+. "$SRC_DIR/scripts/lib/members.sh"
+detect_members
+echo "    members ($BIND_MODE): $MEMBER_BDFS"
+[ -n "$SUBSYSTEM_VENDOR" ] && echo "    subsystem_vendor: $SUBSYSTEM_VENDOR"
 echo
 
 echo "==> [3/8] building rcraid.ko against live kernel $(uname -r)"
@@ -182,13 +135,47 @@ for bdf in $MEMBER_BDFS; do
     fi
 done
 
-insmod "$SRC_DIR/rcraid.ko" \
-    enable_writes=1 "safe_subsys_vendor=$SUBSYSTEM_VENDOR" 2>&1 \
-    | sed 's/^/    /' || {
-    echo "insmod failed — see dmesg" >&2
-    dmesg | tail -20 >&2
-    exit 1
-}
+# A re-run in the same live session finds rcraid already loaded (and the
+# members already pinned, which detect_members picks up); reload so the
+# freshly built module is the one serving the OS installer.
+_reuse_loaded=0
+if grep -q '^rcraid ' /proc/modules && ! rmmod rcraid 2>/dev/null; then
+    # A still-open OS installer holds the array from its own mount
+    # namespace, where findmnt in ours can't see it.
+    if pgrep -ax 'anaconda|calamares|ubiquity' >&2; then
+        echo "rcraid is busy: the OS installer above is still running —" >&2
+        echo "close it and re-run." >&2
+        exit 1
+    fi
+    # Otherwise something we can't name (a lazily-unmounted filesystem from
+    # an earlier run, a root process with the disk open) pins it.  The
+    # loaded module was built from this tree earlier in the session, so
+    # carry on with it rather than demanding a live-session reboot.
+    if [ ! -b /dev/rcraid0 ]; then
+        echo "rcraid is loaded and busy but /dev/rcraid0 is missing —" >&2
+        echo "reboot the live session and re-run." >&2
+        exit 1
+    fi
+    echo "    rcraid is busy and can't be reloaded; reusing the loaded module"
+    _reuse_loaded=1
+fi
+
+# Give /dev/rcraid0pN the by-uuid/by-partuuid links stock udev withholds
+# from rcraid* (see the rule).  /run so it lasts only for this live session.
+mkdir -p /run/udev/rules.d
+install -m 0644 "$SRC_DIR/packaging/udev/61-rcraid-storage.rules" \
+    /run/udev/rules.d/61-rcraid-storage.rules
+udevadm control --reload-rules 2>/dev/null || true
+
+if [ "$_reuse_loaded" = 0 ]; then
+    insmod "$SRC_DIR/rcraid.ko" \
+        enable_writes=1 "$(member_filter_option)" 2>&1 \
+        | sed 's/^/    /' || {
+        echo "insmod failed — see dmesg" >&2
+        dmesg | tail -20 >&2
+        exit 1
+    }
+fi
 
 # Trigger probe for each member after the module is loaded.
 for bdf in $MEMBER_BDFS; do
@@ -280,30 +267,48 @@ echo
 
 echo "==> [6/8] locating the target rootfs on /dev/rcraid0"
 
+# Re-probe the array so the by-uuid links reflect what the installer wrote;
+# the fstab lookups below resolve UUID=/PARTUUID= through them.
+udevadm trigger --action=change --subsystem-match=block \
+    --sysname-match='rcraid*' --settle 2>/dev/null || true
+
 # Probe each partition read-only and find the one that looks like a Linux root
 # (has /etc/os-release or /usr/lib/os-release).  Skip swap, EFI, etc.
+#
+# btrfs installs put / in a subvolume rather than the top level (Fedora
+# Workstation: "root", Ubuntu: "@"), so on btrfs also look one directory
+# down and remember the subvolume for the real mount.
 PROBE_DIR=$(mktemp -d)
 TARGET_PART=""
+TARGET_SUBVOL=""
 for part in /dev/rcraid0p*; do
     [ -b "$part" ] || continue
-    if mount -o ro "$part" "$PROBE_DIR" 2>/dev/null; then
-        if [ -e "$PROBE_DIR/etc/os-release" ] || \
-           [ -e "$PROBE_DIR/usr/lib/os-release" ]; then
-            TARGET_PART="$part"
-            # Note target's distro for the chroot install commands.  Parse
-            # os-release instead of sourcing it: we're root and the file
-            # comes from a just-written target disk — never execute it.
-            if [ -e "$PROBE_DIR/etc/os-release" ]; then
-                osrel="$PROBE_DIR/etc/os-release"
-            else
-                osrel="$PROBE_DIR/usr/lib/os-release"
-            fi
-            target_os=$(awk -F= '$1 == "ID" {gsub(/["'\'']/, "", $2); print $2; exit}' "$osrel")
-            umount "$PROBE_DIR"
-            break
-        fi
-        umount "$PROBE_DIR"
+    mount -o ro "$part" "$PROBE_DIR" 2>/dev/null || continue
+    roots=("$PROBE_DIR")
+    if [ "$(blkid -o value -s TYPE "$part" 2>/dev/null || true)" = btrfs ]; then
+        for d in "$PROBE_DIR"/*/; do
+            [ -d "$d" ] && roots+=("${d%/}")
+        done
     fi
+    for root in "${roots[@]}"; do
+        if [ -e "$root/etc/os-release" ]; then
+            osrel="$root/etc/os-release"
+        elif [ -e "$root/usr/lib/os-release" ]; then
+            osrel="$root/usr/lib/os-release"
+        else
+            continue
+        fi
+        TARGET_PART="$part"
+        TARGET_SUBVOL="${root#"$PROBE_DIR"}"
+        TARGET_SUBVOL="${TARGET_SUBVOL#/}"
+        # Note target's distro for the chroot install commands.  Parse
+        # os-release instead of sourcing it: we're root and the file
+        # comes from a just-written target disk — never execute it.
+        target_os=$(awk -F= '$1 == "ID" {gsub(/["'\'']/, "", $2); print $2; exit}' "$osrel")
+        break
+    done
+    umount "$PROBE_DIR"
+    [ -n "$TARGET_PART" ] && break
 done
 rmdir "$PROBE_DIR"
 
@@ -320,19 +325,21 @@ case "$target_os" in
        TARGET_FAMILY="$FAMILY" ;;
 esac
 
-echo "    found rootfs: $TARGET_PART ($target_os, $TARGET_FAMILY family)"
+echo "    found rootfs: $TARGET_PART${TARGET_SUBVOL:+ (btrfs subvol $TARGET_SUBVOL)} ($target_os, $TARGET_FAMILY family)"
 
 # Mount target rootfs + bind /dev /proc /sys + auto-mount /boot and /boot/efi
 # from the target's fstab if they're separate partitions.
 TARGET=/mnt/rcraid-target
 mkdir -p "$TARGET"
-mount "$TARGET_PART" "$TARGET"
+mount ${TARGET_SUBVOL:+-o "subvol=$TARGET_SUBVOL"} "$TARGET_PART" "$TARGET"
 
 trap 'umount -R "$TARGET" 2>/dev/null || true' EXIT
 
 ESP_DEV=""
 for sub in /boot /boot/efi; do
-    fs_line=$(awk -v sub="$sub" '$2==sub && $1 !~ /^#/ {print; exit}' "$TARGET/etc/fstab" 2>/dev/null || true)
+    # Not `-v sub=`: sub is a gawk builtin, so gawk dies on it and every
+    # lookup came back empty — /boot was never mounted.
+    fs_line=$(awk -v mp="$sub" '$2==mp && $1 !~ /^#/ {print; exit}' "$TARGET/etc/fstab" 2>/dev/null || true)
     [ -n "$fs_line" ] || continue
     fs_spec=$(echo "$fs_line" | awk '{print $1}')
     case "$fs_spec" in
@@ -345,6 +352,12 @@ for sub in /boot /boot/efi; do
         echo "    mounting $sub from $fs_dev"
         mount "$fs_dev" "$TARGET$sub"
         if [ "$sub" = /boot/efi ]; then ESP_DEV="$fs_dev"; fi
+    else
+        # Carrying on would write the initramfs into the rootfs's /boot
+        # directory, which the real /boot mount hides at boot.
+        echo "target fstab has $sub on '$fs_spec' but it doesn't resolve to a" >&2
+        echo "block device — refusing to install into an unmounted $sub." >&2
+        exit 1
     fi
 done
 
@@ -412,7 +425,7 @@ mkdir -p "$TARGET/tmp/rcraid-pkg"
 cp -r "$SRC_DIR/packaging" "$TARGET/tmp/rcraid-pkg/"
 
 # Build the in-target install script.  We do it here rather than copying a
-# separate file in so all variables (subsystem_vendor, family, kver) are
+# separate file in so all variables (family, kver) are
 # baked at the call site — no parsing inside the chroot.
 cat > "$TARGET/tmp/rcraid-in-target.sh" <<EOF
 #!/bin/bash
@@ -421,7 +434,6 @@ set -euo pipefail
 PKG_NAME="$PKG_NAME"
 PKG_VERSION="$PKG_VERSION"
 TARGET_KVERS="$TARGET_KVERS"
-SUBSYSTEM_VENDOR="$SUBSYSTEM_VENDOR"
 TARGET_FAMILY="$TARGET_FAMILY"
 SRC_DIR="/usr/src/\${PKG_NAME}-\${PKG_VERSION}"
 PKG_DIR="/tmp/rcraid-pkg/packaging"
@@ -441,7 +453,7 @@ case "\$TARGET_FAMILY" in
     fedora)
         hdr_pkgs=()
         for kver in \$TARGET_KVERS; do
-            hdr_pkgs+=("kernel-devel-\$kver" "kernel-headers-\$kver")
+            hdr_pkgs+=("kernel-devel-\$kver")
         done
         dnf install -y gcc make "\${hdr_pkgs[@]}" dkms dracut
         ;;
@@ -458,16 +470,12 @@ for kver in \$TARGET_KVERS; do
     dkms install -m "\$PKG_NAME" -v "\$PKG_VERSION" -k "\$kver" --force
 done
 
-echo "    installing udev rule, modprobe drop-in, bind helper"
+# udev rule + modprobe drop-in were rendered into the target by the host
+# side (render_member_config) before this chroot ran.
+echo "    installing bind helper + storage udev rule"
 install -m 0755 "\$PKG_DIR/sbin/rcraid-bind" /usr/sbin/rcraid-bind
-sed "s/@SUBSYSTEM_VENDOR@/\$SUBSYSTEM_VENDOR/g" \\
-    "\$PKG_DIR/udev/50-rcraid.rules.in" \\
-    > /etc/udev/rules.d/50-rcraid.rules
-chmod 0644 /etc/udev/rules.d/50-rcraid.rules
-sed "s/@SUBSYSTEM_VENDOR@/\$SUBSYSTEM_VENDOR/g" \\
-    "\$PKG_DIR/modprobe.d/rcraid.conf.in" \\
-    > /etc/modprobe.d/rcraid.conf
-chmod 0644 /etc/modprobe.d/rcraid.conf
+install -m 0644 "\$PKG_DIR/udev/61-rcraid-storage.rules" \\
+    /etc/udev/rules.d/61-rcraid-storage.rules
 
 # On apt-based targets, keep kernel packages out of unattended-upgrades so
 # kernel updates (and the DKMS rebuild + initramfs regeneration they need)
@@ -499,8 +507,22 @@ else
     echo "ERROR: no initramfs generator in target — boot-from-RAID will fail" >&2
     exit 1
 fi
+
+# SELinux targets (Fedora/RHEL): give everything laid down by hand the
+# target policy's labels, so udev may execute rcraid-bind after boot.
+if command -v restorecon >/dev/null 2>&1 && [ -e /etc/selinux/config ]; then
+    echo "    restoring SELinux labels"
+    restorecon -RF /usr/sbin/rcraid-bind /etc/udev/rules.d/50-rcraid.rules \\
+        /etc/udev/rules.d/61-rcraid-storage.rules /etc/modprobe.d/rcraid.conf /usr/lib/dracut/modules.d/95rcraid \\
+        "\$SRC_DIR" /lib/modules /boot 2>/dev/null || true
+fi
 EOF
 chmod +x "$TARGET/tmp/rcraid-in-target.sh"
+
+# Render the member-specific udev rule + modprobe drop-in straight into the
+# target, from the detection done in Phase 1 — the in-target script and the
+# initramfs it regenerates pick them up from there.
+render_member_config "$TARGET" "$SRC_DIR/packaging"
 
 chroot "$TARGET" /tmp/rcraid-in-target.sh 2>&1 | sed 's/^/    /'
 
@@ -534,7 +556,9 @@ ESP_MNT="$TARGET/boot/efi"
 if [ -z "${ESP_DEV:-}" ]; then
     for _p in /dev/rcraid0p*; do
         [ -b "$_p" ] || continue
-        if [ "$(blkid -o value -s PARTTYPE "$_p" 2>/dev/null || true)" = \
+        # PART_ENTRY_TYPE needs a low-level probe (-p); plain blkid never
+        # reports the GPT type GUID.
+        if [ "$(blkid -p -o value -s PART_ENTRY_TYPE "$_p" 2>/dev/null || true)" = \
              "c12a7328-f81f-11d2-ba4b-00a0c93ec93b" ]; then
             ESP_DEV="$_p"
             break
@@ -550,6 +574,7 @@ if [ -z "${ESP_DEV:-}" ] || [ ! -d "$ESP_MNT/EFI" ]; then
     echo "    no ESP with an EFI/ directory found — skipping."
     echo "    If the box won't boot, confirm the installer created an EFI"
     echo "    System Partition on /dev/rcraid0 and populated \\EFI."
+    EFI_SKIPPED=1
 else
     # 1) Removable-media fallback loader.  Discover the VENDOR loader, and
     #    prefer the TARGET distro's own dir (EFI/$target_os) first.  This
@@ -815,9 +840,16 @@ cat <<EOF
   /dev/rcraid0pN is configured to boot off the AMD-RAID array.
   rcraid is installed via DKMS so it rebuilds on kernel updates.
   An initramfs hook makes the array available before pivot_root.
+$(if [ -n "${EFI_SKIPPED:-}" ]; then cat <<'SKIP'
+  WARNING: step 8 found no ESP, so NO boot entry or \EFI\BOOT
+  fallback was installed.  Fix that before rebooting (see above).
+SKIP
+else cat <<'OK'
   A UEFI boot entry + \EFI\BOOT\BOOTX64.EFI fallback were installed
   so the firmware can find the array even if the installer's own
   boot entry didn't stick.
+OK
+fi)
 
   You can now reboot:
 

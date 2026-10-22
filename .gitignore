@@ -58,5 +58,8 @@ dmesg.log
 
 # Driver installation directory
 /dd/
+
+# AMD driver bundles used as RE study material — never commit AMD binaries
+/drivers/
 .ghidra_workspace/
 .*.d

@@ -59,7 +59,7 @@ all:
 		echo "       Install the headers for the running kernel, or set KERNELDIR=/path/to/kernel/build" >&2; \
 		exit 1; \
 	fi
-	$(MAKE) -C $(KERNELDIR) M=$(PWD) modules
+	$(MAKE) -C $(KERNELDIR) M=$(CURDIR) modules
 
 clean:
 	@echo "Cleaning build files..."
@@ -77,10 +77,10 @@ simple:
 		exit 1; \
 	fi
 	@echo "Building with minimal requirements..."
-	$(MAKE) -C $(KERNELDIR) M=$(PWD) modules KCFLAGS="-Wno-error -Wno-unused-variable -Wno-unused-function -Wno-missing-field-initializers"
+	$(MAKE) -C $(KERNELDIR) M=$(CURDIR) modules KCFLAGS="-Wno-error -Wno-unused-variable -Wno-unused-function -Wno-missing-field-initializers"
 
 install:
-	$(MAKE) -C $(KERNELDIR) M=$(PWD) modules_install
+	$(MAKE) -C $(KERNELDIR) M=$(CURDIR) modules_install
 
 # Help target
 help:

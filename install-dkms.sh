@@ -5,8 +5,9 @@
 #   - DKMS rebuilds the module against every kernel update.
 #   - A udev rule hands matching PCI devices to rcbottom at hot-plug time,
 #     so /dev/rcraid0 appears during boot without any manual unbind+insmod.
-#   - A modprobe.d drop-in records `enable_writes=1` and the array's
-#     `safe_subsys_vendor`, so no extra args are needed at load time.
+#   - A modprobe.d drop-in records `enable_writes=1` and the member filter
+#     (`safe_subsys_vendor`, or `allow_foreign_nvme` on X399), so no extra
+#     args are needed at load time.
 #
 # Requires root.  Run from the repo root.
 
@@ -67,71 +68,17 @@ echo "==> rcraid install-dkms.sh  (driver ${DRIVER_VERSION}, dkms package ${PKG_
 echo
 
 # ----------------------------------------------------------------------------
-# 1. Detect array subsystem_vendor.
+# 1. Detect array members.
 #
-# The AMD chipset reports every downstream NVMe as PCI 1022:b000, including
-# the OS drive.  Subsystem vendor is the only reliable way to tell members
-# apart.  Heuristic: pick the vendor that has >= 2 devices.  If there's a
-# tie, list them and let the user pick.
+# 1022:b000 platforms are told apart by subsystem_vendor; on X399 the members
+# keep native NVMe IDs and are found by their RAIDCore metadata instead.  See
+# scripts/lib/members.sh.
 # ----------------------------------------------------------------------------
 
-declare -A vendor_count
-declare -A vendor_bdfs
-while read -r bdf; do
-    [ -n "$bdf" ] || continue
-    sv=$(cat "/sys/bus/pci/devices/$bdf/subsystem_vendor")
-    vendor_count[$sv]=$((${vendor_count[$sv]:-0} + 1))
-    vendor_bdfs[$sv]="${vendor_bdfs[$sv]:-} $bdf"
-done < <(lspci -d 1022:b000 -D | awk '{print $1}')
-
-if [ ${#vendor_count[@]} -eq 0 ]; then
-    cat >&2 <<EOF
-No PCI 1022:b000 devices found.  This box doesn't appear to have any
-AMD-RAID Bottom controllers.  Aborting.
-
-If the BIOS RAID mode is enabled and you still see no devices, check
-that you're not in AHCI mode and that drives are seated.
-EOF
-    exit 1
-fi
-
-candidates=()
-for sv in "${!vendor_count[@]}"; do
-    if [ "${vendor_count[$sv]}" -ge 2 ]; then
-        candidates+=("$sv")
-    fi
-done
-
-if [ ${#candidates[@]} -eq 0 ]; then
-    echo "Found these 1022:b000 devices but no vendor has >= 2 (so no array detected):" >&2
-    for sv in "${!vendor_count[@]}"; do
-        echo "  subsystem_vendor $sv → ${vendor_bdfs[$sv]}" >&2
-    done
-    echo >&2
-    echo "rcraid needs a multi-drive array.  Aborting." >&2
-    exit 1
-elif [ ${#candidates[@]} -eq 1 ]; then
-    SUBSYSTEM_VENDOR="${candidates[0]}"
-    echo "Detected array members: ${vendor_bdfs[$SUBSYSTEM_VENDOR]# }"
-    echo "Subsystem vendor: $SUBSYSTEM_VENDOR"
-else
-    echo "Multiple candidate arrays detected:"
-    i=1
-    for sv in "${candidates[@]}"; do
-        echo "  [$i] subsystem_vendor $sv → ${vendor_bdfs[$sv]# }"
-        i=$((i + 1))
-    done
-    n=${#candidates[@]}
-    while :; do
-        read -rp "Pick one [1-$n, default 1]: " choice
-        choice="${choice:-1}"
-        if [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le "$n" ]; then
-            break
-        fi
-        echo "  invalid — enter a number between 1 and $n"
-    done
-    SUBSYSTEM_VENDOR="${candidates[$((choice - 1))]}"
-fi
+. "$SRC_DIR/scripts/lib/members.sh"
+detect_members
+echo "Detected array members ($BIND_MODE): $MEMBER_BDFS"
+[ -n "$SUBSYSTEM_VENDOR" ] && echo "Subsystem vendor: $SUBSYSTEM_VENDOR"
 echo
 
 # ----------------------------------------------------------------------------
@@ -195,17 +142,12 @@ echo
 echo "==> installing /usr/sbin/rcraid-bind"
 install -m 0755 "$SRC_DIR/packaging/sbin/rcraid-bind" /usr/sbin/rcraid-bind
 
-echo "==> rendering /etc/udev/rules.d/50-rcraid.rules"
-sed "s/@SUBSYSTEM_VENDOR@/$SUBSYSTEM_VENDOR/g" \
-    "$SRC_DIR/packaging/udev/50-rcraid.rules.in" \
-    > /etc/udev/rules.d/50-rcraid.rules
-chmod 0644 /etc/udev/rules.d/50-rcraid.rules
+echo "==> installing /etc/udev/rules.d/61-rcraid-storage.rules"
+install -m 0644 "$SRC_DIR/packaging/udev/61-rcraid-storage.rules" \
+    /etc/udev/rules.d/61-rcraid-storage.rules
 
-echo "==> rendering /etc/modprobe.d/rcraid.conf"
-sed "s/@SUBSYSTEM_VENDOR@/$SUBSYSTEM_VENDOR/g" \
-    "$SRC_DIR/packaging/modprobe.d/rcraid.conf.in" \
-    > /etc/modprobe.d/rcraid.conf
-chmod 0644 /etc/modprobe.d/rcraid.conf
+echo "==> rendering /etc/udev/rules.d/50-rcraid.rules + /etc/modprobe.d/rcraid.conf"
+render_member_config "" "$SRC_DIR/packaging"
 
 echo "==> reloading udev rules"
 udevadm control --reload-rules
@@ -297,9 +239,10 @@ What's installed:
                  /lib/modules/\$(uname -r)/updates/dkms/rcraid.ko
   Bind helper    /usr/sbin/rcraid-bind
   udev rule      /etc/udev/rules.d/50-rcraid.rules
-                 (filters on subsystem_vendor=$SUBSYSTEM_VENDOR)
+                 /etc/udev/rules.d/61-rcraid-storage.rules
+                 ($([ "$BIND_MODE" = b000 ] && echo "filters on subsystem_vendor=$SUBSYSTEM_VENDOR" || echo "X399: members $MEMBER_BDFS, RAIDCore-verified at bind"))
   modprobe conf  /etc/modprobe.d/rcraid.conf
-                 (enable_writes=1, safe_subsys_vendor=$SUBSYSTEM_VENDOR)
+                 (enable_writes=1, $(member_filter_option))
   initramfs      ${INITRAMFS_GENERATOR:-<none — boot-from-RAID disabled>}
 $([ -e /etc/apt/apt.conf.d/52-rcraid-kernel-hold ] && echo '  apt hold       /etc/apt/apt.conf.d/52-rcraid-kernel-hold
                  (kernel packages held back from unattended-upgrades)')
@@ -311,11 +254,12 @@ kernel's initramfs.
 Next: reboot to test the auto-bind path end-to-end.  After reboot:
 
   lsblk /dev/rcraid0     # should show your volume + partitions
-  lspci -d 1022:b000 -k  # array members should show "rcbottom"
+  lspci -k -s <member>   # array members should show "rcbottom"
+                         # (members: $MEMBER_BDFS)
 
 To take effect WITHOUT rebooting (one-shot test):
 
-  for bdf in ${vendor_bdfs[$SUBSYSTEM_VENDOR]# }; do
+  for bdf in $MEMBER_BDFS; do
       /usr/sbin/rcraid-bind \$bdf
   done
 

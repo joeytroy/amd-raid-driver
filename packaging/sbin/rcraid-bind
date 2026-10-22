@@ -1,10 +1,19 @@
 #!/bin/sh
 # rcraid-bind <pci-bdf>
+# rcraid-bind --disk <nvme-namespace-devnode>
 #
-# Hand a single AMD-RAID Bottom PCI device to the rcbottom driver.
+# Hand a single AMD-RAID array member PCI device to the rcbottom driver.
 # Invoked by udev (see /etc/udev/rules.d/50-rcraid.rules) when the kernel
 # discovers a matching device — typically very early in boot, after nvme has
 # already grabbed the namespace.
+#
+#   <pci-bdf>       1022:b000 platforms: the PCI device itself matched the
+#                   rule (vendor/device + subsystem_vendor).
+#   --disk <dev>    X399: the members keep native NVMe IDs, so the rule fires
+#                   on a member slot's namespace instead.  The namespace must
+#                   carry the RAIDCore metadata block (LBA 0x5000, magic
+#                   "RAIDCore" at byte 8) or nothing is touched; the PCI
+#                   function behind it is then bound as below.
 #
 # Steps:
 #   1. Pin the device to rcbottom via driver_override so nothing else can
@@ -15,11 +24,27 @@
 #   4. Make sure the module is requested.  modprobe is idempotent — does
 #      nothing if it's already loaded.
 #
-# Designed to be safe to run multiple times for the same device.
+# Designed to be safe to run multiple times for the same device.  POSIX sh
+# only: it also runs under busybox in initramfs-tools images.
 
 set -e
 
-dev="$1"
+if [ "$1" = "--disk" ]; then
+    disk="$2"
+    [ -b "$disk" ]                         || exit 0
+    name=$(basename "$disk")
+    lbs=$(cat "/sys/class/block/$name/queue/logical_block_size") || exit 0
+    magic=$(dd if="$disk" bs="$lbs" skip=20480 count=1 2>/dev/null \
+                | dd bs=1 skip=8 count=8 2>/dev/null | tr -d '\000')
+    if [ "$magic" != "RAIDCore" ]; then
+        logger -t rcraid-bind "$disk: no RAIDCore metadata — not an array member, leaving it on nvme" 2>/dev/null || true
+        exit 0
+    fi
+    dev=$(basename "$(readlink -f "/sys/class/block/$name/device/device")")
+else
+    dev="$1"
+fi
+
 [ -n "$dev" ]                              || exit 0
 [ -e "/sys/bus/pci/devices/$dev" ]         || exit 0
 
