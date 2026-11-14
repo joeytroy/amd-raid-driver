@@ -86,6 +86,50 @@ The sections below are the dated implementation log — how each piece was built
 kept for forensics. Where an early "Not started" / "Next steps" note has since
 been implemented, it's marked.
 
+## 2026-11-14 — The live installer stops creating arrays; the TUI is removed
+
+`install-livecd.sh` used to fall back to an interactive array builder whenever no
+disk carried RAIDCore metadata. It is gone (`4a44b30`): an install now requires
+an array the **UEFI RAIDXpert2 utility** created, and stops with an error when
+none exists. The flow it replaced, from the run that used it:
+
+![A blank-disk live session offers to create an array here](screenshots/tui-removed-01-blank-disk-prompt.png)
+*After the build: no RAIDCore metadata on any disk, so "create an array on blank
+disks instead?".*
+
+![A dialog checklist of the four NVMe disks, all ticked](screenshots/tui-removed-02-member-checklist.png)
+*Every raw NVMe disk is offered, eight at most, with nothing to distinguish a
+blank one from the disk the live session might be reading.*
+
+![Level menu offering RAID 0, 10 and 5 for four members](screenshots/tui-removed-03-level-menu-four.png)
+*The level list came from what the module reported it could create, filtered by
+the ticked member count; RAID 6 is listed and refused.*
+
+![Level menu offering RAID 0 and 1 for two members](screenshots/tui-removed-04-level-menu-two.png)
+
+![rxp2adm creating RAID 0 over four disks](screenshots/tui-removed-05-driver-create.png)
+*`mkmeta.py` bootstrapped RAID 0 records so the members would parse, then
+`rxp2adm delete` + `create` stamped the chosen level and the script reloaded the
+module to assemble it.*
+
+Why it went:
+
+- **It wrote metadata the firmware did not.** The records came from this tree's
+  lab writers — `mkmeta.py` (RAID 0/1) and `rxp2adm` (0/1/10, 5 behind
+  `parity_create=1`), metadata only, no data or parity initialisation. That is
+  not a RAIDXpert2 array, and whether the UEFI utility or the Windows driver
+  accept one is unvalidated rather than assumed.
+- **It offered every disk.** The checklist had no guard beyond a count limit; on
+  this box `nvme3n1` is the disk the firmware-RAID-5 check had to exclude as the
+  root filesystem.
+- **Saying yes erased.** The create path zeroed the metadata window, wrote fresh
+  records over every selected disk, then deleted the volume and re-created it
+  mid-session.
+- **It was a second create path to keep in step**, carrying load-time knobs
+  (`parity_create` to let the writer emit a parity record it had just chosen)
+  that nothing else needed. The writers stay in-tree for the QEMU rig, where no
+  firmware can produce those records.
+
 ## 2026-11-14 — CI gates actually run; the parity rig gains the contention case
 
 Two things that were written down but never executed now execute.
