@@ -105,7 +105,7 @@ rebuild and a firmware-created parity array are still unvalidated.
 
 ## 🚀 Key Production Features
 
-*   **Interactive Phase 1 Terminal GUI (TUI):** No pre-configured arrays are required on boot. On clean, blank testing drives, the live-installer automatically spins up a keyboard-driven blue menu canvas (`dialog`). Testers can check off raw NVMe paths using the Spacebar, choose a target level — **0, 1, 10, 5, or 6** (**RAID 6 comes up read-only, and RAID 5 is read-only until the parity-write opt-in is set**, so those levels can only be read by default; RAID 10 needs at least four disks and is awaiting firmware-array validation) — and commit layouts on the fly. Layout metadata is written by `scripts/qemu-test/mkmeta.py`, which covers **RAID 0 and 1** only: selecting 10/5/6 stops with an explicit message instead of stamping a layout the driver cannot validate.
+*   **Interactive Phase 1 Terminal GUI (TUI):** No pre-configured arrays are required on boot. On clean, blank testing drives, the live-installer automatically spins up a keyboard-driven blue menu canvas (`dialog`). Testers can check off raw NVMe paths using the Spacebar, then choose a target level from a list the **built driver itself reports** (`0 1 10 5`) and which is filtered by the member count just picked — RAID 1 wants exactly two, RAID 10 an even four or more, RAID 5 at least three, and RAID 6 is always shown as `NOT SUPPORTED` because there is no Q write/parity path (**RAID 5 is read-only until the parity-write opt-in is set**, and RAID 10 is feature-complete but awaiting a firmware-array run) — and commit layouts on the fly. Layout metadata is written by `scripts/qemu-test/mkmeta.py`, which covers **RAID 0, 1 and 10** (and RAID 5 behind `parity_create=1`): the menu is filtered to what the built driver reports it can create, and RAID 6 stops with an explicit message instead of stamping a layout the driver cannot validate.
 *   **Defensive Hardware Security Guards:** The TUI contains an automated validation length check that enforces a hard **maximum 8-disk constraint** matching AMD firmware specifications, safely preventing memory overrun kernel oops before touching the PCIe bus registers.
 *   **Advanced Rootfs Probing:** Phase 2 avoids fragile, hardcoded partition name assumptions. It uses a read-only sandboxed mount-and-probe matrix to peak inside array partitions, locate the genuine system `/etc/os-release`, and seamlessly execute chroot boot configurations on any distribution setup.
 *   **Non-Blocking Asynchronous Completion Engine:** Parent-bio completion is parked on the `kamd_async_worker` kthread queue, so hardware completion contexts return immediately and never stall the block-layer queue; a separate `kamd_resync` thread owns long-running rebuilds. Over-reports from faulty member paths are absorbed by a bounded tombstone pool instead of being fatal.
@@ -115,35 +115,125 @@ rebuild and a firmware-created parity array are still unvalidated.
 
 ## 🅐 Quick Start: Fresh OS Installation (From Live USB)
 
-This is the recommended deployment path for setting up a fresh Linux environment (Ubuntu / Kubuntu / Mint / Fedora) directly onto an AMD hardware controller layout.
+The recommended path for a fresh Ubuntu / Kubuntu / Mint / Fedora install that
+lives **on** the AMD RAIDXpert2 NVMe array. Three steps: the script stands the
+array up, you partition it from the desktop installer, then the script finishes
+the target system.
 
-### Phase 1 — Provision Array and Expose Device
-1. Boot into your live USB installer media environment, select **"Try"** (Live Session), and open a terminal window.
-2. Clone this repository fork and execute the unified installation entry script:
+Firmware Secure Boot must be **off** for the live session — the live kernel
+refuses the unsigned module, and the key it would need cannot be enrolled
+without rebooting that session. Signing and enrolling the key is what lets you
+switch Secure Boot back **on** afterwards (Step 4).
+
+### Step 1 — Provision the array and expose `/dev/rcraid0`
+
+1. Boot the live USB, pick **Try Kubuntu** (the live session), and open
+   Konsole.
+2. Clone this fork and run the entry script:
    ```bash
    git clone https://github.com/kubuntugamer/amd-raid-driver.git
    cd amd-raid-driver
    sudo ./install-livecd.sh
    ```
-3. The script pulls development dependencies in RAM and compiles the driver, then looks for an array **RAIDXpert2 already created**: it reads the RAIDCore metadata at LBA `0x5000` and, when it is there, takes exactly those disks as members and writes nothing to them. Level and geometry come from the firmware's records — RAID 10/5/6 included.
-4. Only when no disk carries that metadata does it open the **Terminal GUI**: **Spacebar** to check member disks and RAID **0 or 1** (the only levels `mkmeta.py` can write — **5/6 assemble read-only by default; RAID 5 writes need the explicit parity-write opt-in**; RAID 10 needs four disks and is awaiting firmware-array validation). That path *stamps fresh metadata* over the selected disks; with a firmware array the menu never appears.
-5. Either way the driver unbinds the members from `nvme`, binds them to `rcbottom`, and stands up **`/dev/rcraid0`** — then states whether that volume is **writable for the level it read** from the records. RAID 0/1 install fine; **RAID 5/6 come up read-only by default** (RAID 5 writes need the explicit parity-write opt-in, and RAID 6 has none) and the script stops there instead of handing a read-only disk to the installer.
-6. Minimize the terminal and launch your desktop OS installer wizard. Select **Custom Partitioning**, map your layout over `/dev/rcraid0`, and let it copy files. **DO NOT REBOOT** when the installer finishes. Close the wizard panel and return to your open terminal window.
+   It installs its build dependencies, compiles `rcraid.ko` against the running
+   kernel, and builds the `rxp2adm` writer.
+3. It first looks for an array **RAIDXpert2 already created**: RAIDCore
+   metadata at LBA `0x5000`. When it is there, exactly those disks become the
+   members and nothing is written to them — level and geometry come from the
+   firmware's own records, RAID 10/5/6 included.
+4. Only when no disk carries that metadata does the **blue Terminal GUI** open,
+   because blank disks carry no layout to read:
+   - **Spacebar** checks the member disks (hard limit 8, matching firmware),
+     then `< OK >`.
+   - Then the level. The list is the driver's own: it prints
+     `Driver reports it can create: 0 1 10 5` above a menu filtered by the
+     member count you just picked — RAID 1 wants exactly two, RAID 10 an even
+     four or more, RAID 5 at least three. RAID 6 always appears as
+     `NOT SUPPORTED: driver has no Q write/parity path` and cannot be chosen.
+     The clean-room writer (`scripts/qemu-test/mkmeta.py`) stamps **RAID 0, 1
+     and 10**, and RAID 5 only behind `parity_create=1`; anything the driver
+     cannot validate stops with an explicit message instead of being written.
+     That path writes **fresh metadata over the selected disks**, so it is for
+     empty drives only.
+5. Either way the script unbinds the members from `nvme`, binds `rcbottom`,
+   forces a probe on each PCIe port, and stands up **`/dev/rcraid0`**, then
+   reports the volume and whether it is **writable for the level it read**:
+   RAID 0/1 install fine; **RAID 5/6 come up read-only by default** (RAID 5
+   writes need the explicit parity-write opt-in) and the script stops there
+   rather than handing a read-only disk to an installer.
+6. It ends with a prompt and then waits:
+   ```
+   ➡️  Target /dev/rcraid0 under manual partitioning, map root, and let files copy.
+   Press [Enter] ONLY when the graphical OS installer finishes copying file sectors...
+   ```
 
-### Phase 2 — Target Chroot System Locking
-1. Return to your active terminal where the installer script is waiting and press **Enter**.
-2. The engine safely scans your partitions, mounts your target OS root filesystem, bind-mounts virtual filesystems, and chroots inside.
-3. It installs DKMS, bakes the driver hooks straight into the new initramfs boot images, sets up structural udev definitions, and registers a fallback UEFI NVRAM string entry. If you accept its offer to enrol a module-signing key, the driver is signed too, so Secure Boot can be switched back on later.
-4. Once the message flashes `🎉 DONE!`, run **`sudo reboot`** to launch your fresh system straight from the array!
-5. With a signing key enrolled, that first boot stops at shim's **MOK management** screen: **Enroll MOK → Continue → Yes**, type the one-time password the installer printed, and let it reboot. (The live session itself has to run with Secure Boot **off** — the installer refuses to start otherwise, because the live kernel rejects the unsigned module and the key it needs cannot be enrolled without rebooting the session. See `docs/INSTALL.md`, "Secure Boot".)
+Four 3.6 TB members, for reference, come up as a 16.00 TB RAID 0 that the
+installer sees as **`rcraid0 - 14.55 TiB (/dev/rcraid0)`**.
 
-### Phase 3 — Module Signing and Secure Boot (After the First Boot)
+### Step 2 — Partition and install from the desktop installer
 
-Signing is only what lets Secure Boot be switched back **on**; the array boots with Secure Boot still off from the moment the install finishes. The key and its enrolment are handled from inside the installed system, because an enrolment only becomes trusted at the *next* boot — shim's MOK manager runs before the kernel — and a live session cannot reboot into itself. If you never intend to enable Secure Boot, this phase is optional: leave firmware Secure Boot off and nothing needs signing.
+Minimise the terminal. **Do not close it** — Step 3 continues in that window.
+Launch the distribution's installer (on Kubuntu: *Install Kubuntu*) and work
+through to **Partitions**:
 
-**If you accepted the signing key during `install-livecd.sh`** (the default), the key is already on the target and its enrolment is queued. Skip to step 2 below.
+1. **Select storage device → `rcraid0 - 14.55 TiB (/dev/rcraid0)`**, then
+   choose **Manual partitioning**. ("Erase disk" is not the path here — the
+   array usually sits beside the live USB, and manual is what guarantees the
+   ESP lands on the array.)
+2. **New Partition Table → GUID Partition Table (GPT)**, confirm.
+3. Create the **ESP**: *Size* **512 MiB**, *File System* **fat32**,
+   *Mount Point* **`/boot/efi`**, flag **`boot`** checked. The ESP has to be a
+   partition of `rcraid0` itself: shim and grub land there, and that is what
+   lets the box boot with every other disk pulled. Nothing kernel-sized lives
+   on it (kernels and initramfs stay in `/boot` on the root), so 512 MiB is
+   what Ubuntu sizes to and 1 GiB is only worth it for a Windows dual-boot or
+   heavy firmware-capsule use.
+4. Create the **root**: *Size* whatever remains, *File System* **xfs**,
+   *Mount Point* **`/`**.
+5. **Location / Keyboard / Users** as you like, then **Install**, and wait for
+   **“All done.”** Leave *Restart now* **unticked** — the live session still has
+   work to do, and rebooting is your call, not the installer's.
 
-**If you skipped it** (answered no, or set `RCRAID_MOK_ENROLL=0`), boot the installed system with Secure Boot still off and create, use and queue the key in one step:
+### Step 3 — Finish the target system from the terminal
+
+1. Back in the waiting terminal, press **Enter**. The script mounts the target
+   root and bind-mounts the virtual filesystems, then runs inside the new
+   system (`==> [3/3] Mapping Mount Bridges and Diving Inside the Target OS...`).
+2. Inside the target it installs DKMS and the kernel headers, builds and
+   installs `rcraid.ko` for **every** installed kernel, bakes the initramfs
+   hook in, persists the driver options (including any parity-write opt-in),
+   and rebuilds the initramfs.
+3. It then writes the **firmware boot entry** for the array's own ESP and
+   verifies it, printing:
+   ```
+   • firmware boot entry: 'rcraid Array Boot' -> /dev/rcraid0p1
+   ```
+   Failure here is loud and stops the run — a silent `|| true` is what once
+   left a box with no boot entry at all. The entry is appended to the existing
+   boot order rather than forced to the front; put it first in firmware setup,
+   or with `sudo efibootmgr -o <XXXX>,...` using the number it printed.
+4. If you accept the module-signing key offer —
+   `Enrol the installed system's module-signing key in MOK (needed to re-enable Secure Boot later)? [Y/n]`
+   — you are asked for the MOK password **yourself**: type it once (echoed, so
+   you can see what you typed), minimum 8 characters, the same floor the MOK
+   manager enforces. It is never generated, never printed afterwards, and
+   never written to a state file. Unattended runs take it from
+   `RCRAID_MOK_PASSWORD`.
+5. The run ends with `🎉 DONE! The fresh bare-metal PC is 100% prepped. Reboot
+   whenever you choose to launch your array.` The script never reboots for you.
+
+### Step 4 — First boot, then (optionally) Secure Boot
+
+The array boots as soon as the install finishes, with Secure Boot still **off**.
+Signing only matters if you want to switch Secure Boot back **on**; if you never
+do, skip this step and leave firmware Secure Boot off.
+
+**If you accepted the signing key in Step 3** (the default), the key is already
+on the target and its enrolment is queued — go to point 1 below.
+
+**If you skipped it** (answered no, or set `RCRAID_MOK_ENROLL=0`), boot the
+installed system with Secure Boot still off, then create, use and queue the key
+in one step:
 
 ```bash
 cd ~
@@ -152,19 +242,35 @@ cd amd-raid-driver
 sudo RCRAID_MOK_ENROLL=1 ./install-dkms.sh
 ```
 
-Re-running the installer is safe and is the supported way to do this: it reuses an existing key or creates one, points DKMS at it so kernel-update rebuilds stay signed, rebuilds `rcraid.ko` signed, and queues the enrolment — printing the one-time password and the key it used. Then:
+Re-running the installer is safe and is the supported way to do this: it reuses
+an existing key or creates one, points DKMS at it so kernel-update rebuilds stay
+signed, rebuilds `rcraid.ko` signed, and queues the enrolment.
 
-1. From the repo checkout, run `sudo ./scripts/verify-boot-safety.sh`. The pending-enrolment notice it prints is the expected one here; anything it reports as a missing or unsigned module is not.
-2. `sudo reboot`. At shim's **MOK management** screen: **Enroll MOK → Continue → Yes**, type the password, let it reboot. The system comes back with Secure Boot still off.
+1. From the checkout, run `sudo ./scripts/verify-boot-safety.sh`. The
+   pending-enrolment notice it prints is expected here; a missing or unsigned
+   module is not.
+2. Reboot. At shim's blue **MOK management** screen:
+   **Enroll MOK → Continue → Yes**, type the password **you** chose, and let it
+   reboot — MOK manager reboots by itself when it is done, as part of the same
+   boot, not an extra step. It runs **before** the kernel, which is exactly why
+   the module inside the initramfs can already be signed with a key that boot
+   trusts.
 3. Enable **Secure Boot** in firmware and reboot once more.
-4. Confirm the driver survived it:
+4. Confirm the driver survived:
    ```bash
    mokutil --sb-state                                    # SecureBoot enabled
    modinfo -F signer "/lib/modules/$(uname -r)/updates/dkms/rcraid.ko"
    lsblk /dev/rcraid0                                    # volume + partitions
    ```
 
-Skipping the MOK prompt leaves the key untrusted: with Secure Boot on, the kernel then rejects `rcraid.ko` and the array is missing at that boot — which cannot complete at all when `/` lives on the array. The prompt returns on the next boot until it is answered, and `sudo mokutil --import <the certificate the installer printed>` re-queues it if it was dropped. This whole flow needs the boot chain to go through shim (the default on Ubuntu, Debian and Fedora); a kernel started directly by firmware through its own EFI stub never runs MOK manager, so there Secure Boot has to stay off.
+Dropping the MOK prompt leaves the key untrusted: with Secure Boot on, the
+kernel rejects `rcraid.ko` and the array is missing at that boot — which cannot
+complete at all when `/` lives on the array. The screen returns on the next boot
+until it is answered, and `sudo mokutil --import /var/lib/shim-signed/mok/MOK.der`
+re-queues a request that was dropped. This whole flow needs the boot chain to go
+through shim (the default on Ubuntu, Debian and Fedora); a kernel started
+directly by firmware through its own EFI stub never runs MOK manager, so there
+Secure Boot has to stay off.
 
 ---
 

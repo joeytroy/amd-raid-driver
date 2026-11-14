@@ -38,11 +38,14 @@ scripts/qemu-test/run-qemu-raid-test.sh --kver "$KVER" --kernel ./vmlinuz --leve
 - `./build.sh` is the convenience wrapper: it cleans, locates kernel headers and
   builds with `-Wno-error`-style leniency. Use plain `make` when checking that a
   change is actually warning-clean.
-- Never run `insmod` / bind PCI devices on a real machine unless the user
-  explicitly asks. Functional testing belongs in the QEMU rig, which uses
-  synthetic firmware-faithful metadata from `scripts/qemu-test/mkmeta.py`.
-  Binding drives by hand can take the OS disk away (`1022:B000` shadows every
-  NVMe in the box).
+- Hardware testing on this box is expected and authorised: running `insmod`
+  and binding `1022:B000` members by hand is part of the workflow, not a
+  forbidden act. The QEMU rig stays the CI gate for the scenarios it covers,
+  but it is not a substitute for the array box, and hardware results take
+  precedence over rig results.
+- Before binding, confirm the OS disk is not one of the `1022:B000` NVMe
+  members (`lsblk`, `lspci -d 1022:b000`): that controller class shadows every
+  NVMe in the box, so binding it can take the running root away.
 
 ## Blocking CI gates (`.github/workflows/ci.yml`)
 

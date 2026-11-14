@@ -223,14 +223,21 @@ Members are found by the RAIDCore metadata at LBA `0x5000`, so an array
 built in the UEFI RAIDXpert2 utility is used exactly as the firmware left
 it — nothing is written to those disks, and the level is whatever the
 firmware recorded. The disk-selection GUI appears only when **no** disk
-carries that metadata; it can create RAID 0/1 (all `mkmeta.py` writes)
-and overwrites the selected disks.
+carries that metadata; it can create RAID 0, 1, 10 and — behind the
+`parity_create` opt-in — RAID 5, and overwrites the selected disks. The
+level is stamped by the driver's own writer (`rxp2adm`), over the member
+DeviceIDs `mkmeta.py` bootstraps first, because the writer refuses a member
+whose metadata is not already valid. RAID 6 has no write path and is
+refused.
 
 Once the volume is up the script states whether it is **writable for the
 level it found**. Read-only is a hard stop — no OS installer can write to
-it — and happens for RAID 5/6 (the installer does not enable the RAID 5
-parity-write opt-in, and RAID 6 has no write path) or when the driver refused
-to trust the geometry.
+it — and happens for RAID 6 (no write path), for a RAID 5 volume whose
+driver was not loaded with the parity-write opt-in, or when the driver
+refused to trust the geometry. For the levels it creates itself the script
+loads RAID 5 with `parity_create=1 parity_writes=1`, so that volume is
+writable; its parity is still only meaningful for the regions actually
+written.
 
 **3. Run the OS installer — leave this terminal open.**
 Launch the distro's installer from the live desktop (*Install Kubuntu*,

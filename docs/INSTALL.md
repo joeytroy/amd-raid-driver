@@ -291,8 +291,8 @@ The sequence that works:
 2. Run `sudo ./install-livecd.sh`. It asks whether the installed system should
    get its own signing key (default yes) — say yes if you intend to switch
    Secure Boot back on later.
-3. Let the first boot finish: shim asks for the MOK password that the installer
-   printed, exactly as in the DKMS flow above.
+3. Let the first boot finish: shim asks for the MOK password you typed at the
+   installer's prompt, exactly as in the DKMS flow above.
 4. Only then re-enable Secure Boot.
 
 If you never plan to enable Secure Boot, answer no (or set

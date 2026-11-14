@@ -23,7 +23,15 @@ So **steps 0–1 are still unrun** — nobody has assembled RAID 10 metadata
 written by firmware or the vendor driver, and the adjacent pair convention has
 not been checked on this box's NVMe path. Steps 2–6 may use a driver-stamped
 array, because they exercise the same dispatch, failover, rebuild and boot
-paths; the results table stays empty until a firmware-created array is run.
+paths. The results table below records each row's fixture explicitly: a row
+run on driver-written metadata is marked **driver-stamped** and does not
+count toward step 1 or toward promotion in step 7.
+
+2026-11-14: the automated pass (`validate-raid10.sh --full`) ran against such a
+driver-stamped 2×2 array and is recorded below. The run was stopped part-way
+through the rebuild at the operator's request — the module was unloaded, the
+members returned to `nvme`, and their metadata windows zeroed — so rows 3–6
+are partial or unrun, and no promotion follows from any of it.
 
 ## Fast path — one command
 
@@ -197,14 +205,37 @@ corruption.
 - [ ] CI: add `raid10`, `raid10-degraded`, `raid10-degraded-boot` to the
       `qemu-rig` matrix.
 
+## Run environment (2026-11-14)
+
+Array box: 4 × Sabrent Rocket Q 3.6 TB behind `1022:B000`, kernel
+`7.3.0-9-generic`, root on `/dev/sda2` (non-array), 2×2 RAID 10 stamped by
+this tree (`rcstamp --level raid10`, 256 KiB chunks), `enable_writes=1`.
+
+One incident worth recording, because it affects how step 6 is run: this
+**installed** system also carries the live-ISO packages — `casper`,
+`calamares`, `calamares-settings-kubuntu` and `kubuntu-installer-prompt` — and
+its SDDM state preselected `/usr/share/wayland-sessions/kubuntu-live-environment.desktop`.
+Every login therefore started `/usr/libexec/start-kubuntu-live-env`, which runs
+`kwin_wayland … kubuntu-installer-prompt` (the "Try or Install Kubuntu"
+dialog) and then `startplasma-wayland`; `XDG_SESSION_DESKTOP` is forced to
+`KDE`, so the session looks like Plasma. The prompt was silenced by pointing
+the remembered session at `plasma.desktop`; the packages remain installed.
+
+That makes Calamares resident in the session used for these steps, but it is
+**not** the supported live-ISO session, and no installer run has yet been made
+against `/dev/rcraid0` (see row 6).
+
 ## Results
+
+All rows below were executed against **driver-stamped** metadata, not a
+firmware-created array.
 
 | # | Check | Result | Notes |
 |---|---|---|---|
-| 0 | Trust gate | | |
-| 1 | Pair convention | | adjacent — confirmed on X399 (2026-10-07); verify on this box |
-| 2 | Write path | | |
-| 3 | Degraded + fatal boundary | | |
-| 4 | Rebuild + concurrent writes | | |
-| 5 | Boot-degraded + whole-pair refusal | | |
-| 6 | Install / reboot / boot-safety | | |
+| 0 | Trust gate | PASS (driver-stamped) | 4 members, `rcstamp --level raid10`, 256 KiB chunk; `RC_MetaData`/`RC_ConfigCommit` checksums re-verified in place on all four members (`verify-checksums.py`: 4/4 MATCH); **no** `UNTRUSTED` line; volume `optimal`, `live_mask 0xf`, capacity 15,625,935,872 sectors (8 TB). |
+| 1 | Pair convention | NOT RUN on this box | The adjacent convention rests on PlaidPiper's X399 cross-dump (2026-10-07) only. No firmware-created RAID 10 exists on this box, so the raw per-member compare could not be made. |
+| 2 | Write path | PASS | `test_write_path.sh` on the full volume: fragmented 512 B–4 K buffered writes + cache-dropped on-media CRC verify, stripe-unaligned 1 MiB direct writes + verify, `mkfs.ext4` + `e2fsck -fn` clean, dmesg tripwire clean (no `rejected` / `failed SC/SCT` / I/O error lines). |
+| 3 | Degraded + fatal boundary | PARTIAL | Fail one copy (`fail_member 0`) → `state=degraded`, `members` showed slot 0 failed, reads still served by the survivor. Fatal whole-pair boundary and the fast-fail check were not reached. |
+| 4 | Rebuild + concurrent writes | PARTIAL | Reset slot 0 → `needs-resync`; resync advanced to 43% of 7,812,967,936 sectors at ≈1.4 GB/s while a 64 MiB `O_DIRECT` write at logical 2 GiB completed during the rebuild. Completion to `optimal` and the partner-fail sourcing proof were **not** reached — the run was stopped, the module unloaded, member state discarded. |
+| 5 | Boot-degraded + whole-pair refusal | NOT RUN | Requires a reboot with a member (then both copies of a pair) absent. |
+| 6 | Install / reboot / boot-safety | NOT RUN | Calamares is resident in the session (see "Run environment") but was not run against `/dev/rcraid0`. `VALIDATION_OSINSTALL.md` is explicitly payload-only, not a Calamares run. `verify-boot-safety.sh` / `bench.sh` / `test_driver.sh` not run in this pass. |

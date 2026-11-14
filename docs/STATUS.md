@@ -1394,3 +1394,78 @@ with the filesystem mounted read-write. That exercises the data, not the
 driver at boot — the guest sees the array through virtio, and no initramfs in
 this tree embeds `rcraid.ko`, so a firmware-less boot chain for `/dev/rcraid0`
 remains untested.
+
+## 2026-11-14 — partial-row RMW no longer runs off the end of a chunk
+
+Mounting XFS on a 4-member RAID 5 volume oopsed in
+`rc_volume_parity_rmw_write()` before the mount completed: `#PF` on a
+supervisor write in `memcpy`, 3072 bytes into a 4 KiB copy, at the page right
+after one member's coherent chunk buffer. XFS log recovery (or any bvec whose
+first segment does not start on a chunk boundary) hands the RMW overlay a
+segment that spans two chunks. The old code computed the target chunk from
+the segment's *start* and then `memcpy`'d the whole segment there, so the tail
+ran past the end of that chunk's buffer. The overlay now splits the segment at
+each chunk boundary and stops at the parity chunk, which holds no request
+bytes.
+
+Hardware-verified on the 4×3.6 T array, 256 KiB chunk (512 sectors):
+
+- `mount /dev/rcraid0` (XFS with pending log recovery, the crash repro)
+  completes with `Ending clean mount`; 120 files / 3.0 GiB written with
+  `conv=fsync`, unmount/remount, every md5 unchanged.
+- `O_DIRECT` writes starting 6 sectors before a chunk boundary — 4 KiB
+  (crosses one boundary, the crash geometry) and 1 MiB (crosses chunk and row
+  boundaries) — read back byte-identical, no rejection or error in `dmesg`.
+- The 1 MiB region read back with member 1 failed by `FAIL_MEMBER` matches:
+  the parity the fixed overlay wrote reconstructs the failed member's chunks.
+
+Still open on this path: no write-hole journal (a power cut between the data
+and parity commands can leave a row stale) and no automatic rebuild.
+
+## 2026-11-14 — RAID10 fan-out bounces mid-page layouts (issue #20)
+
+The bounce fallback added on 2026-11-13 covered single-member I/O, RAID0
+multi-stripe and RAID1 writes. RAID10's fan-out still built its per-column
+scatterlists straight from the bvec, so a layout PRPs cannot encode reached
+`rc_volume_build_prp` and the request failed with
+`sg entry N starts at in-page offset ... — unexpressible as PRPs`.
+
+Reaching it needs both halves of the shape, and dd produces neither: the
+request must **start** at an in-page offset (XFS log recovery: a 256 KiB
+write beginning 58 sectors into a chunk) so every chunk boundary inside it
+falls mid-page too, and it must span at least cols+1 chunks so the column
+that owns chunk 0 owns a later chunk as well and its fragment becomes the
+member's *second* SG entry. blk-mq's virt_boundary splitter pushes any
+*later* mid-page bvec into a request of its own, which is why a plain
+multi-iovec `pwritev` cannot produce the layout — the first bvec may carry
+an offset, and then the whole run stays one request.
+
+Fix: `rc_volume_raid10_bounce_build()` rebuilds every member's SG list over
+one bounce buffer laid out in COLUMN slices; both copies of a mirror pair
+map the same slice, so the per-member SQE lengths are unchanged. Writes are
+copied into the buffer before submission, a bounced READ is copied back on
+completion. The fast path stays zero-copy. The same change also sets
+`pdu->io_started` in the RAID10 dispatch, which nothing on that path did —
+without it the completion path skipped the READ copy-back and a bounced
+read returned whatever the bio's pages already held.
+
+Rig coverage (`scripts/qemu-test/iovec-split-test.c`, wired through
+`--chunk-index`): `mkmeta.py` now writes RAID10 metadata (FirstCount = cols,
+SecondCount = 2, capacity = per-member user size x cols), and the guest
+writes/reads cols+1 stripes from a row-aligned LBA with the request starting
+2 KiB into a page, then compares the split readback against a plain
+page-aligned read of the same range. Pre-fix it fails with `sg entry 17
+starts at in-page offset 2048`; post-fix:
+
+- `raid10` 4 members, 64 KiB chunks (the trap): PASS
+- `raid0` 4 members, 64 KiB chunks (the same fixture): PASS
+- `raid10` 4 members, 256 KiB chunks, `raid1` 2 members: PASS — the
+  established batteries, unchanged.
+- `make` warning-clean.
+
+CI gained `raid0-prp-split` and `raid10-prp-split` scenarios so this cannot
+regress silently. Not covered: no hardware run — the RAID10 hardware runbook
+(`VALIDATION_RAID10.md`) still has an empty results table, and the box
+currently carries the RAID 5 array. 256 KiB chunks on RAID10 cannot reach
+the trap at all (a request is capped at 128 segments = two 256 KiB chunks),
+so the fixture needs `--chunk-index 1`.
