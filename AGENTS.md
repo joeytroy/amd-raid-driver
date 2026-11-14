@@ -94,7 +94,7 @@ The repo's automated review prompt enforces these; write code that passes it:
   in this project. Keep `BLK_STS_RESOURCE` for transient allocation/unload
   races so the block layer retries.
 - Do not add a feature that writes metadata the driver cannot validate. The
-  TUI's offline encoder (`mkmeta.py`) emits RAID 0/1 only and stops with an
+  offline encoder (`mkmeta.py`) emits RAID 0/1 only and stops with an
   explicit message for 10/5/6. The kernel writer emits RAID 0/1/10, and RAID 5
   only behind `parity_create=1` — metadata over members whose user area is
   known empty, never data/parity initialisation. RAID 6 is never written.

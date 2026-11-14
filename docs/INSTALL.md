@@ -505,14 +505,14 @@ the array's filesystem open after the install, leaving `rcraid` impossible to
 unload. See `rmmod rcraid` under Troubleshooting for the details and the
 measured leak counts.
 
-The array itself normally comes from the **UEFI RAIDXpert2 utility**, and
-that is what the script expects: it reads the RAIDCore metadata at LBA
-`0x5000` and, when it finds it, uses exactly those disks as members and
-writes nothing — the level and geometry are the firmware's, RAID 5/6
-included. The interactive disk/level menu only appears when no disk
-carries that metadata; that path writes fresh RAID 0/1 records (all
-`mkmeta.py` can produce) and needs explicit confirmation
-(`RCRAID_CREATE_ARRAY=1` when running non-interactively).
+The array itself comes from the **UEFI RAIDXpert2 utility**, and that is what
+the script requires: it reads the RAIDCore metadata at LBA `0x5000` and, when
+it finds it, uses exactly those disks as members and writes nothing — the
+level and geometry are the firmware's, RAID 5/6 included. When no disk carries
+that metadata it stops and says so. There is no disk/level menu and no
+install-time array creation: the only writers in this tree
+(`scripts/qemu-test/mkmeta.py`, `rxp2adm`) stamp metadata over blank disks for
+the QEMU rig, which is not an install path.
 
 Before handing `rcraid0` over, it checks `/sys/block/rcraid0/ro` and says
 whether the volume is writable for the level it read. A read-only volume

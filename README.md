@@ -1,10 +1,10 @@
-# ⚡ rcraid (Multi-Format TUI-Enhanced Edition)
+# ⚡ rcraid (AMD RAIDXpert2 NVMe Array Driver)
 
 [![License: GPL-2.0-only](https://img.shields.io/badge/License-GPL--2.0--only-blue.svg)](https://opensource.org/license/gpl-2-0)
 ![Kernel: Linux 7.0+](https://img.shields.io/badge/Kernel-Linux%207.0%2B-orange.svg)
 ![DKMS: out-of-tree](https://img.shields.io/badge/DKMS-out--of--tree-informational.svg)
 
-Your motherboard's AMD RAIDXpert2 NVMe storage arrays become a native, standard block device node right at **/dev/rcraid0**. Partition it, format it, configure it dynamically from a clean terminal wizard, and **boot Linux straight from it with zero graphical overhead.**
+Your motherboard's AMD RAIDXpert2 NVMe storage arrays become a native, standard block device node right at **/dev/rcraid0**. Partition it, format it, and **boot Linux straight from it with zero graphical overhead.**
 
 ---
 
@@ -73,10 +73,10 @@ table is deliberately not duplicated here, so the two can't drift apart.
 
 Where the phases actually stand: **Phase 0** (RAID 0/1/10 + rebuild) is done
 for RAID 0/1 and awaiting the RAID 10 array-box run; **Phase 1** (parity)
-assembles and reads, and RAID 5 writes are opt-in and hardware-validated; **Phase 2** (metadata writer + TUI
-create) is the next PR — the TUI can select 10/5/6 today, but the metadata
-writer only produces 0/1, so those choices stop at an error instead of
-stamping a layout the driver can't validate; phases 3–8 are long-horizon.
+assembles and reads, and RAID 5 writes are opt-in and hardware-validated;
+**Phase 2** (a writer that stamps a level no firmware produced) is not started —
+arrays are created in the UEFI RAIDXpert2 utility, and the offline writer
+produces 0/1 for the test rig; phases 3–8 are long-horizon.
 
 **Prime directive: nothing from experimental branch migrates to main. OCE/ORLM/P2PDMA/io_uring are first-class features of *this* driver.**
 
@@ -105,8 +105,7 @@ rebuild and a firmware-created parity array are still unvalidated.
 
 ## 🚀 Key Production Features
 
-*   **Interactive Phase 1 Terminal GUI (TUI):** No pre-configured arrays are required on boot. On clean, blank testing drives, the live-installer automatically spins up a keyboard-driven blue menu canvas (`dialog`). Testers can check off raw NVMe paths using the Spacebar, then choose a target level from a list the **built driver itself reports** (`0 1 10 5`) and which is filtered by the member count just picked — RAID 1 wants exactly two, RAID 10 an even four or more, RAID 5 at least three, and RAID 6 is always shown as `NOT SUPPORTED` because there is no Q write/parity path (**RAID 5 is read-only until the parity-write opt-in is set**, and RAID 10 is feature-complete but awaiting a firmware-array run) — and commit layouts on the fly. Layout metadata is written by `scripts/qemu-test/mkmeta.py`, which covers **RAID 0, 1 and 10** (and RAID 5 behind `parity_create=1`): the menu is filtered to what the built driver reports it can create, and RAID 6 stops with an explicit message instead of stamping a layout the driver cannot validate.
-*   **Defensive Hardware Security Guards:** The TUI contains an automated validation length check that enforces a hard **maximum 8-disk constraint** matching AMD firmware specifications, safely preventing memory overrun kernel oops before touching the PCIe bus registers.
+*   **Arrays come from firmware; the driver assembles them.** Every level this driver supports — RAID 0, 1, 10, 5 and 6 — is created in the **UEFI RAIDXpert2 utility** before Linux is installed. The installer reads the RAIDCore metadata at LBA `0x5000`, takes exactly the stamped disks as members, writes nothing to them, and takes the level and geometry from those records. A machine with no firmware array stops with a message saying so: there is **no interactive disk/level menu and no install-time array creation**, because the only writers in this tree (`scripts/qemu-test/mkmeta.py`, and `rxp2adm` for RAID 0/1/10 and gated RAID 5) stamp metadata over blank disks for the QEMU rig, where firmware records cannot be produced.
 *   **Advanced Rootfs Probing:** Phase 2 avoids fragile, hardcoded partition name assumptions. It uses a read-only sandboxed mount-and-probe matrix to peak inside array partitions, locate the genuine system `/etc/os-release`, and seamlessly execute chroot boot configurations on any distribution setup.
 *   **Non-Blocking Asynchronous Completion Engine:** Parent-bio completion is parked on the `kamd_async_worker` kthread queue, so hardware completion contexts return immediately and never stall the block-layer queue; a separate `kamd_resync` thread owns long-running rebuilds. Over-reports from faulty member paths are absorbed by a bounded tombstone pool instead of being fatal.
 *   **Persistent Boot Locks:** Automated **DKMS (Dynamic Kernel Module Support)** registration ensures the module automatically re-compiles against any incoming system kernel updates, paired with initramfs hooks and fallback `efibootmgr` NVRAM UEFI string injection.
@@ -116,16 +115,28 @@ rebuild and a firmware-created parity array are still unvalidated.
 ## 🅐 Quick Start: Fresh OS Installation (From Live USB)
 
 The recommended path for a fresh Ubuntu / Kubuntu / Mint / Fedora install that
-lives **on** the AMD RAIDXpert2 NVMe array. Three steps: the script stands the
-array up, you partition it from the desktop installer, then the script finishes
-the target system.
+lives **on** the AMD RAIDXpert2 NVMe array. Three steps: the array is created in
+the UEFI RAIDXpert2 utility, the script stands it up and you partition it from
+the desktop installer, then the script finishes the target system.
 
 Firmware Secure Boot must be **off** for the live session — the live kernel
 refuses the unsigned module, and the key it would need cannot be enrolled
 without rebooting that session. Signing and enrolling the key is what lets you
 switch Secure Boot back **on** afterwards (Step 4).
 
-### Step 1 — Provision the array and expose `/dev/rcraid0`
+### Step 1 — Create the array in firmware, then expose `/dev/rcraid0`
+
+**The array must already exist before this driver sees anything.** Reboot into
+firmware setup, open **RAIDXpert2**, create the array there (RAID 0, 1, 10, 5 or
+6 — the driver assembles all of them), save and exit. The utility writes the
+RAIDCore metadata this driver validates, so the level and geometry always come
+from firmware records rather than from this repo.
+
+The installer does not create arrays, and that is deliberate: the only writers
+in the tree stamp metadata over blank disks for the test rig
+(`scripts/qemu-test/mkmeta.py`, `rxp2adm`), where no firmware can produce those
+records. A box with no RAIDXpert2 array stops with a message instead of
+inventing one.
 
 1. Boot the live USB, pick **Try Kubuntu** (the live session), and open
    Konsole.
@@ -135,33 +146,20 @@ switch Secure Boot back **on** afterwards (Step 4).
    cd amd-raid-driver
    sudo ./install-livecd.sh
    ```
-   It installs its build dependencies, compiles `rcraid.ko` against the running
-   kernel, and builds the `rxp2adm` writer.
-3. It first looks for an array **RAIDXpert2 already created**: RAIDCore
-   metadata at LBA `0x5000`. When it is there, exactly those disks become the
-   members and nothing is written to them — level and geometry come from the
-   firmware's own records, RAID 10/5/6 included.
-4. Only when no disk carries that metadata does the **blue Terminal GUI** open,
-   because blank disks carry no layout to read:
-   - **Spacebar** checks the member disks (hard limit 8, matching firmware),
-     then `< OK >`.
-   - Then the level. The list is the driver's own: it prints
-     `Driver reports it can create: 0 1 10 5` above a menu filtered by the
-     member count you just picked — RAID 1 wants exactly two, RAID 10 an even
-     four or more, RAID 5 at least three. RAID 6 always appears as
-     `NOT SUPPORTED: driver has no Q write/parity path` and cannot be chosen.
-     The clean-room writer (`scripts/qemu-test/mkmeta.py`) stamps **RAID 0, 1
-     and 10**, and RAID 5 only behind `parity_create=1`; anything the driver
-     cannot validate stops with an explicit message instead of being written.
-     That path writes **fresh metadata over the selected disks**, so it is for
-     empty drives only.
-5. Either way the script unbinds the members from `nvme`, binds `rcbottom`,
-   forces a probe on each PCIe port, and stands up **`/dev/rcraid0`**, then
-   reports the volume and whether it is **writable for the level it read**:
-   RAID 0/1 install fine; **RAID 5/6 come up read-only by default** (RAID 5
-   writes need the explicit parity-write opt-in) and the script stops there
-   rather than handing a read-only disk to an installer.
-6. It ends with a prompt and then waits:
+   It installs its build dependencies and compiles `rcraid.ko` against the
+   running kernel.
+3. It looks for the array **RAIDXpert2 created**: RAIDCore metadata at LBA
+   `0x5000`. Exactly the disks carrying it become the members and nothing is
+   written to them — level and geometry come from the firmware's own records,
+   RAID 10/5/6 included. No disk carries it? The script stops and tells you to
+   create the array in the UEFI utility first; nothing has been written.
+4. It then unbinds the members from `nvme`, binds `rcbottom`, forces a probe on
+   each PCIe port, and stands up **`/dev/rcraid0`**, and reports the volume and
+   whether it is **writable for the level it read**: RAID 0/1 install fine;
+   **RAID 5/6 come up read-only by default** (RAID 5 writes need the explicit
+   parity-write opt-in) and the script stops there rather than handing a
+   read-only disk to an installer.
+5. It ends with a prompt and then waits:
    ```
    ➡️  Target /dev/rcraid0 under manual partitioning, map root, and let files copy.
    Press [Enter] ONLY when the graphical OS installer finishes copying file sectors...

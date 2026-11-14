@@ -76,9 +76,9 @@ vendor-written media),
 hot-plug/rebuild, SMART pass-through,
 multi-volume, array creation from Linux
 beyond RAID0/RAID1/RAID10 (`rcadm -C` now stamps all three levels; the live
-installer still stamps only 0/1 via `scripts/qemu-test/mkmeta.py`; 10/5/6
-firmware-compatible records, and the
-firmware-compatible records RAIDXpert2/Windows would accept, are still open).
+installer stamps nothing — it assembles the array the UEFI RAIDXpert2 utility
+created; 10/5/6 firmware-compatible records, and the firmware-compatible
+records RAIDXpert2/Windows would accept, are still open).
 The prioritized roadmap is in [`IMPLEMENTATION.MD`](IMPLEMENTATION.MD); the
 RE ground truth is in [`REVERSE_ENGINEERING.md`](REVERSE_ENGINEERING.md).
 
@@ -478,18 +478,19 @@ generation.
   verification, user-facing instructions); `verify-boot-safety.sh` reports a
   still-queued enrolment, and `uninstall-dkms.sh` now removes rcraid's signing
   drop-in (leaving the enrolled key, which other modules may share).
-- **The live installer no longer invents the array.** `install-livecd.sh` used
-  to list every NVMe disk in a TUI and stamp fresh RAID 0/1 metadata over the
-  ticked disks — wrong for a firmware array, which has nothing to tick and is
-  usually a level `mkmeta.py` cannot produce (the 3-disk RAID 5 would abort
-  outright). It now reads the RAIDCore magic at LBA `0x5000` first and, when
-  found, takes exactly those disks as members and writes nothing; level and
-  geometry come from the firmware's records. The TUI/creation path is reserved
-  for disks carrying no metadata at all and needs explicit confirmation
-  (`RCRAID_CREATE_ARRAY=1` in scripted runs); `phase1-tui.sh` also stops
-  inventing `nvme0n1…4` when no NVMe disk is present. Checked against the test
-  box's firmware RAID 5: detection returns exactly `nvme0n1 nvme1n1 nvme2n1`
-  and excludes the root disk `nvme3n1`.
+- **The live installer no longer invents the array — and no longer offers to.**
+  `install-livecd.sh` used to list every NVMe disk in a TUI and stamp fresh
+  RAID 0/1 metadata over the ticked disks — wrong for a firmware array, which
+  has nothing to tick and is usually a level `mkmeta.py` cannot produce (the
+  3-disk RAID 5 would abort outright). It read the RAIDCore magic at LBA
+  `0x5000` and, when found, took exactly those disks as members and wrote
+  nothing; level and geometry came from the firmware's records. On 2026-11-14
+  the leftover create path went too: the script now stops with an error when no
+  disk carries that metadata, `scripts/phase1-tui.sh` is gone, and the only
+  writers left in the tree (`scripts/qemu-test/mkmeta.py`, `rxp2adm`) are for
+  the QEMU rig over blank images. Checked against the test box's firmware RAID
+  5: detection returns exactly `nvme0n1 nvme1n1 nvme2n1` and excludes the root
+  disk `nvme3n1`.
   The installer also **states whether the volume is writable**, and refuses to
   hand it to the distro installer when it is not: `/sys/block/rcraid0/ro` is
   the authority, the level is taken from the driver's `(level=…)` assembly log,

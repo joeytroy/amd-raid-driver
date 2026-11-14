@@ -656,7 +656,7 @@ ORLM, COW, P2PDMA, io_uring, ZNS/FDP) are not on the daily-driver path at all.
 |---|---|---|---|
 | 0 | RAID 0 / 1 / 10 I/O + rebuild | ✅ RAID0 and RAID1 shipped and hardware-validated; RAID10 feature-complete, array-box run pending ([VALIDATION_RAID10.md](VALIDATION_RAID10.md)) | Production baseline |
 | 1 | RAID 5/6 I/O + rebuild | 🟡 Assembly + reads wired; RAID 5 writes opt-in and hardware-validated 2026-11-13, RAID 6 forced read-only; create/delete metadata works in the rig (RAID 5 behind `parity_create=1`); first firmware 3-disk RAID 5 metadata parsed, assembled and read back 2026-11-08 (`0x1BF5`, N=3, `(N-1)` × user size); placement settled from the vendor core, corroboration pending (issue #6); Q generator now the vendor's EVENODD, uncalled (issue #10); RAID 5 degraded reads + manual parity rebuild hardware-validated 2026-11-13 | Inspect and read existing parity arrays |
-| 2 | Metadata writer + TUI create | ⏳ Planned — leads the next-PR order: `mkmeta.py` writes RAID0/1 only, so the TUI's 10/5/6 choices stop at an error message | Create RAID 5/6 arrays |
+| 2 | Metadata writer for levels no firmware produced | ⏳ Planned — `scripts/qemu-test/mkmeta.py` writes RAID 0/1 (and `rxp2adm` 10, plus 5 behind `parity_create=1`) for the QEMU rig only; real arrays are created in the UEFI RAIDXpert2 utility, so no install path waits for this | Driver-created arrays in the rig, and on erased lab disks |
 | 3 | OCE (Online Capacity Expansion) | 🗺️ Roadmap — this driver | Add drives online, restripe, grow FS |
 | 4 | ORLM (Online RAID Level Migration) | 🗺️ Roadmap — this driver | RAID 0↔5↔6↔10 online, zero host CPU |
 | 5 | COW snapshots + instant clone | 🗺️ Future | Fast clones, no space cost |
@@ -666,8 +666,10 @@ ORLM, COW, P2PDMA, io_uring, ZNS/FDP) are not on the daily-driver path at all.
 
 Phases 3–8 have no code, no design notes and no exit criteria in this tree.
 They are recorded so the ambition is explicit, not because they are
-scheduled. Phase 2 is the only one of the set that unblocks a user-visible
-dead end, which is why it opens the next-PR order.
+scheduled. Phase 2 is the only one of the set that changes what the tree can
+test — the rig can only boot arrays it encoded itself — which is why it opens
+the next-PR order. It is not on the install path: there the UEFI RAIDXpert2
+utility creates the array.
 
 ## 🤔 Open reverse-engineering questions
 
@@ -695,13 +697,13 @@ hardware-validated (2026-07-10, the dev box boots from the mirror) and
 what is actually left; several items are now verification and documentation
 rather than code.
 
-1. **Metadata writer for RAID10/5/6** — the Phase-1 TUI offers levels
-   0/1/10/5/6 but `scripts/qemu-test/mkmeta.py` writes only 0 and 1, so
-   selecting anything else stops at an error message. Either implement the
-   records (RAID10 first: `0x1BF6` + 2×2 is already proven by the X399
-   fixtures) or reduce the TUI to what the writer can produce. This is the
-   gap between "the installer creates parity arrays" being true and it
-   being a documented dead end.
+1. **Metadata writer for RAID10/5/6** — `scripts/qemu-test/mkmeta.py` writes
+   RAID 0/1 only, so the rig cannot boot a synthetic array at any other level
+   (`rxp2adm create` writes 10, and 5 behind `parity_create=1`, but only over
+   members that already parse). Implement the records (RAID10 first: `0x1BF6`
+   + 2×2 is already proven by the X399 fixtures). No install path depends on
+   this any more: on 2026-11-14 `install-livecd.sh` dropped array creation and
+   the TUI, and now requires the array the UEFI RAIDXpert2 utility created.
 2. **Corroborate the RAID5/6 on-disk placement** (issue #6) — the read-only
    parity path assembles and reads: a firmware-created 3-disk RAID 5 was
    parsed, assembled and read on 2026-11-08 (`0x1BF5`, N=3, `(N-1)` × user
