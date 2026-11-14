@@ -3888,11 +3888,16 @@ static void rc_volume_unmap_request_sg(struct rc_volume_pdu *pdu)
 		if (pdu->ms_bounce) {
 			if (pdu->io_started && pdu->op == REQ_OP_READ &&
 			    !pdu->sc_sct &&
-			    !atomic_read(&pdu->members_pending))
+			    !atomic_read(&pdu->members_pending) &&
 				rc_volume_ms_bounce_copy(
 					blk_mq_rq_from_pdu(pdu), pdu->ms_bounce,
 					pdu->ms_bounce_off, pdu->ms_bounce_len,
-					pdu->ms_bounce_slots, false);
+					pdu->ms_bounce_slots, false))
+				rc_printk(RC_ERROR,
+					  "rc_volume_unmap_request_sg: bounced READ copy-back failed (pos=%llu len=%u) — the bio keeps its old contents; this is a layout bug, not a device error\n",
+					  (unsigned long long)blk_rq_pos(
+						  blk_mq_rq_from_pdu(pdu)),
+					  blk_rq_bytes(blk_mq_rq_from_pdu(pdu)));
 			rc_volume_bounce_free(pdu->ms_bounce);
 			pdu->ms_bounce = NULL;
 		}
@@ -4639,7 +4644,12 @@ static blk_status_t rc_volume_parity_rmw_write(struct request *req,
 				pd[i] ^= sd[i];	/* P_old ^= D_old */
 		}
 
-		/* Overlay the part of the request that falls in this row. */
+		/* Overlay the part of the request that falls in this row.
+		 * A bvec does not have to start on a chunk boundary, so split it
+		 * where it runs into the next chunk: one memcpy of the whole
+		 * segment into chunk @mbr would run past the end of that chunk's
+		 * coherent buffer and fault on the unmapped page after it (seen
+		 * mounting XFS on a 4-member RAID 5, 2026-11-14). */
 		rq_for_each_segment(bv, req, iter) {
 			sector_t seg_start = lba;
 			sector_t seg_end = lba + bv.bv_len / 512;
@@ -4647,18 +4657,27 @@ static blk_status_t rc_volume_parity_rmw_write(struct request *req,
 			sector_t to = min_t(sector_t, seg_end, cur + nsec);
 
 			if (from < to) {
-				u32 rel = (u32)(from - cur);
-				u32 skip = (u32)(from - seg_start);
-				u32 len = (u32)(to - from) * 512u;
-				u32 mbr = (row_off + rel) / chunk;
-				u32 coff = (row_off + rel) % chunk;
 				u8 *src = kmap_local_page(bv.bv_page);
 
-				if (mbr < (u32)parity)
+				while (from < to) {
+					u32 rpos = row_off + (u32)(from - cur);
+					u32 mbr = rpos / chunk;
+					u32 coff = rpos % chunk;
+					u32 nsplit = min_t(u32,
+							   (u32)(to - from),
+							   chunk - coff);
+					u32 skip = (u32)(from - seg_start);
+
+					/* The parity chunk holds no request bytes. */
+					if (mbr >= (u32)parity)
+						break;
 					memcpy((u8 *)rc_volume_rmw[mbr].va +
 					       (size_t)coff * 512u,
 					       src + bv.bv_offset +
-					       (size_t)skip * 512u, len);
+					       (size_t)skip * 512u,
+					       nsplit * 512u);
+					from += nsplit;
+				}
 				kunmap_local(src);
 			}
 			lba = seg_end;
@@ -5009,6 +5028,77 @@ static int rc_volume_ms_bounce_build(struct request *req,
 					RC_VOLUME_MS_PAGES_PER_MEMBER,
 					pdu->ms_bounce + pdu->ms_bounce_off[m],
 					pdu->ms_bounce_len[m], &sg_used[m]))
+			goto err;
+	}
+	return 0;
+
+err:
+	rc_volume_bounce_free(pdu->ms_bounce);
+	pdu->ms_bounce = NULL;
+	return -EINVAL;
+}
+
+/* Rebuild RAID10's per-member SG lists over COLUMN slices of one bounce
+ * buffer.  Both copies of a mirror pair hold the same bytes, so a column
+ * has ONE slice and both members' SG lists map it — which is why this
+ * cannot reuse rc_volume_ms_bounce_build (that one lays out one slice per
+ * member).  Slices follow column order, matching the member-LBA order the
+ * per-member SQE lengths were computed from.  Returns 0, -ENOMEM when no
+ * pool buffer is available, or -EINVAL when the layout does not add up. */
+static int rc_volume_raid10_bounce_build(struct request *req,
+					 struct rc_volume_pdu *pdu,
+					 u32 *sg_used,
+					 const u32 *member_sectors,
+					 const bool *member_has_data,
+					 u32 cols, enum req_op op)
+{
+	u32 bytes = blk_rq_bytes(req);
+	u32 off = 0;
+	u32 c;
+	int m;
+
+	if (!bytes || bytes > RC_VOLUME_DATA_BYTES || !cols ||
+	    cols > RC_VOLUME_MAX_MEMBERS)
+		return -EINVAL;
+
+	pdu->ms_bounce = rc_volume_bounce_alloc();
+	if (!pdu->ms_bounce)
+		return -ENOMEM;
+
+	/* One slice per column.  A degraded column has only one live copy,
+	 * so take whichever copy carries the data. */
+	for (c = 0; c < cols; c++) {
+		u32 len = 0;
+
+		for (m = 0; m < (int)(cols * 2u); m++) {
+			if (member_has_data[m] && (u32)m / 2u == c) {
+				len = member_sectors[m] * 512u;
+				break;
+			}
+		}
+		pdu->ms_bounce_off[c] = off;
+		pdu->ms_bounce_len[c] = len;
+		off += len;
+	}
+	if (off != bytes)
+		goto err;
+	/* The completion path copies a bounced READ back with this geometry:
+	 * one slice per column, positions 0..cols-1. */
+	pdu->ms_bounce_slots = (u8)cols;
+
+	if (op == REQ_OP_WRITE &&
+	    rc_volume_ms_bounce_copy(req, pdu->ms_bounce, pdu->ms_bounce_off,
+				     pdu->ms_bounce_len, cols, true))
+		goto err;
+
+	for (m = 0; m < (int)(cols * 2u); m++) {
+		if (!member_has_data[m])
+			continue;
+		c = (u32)m / 2u;
+		if (rc_volume_bounce_sg(pdu->ms_sg[m],
+					RC_VOLUME_MS_PAGES_PER_MEMBER,
+					pdu->ms_bounce + pdu->ms_bounce_off[c],
+					pdu->ms_bounce_len[c], &sg_used[m]))
 			goto err;
 	}
 	return 0;
@@ -5845,6 +5935,36 @@ static blk_status_t rc_volume_dispatch_raid10(
 		return BLK_STS_IOERR;
 	}
 
+	/* A member's run starts mid-page when the request itself starts
+	 * mid-page and its chunk boundary falls inside a page (XFS log
+	 * recovery: a 256 KiB write beginning 58 sectors into a chunk), or
+	 * when the bio joins runs with a page gap.  blk-mq's virt_boundary
+	 * splitter only pushes LATER mid-page bvecs into a request of their
+	 * own; a mid-page FIRST bvec keeps the whole run in one request, and
+	 * the column that also owns a later chunk then gets a non-first SG
+	 * entry PRPs cannot encode.  Rebuild every member's list over a
+	 * bounce buffer in that case; the fast path stays zero-copy. */
+	for (m = 0; m < nm; m++) {
+		if (member_has_data[m] &&
+		    !rc_volume_sg_prp_ready(pdu->ms_sg[m], sg_used[m]))
+			break;
+	}
+	if (m < nm) {
+		int bret = rc_volume_raid10_bounce_build(req, pdu, sg_used,
+							member_sectors,
+							member_has_data,
+							cols, op);
+
+		if (bret == -ENOMEM)
+			return BLK_STS_RESOURCE;
+		if (bret) {
+			rc_printk(RC_ERROR,
+				  "rc_volume_dispatch_raid10: bounce layout failed — pos=%llu len=%u rejected\n",
+				  (u64)pos, nr_sectors);
+			return BLK_STS_IOERR;
+		}
+	}
+
 	for (m = 0; m < nm; m++) {
 		if (!member_has_data[m])
 			continue;
@@ -5878,6 +5998,8 @@ static blk_status_t rc_volume_dispatch_raid10(
 				pdu->ms_nents[m] = 0;
 			}
 			pdu->ms_active = false;
+			rc_volume_bounce_free(pdu->ms_bounce);
+			pdu->ms_bounce = NULL;
 			return BLK_STS_IOERR;
 		}
 		pdu->ms_nents[m] = mapped;
@@ -5942,6 +6064,11 @@ static blk_status_t rc_volume_dispatch_raid10(
 			return BLK_STS_DEV_RESOURCE;
 		}
 
+		/* Marks the request as handed to hardware: the completion path
+		 * only copies a bounced READ back into the bio's pages when
+		 * this is set, so a pre-submit error can never leak bounce
+		 * buffer contents into a failed READ. */
+		pdu->io_started = true;
 		blk_mq_start_request(req);
 		for (m = 0; m < nm; m++)
 			if (pdu->ms_nents[m])
