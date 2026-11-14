@@ -148,6 +148,9 @@ inventing one.
    ```
    It installs its build dependencies and compiles `rcraid.ko` against the
    running kernel.
+
+   ![The entry script running in the live session's Konsole](docs/screenshots/install-01-run-script.png)
+
 3. It looks for the array **RAIDXpert2 created**: RAIDCore metadata at LBA
    `0x5000`. Exactly the disks carrying it become the members and nothing is
    written to them — level and geometry come from the firmware's own records,
@@ -178,7 +181,13 @@ through to **Partitions**:
    choose **Manual partitioning**. ("Erase disk" is not the path here — the
    array usually sits beside the live USB, and manual is what guarantees the
    ESP lands on the array.)
+
+   ![Calamares: storage device rcraid0 - 14.55 TiB, Manual partitioning selected](docs/screenshots/install-02-manual-partitioning.png)
+
 2. **New Partition Table → GUID Partition Table (GPT)**, confirm.
+
+   ![Calamares: creating a new GPT partition table on rcraid0](docs/screenshots/install-03-gpt.png)
+
 3. Create the **ESP**: *Size* **512 MiB**, *File System* **fat32**,
    *Mount Point* **`/boot/efi`**, flag **`boot`** checked. The ESP has to be a
    partition of `rcraid0` itself: shim and grub land there, and that is what
@@ -186,11 +195,19 @@ through to **Partitions**:
    on it (kernels and initramfs stay in `/boot` on the root), so 512 MiB is
    what Ubuntu sizes to and 1 GiB is only worth it for a Windows dual-boot or
    heavy firmware-capsule use.
+
+   ![Calamares: 512 MiB fat32 mounted at /boot/efi with the boot flag set](docs/screenshots/install-04-esp.png)
+
 4. Create the **root**: *Size* whatever remains, *File System* **xfs**,
    *Mount Point* **`/`**.
+
+   ![Calamares: the remaining 14.55 TiB as xfs mounted at /](docs/screenshots/install-05-root.png)
+
 5. **Location / Keyboard / Users** as you like, then **Install**, and wait for
    **“All done.”** Leave *Restart now* **unticked** — the live session still has
    work to do, and rebooting is your call, not the installer's.
+
+   ![Calamares: All done, with Restart now left unticked](docs/screenshots/install-06-all-done.png)
 
 ### Step 3 — Finish the target system from the terminal
 
@@ -219,6 +236,8 @@ through to **Partitions**:
    `RCRAID_MOK_PASSWORD`.
 5. The run ends with `🎉 DONE! The fresh bare-metal PC is 100% prepped. Reboot
    whenever you choose to launch your array.` The script never reboots for you.
+
+   ![The closing MOK enrolment instructions and the DONE banner](docs/screenshots/install-07-done-mok.png)
 
 ### Step 4 — First boot, then (optionally) Secure Boot
 
