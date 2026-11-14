@@ -187,6 +187,15 @@ jobs:
           # the driver's writer, and require the same capacity and level.
           - { scenario: raid5-create-delete, level: raid5,
               extra: "--members 4 --create-test" }
+          # Fan-out with a mid-page non-first SG entry (issue #20): the
+          # request starts 2 KiB into a page and covers cols+1 stripes, so
+          # the column that owns chunk 0 and chunk `cols` gives one member
+          # a fragment no PRP list can encode.  64 KiB chunks keep the
+          # whole request inside max_hw_sectors / max_segments.
+          - { scenario: raid0-prp-split, level: raid0,
+              extra: "--members 4 --chunk-index 1" }
+          - { scenario: raid10-prp-split, level: raid10,
+              extra: "--members 4 --chunk-index 1" }
     steps:
       - uses: actions/checkout@v4
 

@@ -48,6 +48,8 @@ parity_write_test=0
 parity_row_kib=0
 create_test=0
 api_members=0
+prp_chunk_bytes=0
+prp_cols=0
 for arg in $(cat /proc/cmdline); do
     case "$arg" in
         expected_sectors=*) expected_sectors="${arg#expected_sectors=}" ;;
@@ -58,6 +60,8 @@ for arg in $(cat /proc/cmdline); do
         parity_row_kib=*)   parity_row_kib="${arg#parity_row_kib=}" ;;
         create_test=*)      create_test="${arg#create_test=}" ;;
         api_members=*)      api_members="${arg#api_members=}" ;;
+        prp_chunk_bytes=*)  prp_chunk_bytes="${arg#prp_chunk_bytes=}" ;;
+        prp_cols=*)         prp_cols="${arg#prp_cols=}" ;;
     esac
 done
 [ -n "$expected_sectors" ] || fail "no expected_sectors= on kernel cmdline"
@@ -303,6 +307,23 @@ done
 echo 3 > /proc/sys/vm/drop_caches
 got=$(dd if=/dev/rcraid0 bs=1M skip=33 count=4 2>/dev/null | md5sum | cut -d' ' -f1)
 [ "$got" = "$want" ] || fail "region at 33 MiB corrupted by later writes"
+
+# Split-iovec test (issue #20): a 3-stripe request whose third iovec starts
+# 2 KiB into a page gives column 0 two fragments and makes its second SG
+# entry start at an in-page offset — inexpressible as PRPs.  The driver
+# must copy such a request through its bounce buffer, for the WRITE fan-out
+# and for the multi-stripe READ copy-back.  dd cannot build this layout.
+if [ "$prp_chunk_bytes" -gt 0 ] && [ "$prp_cols" -gt 0 ]; then
+    echo "rcraid-test: split-iovec write+read (mid-page non-first SG entry)"
+    mark "split iovec start"
+    errs_before=$(dmesg | grep -c "unexpressible as PRPs")
+    /rciovecsplit /dev/rcraid0 "$prp_chunk_bytes" "$prp_cols" \
+        || fail "split-iovec write/read (PRP-inexpressible layout rejected)"
+    errs_after=$(dmesg | grep -c "unexpressible as PRPs")
+    [ "$errs_before" = "$errs_after" ] \
+        || fail "driver rejected a split-iovec request instead of bouncing it"
+    echo "rcraid-test: split-iovec layout round-tripped"
+fi
 
 # Three cycles, not one: the reload path is where the sync-metadata-read
 # vs ISR CQ race lived (the volume disk exists while the re-probed members

@@ -19,7 +19,7 @@
 #                         [--level raid0|raid1|raid5|raid10]
 #                         [--parity-writes] [--create-test]
 #                         [--members N] [--size-mib M] [--workdir DIR]
-#                         [--writer mkmeta|encoder]
+#                         [--writer mkmeta|encoder] [--chunk-index 0-3]
 #
 # The statically linked busybox packed into the initramfs is found
 # automatically; set BUSYBOX=/path/to/busybox to force a specific binary.
@@ -42,6 +42,7 @@ MEMBERS=2
 SIZE_MIB=1024
 WORKDIR=""
 WRITER=mkmeta
+CHUNK_INDEX=3
 FAIL_MEMBER=0
 OMIT_MEMBER=0
 PARITY_WRITES=0
@@ -60,6 +61,7 @@ while [ $# -gt 0 ]; do
         # encoder via rc_meta_build.h.  The latter proves the writer
         # primitive that rxp2adm CREATE will be built on actually assembles.
         --writer)   WRITER="$2"; shift 2 ;;
+        --chunk-index) CHUNK_INDEX="$2"; shift 2 ;;
         --fail-member) FAIL_MEMBER=1; shift ;;
         # Degraded BOOT: write metadata for the full member set but attach
         # all-but-the-last drive to the VM; the guest loads with
@@ -163,14 +165,15 @@ done
 case "$WRITER" in
     mkmeta)
         MKMETA_OUT="$(python3 "$SCRIPT_DIR/mkmeta.py" --level "$LEVEL" \
-            "${IMAGES[@]}")" ;;
+            --chunk-index "$CHUNK_INDEX" "${IMAGES[@]}")" ;;
     encoder)
         make -s -C "$REPO_DIR" stamp-tool \
             STAMP_TOOL_BIN="$WORKDIR/rcstamp" > /dev/null || {
             echo "failed to build the encoder stamping tool" >&2
             exit 1
         }
-        MKMETA_OUT="$("$WORKDIR/rcstamp" --level "$LEVEL" "${IMAGES[@]}")" ;;
+        MKMETA_OUT="$("$WORKDIR/rcstamp" --level "$LEVEL" \
+            --chunk-index "$CHUNK_INDEX" "${IMAGES[@]}")" ;;
     *)
         echo "--writer must be mkmeta or encoder" >&2
         exit 2 ;;
@@ -178,6 +181,32 @@ esac
 echo "$MKMETA_OUT" | sed 's/^/    /'
 EXPECTED_SECTORS="$(echo "$MKMETA_OUT" | awk -F= '/^capacity_sectors=/ {print $2}')"
 [ -n "$EXPECTED_SECTORS" ] || { echo "mkmeta produced no capacity" >&2; exit 1; }
+
+# RAID0/RAID10: hand the guest the geometry for the split-iovec test, the
+# only way to force a non-first SG entry at an in-page offset (dd's layout
+# is always page-aligned and cannot reach that hole, issue #20).
+# PRP_COLS is the stripe column count: every member for RAID0, half of
+# them for RAID10.
+PRP_CHUNK_BYTES=0
+PRP_COLS=0
+if [ "$LEVEL" = raid0 ] || [ "$LEVEL" = raid10 ]; then
+    PRP_CHUNK_SECTORS="$(printf '%s\n' "$MKMETA_OUT" | grep -o 'chunk_sectors=[0-9]*' | cut -d= -f2 | head -n1)"
+    [ -n "$PRP_CHUNK_SECTORS" ] || { echo "$LEVEL: no chunk_sectors from the writer" >&2; exit 1; }
+    PRP_CHUNK_BYTES=$(( PRP_CHUNK_SECTORS * 512 ))
+    if [ "$LEVEL" = raid10 ]; then
+        PRP_COLS=$(( MEMBERS / 2 ))
+    else
+        PRP_COLS=$MEMBERS
+    fi
+    # The trap only exists while the whole request stays one request:
+    # blk-mq splits at max_hw_sectors (1 MiB) and max_segments (128).
+    if [ $(( PRP_CHUNK_BYTES * (PRP_COLS + 1) )) -gt 1048576 ] || \
+       [ $(( PRP_CHUNK_BYTES / 4096 * (PRP_COLS + 1) )) -gt 128 ]; then
+        echo "==> split-iovec test skipped: ${PRP_CHUNK_BYTES}B x $((PRP_COLS + 1)) stripes exceeds one request"
+        PRP_CHUNK_BYTES=0
+        PRP_COLS=0
+    fi
+fi
 
 # A full RAID 5 row is chunk x data members.  Pass it to the guest so the
 # parity-write scenario writes exactly one row: anything shorter is a
@@ -255,6 +284,15 @@ gcc -static -O2 -Wall -Wextra -Werror -o "$WORKDIR/rcapireadtest" \
     exit 1
 }
 install -m 0755 "$WORKDIR/rcapireadtest" "$INITRD_DIR/rcapireadtest"
+# Split-iovec helper (issue #20): a pwritev whose third iovec starts 2 KiB
+# into a page, laid out so one RAID10 column gets the mid-page fragment.
+# Nothing else in the battery builds a non-page-aligned bvec after PRP1.
+gcc -static -O2 -Wall -Wextra -Werror -o "$WORKDIR/rciovecsplit" \
+    "$SCRIPT_DIR/iovec-split-test.c" || {
+    echo "failed to build the split-iovec helper" >&2
+    exit 1
+}
+install -m 0755 "$WORKDIR/rciovecsplit" "$INITRD_DIR/rciovecsplit"
 if [ "$CREATE_TEST" = 1 ]; then
     gcc -static -O2 -Wall -Wextra -Werror -o "$WORKDIR/rxp2adm" \
         "$REPO_DIR/src/rxp2adm.c" -I"$REPO_DIR/src" || {
@@ -298,7 +336,7 @@ timeout --foreground "${RCRAID_QEMU_TIMEOUT:-300}" qemu-system-x86_64 \
     -M q35 -m 2048 -smp 4 "${ACCEL_ARGS[@]}" \
     -kernel "$KERNEL" \
     -initrd "$WORKDIR/initramfs.gz" \
-    -append "console=ttyS0 rdinit=/init expected_sectors=$EXPECTED_SECTORS expected_level=$LEVEL fail_member=$FAIL_MEMBER degraded_boot=$OMIT_MEMBER parity_write_test=$PARITY_WRITES parity_row_kib=$PARITY_ROW_KIB create_test=$CREATE_TEST api_members=$MEMBERS panic=-1" \
+    -append "console=ttyS0 rdinit=/init expected_sectors=$EXPECTED_SECTORS expected_level=$LEVEL fail_member=$FAIL_MEMBER degraded_boot=$OMIT_MEMBER parity_write_test=$PARITY_WRITES parity_row_kib=$PARITY_ROW_KIB create_test=$CREATE_TEST api_members=$MEMBERS prp_chunk_bytes=$PRP_CHUNK_BYTES prp_cols=$PRP_COLS panic=-1" \
     "${DRIVE_ARGS[@]}" \
     -nographic -no-reboot \
     > "$CONSOLE_LOG" 2>&1 || true   # qemu exit code isn't the verdict
