@@ -29,7 +29,7 @@
 #
 # RCRAID_ALLOW_SECURE_BOOT=1 tells the callers "I sign the modules myself";
 # RCRAID_MOK_KEY / RCRAID_MOK_CERT override key discovery; RCRAID_MOK_PASSWORD
-# sets the enrolment password instead of generating one; RCRAID_MOK_ENROLL=1
+# sets the enrolment password instead of prompting for one; RCRAID_MOK_ENROLL=1
 # asks for a key even with Secure Boot off (the post-boot signing path, see
 # mok_setup_signing); RCRAID_EFIVARS_DIR overrides the efivarfs path (for tests
 # only).
@@ -243,13 +243,17 @@ EOF
     chmod 0644 "$conf"
 }
 
-# Queue a MokNew request for $1 (a DER certificate) and set MOK_PASSWORD to the
-# one-time password the MOK manager will ask for at the next boot.  The
-# password is generated (or taken from RCRAID_MOK_PASSWORD) and written to
-# mokutil's stdin, which it reads instead of the terminal when stdin is not a
-# tty — that keeps the password known so it can be printed for the reboot.
-# When a request for the same certificate is already queued, MOK_PASSWORD is
-# left empty: the password belongs to whoever queued it.
+# Queue a MokNew request for $1 (a DER certificate).  The password the MOK
+# manager will ask for at the next boot is the operator's: typed here, or set
+# in RCRAID_MOK_PASSWORD, then written to mokutil's stdin (which it reads
+# instead of the terminal when stdin is not a tty).  Nothing is generated —
+# the value has to be typed again at the MOK screen, on a text console, so it
+# has to be something a person can remember.  It is typed in the clear: this
+# runs on the operator's own console, and a value they cannot see is a value
+# they will mistype at the MOK screen anyway.
+# The password is never returned to the caller or written to a state file;
+# when a request for the same certificate is already queued it belongs to
+# whoever queued it.
 mok_queue_enrollment() {
     local cert="$1" pw="${RCRAID_MOK_PASSWORD:-}"
     if ! command -v mokutil >/dev/null 2>&1; then
@@ -258,16 +262,25 @@ mok_queue_enrollment() {
         return 1
     fi
     if mok_is_pending "$cert"; then
-        MOK_PASSWORD=""
         return 0
     fi
     if [ -z "$pw" ]; then
-        if ! command -v openssl >/dev/null 2>&1; then
-            echo "ERROR: openssl is not installed, so no enrolment password can be" >&2
-            echo "       generated.  Install it or set RCRAID_MOK_PASSWORD." >&2
+        if [ ! -t 0 ]; then
+            echo "ERROR: a MOK enrolment password is needed, but stdin is not a" >&2
+            echo "       terminal to ask for one.  Set RCRAID_MOK_PASSWORD and" >&2
+            echo "       re-run, or run this installer interactively." >&2
             return 1
         fi
-        pw=$(openssl rand -hex 8)
+        read -rp "MOK password (typed again at the MOK screen): " pw || {
+            echo >&2
+            echo "ERROR: no MOK password entered." >&2
+            return 1
+        }
+        if [ "${#pw}" -lt 8 ]; then
+            echo "ERROR: the MOK password must be at least 8 characters — that is" >&2
+            echo "       the minimum MOK manager accepts." >&2
+            return 1
+        fi
     fi
     if ! printf '%s\n%s\n' "$pw" "$pw" | mokutil --import "$cert" >/dev/null 2>&1; then
         echo "ERROR: mokutil --import $cert failed." >&2
@@ -278,8 +291,6 @@ mok_queue_enrollment() {
         echo "       pending — the key would not be enrolled at the next boot." >&2
         return 1
     fi
-    MOK_PASSWORD="$pw"
-
     # MokManager waits ~10 s by default and then *clears* the pending request
     # and boots on.  On a machine that boots from the array that is a failed
     # boot with a password nobody got to use, so ask it to wait for a human
@@ -309,7 +320,6 @@ mok_state_reset() {
     MOK_SIGNING=0
     MOK_ENROLL_PENDING=0
     MOK_CERT=""
-    MOK_PASSWORD=""
 }
 
 # Adopt the state a target-system install wrote (install-livecd.sh's chroot
@@ -322,7 +332,6 @@ mok_load_state() {
     MOK_SIGNING="$(sed -n 's/^MOK_SIGNING=//p' "$f")"
     MOK_ENROLL_PENDING="$(sed -n 's/^MOK_ENROLL_PENDING=//p' "$f")"
     MOK_CERT="$(sed -n 's/^MOK_CERT=//p' "$f")"
-    MOK_PASSWORD="$(sed -n 's/^MOK_PASSWORD=//p' "$f")"
     return 0
 }
 
@@ -340,7 +349,7 @@ enrolment.  Signing is completed by the reboot that follows this install:
 shim's MOK manager runs BEFORE the kernel, so the module in the initramfs is
 already signed with a key that boot trusts.
 
-  one-time password: ${MOK_PASSWORD:-<the password set when the request was queued>}
+  password: the one you chose when this request was queued.
 
 At the blue "MOK management" screen: Enroll MOK -> Continue -> Yes -> type the
 password -> Reboot.  (MOK manager reboots by itself when it is done; that is
@@ -353,7 +362,8 @@ the array, that boot cannot complete at all.  Recovery is that same screen on
 the following boot, or:
 
   sudo mokutil --import ${MOK_CERT}
-  sudo reboot
+
+then reboot whenever you choose to — the request waits until you do.
 
 This requires the boot chain to go through shim (the default on Ubuntu/Debian
 and Fedora).  A kernel booted by firmware directly through its own EFI stub
@@ -368,7 +378,6 @@ EOF
 # Sets, for the caller:
 #   MOK_SIGNING         1 when DKMS is configured to sign with MOK_KEY/MOK_CERT
 #   MOK_ENROLL_PENDING  1 when the next boot must complete a MOK enrolment
-#   MOK_PASSWORD        the enrolment password (empty when already queued)
 #   MOK_KEY / MOK_CERT  the pair in use
 #
 # Returns non-zero only when the module would end up unsigned on a Secure-Boot-

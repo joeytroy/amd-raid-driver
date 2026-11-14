@@ -35,6 +35,22 @@ fi
 
 . "$SRC_DIR/scripts/lib/secure-boot.sh"
 
+# A DELETE tears the volume's gendisk down asynchronously, so `rmmod` issued
+# right after the writer returns can lose the race with the block-device
+# release and fail "Module rcraid is in use" while /proc/modules already shows
+# refcount 0 (seen 2026-11-14 immediately after `rxp2adm create`).  Retrying
+# beats telling the operator to reboot a live session whose array was just
+# created: the metadata is on the disks and the volume only needs re-probing.
+unload_rcraid() {
+    local i
+
+    for i in 1 2 3 4 5 6 7 8 9 10; do
+        rmmod rcraid 2>/dev/null && return 0
+        sleep 1
+    done
+    return 1
+}
+
 # Secure Boot has to be off for the live session, and that is a property of
 # where this script runs rather than an oversight: the live kernel refuses
 # unsigned out-of-tree modules, and the only key that could sign this
@@ -72,15 +88,50 @@ sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends -qq b
 
 echo "🛠️  Step 2: Invoking Makefile tree compilation..."
 make -C "$SRC_DIR" clean all
+# The control CLI carries the driver's own metadata writer, which is what
+# stamps a level the offline encoder (mkmeta.py) cannot produce.
+make -C "$SRC_DIR" rxp2adm
+
+# A re-run must not need a manual teardown.  An earlier run — or an array still
+# assembled from it — leaves rcraid loaded with the members bound to rcbottom,
+# which hides them from lsblk (so the picker would see no disks) and makes
+# insmod fail with "File exists".  Unstack that here; the RAIDCore metadata on
+# the disks is not touched, so the picker can still find it and reuse it.
+# Read /proc/modules directly: `lsmod | grep -q` under `set -o pipefail` is a
+# race — grep exits at the first match, lsmod dies of SIGPIPE with status 141,
+# and pipefail makes this condition false even though the module is loaded.
+# That is exactly how a re-run used to skip the unload and then see no disks.
+if grep -q '^rcraid' /proc/modules; then
+    echo "♻️  Unloading the rcraid instance left by an earlier run..."
+    for link in /sys/bus/pci/drivers/rcbottom/*; do
+        [ -e "$link" ] || continue
+        bdf=$(basename "$link")
+        case "$bdf" in
+            [0-9a-f][0-9a-f][0-9a-f][0-9a-f]:*) ;;
+            *) continue ;;
+        esac
+        echo "$bdf" > "/sys/bus/pci/drivers/rcbottom/unbind" 2>/dev/null || true
+        if [ -e "/sys/bus/pci/devices/$bdf/driver_override" ]; then
+            echo "" > "/sys/bus/pci/devices/$bdf/driver_override" 2>/dev/null || true
+        fi
+        echo "$bdf" > "/sys/bus/pci/drivers/nvme/bind" 2>/dev/null || true
+    done
+    if ! unload_rcraid; then
+        echo "❌ rcraid is still in use — something has /dev/rcraid0 open or mounted." >&2
+        echo "   Unmount/close it and re-run. Nothing on the disks was changed." >&2
+        exit 1
+    fi
+    udevadm settle 2>/dev/null || true
+fi
 
 echo "🔍 Step 3: Looking for an array the firmware already created..."
 # The array is normally built in the UEFI RAIDXpert2 utility, which writes the
 # RAIDCore metadata itself — the same records the driver validates and
-# rcraid-bind gates on. When those records are on the disks there is nothing to
-# create here: the member list comes from the disks, not from a menu, and
-# nothing may be stamped over the firmware's records (which would also destroy
-# levels mkmeta.py cannot produce, RAID 5/6 included). The interactive creation
-# path is offered only when no disk carries that metadata at all.
+# rcraid-bind gates on.  Those records are detected here so the picker can offer
+# "keep" and reuse the member list from the disks rather than from a menu.
+# Choosing a level instead is a deliberate re-create: it erases the records and
+# everything written through them.  The menu only lists levels this hardware and
+# the writer can actually create — 0/1/10, and 5 behind parity_create=1.
 RC_MAGIC="52414944436f7265"   # "RAIDCore" at +0x08 of the LBA 0x5000 sector
 FW_MEMBERS=""
 for disk in $(lsblk -dno NAME,TYPE | awk '$2 == "disk" && $1 ~ /^nvme/ { print $1 }'); do
@@ -92,37 +143,64 @@ for disk in $(lsblk -dno NAME,TYPE | awk '$2 == "disk" && $1 ~ /^nvme/ { print $
 done
 FW_MEMBERS="${FW_MEMBERS# }"
 
+# The level picker runs whether or not the disks already carry an array.  With
+# records present it gains a "keep" entry that installs onto them untouched;
+# picking a level re-creates the array, which is the operator's call to make.
+TUI_HAS_EXISTING_ARRAY=0
+TUI_EXISTING_MEMBERS=""
 if [ -n "$FW_MEMBERS" ]; then
-    SELECTED_DRIVES="$FW_MEMBERS"
-    RAID_LEVEL="firmware"
-    echo "✅ Existing array found — members: ${SELECTED_DRIVES}"
-    echo "   Level and geometry come from the RAIDCore metadata already on those"
-    echo "   disks; nothing is written to them. Change the array in the UEFI utility."
-else
-    echo "⚠️  No RAIDCore metadata on any disk, so there is no array to install onto."
-    echo "   Arrays are normally created in the UEFI RAIDXpert2 utility, which"
-    echo "   writes this metadata. Only continue if you mean to create RAID 0/1 on"
-    echo "   blank disks here — that writes fresh metadata over what is on them."
-    CREATE_ARRAY="${RCRAID_CREATE_ARRAY:-}"
-    if [ -z "$CREATE_ARRAY" ] && [ -t 0 ]; then
-        read -rp "Create an array on blank disks instead? [y/N] " _mk
-        case "$_mk" in
-            [yY]*) CREATE_ARRAY=1 ;;
-            *)     CREATE_ARRAY=0 ;;
-        esac
-    fi
-    if [ "$CREATE_ARRAY" != 1 ]; then
-        echo "❌ Create the array in the UEFI RAID utility, then re-run this script." >&2
-        echo "   (Non-interactive runs: RCRAID_CREATE_ARRAY=1 to create RAID 0/1 here.)" >&2
+    TUI_HAS_EXISTING_ARRAY=1
+    TUI_EXISTING_MEMBERS="$FW_MEMBERS"
+    export TUI_HAS_EXISTING_ARRAY TUI_EXISTING_MEMBERS
+    echo "✅ Existing array found — members: ${FW_MEMBERS}"
+    echo "   Its level and geometry come from the RAIDCore metadata on those disks."
+fi
+
+# The level menu is the driver's answer, not a list kept here: the writer takes
+# RAID 0/1/10 unconditionally (rc_volume_create_array_indexed), and RAID 5 only
+# behind the parity_create gate, which is therefore the knob to look for in the
+# module this build produced; a level the writer has no path for never appears.
+TUI_LEVELS="0 1 10"
+# No `grep -q` here for the same reason: it would SIGPIPE cut and, with
+# pipefail, hide the parity_create parameter from an otherwise fine module.
+if modinfo -F parm "$SRC_DIR/rcraid.ko" 2>/dev/null | cut -d: -f1 \
+        | grep -x parity_create >/dev/null; then
+    TUI_LEVELS="$TUI_LEVELS 5"
+fi
+export TUI_LEVELS
+echo "🔎 Driver reports creatable levels: ${TUI_LEVELS}"
+
+echo "🖥️  Step 3: Launching interactive Terminal GUI wizard configuration pass..."
+TUI_ENV_FILE=$(mktemp)
+export TUI_ENV_FILE
+"$SRC_DIR/scripts/phase1-tui.sh"
+# shellcheck source=/dev/null  # temp file created just above
+. "$TUI_ENV_FILE"
+rm -f "$TUI_ENV_FILE"
+
+if [ "$RAID_LEVEL" = "keep" ]; then
+    if [ -z "$TUI_EXISTING_MEMBERS" ]; then
+        echo "❌ No array is on the disks, so there is nothing to keep." >&2
         exit 1
     fi
-    echo "🖥️  Step 3: Launching interactive Terminal GUI wizard configuration pass..."
-    TUI_ENV_FILE=$(mktemp)
-    export TUI_ENV_FILE
-    "$SRC_DIR/scripts/phase1-tui.sh"
-    # shellcheck source=/dev/null  # temp file created just above
-    . "$TUI_ENV_FILE"
-    rm -f "$TUI_ENV_FILE"
+    SELECTED_DRIVES="$TUI_EXISTING_MEMBERS"
+    RAID_LEVEL="firmware"
+    CREATE_WITH_DRIVER=0
+else
+    # The menu offers the levels this hardware and writer can create: 0/1/10, and
+    # 5 only behind parity_create=1.  Anything else is refused here rather than
+    # after the disks have been committed.
+    case "$RAID_LEVEL" in
+        0|1|10|5) ;;
+        *)
+            echo "❌ Unsupported RAID level '${RAID_LEVEL}'." >&2
+            exit 1 ;;
+    esac
+    CREATE_WITH_DRIVER=1
+    if [ -n "$TUI_EXISTING_MEMBERS" ]; then
+        echo "♻️  RAID ${RAID_LEVEL} replaces the array currently on those disks:"
+        echo "    its records, and everything written through it, are erased."
+    fi
 fi
 
 clear
@@ -140,21 +218,16 @@ echo "----------------------------------------------------------------------"
 if [ "$RAID_LEVEL" = "firmware" ]; then
     echo "📝 Step 1: Using the firmware's RAIDCore records — nothing written to the disks."
 else
-# Real metadata pass.  scripts/qemu-test/mkmeta.py is the only writer in the
-# tree that produces a block rc_nvme_read_validate_metadata() accepts: the
-# RC_MetaData sector at LBA 0x5000 (magic "RAIDCore", version 0x00030000 and
-# the XOR-lane-shuffle checksum), the config-commit block at 0x5001, and the
-# config ring at 0x5800 carrying the LD record plus its element array.  An
-# earlier revision stamped 4 bytes (0x25BD + level) here and then printed
-# "[Matches: OK]" without comparing anything; no parser can validate that.
-echo "📝 Step 1: Writing RAIDCore metadata onto block storage targets..."
-case "$RAID_LEVEL" in
-    0) MKMETA_LEVEL="raid0" ;;
-    1) MKMETA_LEVEL="raid1" ;;
-    *) echo "❌ RAID ${RAID_LEVEL} metadata cannot be written from Linux yet." >&2
-       echo "   mkmeta.py covers RAID0 and RAID1 only — create RAID ${RAID_LEVEL} in firmware RAIDXpert2." >&2
-       exit 1 ;;
-esac
+# Bootstrap pass, not the final one.  The driver's CREATE (rxp2adm) refuses a
+# member whose metadata is not already valid: it stamps the LD record over the
+# DeviceIDs it reads back, and a blank disk has none.  So mkmeta.py writes just
+# enough for the driver to bind and identify the members — the RC_MetaData
+# sector at LBA 0x5000 (magic "RAIDCore", version 0x00030000, XOR-lane-shuffle
+# checksum), the config-commit block at 0x5001 and the config ring at 0x5800 —
+# always as RAID 0, which is the one geometry valid for every member count.
+# The requested level is written afterwards by the driver's own writer.
+echo "📝 Step 1: Bootstrapping member DeviceIDs so the driver can stamp the array..."
+MKMETA_LEVEL="raid0"
 
 MEMBER_PATHS=""
 for disk in $SELECTED_DRIVES; do
@@ -165,6 +238,18 @@ for disk in $SELECTED_DRIVES; do
         exit 1
     fi
 done
+
+# Replacing an array: clear the records it left behind first, so the bootstrap
+# does not land on top of a config ring that still describes the old geometry.
+# This is the re-create the operator chose in the level menu, so the erase of
+# the old array's partitions is intended here.
+if [ -n "$FW_MEMBERS" ]; then
+    echo "🧹 Step 1a: Clearing the previous array's RAIDCore records..."
+    for disk in $SELECTED_DRIVES; do
+        sudo dd if=/dev/zero of="/dev/$disk" bs=1M seek=10 count=2 oflag=direct status=none
+        echo "    • /dev/$disk: metadata window zeroed"
+    done
+fi
 
 # shellcheck disable=SC2086  # member order IS the on-disk position order
 if ! MKMETA_OUT=$(sudo python3 "$SRC_DIR/scripts/qemu-test/mkmeta.py" \
@@ -194,7 +279,12 @@ echo "🔌 Step 2: Extracting PCIe hardware BDF trees and breaking generic gener
 MEMBER_BDFS=""
 for disk in $SELECTED_DRIVES; do
     if [ -e "/sys/block/$disk/device" ]; then
-        bdf=$(basename "$(readlink -f "/sys/block/$disk/device")" 2>/dev/null || echo "")
+        # /sys/block/nvme0n1/device resolves to the NVMe controller
+        # (.../0000:03:00.0/nvme/nvme0), so its basename is "nvme0" and not
+        # the PCI address rcraid binds to.  The address is an ancestor on that
+        # path; take the last BDF-shaped component of it.
+        bdf=$(printf '%s' "$(readlink -f "/sys/block/$disk/device" 2>/dev/null)" \
+              | grep -oE '[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-9a-f]' | tail -1 || true)
         if [ -n "$bdf" ] && [ -e "/sys/bus/pci/devices/$bdf" ]; then
             MEMBER_BDFS="$MEMBER_BDFS $bdf"
             echo "    • Found PCIe Component: Slot $disk maps to BDF Address $bdf"
@@ -206,14 +296,29 @@ for disk in $SELECTED_DRIVES; do
 done
 MEMBER_BDFS="${MEMBER_BDFS# }"
 
-SUBSYSTEM_VENDOR="0x1022"
+SUBSYSTEM_VENDOR=""
 if [ -n "$MEMBER_BDFS" ]; then
-    SUBSYSTEM_VENDOR=$(cat "/sys/bus/pci/devices/$(echo $MEMBER_BDFS | awk '{print $1}')/subsystem_vendor" 2>/dev/null || echo "0x1022")
+    SUBSYSTEM_VENDOR=$(cat "/sys/bus/pci/devices/$(echo $MEMBER_BDFS | awk '{print $1}')/subsystem_vendor" 2>/dev/null || true)
+fi
+# safe_subsys_vendor is a probe *filter*, and 0 disables it (rc_bottom.c).
+# Never pass a guessed vendor the members do not report: on a board whose
+# subsystem vendor is the board maker's (0x1987 on this array box) a guessed
+# 0x1022 makes probe skip every member and no volume ever assembles.
+if [ -z "$SUBSYSTEM_VENDOR" ]; then
+    SUBSYSTEM_VENDOR=0
+    echo "    • WARN: the members' subsystem_vendor could not be read; loading rcraid without the probe filter."
 fi
 
 echo "📥 Step 3: Injecting compiled out-of-tree module (rcraid.ko) with active developer override flags..."
-echo "    • Parameters: enable_writes=1 safe_subsys_vendor=${SUBSYSTEM_VENDOR}"
-insmod "$SRC_DIR/rcraid.ko" enable_writes=1 "safe_subsys_vendor=$SUBSYSTEM_VENDOR"
+# RAID 5 needs both opt-ins at load time: parity_create=1 lets the writer emit a
+# 0x1BF5 record, and parity_writes=1 is what makes the volume writable so an OS
+# install can proceed at all.  Neither initialises data or parity.
+LOAD_PARAMS=(enable_writes=1 "safe_subsys_vendor=$SUBSYSTEM_VENDOR")
+if [ "$RAID_LEVEL" = 5 ]; then
+    LOAD_PARAMS+=(parity_create=1 parity_writes=1)
+fi
+echo "    • Parameters: ${LOAD_PARAMS[*]}"
+insmod "$SRC_DIR/rcraid.ko" "${LOAD_PARAMS[@]}"
 
 if [ -n "$MEMBER_BDFS" ]; then
     echo "⚡ Step 4: Forcing hardware bus probes across unchained PCIe ports..."
@@ -223,17 +328,66 @@ if [ -n "$MEMBER_BDFS" ]; then
     done
 fi
 
-echo "🔍 Step 5: Waiting for the driver validation matrix to instantiate /dev/rcraid0..."
-udevadm settle 2>/dev/null || true
-for i in {1..20}; do
-    if [ -b /dev/rcraid0 ]; then
-        break
-    fi
-    echo "    • [Attempt $i/20] Scanning device mapping nodes..."
-    sleep 0.5
-done
+# Wait for the driver to publish the volume node.  Needed twice on the create
+# path: once for the bootstrap array whose DeviceIDs the writer reads back, and
+# once for the array that replaces it.
+wait_for_volume() {
+    local i
+    udevadm settle 2>/dev/null || true
+    for i in {1..20}; do
+        [ -b /dev/rcraid0 ] && return 0
+        echo "    • [Attempt $i/20] Scanning device mapping nodes..."
+        sleep 0.5
+    done
+    return 1
+}
 
-if [ ! -b /dev/rcraid0 ]; then
+if [ "${CREATE_WITH_DRIVER:-0}" = 1 ]; then
+    echo "📝 Step 4: Creating RAID ${RAID_LEVEL} through the driver's writer (rxp2adm)..."
+    if ! wait_for_volume; then
+        echo "❌ The bootstrap array never assembled, so the driver has no member" >&2
+        echo "   DeviceIDs to stamp. Only the bootstrap metadata was written." >&2
+        exit 1
+    fi
+    RXP2ADM="$SRC_DIR/.rxp2adm/rxp2adm"
+    if [ ! -x "$RXP2ADM" ]; then
+        echo "❌ rxp2adm was not built ($RXP2ADM missing)." >&2
+        exit 1
+    fi
+    echo "    • before:"
+    "$RXP2ADM" list | sed 's/^/      /'
+    # DELETE returns the members to the free pool and tears the volume down;
+    # CREATE refuses while one is assembled, so this order is required.
+    "$RXP2ADM" delete -a 0
+    FREE_IDX=$("$RXP2ADM" list | awk '
+        /^Disks/  { on = 1; next }
+        /^Arrays/ { on = 0; next }
+        on && $2 == "free" { print $1 }')
+    N_FREE=$(echo "$FREE_IDX" | wc -w)
+    N_SEL=$(echo "$SELECTED_DRIVES" | wc -w)
+    if [ "$N_FREE" -ne "$N_SEL" ]; then
+        echo "❌ The driver reports $N_FREE free member(s) but $N_SEL were selected." >&2
+        echo "   Refusing to stamp a set that does not match the selection." >&2
+        exit 1
+    fi
+    # shellcheck disable=SC2086  # the index list must split into separate args
+    "$RXP2ADM" create -l "$RAID_LEVEL" -d $FREE_IDX
+    # CREATE persists metadata only; the volume appears when the driver next
+    # assembles it, so reload here instead of leaving the operator to reboot.
+    if ! unload_rcraid; then
+        echo "❌ rcraid would not unload, so the new array cannot be assembled" >&2
+        echo "   without a reboot. RAID ${RAID_LEVEL} metadata is on the disks;" >&2
+        echo "   reboot the live session and re-run this script to continue." >&2
+        exit 1
+    fi
+    insmod "$SRC_DIR/rcraid.ko" "${LOAD_PARAMS[@]}"
+    for bdf in $MEMBER_BDFS; do
+        echo "$bdf" > /sys/bus/pci/drivers_probe 2>/dev/null || true
+    done
+fi
+
+echo "🔍 Step 5: Waiting for the driver validation matrix to instantiate /dev/rcraid0..."
+if ! wait_for_volume; then
     echo "❌ Critical Failure: /dev/rcraid0 did not appear." >&2
     echo "   No member was accepted, or the firmware has no array. Check:" >&2
     echo "     dmesg | grep -i 'rcraid\|rc_volume'" >&2
@@ -249,10 +403,46 @@ lsblk /dev/rcraid0
 # writable volume, and whether this one is writable depends on the level and
 # geometry the driver read out of the firmware's records — not on the level
 # anyone meant to create.
-RO_STATE="$(cat /sys/block/rcraid0/ro 2>/dev/null || echo unknown)"
-VOL_LEVEL="$(dmesg 2>/dev/null | grep -o '(level=[A-Za-z0-9]*)' | tail -1 | tr -d '()')"
-VOL_LEVEL="${VOL_LEVEL#level=}"
-[ -n "$VOL_LEVEL" ] || VOL_LEVEL="unknown"
+# Read it from debugfs, which describes the volume assembled right now: dmesg
+# keeps every assembly of this boot, so parsing it can answer with the level of
+# an array that has since been replaced.
+read_volume_state() {
+    RO_STATE="$(cat /sys/block/rcraid0/ro 2>/dev/null || echo unknown)"
+    VOL_LEVEL="$(sed -n 's/^level:[[:space:]]*//p' \
+                  /sys/kernel/debug/rcraid/volume 2>/dev/null | head -1)"
+    if [ -z "$VOL_LEVEL" ]; then
+        VOL_LEVEL="$(dmesg 2>/dev/null | grep -o '(level=[A-Za-z0-9]*)' \
+                     | tail -1 | tr -d '()' || true)"
+        VOL_LEVEL="${VOL_LEVEL#level=}"
+    fi
+    VOL_LEVEL="${VOL_LEVEL^^}"
+    [ -n "$VOL_LEVEL" ] || VOL_LEVEL="unknown"
+}
+read_volume_state
+
+# A RAID 5 array this script did not create — the UEFI utility's, or one left on
+# the disks by an earlier run — assembles with parity writes off: parity_writes
+# is only in LOAD_PARAMS when this script is the one creating level 5.  An
+# install needs the volume writable, so re-load once with the opt-in instead of
+# sending the operator back to the firmware.  Loading with it writes nothing;
+# the flag only permits writes *through* the volume afterwards.
+if [ "$RO_STATE" != "0" ] && [ "$VOL_LEVEL" = "RAID5" ]; then
+    echo "🔁 RAID 5 assembled read-only (parity writes default off) — re-loading rcraid with parity_writes=1..."
+    if ! unload_rcraid; then
+        echo "❌ rcraid would not unload, so the volume cannot be re-loaded with parity" >&2
+        echo "   writes enabled. Reboot the live session and re-run this script." >&2
+        exit 1
+    fi
+    insmod "$SRC_DIR/rcraid.ko" "${LOAD_PARAMS[@]}" parity_writes=1
+    for bdf in $MEMBER_BDFS; do
+        echo "$bdf" > /sys/bus/pci/drivers_probe 2>/dev/null || true
+    done
+    if ! wait_for_volume; then
+        echo "❌ The array did not re-assemble after enabling parity writes." >&2
+        exit 1
+    fi
+    read_volume_state
+fi
 
 if [ "$RO_STATE" = "0" ]; then
     echo "✅ Volume is WRITABLE (level ${VOL_LEVEL}) — the OS installer can use it."
@@ -260,10 +450,10 @@ else
     echo "❌ Volume is READ-ONLY (level ${VOL_LEVEL}, ro=${RO_STATE}) — an OS install"
     echo "   cannot proceed on it."
     case "$VOL_LEVEL" in
-        RAID5|RAID6)
-            echo "   This driver has no parity write path (issue #6), so RAID 5/6 volumes"
-            echo "   are forced read-only. Recreate the array as RAID 0 or RAID 1 in the"
-            echo "   UEFI RAIDXpert2 utility, then re-run this script."
+        RAID5)
+            echo "   RAID 5 writes need parity_writes=1, which this script passes, and the"
+            echo "   driver still refuses. The veto it logged is above:"
+            dmesg 2>/dev/null | grep -i "READ-ONLY\|UNTRUSTED\|parity" | tail -3 | sed 's/^/     /'
             ;;
         *)
             echo "   The driver refused writes for this level/geometry; dmesg says why:"
@@ -277,13 +467,33 @@ echo "======================================================================"
 echo "➡️  Open your graphical Kubuntu installer desktop app now."
 echo "➡️  Target /dev/rcraid0 under manual partitioning, map root, and let files copy."
 echo "======================================================================"
+
+# The final Calamares job (calamares-logs-helper) copies /var/log/casper.log
+# into the target.  That file only exists on a casper live boot; launched from
+# an installed system the copy fails and Calamares reports "Installation
+# Failed" *after* a complete, bootable install.  Give it something to copy.
+[ -e /var/log/casper.log ] || sudo touch /var/log/casper.log
+
 read -rp "Press [Enter] ONLY when the graphical OS installer finishes copying file sectors... " _
 
 echo "==> [3/3] Mapping Mount Bridges and Diving Inside the Target OS..."
+# Partition nodes appear a moment after the volume node, and every probe below
+# iterates /dev/rcraid0p*: without this wait an immediate phase 3 reports "no
+# rootfs on the array" while the filesystem is sitting right there.
+for _ in {1..20}; do
+    ls /dev/rcraid0p* >/dev/null 2>&1 && break
+    sleep 0.5
+done
+
 for _part in /dev/rcraid0 /dev/rcraid0p*; do
     [ -b "$_part" ] || continue
-    mapfile -t mps < <(findmnt -nro TARGET --source "$_part" 2>/dev/null || true)
-    for mp in "${mps[@]}"; do [ -n "$mp" ] && sudo umount -R "$mp" 2>/dev/null || true; done
+    # One mount point per line: an empty array expanded as "${mps[@]}" trips
+    # `set -u` on some bash builds, and there is usually nothing mounted here
+    # anyway, so the loop would abort on the normal path.
+    while IFS= read -r mp; do
+        [ -n "$mp" ] || continue
+        sudo umount -R "$mp" 2>/dev/null || true
+    done < <(findmnt -nro TARGET --source "$_part" 2>/dev/null || true)
 done
 
 PROBE_DIR=$(mktemp -d)
@@ -390,6 +600,7 @@ set -euo pipefail
 
 VER="$1"
 SUBSYS="$2"
+VOL_LEVEL_ARG="${3:-}"
 . /tmp/pkg/lib/secure-boot.sh
 
 export DEBIAN_FRONTEND=noninteractive
@@ -405,7 +616,6 @@ apt-get install -y -qq build-essential "linux-headers-$KVER" dkms \
 # before that kernel, so it is trusted the first time it is loaded).
 MOK_SIGNING=0
 MOK_ENROLL_PENDING=0
-MOK_PASSWORD="${RCRAID_MOK_PASSWORD:-}"
 MOK_KEY=""
 MOK_CERT=""
 if [ "${RCRAID_TARGET_MOK:-0}" = 1 ]; then
@@ -439,6 +649,17 @@ sed "s/@SUBSYSTEM_VENDOR@/$SUBSYS/g" \
     /tmp/pkg/packaging/udev/50-rcraid.rules.in > /etc/udev/rules.d/50-rcraid.rules
 sed "s/@SUBSYSTEM_VENDOR@/$SUBSYS/g" \
     /tmp/pkg/packaging/modprobe.d/rcraid.conf.in > /etc/modprobe.d/rcraid.conf
+# A RAID 5/6 volume is forced read-only unless parity_writes=1 is set at load
+# time (rc_volume_create_disk: enable_writes alone is not enough), and root
+# cannot mount read-write on a read-only volume — the install would not boot.
+# Persist the opt-in with the other options, before the initramfs is rebuilt,
+# so the copy that modprobe reads from the initrd carries it too.
+case "$VOL_LEVEL_ARG" in
+    RAID5|RAID6)
+        sed -i 's/^\(options[[:space:]]\+rcraid[[:space:]]\+\)/\1parity_writes=1 /' \
+            /etc/modprobe.d/rcraid.conf
+        ;;
+esac
 install -m 0755 /tmp/pkg/packaging/initramfs-tools/hooks/rcraid \
     /etc/initramfs-tools/hooks/rcraid
 # Hold kernel packages out of unattended-upgrades: a kernel update that
@@ -474,18 +695,18 @@ if [ "$MOK_SIGNING" = 1 ] && ! mok_is_enrolled "$MOK_CERT"; then
         echo "Could not queue the MOK enrolment for the target system." >&2
         exit 1
     fi
-    echo "    • MOK enrolment queued (password for the next boot: $MOK_PASSWORD)"
+    echo "    • MOK enrolment queued — the MOK screen asks for the password you entered"
 fi
 
 {
     echo "MOK_SIGNING=$MOK_SIGNING"
     echo "MOK_ENROLL_PENDING=$MOK_ENROLL_PENDING"
     echo "MOK_CERT=$MOK_CERT"
-    echo "MOK_PASSWORD=$MOK_PASSWORD"
 } > /tmp/pkg/mok-state
 EOS
 
-chroot "$TARGET_MNT" /bin/bash /tmp/pkg/rcraid-target.sh "$TGT_VER" "$SUBSYSTEM_VENDOR"
+chroot "$TARGET_MNT" /bin/bash /tmp/pkg/rcraid-target.sh \
+    "$TGT_VER" "$SUBSYSTEM_VENDOR" "$VOL_LEVEL"
 
 # Carry the signing outcome back out of the chroot for the closing message.
 mok_state_reset
@@ -494,10 +715,49 @@ mok_load_state "$MOK_STATE"
 rm -f "$MOK_STATE"
 
 if [ -n "$ESP_DEV" ] && [ -d "$TARGET_MNT/boot/efi/EFI" ]; then
-    mkdir -p "$TARGET_MNT/boot/efi/EFI/BOOT"
-    cp "$TARGET_MNT/boot/efi/EFI/$target_os/shimx64.efi" "$TARGET_MNT/boot/efi/EFI/BOOT/BOOTX64.EFI" 2>/dev/null || true
-    cp "$TARGET_MNT/boot/efi/EFI/$target_os/grubx64.efi" "$TARGET_MNT/boot/efi/EFI/BOOT/" 2>/dev/null || true
-    efibootmgr -c -d "${ESP_DEV%p*}" -p "${ESP_DEV##*p}" -L "rcraid Array Boot" -l "\\EFI\\BOOT\\BOOTX64.EFI" >/dev/null 2>&1 || true
+    ESP_DIR="$TARGET_MNT/boot/efi"
+    ESP_OS_DIR="$ESP_DIR/EFI/$target_os"
+    mkdir -p "$ESP_DIR/EFI/BOOT"
+    # The removable-media path, independent of the install's own directory
+    # name: firmware falls back to it when the NVRAM entry is lost or absent.
+    if [ -e "$ESP_OS_DIR/shimx64.efi" ]; then
+        cp "$ESP_OS_DIR/shimx64.efi" "$ESP_DIR/EFI/BOOT/BOOTX64.EFI" || true
+        cp "$ESP_OS_DIR/grubx64.efi" "$ESP_DIR/EFI/BOOT/" || true
+    else
+        echo "⚠️  $ESP_OS_DIR/shimx64.efi is missing — the firmware entry points at" >&2
+        echo "    EFI/BOOT/BOOTX64.EFI, which only works if that fallback exists." >&2
+    fi
+    # grub-install writes the bootloader to the array's ESP, but the firmware
+    # only boots what its own NVRAM menu lists.  That entry is ours to create,
+    # and it has to be *verified*: `efibootmgr -c ... || true` was silent when
+    # it failed, which is exactly how an install ends with a complete ESP and
+    # no array in the boot menu (2026-11-14: shim+grub present on rcraid0p1,
+    # no Boot#### referencing its PARTUUID 69818327-...).
+    if ! efibootmgr -c -d "${ESP_DEV%p*}" -p "${ESP_DEV##*p}" \
+            -L "rcraid Array Boot" -l '\EFI\BOOT\BOOTX64.EFI' >/dev/null; then
+        echo "❌ efibootmgr could not add the array to the firmware boot menu." >&2
+        echo "   The ESP is written; add the entry by hand:" >&2
+        echo "     sudo efibootmgr -c -d ${ESP_DEV%p*} -p ${ESP_DEV##*p} -L 'rcraid Array Boot' -l '\EFI\BOOT\BOOTX64.EFI'" >&2
+        exit 1
+    fi
+    if ! efibootmgr -v | grep -q "rcraid Array Boot"; then
+        echo "❌ efibootmgr reported success but no 'rcraid Array Boot' entry is" >&2
+        echo "   present. Do not pull any other disk until this is fixed." >&2
+        exit 1
+    fi
+    echo "    • firmware boot entry: 'rcraid Array Boot' -> ${ESP_DEV}"
+else
+    # Silent here meant an install that looked complete and had no array in the
+    # firmware menu: the entry is the only thing that makes the firmware boot
+    # the array, so a missing ESP has to stop the install, not be skipped.
+    echo "❌ No EFI system partition to put the boot entry on." >&2
+    echo "   ESP found on /dev/rcraid0p*: '${ESP_DEV:-none}'" >&2
+    echo "   EFI directory under $TARGET_MNT/boot/efi: $([ -d "$TARGET_MNT/boot/efi/EFI" ] && echo present || echo missing)" >&2
+    echo "   Looked for PARTTYPE c12a7328-f81f-11d2-ba4b-00a0c93ec93b on the" >&2
+    echo "   array's partitions. The OS is installed; only the firmware menu" >&2
+    echo "   entry is missing. Add it once an ESP exists:" >&2
+    echo "     sudo efibootmgr -c -d /dev/rcraid0 -p <esp-partnum> -L 'rcraid Array Boot' -l '\\EFI\\BOOT\\BOOTX64.EFI'" >&2
+    exit 1
 fi
 
 umount -R "$TARGET_MNT" 2>/dev/null || true
@@ -515,4 +775,4 @@ if [ "$MOK_SIGNING" = 1 ] && [ "$MOK_ENROLL_PENDING" = 1 ]; then
     echo
 fi
 
-echo -e "\n🎉 DONE! The fresh bare-metal PC is 100% prepped. Run 'sudo reboot' to launch your array!"
+echo -e "\n🎉 DONE! The fresh bare-metal PC is 100% prepped. Reboot whenever you choose to launch your array."

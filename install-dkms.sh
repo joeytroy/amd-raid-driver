@@ -190,7 +190,7 @@ if [ "$MOK_SIGNING" = 1 ]; then
     if [ "$MOK_ENROLL_PENDING" = 1 ]; then
         # Printed here as well as at the end: if a later step fails, the
         # enrolment is already queued and the password must not be lost.
-        echo "    MOK enrolment queued for the next boot — password: ${MOK_PASSWORD:-<set when it was queued>}"
+        echo "    MOK enrolment queued for the next boot — the MOK screen asks for the password you entered"
     fi
     echo
 fi
