@@ -241,6 +241,9 @@ def counts_for(level: str, members: int):
         return 1, 2
     if level == "raid5":
         return 1, members
+    if level == "raid10":
+        # 2-way mirrors, so half the members are stripe columns.
+        return members // 2, 2
     raise ValueError(level)
 
 
@@ -391,6 +394,9 @@ def main():
         sys.exit("mkmeta: raid1 wants exactly 2 members")
     if args.level == "raid5" and len(args.images) < 3:
         sys.exit("mkmeta: raid5 wants at least 3 members")
+    if args.level == "raid10" and (len(args.images) < 4 or
+                                   len(args.images) % 2):
+        sys.exit("mkmeta: raid10 wants an even number of members, >= 4")
     if len(args.images) < 2:
         sys.exit("mkmeta: need at least 2 member images")
 
@@ -423,6 +429,10 @@ def main():
         # One member's worth is parity; the driver's capacity cross-check
         # derives data_cols = devices - 1 for parity levels.
         capacity = user_size * (len(args.images) - 1)
+    elif args.level == "raid10":
+        # Every column is a 2-way mirror, so only the columns add capacity
+        # (the driver cross-checks capacity == user_size x FirstCount).
+        capacity = user_size * (len(args.images) // 2)
     else:  # raid1
         capacity = user_size
 
