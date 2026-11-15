@@ -86,6 +86,34 @@ The sections below are the dated implementation log — how each piece was built
 kept for forensics. Where an early "Not started" / "Next steps" note has since
 been implemented, it's marked.
 
+## 2026-11-14 — First bare-metal boot from the array
+
+The live-session install path now produces a machine that boots from
+`/dev/rcraid0` on real hardware, not only under QEMU. The 4-member
+firmware-created RAID 0 (`0x1bf6`, 1024 KiB stripe, 14.55 TiB) was installed
+from the live USB (Calamares root, then the script's finish-the-target phase)
+and rebooted:
+
+- UEFI booted `Boot0000` on `rcraid0p2` — the array's own ESP. Its partition
+  GUID matches `blkid`'s `PARTUUID` for `rcraid0p2`, so the firmware's RAID
+  stack presented the array as a boot disk and served GRUB from it.
+- GRUB loaded `vmlinuz-7.3.0-10-generic` and the initramfs from the XFS root
+  on `rcraid0p1`. That initramfs carries `rcraid.ko.zst`, `rcraid-bind`,
+  `50-rcraid.rules` and `rcraid.conf`.
+- `rcraid` loaded at 3.757 s, and the four real `1022:B000` functions
+  assembled into `/dev/rcraid0` read-write at 3.979 s (`enable_writes=1`,
+  no `allow_foreign_nvme`).
+- XFS mounted `/` clean at 34.34 s; `systemctl --failed` was empty.
+
+The installed tree persisted across the reboot, so this is not the QEMU
+snapshot result. Remaining limits: only RAID 0 has had a hardware boot
+(RAID 1/10/5 are QEMU-only), and a driver-created array still cannot be
+firmware-booted because it is absent from firmware configuration. The
+installer USB was still attached with its ESP first in `BootOrder`, so this
+boot reached the array by fall-through or manual selection; set the array
+first before calling unattended reboot tested. Details and evidence in
+[`VALIDATION_OSINSTALL.md`](VALIDATION_OSINSTALL.md).
+
 ## 2026-11-14 — The live installer stops creating arrays; the TUI is removed
 
 `install-livecd.sh` used to fall back to an interactive array builder whenever no
@@ -1438,9 +1466,9 @@ caveats (payload, not the graphical installer) and per-level screenshots:
 All four installed roots also boot: attached as the guest's only disk with the
 host 7.3.0-10 kernel/initrd, each reached `getty.target` and a login prompt
 with the filesystem mounted read-write. That exercises the data, not the
-driver at boot — the guest sees the array through virtio, and no initramfs in
-this tree embeds `rcraid.ko`, so a firmware-less boot chain for `/dev/rcraid0`
-remains untested.
+driver at boot — the guest sees the array through virtio. The driver-in-boot
+path is the separate bare-metal run above; a firmware-less boot of a
+driver-created array for `/dev/rcraid0` remains untested.
 
 ## 2026-11-14 — partial-row RMW no longer runs off the end of a chunk
 

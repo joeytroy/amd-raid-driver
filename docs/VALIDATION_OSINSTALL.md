@@ -66,11 +66,10 @@ it read-write, reaches `getty.target` and serves a login prompt.
 
 **What it does not prove:** the guest reaches the array through virtio, not
 through `rcraid`. Booting the *driver* at boot time (kernel + initramfs
-carrying `rcraid.ko`, root on `/dev/rcraid0`) is still untested, because no
-initramfs in this tree embeds the module and the firmware cannot boot an
-array the driver presents. The first ISO `initrd` attempt failed for exactly
-that reason — the ISO ships the casper live initramfs, which searches for a
-live medium instead of honouring `root=`.
+carrying `rcraid.ko`, root on `/dev/rcraid0`) is covered separately: see
+"Bare-metal boot from the array" below. The first ISO `initrd` attempt failed
+for the opposite reason — the ISO ships the casper live initramfs, which
+searches for a live medium instead of honouring `root=`.
 
 ## Driver in the boot path (2026-11-13)
 
@@ -120,19 +119,69 @@ Limits of this run:
 - Not a run of the Calamares installer: it is the installer's filesystem
   payload plus the chroot/boot setup, as above.
 
+## Bare-metal boot from the array (2026-11-14)
+
+The first real-hardware boot in which `rcraid` mounts `/`. The array is the
+firmware-created 4-member RAID 0 already described in issue #14
+(`devtype=0x1bf6`, 1024 KiB stripe, 31,251,677,184 sectors); nothing was
+stamped or created by this tree's writers. The OS is the Kubuntu 26.10
+live-session install from the README quick start, on XFS over `rcraid0p1`.
+
+Chain observed on the box after reboot:
+
+1. UEFI boots `Boot0000` ("Kubuntu"), `HD(2,GPT,0a4954a9-9fa8-4b97-b7b6-3691ea1f1956,0x800,0x200000)` — `blkid`/`sgdisk` resolve that GUID to
+   `/dev/rcraid0p2`, the array's own ESP. The firmware's RAID stack therefore
+   presents the array as a boot disk and serves the ESP and GRUB from it. A
+   second entry, `Boot0001` ("rcraid Array Boot", created by
+   `install-livecd.sh`), points at `\EFI\BOOT\BOOTX64.EFI` on the same
+   partition.
+2. GRUB reads `grub.cfg` (`search.fs_uuid 54fc50b2-13d2-407e-8c36-f03afc2b060a`, the XFS root) and loads `vmlinuz-7.3.0-10-generic` and
+   `initrd.img-7.3.0-10-generic` from `rcraid0p1`.
+3. The initramfs built by `/etc/initramfs-tools/hooks/rcraid` carries
+   `rcraid.ko.zst`, `/usr/sbin/rcraid-bind`, `50-rcraid.rules` and
+   `rcraid.conf` (2,558 entries total). `rcraid` loads at 3.757 s, probes the
+   four `1022:B000` functions, and `/dev/rcraid0` comes up read-write at
+   3.979 s.
+4. XFS mounts `/` at 34.33 s — `Mounting V5 Filesystem 54fc50b2-…` then
+   `Ending clean mount` — and `systemctl --failed` reports no failed units.
+   `/proc/cmdline` is `root=UUID=54fc50b2-… ro quiet splash`; systemd remounts
+   it read-write.
+
+What this adds over the QEMU runs: the installed udev rule and `rcraid-bind`
+ran against real `1022:B000` functions (no `allow_foreign_nvme`), and the
+tree that booted persisted on the members across the reboot — it was written
+by the install and read back by this boot, not absorbed by a snapshot.
+
+Caveats:
+
+- `BootOrder` is `0004,0001,0000`: entry `0004` is the installer USB's ESP
+  (partition GUID `56209523-…-b848`), still plugged in. `BootCurrent` is
+  `0000`, so this boot reached the array either by fall-through or by a
+  manual selection. Put the array first (`efibootmgr -o`) or remove the USB
+  before treating an unattended reboot as tested.
+- Only RAID 0 was run this way on hardware. The RAID 1/10/5 installed roots
+  still have QEMU boots only.
+- The array is firmware-created. A driver-created array (this tree's
+  `mkmeta.py` / `rxp2adm`) is absent from firmware configuration, so a
+  firmware-less boot remains untested and out of scope until the config-ring
+  writer can produce firmware-compatible records.
+- Not a Secure Boot run: the boot used the installed module-signing key with
+  firmware Secure Boot off, as the README requires for the live session.
+
 ## What this is not
 
-- Not a run of the Kubuntu installer (Calamares/subiquity). No partition
-  table, bootloader or `apt` stage was exercised; the filesystem was created
-  directly on `/dev/rcraid0` and the root tree copied onto it. An installer
-  run in a guest needs a bootable guest whose initramfs carries `rcraid.ko`,
-  because the stock Ubuntu initramfs does not. A live-session install on the
-  array box is a different run and does exist: see the README quick start and
-  the 2026-11-14 entry in `STATUS.md`.
-- Not a firmware boot: firmware still cannot boot an array this driver
-  presents. The QEMU run above boots the installed root with the driver in the
-  initramfs; the host itself was never rebooted onto the array.
-- Not a firmware-created array: every array here was stamped by this driver.
+- Not a run of the Kubuntu installer (Calamares/subiquity): the payload runs
+  above create the filesystem directly on `/dev/rcraid0` and copy the root
+  tree onto it, so no partition table, bootloader or `apt` stage is
+  exercised. The live-session install is a different run and is what the
+  bare-metal boot above used; see the README quick start.
+- Not a firmware boot of a **driver-created** array. The QEMU runs above
+  boot the installed root with the driver in the initramfs. The array box now
+  does boot a **firmware-created** array end to end on real hardware (next
+  section); an array stamped by this tree's writers is not in the firmware's
+  configuration and has never been firmware-booted.
+- Not a firmware-created array: every array in the QEMU runs above was
+  stamped by this driver.
 
 ## Screenshots
 
