@@ -112,6 +112,47 @@ rebuild and a firmware-created parity array are still unvalidated.
 
 ---
 
+## 📈 Measured Performance — Array Box (2026-11-14)
+
+Throughput measured on this driver's own array box: a **4-member RAID 0**
+(`devtype=0x1bf6`, 1024 KiB stripe, 14.6 TiB usable) of four `1022:B000`
+members, mounted XFS, kernel `7.3.0-10-generic`, driver `9.3.3.00291`
+(build `80e4ebc`).
+
+Method: KDiskMark 3.1.3 from the distribution is GUI-only (no `--tui`, no CLI),
+so its engine was run directly — `fio` with the KDiskMark *Default* profile:
+1 GiB file, 5 passes, `direct=1`, libaio, and
+`buffer_compress_percentage=0` (incompressible data; this stack compresses, so
+fio's default low-entropy buffers report fiction). Two consecutive batteries
+were run, the second after `echo 3 > /proc/sys/vm/drop_caches`.
+
+| Test | Run 1 | Run 2 |
+| --- | --- | --- |
+| SEQ1M Q8T1 read | 12.6 GiB/s | 12.6 GiB/s |
+| SEQ1M Q8T1 write | 11.2 GiB/s | 10.5 GiB/s |
+| SEQ1M Q1T1 read | 6066 MiB/s | 5981 MiB/s |
+| SEQ1M Q1T1 write | 5505 MiB/s | 5559 MiB/s |
+| RND4K Q32T1 read | 1603 MiB/s (≈410k IOPS) | 1607 MiB/s (≈411k IOPS) |
+| RND4K Q32T1 write | 2025 MiB/s (≈518k IOPS) | 2042 MiB/s (≈523k IOPS) |
+| RND4K Q1T1 read | 57.8 MiB/s (≈14.8k IOPS) | 57.8 MiB/s (≈14.8k IOPS) |
+| RND4K Q1T1 write | 244 MiB/s (≈62k IOPS) | 245 MiB/s (≈63k IOPS) |
+
+Random-test IOPS are derived from the 4 KiB bandwidth; everything else is as
+reported by fio.
+
+*   **Repeatability is good.** Every test lands within a few percent across the
+    two runs, so the data path is deterministic under load.
+*   **One asymmetry is open, not explained.** 4 KiB QD1 read is ~4× slower than
+    the equivalent write (≈68 µs vs ≈16 µs per request). It reproduces exactly,
+    so it is a property of this path — but it has not been compared against a
+    raw-member baseline yet, and therefore is **not** attributed to the driver.
+*   **Scope.** These numbers are filesystem-visible XFS throughput through the
+    array with default queue settings (`mq-deadline`, `max_sectors_kb=1024`).
+    They are not comparable to the older Q8 sequential figures in
+    `docs/archive/WORKSTATION_SESSION.md`, which used a different test size.
+
+---
+
 ## 🅐 Quick Start: Fresh OS Installation (From Live USB)
 
 The recommended path for a fresh Ubuntu / Kubuntu / Mint / Fedora install that
