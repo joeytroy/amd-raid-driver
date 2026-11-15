@@ -225,7 +225,7 @@ those disks, and the level is whatever the firmware recorded, RAID 10/5/6
 included. **The array has to exist before this script runs:** with no RAIDCore
 metadata on any disk there is nothing to install onto, and it stops and says
 so rather than writing anything. There are no disk or level menus and no
-install-time creation; the only writer in this tree
+install-time creation; the only userspace writer in this tree
 (`scripts/qemu-test/mkmeta.py`, RAID 0/1 only) exists for the QEMU rig, over
 blank images.
 

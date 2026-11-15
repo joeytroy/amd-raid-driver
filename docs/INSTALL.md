@@ -510,7 +510,7 @@ the script requires: it reads the RAIDCore metadata at LBA `0x5000` and, when
 it finds it, uses exactly those disks as members and writes nothing — the
 level and geometry are the firmware's, RAID 5/6 included. When no disk carries
 that metadata it stops and says so. There is no disk/level menu and no
-install-time array creation: the only writer in this tree
+install-time array creation: the only userspace writer in this tree
 (`scripts/qemu-test/mkmeta.py`) stamps RAID 0/1 metadata over blank disks for
 the QEMU rig, which is not an install path.
 

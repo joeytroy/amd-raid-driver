@@ -105,7 +105,7 @@ rebuild and a firmware-created parity array are still unvalidated.
 
 ## 🚀 Key Production Features
 
-*   **Arrays come from firmware; the driver assembles them.** Every level this driver supports — RAID 0, 1, 10, 5 and 6 — is created in the **UEFI RAIDXpert2 utility** before Linux is installed. The installer reads the RAIDCore metadata at LBA `0x5000`, takes exactly the stamped disks as members, writes nothing to them, and takes the level and geometry from those records. A machine with no firmware array stops with a message saying so: there is **no interactive disk/level menu and no install-time array creation**, because the only writer in this tree (`scripts/qemu-test/mkmeta.py`, RAID 0/1 only) stamps metadata over blank disks for the QEMU rig, where firmware records cannot be produced.
+*   **Arrays come from firmware; the driver assembles them.** Every level this driver supports — RAID 0, 1, 10, 5 and 6 — is created in the **UEFI RAIDXpert2 utility** before Linux is installed. The installer reads the RAIDCore metadata at LBA `0x5000`, takes exactly the stamped disks as members, writes nothing to them, and takes the level and geometry from those records. A machine with no firmware array stops with a message saying so: there is **no interactive disk/level menu and no install-time array creation**, because the only userspace writer in this tree (`scripts/qemu-test/mkmeta.py`, RAID 0/1 only) stamps metadata over blank disks for the QEMU rig, where firmware records cannot be produced.
 *   **Advanced Rootfs Probing:** Phase 2 avoids fragile, hardcoded partition name assumptions. It uses a read-only sandboxed mount-and-probe matrix to peak inside array partitions, locate the genuine system `/etc/os-release`, and seamlessly execute chroot boot configurations on any distribution setup.
 *   **Non-Blocking Asynchronous Completion Engine:** Parent-bio completion is parked on the `kamd_async_worker` kthread queue, so hardware completion contexts return immediately and never stall the block-layer queue; a separate `kamd_resync` thread owns long-running rebuilds. Over-reports from faulty member paths are absorbed by a bounded tombstone pool instead of being fatal.
 *   **Persistent Boot Locks:** Automated **DKMS (Dynamic Kernel Module Support)** registration ensures the module automatically re-compiles against any incoming system kernel updates, paired with initramfs hooks and fallback `efibootmgr` NVRAM UEFI string injection.
@@ -173,9 +173,9 @@ firmware setup, open **RAIDXpert2**, create the array there (RAID 0, 1, 10, 5 or
 RAIDCore metadata this driver validates, so the level and geometry always come
 from firmware records rather than from this repo.
 
-The installer does not create arrays, and that is deliberate: the only writers
-in the tree stamp metadata over blank disks for the test rig
-(`scripts/qemu-test/mkmeta.py`), where no firmware can produce those
+The installer does not create arrays, and that is deliberate: the only
+userspace writer in the tree (`scripts/qemu-test/mkmeta.py`) stamps metadata
+over blank disks for the test rig, where no firmware can produce those
 records. A box with no RAIDXpert2 array stops with a message instead of
 inventing one.
 

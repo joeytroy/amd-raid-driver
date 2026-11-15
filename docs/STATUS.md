@@ -73,12 +73,12 @@ forced read-only — but that array no longer exists, so it cannot be re-read;
 the QEMU rig re-verified parity assembly on 2026-11-13 with a 4-member
 synthetic fixture, but that fixture comes from our own encoder, not
 vendor-written media),
-hot-plug/rebuild, SMART pass-through,
-multi-volume, array creation from Linux
-beyond RAID0/RAID1/RAID10 (`rcadm -C` now stamps all three levels; the live
-installer stamps nothing — it assembles the array the UEFI RAIDXpert2 utility
-created; 10/5/6 firmware-compatible records, and the firmware-compatible
-records RAIDXpert2/Windows would accept, are still open).
+hot-plug/rebuild, SMART pass-through, multi-volume. There is no supported
+Linux-side array create or delete path: lifecycle belongs to the **UEFI
+RAIDXpert2** utility and the driver assembles what firmware wrote. The lab
+metadata writer behind `AMD_IOCTL_CREATE_ARRAY`/`AMD_IOCTL_DELETE_ARRAY`
+stamps records over erased members for rig fixtures only and is not a way to
+manage an array.
 The prioritized roadmap is in [`IMPLEMENTATION.MD`](IMPLEMENTATION.MD); the
 RE ground truth is in [`REVERSE_ENGINEERING.md`](REVERSE_ENGINEERING.md).
 
@@ -155,8 +155,9 @@ Why it went:
   mid-session.
 - **It was a second create path to keep in step**, carrying load-time knobs
   (`parity_create` to let the writer emit a parity record it had just chosen)
-  that nothing else needed. The writers stay in-tree for the QEMU rig, where no
-  firmware can produce those records.
+  that nothing else needed. `scripts/qemu-test/mkmeta.py` stays in-tree for the
+  QEMU rig, where no firmware can produce those records; `rxp2adm` and the GUI
+  are no longer shipped (`b36bec9`).
 
 ## 2026-11-14 — CI gates actually run; the parity rig gains the contention case
 
@@ -669,12 +670,12 @@ generation.
   because it allocated a major but never created a node.
   Read-only `AMD_IOCTL_GET_STATUS` and `AMD_IOCTL_GET_HARDWARE_INVENTORY` are
   available without privileges, so `rcraidXpert` can open the node `O_RDONLY`.
-  `AMD_IOCTL_FAIL_MEMBER`, `AMD_IOCTL_START_RESYNC`,
-  `AMD_IOCTL_COMMIT_NEW_ARRAY`, and `AMD_IOCTL_DESTROY_ARRAY` require
+  `AMD_IOCTL_FAIL_MEMBER` and `AMD_IOCTL_START_RESYNC` require
   `capable(CAP_SYS_ADMIN)` — `capable()` rather than `ns_capable()`, because
   these actions reshape state shared by the whole system — and log the caller
-  on refusal. Array create/destroy remain `-EOPNOTSUPP`; the metadata-writing
-  path is still unimplemented.
+  on refusal. *(Superseded: `COMMIT_NEW_ARRAY`/`DESTROY_ARRAY` were never
+  implemented and are gone (`89fce88`); `CREATE_ARRAY`/`DELETE_ARRAY` now
+  route to the lab metadata writer.)*
   The commands now target the assembled volume (`rc_volume_get_status()`,
   `rc_volume_fail_member_slot()`, `rc_volume_request_resync()`) instead of the
   idle async mirror engine. RAID 5/6 resync is refused because there is no
