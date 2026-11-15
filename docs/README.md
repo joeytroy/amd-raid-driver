@@ -219,25 +219,22 @@ The script installs build tools, compiles the module against the live
 kernel, auto-detects your array members, binds them, and loads `rcraid`.
 When it prints that **`/dev/rcraid0` is up**, it pauses and waits for you.
 
-Members are found by the RAIDCore metadata at LBA `0x5000`, so an array
-built in the UEFI RAIDXpert2 utility is used exactly as the firmware left
-it — nothing is written to those disks, and the level is whatever the
-firmware recorded. The disk-selection GUI appears only when **no** disk
-carries that metadata; it can create RAID 0, 1, 10 and — behind the
-`parity_create` opt-in — RAID 5, and overwrites the selected disks. The
-level is stamped by the driver's own writer (`rxp2adm`), over the member
-DeviceIDs `mkmeta.py` bootstraps first, because the writer refuses a member
-whose metadata is not already valid. RAID 6 has no write path and is
-refused.
+Members are found by the RAIDCore metadata at LBA `0x5000`, so the array is
+used exactly as the UEFI RAIDXpert2 utility left it — nothing is written to
+those disks, and the level is whatever the firmware recorded, RAID 10/5/6
+included. **The array has to exist before this script runs:** with no RAIDCore
+metadata on any disk there is nothing to install onto, and it stops and says
+so rather than writing anything. There are no disk or level menus and no
+install-time creation; the writers in this tree (`scripts/qemu-test/mkmeta.py`,
+`rxp2adm`) exist for the QEMU rig, over blank images.
 
 Once the volume is up the script states whether it is **writable for the
 level it found**. Read-only is a hard stop — no OS installer can write to
-it — and happens for RAID 6 (no write path), for a RAID 5 volume whose
-driver was not loaded with the parity-write opt-in, or when the driver
-refused to trust the geometry. For the levels it creates itself the script
-loads RAID 5 with `parity_create=1 parity_writes=1`, so that volume is
-writable; its parity is still only meaningful for the regions actually
-written.
+it — and happens for RAID 6 (no write path) or when the driver refused to
+trust the geometry. A firmware RAID 5 volume assembles read-only until it is
+loaded with `parity_writes=1`, which the script does itself before
+continuing, so that level installs; its parity is still only meaningful for
+the regions actually written.
 
 **3. Run the OS installer — leave this terminal open.**
 Launch the distro's installer from the live desktop (*Install Kubuntu*,
@@ -247,12 +244,16 @@ etc.) and:
   for the whole run — in our testing this is what keeps the installer from
   restarting the session and dropping the loaded driver (and the array)
   partway through the install.
-- Point the install at **`/dev/rcraid0`**. The simplest option is
-  **"Erase disk and install"** with `/dev/rcraid0` selected as the target
-  — the installer auto-partitions it and phase 2 picks up the result. (Use
-  Manual/Custom instead only if you want a specific layout.) Just make sure
-  the disk you erase is `/dev/rcraid0`, **not** your OS drive or the live
-  USB.
+- Point the install at **`/dev/rcraid0`** with **Manual partitioning**, not
+  "Erase disk and install": the ESP has to be a partition of the array, and
+  creating it by hand is the layout the install has been validated with.
+  Select `rcraid0 - … (/dev/rcraid0)` as the storage device, create a **GPT**
+  table, then add a **512 MiB fat32** partition mounted at **`/boot/efi`** with
+  the **`boot`** flag, and the remainder as **xfs** mounted at **`/`**. Phase 2
+  probes `/dev/rcraid0p*` for the rootfs and the ESP, so it picks up what you
+  create — and stops with an error rather than guessing if the array has no
+  ESP. Just make sure the disk you partition is `/dev/rcraid0`, **not** your OS
+  drive or the live USB.
 - Let it finish, but when it offers to reboot, **do *not* reboot.** Close
   the installer and return to the terminal.
 

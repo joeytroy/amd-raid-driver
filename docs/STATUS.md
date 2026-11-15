@@ -1142,8 +1142,10 @@ per-CPU queues) is done — see "Since done" above. What remains, in rough
 priority:
 
 1. **Metadata writer for RAID10/5/6** — the kernel writer handles 0/1/10 and
-   opt-in RAID 5; the installer's offline encoder (`mkmeta.py`) still writes 0/1
-   only, so its 10/5/6 choices stop at an error message.
+   opt-in RAID 5; the rig's offline encoder (`mkmeta.py`) still writes 0/1 only,
+   so the rig cannot boot a synthetic array at another level. Arrays for real
+   installs are created in the UEFI RAIDXpert2 utility, so no install path
+   waits for this.
 2. **RAID10 hardware validation** — RAID0/1/10 dispatch is implemented and
    RAID0/1 are hardware-validated; what remains for RAID10 is the array-box run
    and sign-off in [`VALIDATION_RAID10.md`](VALIDATION_RAID10.md), then promoting
