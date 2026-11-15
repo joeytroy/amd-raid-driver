@@ -210,7 +210,7 @@ Flash a stock Ubuntu / Kubuntu / Debian / Fedora ISO, boot it, and choose
 
 ```sh
 sudo apt install -y git          # or: sudo dnf install -y git
-git clone https://github.com/joeytroy/amd-raid-driver.git
+git clone https://github.com/kubuntugamer/amd-raid-driver.git
 cd amd-raid-driver
 sudo ./install-livecd.sh
 ```

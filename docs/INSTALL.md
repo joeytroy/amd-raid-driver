@@ -78,7 +78,7 @@ sudo apt install -y \
 ### Get the source
 
 ```bash
-git clone https://github.com/joeytroy/amd-raid-driver.git
+git clone https://github.com/kubuntugamer/amd-raid-driver.git
 cd amd-raid-driver
 ```
 
@@ -479,7 +479,7 @@ sudo apt update
 sudo apt install -y build-essential linux-headers-$(uname -r) git \
     flex bison libssl-dev libelf-dev dwarves
 
-git clone https://github.com/joeytroy/amd-raid-driver.git
+git clone https://github.com/kubuntugamer/amd-raid-driver.git
 cd amd-raid-driver
 sudo cp /sys/kernel/btf/vmlinux /usr/lib/modules/$(uname -r)/build/ 2>/dev/null || true
 
