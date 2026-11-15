@@ -70,6 +70,9 @@ scripts/qemu-test/run-qemu-raid-test.sh --kver "$KVER" --kernel ./vmlinuz --leve
 7. **checkpatch** — **advisory only** (not blocking). Five source files still
    use 4-space indentation; normalize to kernel tabs in the file you touch, but
    don't reformat unrelated code.
+8. **clone-urls** — every `git clone` in tracked `*.md` / `*.sh` fetches this
+   repository (taken from `GITHUB_REPOSITORY`), not the upstream fork.
+   `scripts/check-clone-urls.sh` runs it locally too.
 
 Use kernel-driver style: tabs, `/* */` comments, no C99 declarations after
 statements unless the surrounding file already does so — match the file.

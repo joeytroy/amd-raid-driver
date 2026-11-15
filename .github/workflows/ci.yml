@@ -15,6 +15,8 @@
 #   * whitespace — no trailing whitespace / no conflict markers in the diff
 #   * shellcheck — every shell script in the repo, severity warning+
 #                  (the scripts can brick boots; they merge linted)
+#   * clone-urls — every documented `git clone` fetches this repository
+#                  (GITHUB_REPOSITORY), not the upstream fork
 #
 # Advisory gate (reported, does NOT block — see checkpatch job comment):
 #   * checkpatch — kernel coding-style on the PR diff
@@ -298,6 +300,22 @@ jobs:
           printf '  %s\n' "${scripts[@]}"
           shellcheck --severity=warning "${scripts[@]}"
           echo "All shell scripts are shellcheck-clean (severity >= warning)."
+
+  # ---------------------------------------------------------------------------
+  # clone-urls — BLOCKING gate over every documented `git clone`.  The install
+  # instructions are followed verbatim on a live USB, and three of them still
+  # cloned the upstream fork after the installer work moved here: following one
+  # built a tree without this branch's installer, which reads as the docs being
+  # wrong about the driver.  The expected repository comes from
+  # GITHUB_REPOSITORY, so the gate is correct for forks too.
+  # ---------------------------------------------------------------------------
+  clone-urls:
+    name: clone-urls
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Every documented git clone fetches this repository
+        run: scripts/check-clone-urls.sh
 
   # ---------------------------------------------------------------------------
   # checkpatch — ADVISORY for now (continue-on-error).  Five source files
