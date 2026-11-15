@@ -124,9 +124,11 @@ Limits of this run:
 
 - Not a run of the Kubuntu installer (Calamares/subiquity). No partition
   table, bootloader or `apt` stage was exercised; the filesystem was created
-  directly on `/dev/rcraid0` and the root tree copied onto it. A real
-  installer run needs a bootable guest whose initramfs carries `rcraid.ko`,
-  because the stock Ubuntu initramfs does not.
+  directly on `/dev/rcraid0` and the root tree copied onto it. An installer
+  run in a guest needs a bootable guest whose initramfs carries `rcraid.ko`,
+  because the stock Ubuntu initramfs does not. A live-session install on the
+  array box is a different run and does exist: see the README quick start and
+  the 2026-11-14 entry in `STATUS.md`.
 - Not a firmware boot: firmware still cannot boot an array this driver
   presents. The QEMU run above boots the installed root with the driver in the
   initramfs; the host itself was never rebooted onto the array.
