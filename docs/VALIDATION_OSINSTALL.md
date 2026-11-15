@@ -139,7 +139,7 @@ tree and the state line reflect that level:
 
 | Level | Screenshot |
 |---|---|
-| RAID 0 | `docs/screenshots/os-install-raid0.png` |
-| RAID 1 | `docs/screenshots/os-install-raid1.png` |
-| RAID 10 | `docs/screenshots/os-install-raid10.png` |
-| RAID 5 | `docs/screenshots/os-install-raid5.png` |
+| RAID 0 | ![RAID 0 installed on the array](screenshots/os-install-raid0.png) |
+| RAID 1 | ![RAID 1 installed on the array](screenshots/os-install-raid1.png) |
+| RAID 10 | ![RAID 10 installed on the array](screenshots/os-install-raid10.png) |
+| RAID 5 | ![RAID 5 installed on the array](screenshots/os-install-raid5.png) |
