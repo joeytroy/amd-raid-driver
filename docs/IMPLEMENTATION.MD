@@ -222,39 +222,12 @@ For status of work already done, see [`STATUS.md`](STATUS.md).
       failed, 64 MiB degraded readback, 85 MiB rebuild, optimal readback and
       new writes). Without `parity_writes=1` the volume stays read-only and the
       installer's hard stop is unchanged. Still open: the write hole, parity
-      initialisation, automatic rebuild, the metadata writer, a firmware-created
+      initialisation, automatic rebuild, a firmware-created
       parity array, and vendor-written corroboration (issues #6 and #3).
 
 - [ ] **Multi-volume support** — BIOS can create multiple arrays
       on the same members. We hardcode one `/dev/rcraid0`. Refactor
       `rc_volume_registry` to be a list, create one gendisk per LD.
-
-- [ ] **Array creation from Linux** — today the only way to make
-      an array is BIOS / RAIDXpert. Add an ioctl + userspace tool
-      (`rcraid-create`) that writes RAIDCore metadata + LD record.
-      Would let us live without rebooting for every array change.
-      *Progress (2026-11-09):* the metadata encoder exists
-      (`src/rc_meta_build.h`: per-member block, config generation,
-      commit block) and `make test-metabuild` diffs its output byte for
-      byte against `scripts/qemu-test/mkmeta.py`, so a writer cannot
-      drift from the layout the driver and rig already parse.  The
-      driver also re-encodes each member's RC_MetaData block at
-      assembly and logs whether it matches the bytes on media
-      (`rc_nvme_verify_meta_encoding`), which is true on rig-written
-      RAID0/RAID1 images.  The member block can also be written back
-      through the driver's own NVMe queues and flushed
-      (`meta_write_probe`, rig-only): the QEMU battery rewrites LBA
-      0x5000, proves the medium changed, and restores the original on
-      RAID0, RAID1 and degraded RAID1.  The encoder's output is now booted
-      end to end: `make stamp-tool`
-      writes a complete image set (metadata, commit, generation) from
-      `rc_meta_build.h` for RAID 0, RAID 1 and RAID 10 sets, and the QEMU
-      rig assembles it with `--writer encoder` — RAID0 up at the expected
-      capacity, full guest battery.  A stamped 4-member RAID10 set also
-      assembles at the right level and capacity, and the full guest battery
-      passes on it after fixing the per-chunk read copy roll (see STATUS);
-      still no array-box run.  Still missing: doing that from inside the
-      kernel, choosing the free devices, and the hot gendisk create/teardown.
 
 - [x] **Replace / rebuild a failed drive** — moot for RAID0; needed
       for RAID1/5/10. Background rebuild kthread, progress in
@@ -497,7 +470,7 @@ ORLM, COW, P2PDMA, io_uring, ZNS/FDP) are not on the daily-driver path at all.
 |---|---|---|---|
 | 0 | RAID 0 / 1 / 10 I/O + rebuild | ✅ RAID0 and RAID1 shipped and hardware-validated; RAID10 feature-complete, array-box run pending ([VALIDATION_RAID10.md](VALIDATION_RAID10.md)) | Production baseline |
 | 1 | RAID 5/6 I/O + rebuild | 🟡 Assembly + reads wired; RAID 5 writes opt-in and hardware-validated 2026-11-13, RAID 6 forced read-only; create/delete metadata is a lab-only writer (RAID 5 behind `parity_create=1`, no longer rig-exercised); first firmware 3-disk RAID 5 metadata parsed, assembled and read back 2026-11-08 (`0x1BF5`, N=3, `(N-1)` × user size); placement settled from the vendor core, corroboration pending (issue #6); Q generator now the vendor's EVENODD, uncalled (issue #10); RAID 5 degraded reads + manual parity rebuild hardware-validated 2026-11-13 | Inspect and read existing parity arrays |
-| 2 | Metadata writer for levels no firmware produced | ⏳ Planned — `scripts/qemu-test/mkmeta.py` writes RAID 0/1 for the QEMU rig only; real arrays are created in the UEFI RAIDXpert2 utility, so no install path waits for this | Driver-created arrays in the rig, and on erased lab disks |
+| 2 | Rig metadata fixtures for levels no firmware produced | ⏳ Planned — `scripts/qemu-test/mkmeta.py` writes RAID 0/1 for the QEMU rig only; this is test-fixture generation, not array lifecycle: real arrays are created in the UEFI RAIDXpert2 utility and no install path waits for it | QEMU scenarios at RAID10 and synthetic parity levels |
 | 3 | OCE (Online Capacity Expansion) | 🗺️ Roadmap — this driver | Add drives online, restripe, grow FS |
 | 4 | ORLM (Online RAID Level Migration) | 🗺️ Roadmap — this driver | RAID 0↔5↔6↔10 online, zero host CPU |
 | 5 | COW snapshots + instant clone | 🗺️ Future | Fast clones, no space cost |
@@ -509,8 +482,8 @@ Phases 3–8 have no code, no design notes and no exit criteria in this tree.
 They are recorded so the ambition is explicit, not because they are
 scheduled. Phase 2 is the only one of the set that changes what the tree can
 test — the rig can only boot arrays it encoded itself — which is why it opens
-the next-PR order. It is not on the install path: there the UEFI RAIDXpert2
-utility creates the array.
+the next-PR order as fixture work. It is not on the install path: there the
+UEFI RAIDXpert2 utility creates the array.
 
 ## 🤔 Open reverse-engineering questions
 
@@ -538,12 +511,12 @@ hardware-validated (2026-07-10, the dev box boots from the mirror) and
 what is actually left; several items are now verification and documentation
 rather than code.
 
-1. **Metadata writer for RAID10/5/6** — `scripts/qemu-test/mkmeta.py` writes
-   RAID 0/1 only, so the rig cannot boot a synthetic array at any other
-   level. Implement the records (RAID10 first: `0x1BF6`
-   + 2×2 is already proven by the X399 fixtures). No install path depends on
-   this any more: on 2026-11-14 `install-livecd.sh` dropped array creation and
-   the TUI, and now requires the array the UEFI RAIDXpert2 utility created.
+1. **Rig metadata fixtures for RAID10/5/6** — `scripts/qemu-test/mkmeta.py`
+   writes RAID 0/1 only, so the rig cannot boot a synthetic array at any other
+   level. Implement the records (RAID10 first: `0x1BF6` + 2×2 is already proven
+   by the X399 fixtures). This is fixture generation for the QEMU rig, not
+   array lifecycle: no install path depends on it, because `install-livecd.sh`
+   requires the array the UEFI RAIDXpert2 utility created (issue #16).
 2. **Corroborate the RAID5/6 on-disk placement** (issue #6) — the read-only
    parity path assembles and reads: a firmware-created 3-disk RAID 5 was
    parsed, assembled and read on 2026-11-08 (`0x1BF5`, N=3, `(N-1)` × user
@@ -568,7 +541,7 @@ rather than code.
    assumption.
 4. **SMART pass-through** — per-member health visibility (SMART log
    LID=0x02, temperature, wear). Small, isolated, no data-path risk, and
-   currently the largest user-visible gap after array creation.
+   currently the largest user-visible health gap.
 5. **Control bridge → uevents → `rcraidctl`** — the ioctl transport is now
    registered and live; the remaining work is a CLI and uevents. uevents are
    the cheap half of monitoring once state transitions are already tracked.
