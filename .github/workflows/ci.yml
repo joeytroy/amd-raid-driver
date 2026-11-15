@@ -9,8 +9,7 @@
 #                  arrays (incl. the stale-generation decoy) and runs the
 #                  full write/readback/discard battery; a RAID5 scenario
 #                  exercises the opt-in write path (full-row parity plus
-#                  partial-row read-modify-write) and delete/create
-#                  reassembly through the clean-room rxp2adm
+#                  partial-row read-modify-write)
 #   * spdx       — every C/H source carries an SPDX GPL-2.0-only tag
 #   * whitespace — no trailing whitespace / no conflict markers in the diff
 #   * shellcheck — every shell script in the repo, severity warning+
@@ -185,10 +184,6 @@ jobs:
           # read-modify-write.  The guest helper verifies every byte.
           - { scenario: raid5-parity-write, level: raid5,
               extra: "--members 4 --parity-writes" }
-          # Delete the synthetic RAID 5 through rxp2adm, re-create it through
-          # the driver's writer, and require the same capacity and level.
-          - { scenario: raid5-create-delete, level: raid5,
-              extra: "--members 4 --create-test" }
           # Fan-out with a mid-page non-first SG entry (issue #20): the
           # request starts 2 KiB into a page and covers cols+1 stripes, so
           # the column that owns chunk 0 and chunk `cols` gives one member

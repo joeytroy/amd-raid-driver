@@ -37,7 +37,7 @@ Module.symvers
 # Userspace metadata encoder harness build dir (make test-metabuild)
 .metabuild-test/
 
-# Clean-room rxp2adm CLI build dir (make rxp2adm)
+# Local rxp2adm build output (the CLI is no longer shipped)
 .rxp2adm/
 
 # Python bytecode from scripts/qemu-test (mkmeta.py)
@@ -49,3 +49,8 @@ __pycache__/
 
 # Local workstation session state
 sessid
+
+# Array-mutation tooling is not shipped; the driver only assembles arrays
+# created by UEFI RAIDXpert2. See issue #16.
+src/rxp2adm.c
+rcraidXpert/

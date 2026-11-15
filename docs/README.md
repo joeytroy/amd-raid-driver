@@ -225,8 +225,9 @@ those disks, and the level is whatever the firmware recorded, RAID 10/5/6
 included. **The array has to exist before this script runs:** with no RAIDCore
 metadata on any disk there is nothing to install onto, and it stops and says
 so rather than writing anything. There are no disk or level menus and no
-install-time creation; the writers in this tree (`scripts/qemu-test/mkmeta.py`,
-`rxp2adm`) exist for the QEMU rig, over blank images.
+install-time creation; the only writer in this tree
+(`scripts/qemu-test/mkmeta.py`, RAID 0/1 only) exists for the QEMU rig, over
+blank images.
 
 Once the volume is up the script states whether it is **writable for the
 level it found**. Read-only is a hard stop — no OS installer can write to
@@ -355,8 +356,8 @@ Full setup, troubleshooting, and the Secure-Boot / signing details are in
   reverse engineering of the config-ring writer and is a roadmap item.
 - **RAID10 hardware validation** — the level itself is feature-complete
   (dispatch, per-pair failover, rebuild, degraded boot), but its only
-  `1022:B000` array-box run used metadata this driver wrote (`rcadm -C -r10`,
-  2×2, 8 TB, 2026-11-13); a firmware-created array has not been assembled yet,
+  `1022:B000` array-box run used metadata this driver wrote (2×2, 8 TB,
+  2026-11-13); a firmware-created array has not been assembled yet,
   so don't put data you can't lose on it. See
   [`VALIDATION_RAID10.md`](VALIDATION_RAID10.md). **RAID5/6** — a parity volume
   is now identified from the LD `DeviceType`, assembles at the right capacity
@@ -365,9 +366,10 @@ Full setup, troubleshooting, and the Secure-Boot / signing details are in
   full-row parity generation plus read-modify-write for partial rows),
   hardware-validated 2026-11-13 on a 4-member array stamped by this driver;
   RAID 6 has none. RAID 5 also has hardware-validated degraded reads and a
-  manual parity rebuild (2026-11-13); while degraded it is read-only. DELETE handles parity LDs, and the
-  clean-room `rxp2adm` can create RAID 5 behind `parity_create=1` — metadata only
-  over erased members, with no initialisation pass. Vendor parity placement is settled against
+  manual parity rebuild (2026-11-13); while degraded it is read-only. Array creation and deletion are
+  **UEFI RAIDXpert2 only**: the driver's lab metadata writer is not an
+  array-lifecycle tool and must never be pointed at firmware-managed members
+  (issue #16). Vendor parity placement is settled against
   the vendor implementation (dedicated, on member `N-1`) and the map matches
   it; what is still owed is corroboration — no vendor-written array has been
   read back through it, so treat that as the last open check rather than as

@@ -80,9 +80,8 @@ the install repeated end to end.
 
 Method, per level:
 
-1. Recreate the array with `rxp2adm` (RAID 5: discard the members, bootstrap
-their device IDs with the rig's `mkmeta.py`, then DELETE and CREATE again
-through the driver's writer), mkfs.ext4, and extract the ISO squashfs.
+1. Create the array in the UEFI RAIDXpert2 utility, mkfs.ext4 it, and extract
+the ISO squashfs.
 2. Copy the 7.3.0-10 kernel tree, install this tree's `rcraid.ko` plus
 `packaging/sbin/rcraid-bind`, the udev rule, the modprobe drop-in
 (`enable_writes=1 parity_writes=1`) and the initramfs hook, then build the
@@ -161,8 +160,8 @@ Caveats:
   before treating an unattended reboot as tested.
 - Only RAID 0 was run this way on hardware. The RAID 1/10/5 installed roots
   still have QEMU boots only.
-- The array is firmware-created. A driver-created array (this tree's
-  `mkmeta.py` / `rxp2adm`) is absent from firmware configuration, so a
+- The array is firmware-created. A driver-stamped array (`mkmeta.py` in the
+  rig) is absent from firmware configuration, so a
   firmware-less boot remains untested and out of scope until the config-ring
   writer can produce firmware-compatible records.
 - Not a Secure Boot run: the boot used the installed module-signing key with

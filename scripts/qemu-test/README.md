@@ -5,9 +5,9 @@ RAIDCore metadata** — an array that can be created, corrupted, and
 destroyed freely, unlike the dev box's RAID0 (which is the rootfs).
 This is the development rig for RAID1 / failure-handling / rebuild work,
 and it is the CI `qemu-rig` gate: it runs on every push to `main` and
-every PR as six scenarios — `raid0`, `raid1`, `raid1-degraded`,
-`raid1-degraded-boot`, `raid5-parity-write` and `raid5-create-delete` —
-each followed by the guest battery.
+every PR as five scenarios — `raid0`, `raid1`, `raid1-degraded`,
+`raid1-degraded-boot` and `raid5-parity-write` — each followed by the guest
+battery.
 
 ```sh
 # One-time: the Ubuntu kernel image is root-readable only
@@ -24,10 +24,6 @@ sudo install -m 644 /boot/vmlinuz-$(uname -r) ~/vmlinuz
 # concurrent buffered writers (the contention shape behind issue #17):
 ./scripts/qemu-test/run-qemu-raid-test.sh --kernel ~/vmlinuz \
     --level raid5 --members 4 --parity-writes
-
-# Delete the synthetic RAID 5, re-create it through the driver, reassemble:
-./scripts/qemu-test/run-qemu-raid-test.sh --kernel ~/vmlinuz \
-    --level raid5 --members 4 --create-test
 ```
 
 Exit 0 iff the guest prints `RCRAID-TEST-PASS`. On failure the workdir

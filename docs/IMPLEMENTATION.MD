@@ -380,9 +380,15 @@ rebuild) being the definition of the category. The items below are what
 
 #### `rcadm` parity on `/dev/rc_api` — inventory (2026-11-10)
 
-`rcadm` stays AMD's binary; the deliverable is the kernel ABI it speaks, not a
-replacement CLI, so this subsection is the entire userspace-parity budget. The
-read half is done (`src/rc_api.c`, `src/rc_cfgwrite.h`): `INQUIRY` EVPD page
+*Status 2026-11-14:* AMD's `rcadm` is not a supported tool for this driver and
+the driver's mutation writer is a lab method, not array lifecycle — see issue
+#16. This subsection is kept as the reverse-engineering inventory behind the
+`/dev/rc_api` read surface, not as a supported control path.
+
+`rcadm` stays AMD's binary and is not a supported tool for this driver (issue
+#16); the read ABI below is documented for reverse-engineering and future
+compatibility work, not as a userspace-parity commitment. The read half is
+done (`src/rc_api.c`, `src/rc_cfgwrite.h`): `INQUIRY` EVPD page
 `0xD7`, the mailbox-window handshake, and a 64 KiB config packet synthesized
 from the volume this driver actually assembled. `--version`, `--show` and
 `--list` are answered from that packet, exercised by hand against a QEMU
@@ -401,8 +407,9 @@ undecodable frame must return CHECK CONDITION with an ILLEGAL REQUEST ASC,
 and a zero-length read must be refused rather than answered. Assertions are
 field-level, including the vendor's nonstandard success status `0x01`. The
 harness is skipped on the two degraded scenarios, where a partial member set
-is the expected state. This is issue #13's option 1; mutation *success* paths
-are covered by `raid5-create-delete`, not here.
+is the expected state. This is issue #13's option 1; mutation paths are not
+covered, because the writer is lab-only and its CLI has been removed (issue
+#16).
 
 *Status 2026-11-13:* the controller list (`-q -ct N`) and
 `/proc/rcraid/version` now work on the live 4-member RAID 0; the controller
@@ -442,8 +449,8 @@ The cost is dominated by three shared pieces, not by the verbs:
 
 | Verb | Code | Payload | Blocked on |
 |---|---|---|---|
-| CREATE | 2 | 172 B, decoded | implemented for RAID 0/1/10 over the disks named with `-d`; hardware-validated 2026-11-13 (RAID 0 ×4 = 16 TB, RAID 1 = 4 TB, RAID 10 ×4 = 8 TB; all assemble `optimal` and read back — issue #15). `PreferDeviceID` is the logical-device Id rcadm looks up after the write and is now stamped, so the CLI and the packet agree on the Id; `rcadm` still exits 1 because its post-write handle lookup uses the in-process config cache and reports `LOGICAL_DEVICE_NOT_FOUND` (10) — issue #16. DELETE exits 0. The old 16 GiB default came from a misread `GET_CREATE_INFO` reply; max size now reports real free space. JBOD (`0x1BF7`) and RAIDAble (`0x1BFB`) are refused by the `DeviceType` gate; RAID 5 `CREATE` is now implemented behind `parity_create=1` (metadata only over erased members) and reachable through the clean-room `rxp2adm`; AMD's CLI still stops at its licence check before any frame, so that verb remains untested. RAID 6 `CREATE` stays refused. DELETE removes parity LDs as well as `0x1BF6` volumes (issue #16) |
-| DELETE | 3 | 24 B, decoded | implemented; hardware-validated 2026-11-13 |
+| CREATE | 2 | 172 B, decoded | **Lab metadata writer only, not an array lifecycle.** It stamps RAID 0/1/10 LD records (RAID 5 behind `parity_create=1`) over erased members and initialises neither data nor parity, so it must never be pointed at firmware-managed members; the userspace CLI has been removed and AMD's `rcadm` is not a supported tool (issue #16). Real arrays are created and deleted in the UEFI RAIDXpert2 utility. The old 16 GiB default came from a misread `GET_CREATE_INFO` reply; max size now reports real free space. JBOD (`0x1BF7`) and RAIDAble (`0x1BFB`) are refused by the `DeviceType` gate; RAID 6 `CREATE` stays refused |
+| DELETE | 3 | 24 B, decoded | lab metadata rewrite only — it edits the generation the firmware reads, so it is not a firmware-compatible delete (issue #16) |
 | TRANSFORM | 8 | 140 B, decoded | OCE/ORLM data movement (phases 3–4) |
 | ACCEPT_CONFIG_CHANGES | 15 | — | persistence (two-phase commit) |
 | COMMIT_PREVIOUS_CONFIG | 36 | 4 B | persistence (rollback) |
@@ -547,9 +554,9 @@ cost; it only saves the ABI decoding, which is the smallest part.
       *Status 2026-11-14:* the build half is covered — CI compiles this
       tree warning-clean inside Fedora, Arch, Ubuntu 24.04 HWE and
       Ubuntu 26.04 containers on every push and PR, and the QEMU rig
-      boots the module through six array scenarios (`raid0`, `raid1`,
-      `raid1-degraded`, `raid1-degraded-boot`, `raid5-parity-write`,
-      `raid5-create-delete`) plus the guest battery. What that does
+      boots the module through five array scenarios (`raid0`, `raid1`,
+      `raid1-degraded`, `raid1-degraded-boot`, `raid5-parity-write`) plus
+      the guest battery. What that does
       **not** establish: runtime on anything but the array box's kernel
       (the container jobs are compile-only), drive models other than the
       Sabrent/Crucial sets, or member counts above 4 on real hardware.
@@ -655,8 +662,8 @@ ORLM, COW, P2PDMA, io_uring, ZNS/FDP) are not on the daily-driver path at all.
 | Phase | Feature | Status (2026-11-14) | Enables |
 |---|---|---|---|
 | 0 | RAID 0 / 1 / 10 I/O + rebuild | ✅ RAID0 and RAID1 shipped and hardware-validated; RAID10 feature-complete, array-box run pending ([VALIDATION_RAID10.md](VALIDATION_RAID10.md)) | Production baseline |
-| 1 | RAID 5/6 I/O + rebuild | 🟡 Assembly + reads wired; RAID 5 writes opt-in and hardware-validated 2026-11-13, RAID 6 forced read-only; create/delete metadata works in the rig (RAID 5 behind `parity_create=1`); first firmware 3-disk RAID 5 metadata parsed, assembled and read back 2026-11-08 (`0x1BF5`, N=3, `(N-1)` × user size); placement settled from the vendor core, corroboration pending (issue #6); Q generator now the vendor's EVENODD, uncalled (issue #10); RAID 5 degraded reads + manual parity rebuild hardware-validated 2026-11-13 | Inspect and read existing parity arrays |
-| 2 | Metadata writer for levels no firmware produced | ⏳ Planned — `scripts/qemu-test/mkmeta.py` writes RAID 0/1 (and `rxp2adm` 10, plus 5 behind `parity_create=1`) for the QEMU rig only; real arrays are created in the UEFI RAIDXpert2 utility, so no install path waits for this | Driver-created arrays in the rig, and on erased lab disks |
+| 1 | RAID 5/6 I/O + rebuild | 🟡 Assembly + reads wired; RAID 5 writes opt-in and hardware-validated 2026-11-13, RAID 6 forced read-only; create/delete metadata is a lab-only writer (RAID 5 behind `parity_create=1`, no longer rig-exercised); first firmware 3-disk RAID 5 metadata parsed, assembled and read back 2026-11-08 (`0x1BF5`, N=3, `(N-1)` × user size); placement settled from the vendor core, corroboration pending (issue #6); Q generator now the vendor's EVENODD, uncalled (issue #10); RAID 5 degraded reads + manual parity rebuild hardware-validated 2026-11-13 | Inspect and read existing parity arrays |
+| 2 | Metadata writer for levels no firmware produced | ⏳ Planned — `scripts/qemu-test/mkmeta.py` writes RAID 0/1 for the QEMU rig only; real arrays are created in the UEFI RAIDXpert2 utility, so no install path waits for this | Driver-created arrays in the rig, and on erased lab disks |
 | 3 | OCE (Online Capacity Expansion) | 🗺️ Roadmap — this driver | Add drives online, restripe, grow FS |
 | 4 | ORLM (Online RAID Level Migration) | 🗺️ Roadmap — this driver | RAID 0↔5↔6↔10 online, zero host CPU |
 | 5 | COW snapshots + instant clone | 🗺️ Future | Fast clones, no space cost |
@@ -698,9 +705,8 @@ what is actually left; several items are now verification and documentation
 rather than code.
 
 1. **Metadata writer for RAID10/5/6** — `scripts/qemu-test/mkmeta.py` writes
-   RAID 0/1 only, so the rig cannot boot a synthetic array at any other level
-   (`rxp2adm create` writes 10, and 5 behind `parity_create=1`, but only over
-   members that already parse). Implement the records (RAID10 first: `0x1BF6`
+   RAID 0/1 only, so the rig cannot boot a synthetic array at any other
+   level. Implement the records (RAID10 first: `0x1BF6`
    + 2×2 is already proven by the X399 fixtures). No install path depends on
    this any more: on 2026-11-14 `install-livecd.sh` dropped array creation and
    the TUI, and now requires the array the UEFI RAIDXpert2 utility created.

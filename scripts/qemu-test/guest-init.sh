@@ -46,7 +46,6 @@ fail_member=0
 degraded_boot=0
 parity_write_test=0
 parity_row_kib=0
-create_test=0
 api_members=0
 prp_chunk_bytes=0
 prp_cols=0
@@ -58,7 +57,6 @@ for arg in $(cat /proc/cmdline); do
         degraded_boot=*)    degraded_boot="${arg#degraded_boot=}" ;;
         parity_write_test=*) parity_write_test="${arg#parity_write_test=}" ;;
         parity_row_kib=*)   parity_row_kib="${arg#parity_row_kib=}" ;;
-        create_test=*)      create_test="${arg#create_test=}" ;;
         api_members=*)      api_members="${arg#api_members=}" ;;
         prp_chunk_bytes=*)  prp_chunk_bytes="${arg#prp_chunk_bytes=}" ;;
         prp_cols=*)         prp_cols="${arg#prp_cols=}" ;;
@@ -119,7 +117,6 @@ bind_nvme_functions() {
 MODARGS="enable_writes=1 allow_foreign_nvme=1 meta_write_probe=1 meta_write_probe_junk=1"
 [ "$degraded_boot" = "1" ] && MODARGS="$MODARGS allow_degraded=1"
 [ "$parity_write_test" = "1" ] && MODARGS="$MODARGS parity_writes=1"
-[ "$create_test" = "1" ] && MODARGS="$MODARGS parity_create=1"
 
 echo "rcraid-test: loading rcraid.ko ($MODARGS)"
 insmod /rcraid.ko $MODARGS || fail "insmod rcraid.ko"
@@ -190,35 +187,6 @@ fi
 # that reads across the whole volume are served.
 # ---------------------------------------------------------------------------
 if [ "$expected_level" = "raid5" ]; then
-    # CREATE/DELETE through our own CLI: delete the synthetic RAID 5, stamp
-    # it again with the driver's writer (0x1BF5, 1 x N), verify reassembly
-    # at the same capacity, then let any write test run on the new volume.
-    if [ "$create_test" = "1" ]; then
-        mark "raid5 delete + create"
-        /rxp2adm delete || fail "rxp2adm delete of the RAID5 fixture"
-        i=0
-        while [ -b /dev/rcraid0 ]; do
-            i=$((i + 1))
-            [ "$i" -le 50 ] || fail "/dev/rcraid0 survived DELETE"
-            sleep 0.1
-        done
-        /rxp2adm create -l 5 -d 0 1 2 3 || fail "rxp2adm create -l 5"
-        i=0
-        while [ ! -b /dev/rcraid0 ]; do
-            i=$((i + 1))
-            [ "$i" -le 100 ] || fail "created RAID5 did not assemble"
-            sleep 0.1
-        done
-        created=$(cat /sys/block/rcraid0/size)
-        [ "$created" = "$expected_sectors" ] \
-            || fail "created capacity $created != $expected_sectors"
-        dmesg | grep "rc_volume_parse_logical_device" | grep "(match)" \
-            | grep -q "level=RAID5" || fail "created array did not parse as RAID5"
-        dd if=/dev/rcraid0 of=/dev/null bs=1M count=4 2>/dev/null \
-            || fail "read from created RAID5"
-        echo "rcraid-test: raid5 delete + create + reassembly ok"
-    fi
-
     # Opt-in RAID 5 write path.  A complete row generates P from the request
     # itself; a shorter write must be read-modify-written (the driver reads
     # the row, overlays the request, regenerates P).  Both must round-trip,

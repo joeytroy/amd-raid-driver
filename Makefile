@@ -69,7 +69,6 @@ clean:
 	@rm -rf $(ASYNC_TEST_BIN) $(dir $(ASYNC_TEST_BIN))
 	@rm -rf $(CFGWRITE_TEST_BIN) $(dir $(CFGWRITE_TEST_BIN))
 	@rm -rf $(METABUILD_TEST_BIN) $(dir $(METABUILD_TEST_BIN))
-	@rm -rf $(RXP2ADM_BIN) $(dir $(RXP2ADM_BIN))
 	@echo "Clean completed"
 
 # Lenient build target: extra warnings suppressed via KCFLAGS (the
@@ -206,22 +205,6 @@ $(METABUILD_TEST_BIN): $(METABUILD_TEST_DEPS)
 	$(CC) -O1 -g -Wall -Wextra -Werror -o $(METABUILD_TEST_BIN) \
 		$(METABUILD_TEST_SRC) -Isrc
 
-# ------------------------------------------------------------------------------
-# Clean-room rxp2adm CLI.
-#
-# Userspace tool over /dev/amd_ctl0; it never invokes or patches AMD's
-# rcadm.  The ioctl ABI lives in src/amd_raid_uapi.h, which is also the
-# header rcraidXpert consumes.
-# ------------------------------------------------------------------------------
-RXP2ADM_BIN ?= $(CURDIR)/.rxp2adm/rxp2adm
-
-rxp2adm: $(RXP2ADM_BIN)
-
-$(RXP2ADM_BIN): src/rxp2adm.c src/amd_raid_uapi.h
-	@mkdir -p $(dir $(RXP2ADM_BIN))
-	@echo "Building rxp2adm (userspace control CLI)..."
-	$(CC) -O2 -Wall -Wextra -Werror -o $(RXP2ADM_BIN) src/rxp2adm.c -Isrc
-
 # Help target
 help:
 	@echo "AMD RAID Driver for Linux"
@@ -235,8 +218,7 @@ help:
 	@echo "  test-cfgwrite   - Build and run the RC_CfgWrite decoder harness (userspace)"
 	@echo "  test-metabuild  - Diff the metadata encoder against mkmeta.py (userspace)"
 	@echo "  stamp-tool      - Build the image-set stamping tool (userspace)"
-	@echo "  rxp2adm         - Build the clean-room control CLI (userspace)"
 	@echo "  help            - Show this help"
 
 .PHONY: all clean install help test-async test-async-asan test-async-tsan \
-	test-cfgwrite test-metabuild stamp-tool rxp2adm
+	test-cfgwrite test-metabuild stamp-tool

@@ -358,10 +358,10 @@ capture `dmesg | tail -60` first.
    assembles what the vendor stamped; it does not re-prove parity reads.
 
 Afterwards either keep the array as the only real RAID 5 fixture or delete it
-with the vendor driver, the UEFI utility, or `rxp2adm delete` under this module —
-DELETE now removes parity LDs (`0x1BF5` / `0x1BFA`) as well as `0x1BF6`, and the
-QEMU rig exercises delete → create → reassembly. Do not bind devices on a
-machine whose OS disk sits behind `1022:B000`.
+in the UEFI RAIDXpert2 utility. Do not use the driver's metadata writer to
+mutate it: the writer rewrites the same generation the firmware reads and is
+not a firmware-compatible delete (issue #16). Do not bind devices on a machine
+whose OS disk sits behind `1022:B000`.
 
 Fallbacks if the patched blob still wedges: create the array in UEFI
 RAIDXpert2 ([`AFTER-REBOOT.md`](AFTER-REBOOT.md)), or boot a kernel in the
@@ -408,9 +408,10 @@ removed on 2026-11-09. Rows 4–6 are the 2026-11-13 run on a driver-stamped
 still has no vendor-written bytes to check against; row 7 waits on a
 boot-from-array run.
 
-Not a hardware result: delete → create → reassembly is QEMU-verified on the
-synthetic 4-member fixture (`--create-test`). It does not cover initialising a
-real array's data/parity, nor firmware acceptance of the stamped generation.
+Not covered: delete → create → reassembly through the driver's writer. That
+path was QEMU-verified on the synthetic fixture until the tooling was removed;
+it never covered initialising a real array's data/parity or firmware acceptance
+of the stamped generation, and array lifecycle is now UEFI RAIDXpert2 only.
 
 ## Promote
 

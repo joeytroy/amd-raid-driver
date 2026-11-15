@@ -54,11 +54,9 @@ scripts/qemu-test/run-qemu-raid-test.sh --kver "$KVER" --kernel ./vmlinuz --leve
 2. **warnings** — no compiler warnings in `rc_*.c` / `rc_*.h` other than
    `-Wunused-parameter`.
 3. **qemu-rig** — boots the module against synthetic arrays for `raid0`,
-   `raid1`, `raid1-degraded`, `raid1-degraded-boot`, `raid5-parity-write`, and
-   `raid5-create-delete`
-   (the opt-in RAID5 write path: full-row parity, in-row/boundary/cross-row
-   read-modify-write) and `raid5-create-delete` (delete a parity LD, re-create
-   it through the driver's writer, require the same capacity/level), then runs
+   `raid1`, `raid1-degraded`, `raid1-degraded-boot`, and
+   `raid5-parity-write` (the opt-in RAID5 write path: full-row parity,
+   in-row/boundary/cross-row read-modify-write), then runs
    the guest battery: write/readback, module
    reload cycles, discard+rewrite, `mke2fs` (sub-page buffered writeback),
    and the stale-config-generation decoy.
@@ -107,8 +105,8 @@ The repo's automated review prompt enforces these; write code that passes it:
 | Level | State |
 |---|---|
 | RAID 0 / RAID 1 | Hardware-validated baseline, production-supported |
-| RAID 10 | Feature-complete; an `rcadm -C -r10` 2×2 array written by this driver was assembled and read on real hardware 2026-11-13, **but no firmware-created array-box run yet** (`docs/VALIDATION_RAID10.md` runbook exists; its results table is still empty) |
-| RAID 5 / RAID 6 | RAID 5: assemble/read, opt-in writes (`enable_writes=1 parity_writes=1`; full rows generate P, partial rows RMW under one lock), and **hardware-validated degraded reads + manual parity rebuild 2026-11-13**. One failed member leaves the volume `degraded` and read-only: reads reconstruct from P plus survivors, writes/discards are refused, and `START_RESYNC` rebuilds the member (64 MiB written, 64 MiB degraded readback, 85 MiB rebuild, optimal readback all passed on a 4-member 256 MiB driver-stamped array). No write-hole journal, no parity initialisation, no automatic rebuild, and state is in-memory only. RAID 6 writes/rebuild refused; read-only by default. DELETE removes parity LDs; RAID 5 CREATE behind `parity_create=1` (metadata only, erased members). Layout settled against the vendor core, not yet corroborated on vendor-written data |
+| RAID 10 | Feature-complete; a 2×2 array stamped by this driver's lab writer was assembled and read on real hardware 2026-11-13, **but no firmware-created array-box run yet** (`docs/VALIDATION_RAID10.md` runbook exists; its results table is still empty) |
+| RAID 5 / RAID 6 | RAID 5: assemble/read, opt-in writes (`enable_writes=1 parity_writes=1`; full rows generate P, partial rows RMW under one lock), and **hardware-validated degraded reads + manual parity rebuild 2026-11-13**. One failed member leaves the volume `degraded` and read-only: reads reconstruct from P plus survivors, writes/discards are refused, and `START_RESYNC` rebuilds the member (64 MiB written, 64 MiB degraded readback, 85 MiB rebuild, optimal readback all passed on a 4-member 256 MiB driver-stamped array). No write-hole journal, no parity initialisation, no automatic rebuild, and state is in-memory only. RAID 6 writes/rebuild refused; read-only by default. DELETE removes parity LDs; RAID 5 CREATE behind `parity_create=1` (metadata only, erased members, lab use only — never firmware-managed members; issue #16). Layout settled against the vendor core, not yet corroborated on vendor-written data |
 
 - RAID 5 `DeviceType` is `0x1BF5`, RAID 6 is `0x1BFA`. Level comes from the LD
   `DeviceType` alone — never infer it from member counts.

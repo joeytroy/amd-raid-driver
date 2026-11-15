@@ -7682,7 +7682,7 @@ int rc_volume_create_array_indexed(u32 level, const u32 *indices,
 	case AMD_ARRAY_LEVEL_RAID5:
 		if (!rc_volume_parity_create) {
 			rc_printk(RC_WARN,
-				  "rxp2adm: RAID 5 CREATE refused: the metadata writer does not initialise data/parity, so CREATE needs parity_create=1 and members with an empty user area\n");
+				  "rcraid: RAID 5 CREATE refused: the metadata writer does not initialise data/parity, so CREATE needs parity_create=1 and members with an empty user area\n");
 			return -EOPNOTSUPP;
 		}
 		if (count < 3)
@@ -7693,7 +7693,7 @@ int rc_volume_create_array_indexed(u32 level, const u32 *indices,
 		break;
 	case AMD_ARRAY_LEVEL_RAID6:
 		rc_printk(RC_WARN,
-			  "rxp2adm: RAID 6 CREATE refused: there is no Q write or initialisation path\n");
+			  "rcraid: RAID 6 CREATE refused: there is no Q write or initialisation path\n");
 		return -EOPNOTSUPP;
 	default:
 		return -EINVAL;
@@ -7706,7 +7706,7 @@ int rc_volume_create_array_indexed(u32 level, const u32 *indices,
 		if (!a || !a->ctx.nvme.md_valid || !a->ctx.nvme.ns1_nsze) {
 			mutex_unlock(&rc_state.lock);
 			rc_printk(RC_WARN,
-				  "rxp2adm: disk %u is not a bound, initialised member\n",
+				  "rcraid: disk %u is not a bound, initialised member\n",
 				  indices[i]);
 			return -ENODEV;
 		}
@@ -7718,7 +7718,7 @@ int rc_volume_create_array_indexed(u32 level, const u32 *indices,
 				     count, size_mb, 0, ids, count);
 	if (ret)
 		rc_printk(RC_WARN,
-			  "rxp2adm: CREATE level %u over %u disk(s) failed (%d)\n",
+			  "rcraid: CREATE level %u over %u disk(s) failed (%d)\n",
 			  level, count, ret);
 	return ret;
 }

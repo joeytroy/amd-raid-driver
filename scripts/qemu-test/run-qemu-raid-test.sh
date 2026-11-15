@@ -17,7 +17,7 @@
 # Usage:
 #   run-qemu-raid-test.sh [--kernel <vmlinuz>] [--kver <version>]
 #                         [--level raid0|raid1|raid5|raid10]
-#                         [--parity-writes] [--create-test]
+#                         [--parity-writes]
 #                         [--members N] [--size-mib M] [--workdir DIR]
 #                         [--writer mkmeta|encoder] [--chunk-index 0-3]
 #
@@ -46,7 +46,6 @@ CHUNK_INDEX=3
 FAIL_MEMBER=0
 OMIT_MEMBER=0
 PARITY_WRITES=0
-CREATE_TEST=0
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -59,7 +58,7 @@ while [ $# -gt 0 ]; do
         # Which encoder writes the images: mkmeta.py (Python, default) or
         # "encoder" for src/stamp_meta_userspace.c, the driver's own C
         # encoder via rc_meta_build.h.  The latter proves the writer
-        # primitive that rxp2adm CREATE will be built on actually assembles.
+        # primitive that the driver's CREATE ioctl is built on actually assembles.
         --writer)   WRITER="$2"; shift 2 ;;
         --chunk-index) CHUNK_INDEX="$2"; shift 2 ;;
         --fail-member) FAIL_MEMBER=1; shift ;;
@@ -72,9 +71,6 @@ while [ $# -gt 0 ]; do
         # (parity_writes=1): one complete row must write and read back,
         # a partial row must be refused.
         --parity-writes) PARITY_WRITES=1; shift ;;
-        # Delete the synthetic RAID 5 through our own CLI, then create it
-        # again through the driver's metadata writer and verify reassembly.
-        --create-test) CREATE_TEST=1; shift ;;
         *) echo "unknown arg: $1" >&2; exit 2 ;;
     esac
 done
@@ -85,10 +81,6 @@ if { [ "$FAIL_MEMBER" = 1 ] || [ "$OMIT_MEMBER" = 1 ]; } && [ "$LEVEL" != raid1 
 fi
 if [ "$PARITY_WRITES" = 1 ] && [ "$LEVEL" != raid5 ]; then
     echo "--parity-writes requires --level raid5" >&2
-    exit 2
-fi
-if [ "$CREATE_TEST" = 1 ] && [ "$LEVEL" != raid5 ]; then
-    echo "--create-test requires --level raid5" >&2
     exit 2
 fi
 [ -n "$KERNEL" ] || KERNEL="/boot/vmlinuz-$KVER"
@@ -293,15 +285,6 @@ gcc -static -O2 -Wall -Wextra -Werror -o "$WORKDIR/rciovecsplit" \
     exit 1
 }
 install -m 0755 "$WORKDIR/rciovecsplit" "$INITRD_DIR/rciovecsplit"
-if [ "$CREATE_TEST" = 1 ]; then
-    gcc -static -O2 -Wall -Wextra -Werror -o "$WORKDIR/rxp2adm" \
-        "$REPO_DIR/src/rxp2adm.c" -I"$REPO_DIR/src" || {
-        echo "failed to build the RAID 5 create/delete CLI" >&2
-        exit 1
-    }
-    install -m 0755 "$WORKDIR/rxp2adm" "$INITRD_DIR/rxp2adm"
-    echo "==> bundled rxp2adm for the RAID 5 create/delete test"
-fi
 install -m 0755 "$SCRIPT_DIR/guest-init.sh" "$INITRD_DIR/init"
 (cd "$INITRD_DIR" && find . | cpio -o -H newc --quiet | gzip -1) \
     > "$WORKDIR/initramfs.gz"
@@ -336,7 +319,7 @@ timeout --foreground "${RCRAID_QEMU_TIMEOUT:-300}" qemu-system-x86_64 \
     -M q35 -m 2048 -smp 4 "${ACCEL_ARGS[@]}" \
     -kernel "$KERNEL" \
     -initrd "$WORKDIR/initramfs.gz" \
-    -append "console=ttyS0 rdinit=/init expected_sectors=$EXPECTED_SECTORS expected_level=$LEVEL fail_member=$FAIL_MEMBER degraded_boot=$OMIT_MEMBER parity_write_test=$PARITY_WRITES parity_row_kib=$PARITY_ROW_KIB create_test=$CREATE_TEST api_members=$MEMBERS prp_chunk_bytes=$PRP_CHUNK_BYTES prp_cols=$PRP_COLS panic=-1" \
+    -append "console=ttyS0 rdinit=/init expected_sectors=$EXPECTED_SECTORS expected_level=$LEVEL fail_member=$FAIL_MEMBER degraded_boot=$OMIT_MEMBER parity_write_test=$PARITY_WRITES parity_row_kib=$PARITY_ROW_KIB api_members=$MEMBERS prp_chunk_bytes=$PRP_CHUNK_BYTES prp_cols=$PRP_COLS panic=-1" \
     "${DRIVE_ARGS[@]}" \
     -nographic -no-reboot \
     > "$CONSOLE_LOG" 2>&1 || true   # qemu exit code isn't the verdict

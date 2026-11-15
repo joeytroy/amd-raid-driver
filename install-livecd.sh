@@ -38,7 +38,7 @@ fi
 # A DELETE tears the volume's gendisk down asynchronously, so `rmmod` issued
 # right after the writer returns can lose the race with the block-device
 # release and fail "Module rcraid is in use" while /proc/modules already shows
-# refcount 0 (seen 2026-11-14 immediately after `rxp2adm create`).  Retrying
+# refcount 0 (seen 2026-11-14 immediately after a lab CREATE ioctl).  Retrying
 # beats telling the operator to reboot a live session whose array was just
 # created: the metadata is on the disks and the volume only needs re-probing.
 unload_rcraid() {
@@ -139,9 +139,9 @@ done
 FW_MEMBERS="${FW_MEMBERS# }"
 
 # This installer assembles the array the firmware created; it does not build
-# one.  The writers in this tree (mkmeta.py, rxp2adm) stamp layouts over blank
-# disks for the QEMU rig, where no firmware can produce those records — that is
-# a lab path, not an install path.  Without a firmware array there is nothing to
+# one.  The only writer in this tree (mkmeta.py) stamps RAID 0/1 metadata over
+# blank disks for the QEMU rig, where no firmware can produce those records —
+# that is a lab path, not an install path.  Without a firmware array there is nothing to
 # hand the OS installer, so stop here, before a single disk is touched.
 if [ -z "$FW_MEMBERS" ]; then
     cat >&2 <<'EOF'
