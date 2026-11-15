@@ -85,10 +85,6 @@ struct AmdHardwarePayload {
 
 #define AMD_IOCTL_GET_HARDWARE_INVENTORY \
 	_IOR(AMD_IOCTL_MAGIC, 0x30, struct AmdHardwarePayload)
-#define AMD_IOCTL_COMMIT_NEW_ARRAY \
-	_IOW(AMD_IOCTL_MAGIC, 0x31, struct AmdHardwarePayload)
-#define AMD_IOCTL_DESTROY_ARRAY \
-	_IOW(AMD_IOCTL_MAGIC, 0x32, struct AmdHardwarePayload)
 
 /* -------------------------------------------------------------------------
  * Array management (magic 'a')

@@ -116,22 +116,6 @@ static long amd_raid_ioctl_multiplexer(struct file *file, unsigned int cmd,
 		return ret;
 	}
 
-	case AMD_IOCTL_COMMIT_NEW_ARRAY:
-	case AMD_IOCTL_DESTROY_ARRAY:
-		if (!capable(CAP_SYS_ADMIN)) {
-			pr_warn_ratelimited("rcraid_ctl: rejected configuration change from unprivileged process %s (pid %d)\n",
-					    current->comm, current->pid);
-			return -EPERM;
-		}
-		/*
-		 * Array creation/destruction rewrites firmware-owned metadata.
-		 * The driver does not implement that path yet; fail loudly
-		 * instead of pretending the request was applied.
-		 */
-		pr_warn_ratelimited("rcraid_ctl: array configuration ioctl 0x%x is not implemented\n",
-				    cmd);
-		return -EOPNOTSUPP;
-
 	case AMD_IOCTL_CREATE_ARRAY: {
 		struct amd_array_create req;
 		int ret;

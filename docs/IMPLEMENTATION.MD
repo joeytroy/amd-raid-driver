@@ -314,14 +314,14 @@ rebuild) being the definition of the category. The items below are what
       teardown. `register_chrdev()` was replaced because it allocated a major
       but created no node and reallocated the major on every load.
       Read-only `GET_STATUS` / `GET_HARDWARE_INVENTORY` are unprivileged;
-      `FAIL_MEMBER`, `START_RESYNC`, `CREATE_ARRAY`, `DELETE_ARRAY` and the
-      vendor-ABI `COMMIT_NEW_ARRAY` / `DESTROY_ARRAY` require `CAP_SYS_ADMIN`.
-      The bridge routes to the assembled volume (`rc_volume_*`), not the idle
-      async engine. `CREATE_ARRAY` / `DELETE_ARRAY` call the lab metadata
-      writer (`rc_volume_create_array_indexed()` / `rc_volume_delete_array()`),
+      `FAIL_MEMBER`, `START_RESYNC`, `CREATE_ARRAY` and `DELETE_ARRAY`
+      require `CAP_SYS_ADMIN`. The bridge routes to the assembled volume
+      (`rc_volume_*`), not the idle async engine. `CREATE_ARRAY` /
+      `DELETE_ARRAY` call the lab metadata writer
+      (`rc_volume_create_array_indexed()` / `rc_volume_delete_array()`),
       which stamps records over erased members and is not array lifecycle
-      (issue #16); the vendor-ABI `COMMIT_NEW_ARRAY` / `DESTROY_ARRAY` verbs
-      remain `-EOPNOTSUPP` and log a warning.
+      (issue #16). The never-implemented vendor-ABI `COMMIT_NEW_ARRAY` /
+      `DESTROY_ARRAY` ioctls have been removed from `amd_raid_uapi.h`.
       *Touch points:* `rc_init()`/`rc_exit()` in `rc_main.c`,
       `src/patch_ioctl_bridge.c`, and `src/amd_raid_uapi.h`.
 
