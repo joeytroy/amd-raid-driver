@@ -31,6 +31,9 @@ installkernel() {
 
 install() {
     inst_simple /usr/sbin/rcraid-bind                /usr/sbin/rcraid-bind
+    # rcraid-bind reads the RAIDCore metadata at LBA 0x5000 to tell a member
+    # from any other 1022:b000 disk (issue #8); it refuses to bind without them.
+    inst_multiple dd od
     inst_simple /etc/udev/rules.d/50-rcraid.rules    /etc/udev/rules.d/50-rcraid.rules
     inst_simple /etc/modprobe.d/rcraid.conf          /etc/modprobe.d/rcraid.conf
 }

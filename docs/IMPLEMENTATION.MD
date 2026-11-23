@@ -125,11 +125,21 @@ For status of work already done, see [`STATUS.md`](STATUS.md).
       cycles, 256 MiB SHA-256 matches across each, writes still work
       after.
 
-- [ ] **Hot-plug / drive failure handling** — pulling a member
+- [x] **Hot-plug / drive failure handling** — pulling a member
       drive today will likely oops (NULL ptr on stale `rcraid_dev`).
       Add `.remove` cleanly tearing down a member, mark volume
       degraded (no-op for RAID0 = volume fails), drain pending I/O
       with `BLK_STS_IOERR`.
+      *Resolved:* `rc_bottom_remove()` tears down **volume membership
+      first**, then the controller, then the adapter — the volume must go
+      before `io_queues[]` is freed, or `/dev/rcraid0` keeps dispatching
+      into freed memory (the surprise-remove use-after-free). Per-member
+      state machine (`FAILED` / `NEEDS_RESYNC`) plus a lock-free live mask;
+      the timeout path and drain treat a NULL slot (hot-removed member) as
+      permanently dead and synthesise completions instead of waiting on it.
+      RAID0 fails on a lost member, mirrored levels degrade and keep serving.
+      *Not yet exercised:* a real surprise removal (AER or physical unplug)
+      on hardware — the rig covers death via `fail_member` and the ISR path.
 
 - [x] **FUA / Flush / barrier semantics** — Flush command exists;
       FUA bit on write SQEs is not set even when bio has REQ_FUA.
@@ -173,25 +183,62 @@ For status of work already done, see [`STATUS.md`](STATUS.md).
       rejoins).  Still to come from #51: degraded boot assembly (opt-in
       module param), member re-add plumbing, and the resync engine.
 
-- [ ] **RAID10** — combination of RAID0 + RAID1. Stripe across
+- [x] **RAID10** — combination of RAID0 + RAID1. Stripe across
       mirrored pairs. Reuses RAID0 stripe math + RAID1 mirror dispatch.
+      *Landed 2026-10-02:* `rc_volume_dispatch_raid10()` plus the nested
+      column mapping, per-pair degraded failover, pair-aware rebuild, and
+      boot-time degraded assembly.  **Not yet hardware-validated on
+      `1022:B000`** — [`VALIDATION_RAID10.md`](VALIDATION_RAID10.md) is the
+      gate before the README/STATUS rows may say "stable".
 
-- [ ] **RAID5 / RAID6** — parity calculation in the write path
-      (rmw + p / p+q). Significant work: scrub, rebuild, async XOR.
-      Probably won't land soon; flag as future.
+- [ ] **RAID5 / RAID6** — **read-only by default; full-row RAID 5 writes
+      opt-in, 2026-11-13.** Parity math and the dedicated-parity layout map are
+      done (`src/patch_parity_math.c`, the one place to change once a vendor
+      array confirms the placement). RAID 6 Q is the vendor's EVENODD
+      construction (prime 17, `src/raid6_evenodd.h`), still with no caller: no
+      dual-parity write path exists. The level is identified from the LD
+      `DeviceType` (`0x1BF5` / `0x1BFA`, confirmed on a BIOS-created 3-disk
+      RAID 5), a parity volume assembles at `(N-1)` / `(N-2)` × per-member user
+      size, and reads go through the shared map.
+      **Write path (opt-in):** with `enable_writes=1 parity_writes=1` a request
+      that covers one complete row is written as one NVMe WRITE per data member
+      plus the dedicated parity chunk, with P generated from the request's own
+      bytes into a bounded pool of driver buffers. A partial row is
+      read-modify-written: only the touched data chunks and the old parity are
+      read into per-member DMA buffers, the request's bytes are overlaid and P
+      becomes P_old ^ D_old ^ D_new before the touched chunks plus parity are
+      rewritten. All RAID 5 writes are
+      serialized by one semaphore so a partial and a full write cannot update
+      the same row's parity from different old bytes. Reads fan out per data
+      member when the queue is not chunk-split.      The QEMU rig and, on 2026-11-13, the array box verify full-row, in-row,
+      boundary and cross-row writes; the hardware run also XOR-checked the
+      parity chunk on media. Discards are refused. **Degraded reads and
+      parity rebuild landed 2026-11-13:** with one member failed the volume
+      reports `degraded`, reconstructs a read chunk from P plus the surviving
+      chunks through the synchronous RMW buffers, and refuses writes;
+      `AMD_IOCTL_START_RESYNC` rebuilds a `FAILED` member from the other N-1
+      members in 128 KiB chunks, including the final partial-page tail.
+      Hardware-validated on a 4-member 256 MiB fixture (64 MiB written, member
+      failed, 64 MiB degraded readback, 85 MiB rebuild, optimal readback and
+      new writes). Without `parity_writes=1` the volume stays read-only and the
+      installer's hard stop is unchanged. Still open: the write hole, parity
+      initialisation, automatic rebuild, a firmware-created
+      parity array, and vendor-written corroboration (issues #6 and #3).
 
 - [ ] **Multi-volume support** — BIOS can create multiple arrays
       on the same members. We hardcode one `/dev/rcraid0`. Refactor
       `rc_volume_registry` to be a list, create one gendisk per LD.
 
-- [ ] **Array creation from Linux** — today the only way to make
-      an array is BIOS / RAIDXpert. Add an ioctl + userspace tool
-      (`rcraid-create`) that writes RAIDCore metadata + LD record.
-      Would let us live without rebooting for every array change.
-
-- [ ] **Replace / rebuild a failed drive** — moot for RAID0; needed
+- [x] **Replace / rebuild a failed drive** — moot for RAID0; needed
       for RAID1/5/10. Background rebuild kthread, progress in
       debugfs.
+      *Resolved:* `rc_volume_resync_thread` copies the survivor over the
+      `NEEDS_RESYNC` target behind a logical write-exclusion window, one
+      member at a time; `rc_volume_resync_pick_survivor()` picks the source,
+      and RAID10 rebuilds from the column's pair partner. Progress is
+      `/sys/block/rcraid0/rcraid/resync_progress` (`memberN cur/tot pct%`).
+      **Scope: RAID1, RAID10 and RAID5** — RAID 5 rebuild XORs the other N-1
+      members into the target; RAID 6 remains open.
 
 ---
 
@@ -261,16 +308,49 @@ rebuild) being the definition of the category. The items below are what
 
 ### Management & monitoring plane
 
-- [ ] **Array state observability** — status queryable by a tool, not
-      dmesg: volume state (online/dead/resetting), per-member health,
-      reset/latch state. Start with sysfs attrs; grow into a
-      `rcraidctl` CLI. Windows parity here is RAIDXpert2.
+- [x] **Register the control bridge (`/dev/amd_ctl0`)** —
+      `rc_init()` calls `rc_amd_init_ioctl_bridge()`, which registers a
+      `misc` device at `/dev/amd_ctl0`; `rc_exit()` removes it before volume
+      teardown. `register_chrdev()` was replaced because it allocated a major
+      but created no node and reallocated the major on every load.
+      Read-only `GET_STATUS` / `GET_HARDWARE_INVENTORY` are unprivileged;
+      `FAIL_MEMBER`, `START_RESYNC`, `CREATE_ARRAY` and `DELETE_ARRAY`
+      require `CAP_SYS_ADMIN`. The bridge routes to the assembled volume
+      (`rc_volume_*`), not the idle async engine. `CREATE_ARRAY` /
+      `DELETE_ARRAY` call the lab metadata writer
+      (`rc_volume_create_array_indexed()` / `rc_volume_delete_array()`),
+      which stamps records over erased members and is not array lifecycle
+      (issue #16). The never-implemented vendor-ABI `COMMIT_NEW_ARRAY` /
+      `DESTROY_ARRAY` ioctls have been removed from `amd_raid_uapi.h`.
+      *Touch points:* `rc_init()`/`rc_exit()` in `rc_main.c`,
+      `src/patch_ioctl_bridge.c`, and `src/amd_raid_uapi.h`.
+
+- [ ] **`rcraidctl` / live control CLI** — the transport now exists, but no
+      CLI consumes it. Next step is a small tool over
+      `AMD_IOCTL_GET_STATUS`, `AMD_IOCTL_GET_HARDWARE_INVENTORY`, and
+      `AMD_IOCTL_FAIL_MEMBER`, with `START_RESYNC` limited to RAID 1/10.
+
+- [x] **Array state observability — sysfs half** — status queryable by a
+      tool, not dmesg: volume state (online/dead/resetting), per-member
+      health, reset/latch state.
+      *Resolved:* `/sys/block/rcraid0/rcraid/{state,members,resync_progress,fail_member}`
+      plus the adapter-level `adapter_info` / `queue_stats` /
+      `doorbell_state` / `pending_requests` / `reset` attrs. Machine-readable
+      without log scraping, but only by polling.
+
+- [ ] **`rcraidctl` CLI** — a query/control front end over the sysfs attrs
+      above (and the ioctl bridge, once registered). Windows parity here is
+      RAIDXpert2. The attrs already carry everything such a tool needs; what
+      is missing is the tool, and a transport for the control half.
 
 - [ ] **Event notification** — emit uevents on state transitions
       (member dead, auto-reset attempted/failed, volume offline) so
       monitoring stacks (node_exporter, collectd, udev rules) can
       alert without scraping logs. Structured, ratelimit-safe log
       lines with stable prefixes for the same reason.
+      *Status 2026-11-08:* there are **zero** `kobject_uevent()` calls in the
+      tree — degraded, member death, reset latch and resync completion are
+      all dmesg-only, so the sysfs attrs are poll-only.
 
 ### Validation & support
 
@@ -281,6 +361,17 @@ rebuild) being the definition of the category. The items below are what
       the matrix deliberately. The AHCI variants are already flagged
       best-effort; the NVMe path has the same single-config exposure,
       just undocumented.
+
+      *Status 2026-11-14:* the build half is covered — CI compiles this
+      tree warning-clean inside Fedora, Arch, Ubuntu 24.04 HWE and
+      Ubuntu 26.04 containers on every push and PR, and the QEMU rig
+      boots the module through five array scenarios (`raid0`, `raid1`,
+      `raid1-degraded`, `raid1-degraded-boot`, `raid5-parity-write`) plus
+      the guest battery. What that does
+      **not** establish: runtime on anything but the array box's kernel
+      (the container jobs are compile-only), drive models other than the
+      Sabrent/Crucial sets, or member counts above 4 on real hardware.
+      Those stay open, so the bullet stays unticked.
 
 - [ ] **Power-fail / crash-safety validation** — the design is right
       (members' volatile write cache + honest FLUSH/FUA), but nothing
@@ -371,6 +462,33 @@ honestly.
 
 ---
 
+## 🛰️ Long-horizon phases (0–8)
+
+**Source of truth.** The table below is the only copy: `README.md` links
+here instead of duplicating it, so a phase cannot read "planned" in one file
+and "in progress" in the other. Near-term priority is the ordered list at the
+bottom of this file; the phases are the long view, and several of them (OCE,
+ORLM, COW, P2PDMA, io_uring, ZNS/FDP) are not on the daily-driver path at all.
+
+| Phase | Feature | Status (2026-11-14) | Enables |
+|---|---|---|---|
+| 0 | RAID 0 / 1 / 10 I/O + rebuild | ✅ RAID0 and RAID1 shipped and hardware-validated; RAID10 feature-complete, array-box run pending ([VALIDATION_RAID10.md](VALIDATION_RAID10.md)) | Production baseline |
+| 1 | RAID 5/6 I/O + rebuild | 🟡 Assembly + reads wired; RAID 5 writes opt-in and hardware-validated 2026-11-13, RAID 6 forced read-only; create/delete metadata is a lab-only writer (RAID 5 behind `parity_create=1`, no longer rig-exercised); first firmware 3-disk RAID 5 metadata parsed, assembled and read back 2026-11-08 (`0x1BF5`, N=3, `(N-1)` × user size); placement settled from the vendor core, corroboration pending (issue #6); Q generator now the vendor's EVENODD, uncalled (issue #10); RAID 5 degraded reads + manual parity rebuild hardware-validated 2026-11-13 | Inspect and read existing parity arrays |
+| 2 | Rig metadata fixtures for levels no firmware produced | ⏳ Planned — `scripts/qemu-test/mkmeta.py` writes RAID 0/1 for the QEMU rig only; this is test-fixture generation, not array lifecycle: real arrays are created in the UEFI RAIDXpert2 utility and no install path waits for it | QEMU scenarios at RAID10 and synthetic parity levels |
+| 3 | OCE (Online Capacity Expansion) | 🗺️ Roadmap — this driver | Add drives online, restripe, grow FS |
+| 4 | ORLM (Online RAID Level Migration) | 🗺️ Roadmap — this driver | RAID 0↔5↔6↔10 online, zero host CPU |
+| 5 | COW snapshots + instant clone | 🗺️ Future | Fast clones, no space cost |
+| 6 | P2PDMA (peer-to-peer DMA) | 🗺️ Future | Drive-to-drive DMA, no host copy |
+| 7 | io_uring support | 🗺️ Future | Userspace async I/O, zero-copy |
+| 8 | Hardware offload (NVMe ZNS/FDP) | 🗺️ Future | Zero host CPU, device-managed placement |
+
+Phases 3–8 have no code, no design notes and no exit criteria in this tree.
+They are recorded so the ambition is explicit, not because they are
+scheduled. Phase 2 is the only one of the set that changes what the tree can
+test — the rig can only boot arrays it encoded itself — which is why it opens
+the next-PR order as fixture work. It is not on the install path: there the
+UEFI RAIDXpert2 utility creates the array.
+
 ## 🤔 Open reverse-engineering questions
 
 See the "Open questions" section of
@@ -379,38 +497,67 @@ remaining items:
 
 - [ ] `rcraid.sys` completion ISR (`FUN_14000d2b8`) — never decompiled.
       Confirm CQ entry layout vs. NVMe-standard.
-- [ ] AHCI path bring-up (devices 0x7905 / 7916 / 7917 / 43BD) —
-      MODULE_DEVICE_TABLE already claims them; the AHCI submit /
-      complete path needs to be implemented fresh from `rcbottom.sys`.
+- [ ] AHCI path bring-up (devices 0x7905 / 7916 / 7917 / 43BD) — not in
+      MODULE_DEVICE_TABLE on purpose (claiming them would take the device
+      from `ahci` and drive nothing); re-add them with the AHCI submit /
+      complete path, implemented fresh from `rcbottom.sys`.
 
 ---
 
 ## Suggested next-PR order
 
-The original daily-driver sequence (partition scan, fast discard,
-DKMS/udev, suspend/resume, boot-from-RAID) has shipped, and **RAID1 has
-shipped and is hardware-validated** (2026-07-10 — the dev box now boots
-from the mirror; the QEMU rig + CI qemu-rig jobs cover both levels on
-every PR). Current order, aimed at the enterprise bar:
+The original daily-driver sequence (partition scan, fast discard, DKMS/udev,
+suspend/resume, boot-from-RAID) shipped long ago. So did the first two items
+of the previous version of this list — **hot-plug / degraded failover** and
+**rebuild**, plus the sysfs half of **observability** — and **RAID1** is
+hardware-validated (2026-07-10, the dev box boots from the mirror) and
+**RAID10** is feature-complete pending its array-box run. The order below is
+what is actually left; several items are now verification and documentation
+rather than code.
 
-1. **Hot-plug / drive-failure handling + RAID1 degraded mode** — the
-   mirror must serve from the survivor when a member dies (today the
-   volume fails like RAID0; the data survives but availability doesn't).
-   Rig gains failure injection (QEMU device detach) alongside.
-2. **Rebuild** — background resync kthread + progress reporting;
-   completes the redundancy trio.
-3. **Array state observability + uevents** — sysfs status attrs and
-   state-transition events; cheap once the degraded-state machinery
-   from (1) exists.
-4. **SMART pass-through** — per-member health visibility.
-5. **Kernel test suite integration** — blktests/xfstests in CI so the
-   redundancy work above stays regression-backed.
-6. **Secure Boot documentation** (MOK enrollment; the DKMS/shim path
-   already signs) and **writes-enabled-by-default latch**.
-7. **Multi-volume support** (the BIOS can carry multiple arrays; the
-   committed-generation parser already sees every LD record — the
-   volume layer is what's single-instance), then the remaining
-   enterprise doc items (support matrix, runbook, durability
+1. **Rig metadata fixtures for RAID10/5/6** — `scripts/qemu-test/mkmeta.py`
+   writes RAID 0/1 only, so the rig cannot boot a synthetic array at any other
+   level. Implement the records (RAID10 first: `0x1BF6` + 2×2 is already proven
+   by the X399 fixtures). This is fixture generation for the QEMU rig, not
+   array lifecycle: no install path depends on it, because `install-livecd.sh`
+   requires the array the UEFI RAIDXpert2 utility created (issue #16).
+2. **Corroborate the RAID5/6 on-disk placement** (issue #6) — the read-only
+   parity path assembles and reads: a firmware-created 3-disk RAID 5 was
+   parsed, assembled and read on 2026-11-08 (`0x1BF5`, N=3, `(N-1)` × user
+   size). That array no longer exists, so there is currently no
+   firmware-written parity array to re-read — and it was zeroed at creation
+   anyway, so even while it existed it carried no vendor-written data to
+   check the placement against. The dedicated-parity placement in `src/patch_parity_math.c` is
+   taken from the vendor core rather than inferred, and the RAID6 Q generator
+   is now the vendor's EVENODD (issue #10) — still with no caller, because the
+   full-row path that landed is RAID 5 P-only and RAID 6 has no writes at all.
+   A staged fixture can only show that the
+   driver reads the map it implements: re-stamped under the dedicated layout
+   on 2026-11-08 it round-trips byte-identically, which is self-consistency,
+   not corroboration. Only data written through RAIDXpert2/Windows can prove
+   the firmware writes that map, so until such data is read back, trusting a
+   vendor-written parity array rests on AMD's code rather than on observation.
+3. **RAID10 array-box run** — [`VALIDATION_RAID10.md`](VALIDATION_RAID10.md)'s
+   results table is empty and it is the only thing between a finished
+   feature and promoting it in README/STATUS. Note the scope limit recorded
+   in step 1 there: the adjacent-pair convention is corroborated for 2×2
+   only, and a 6-member 3×2 would assemble on the same unverified
+   assumption.
+4. **SMART pass-through** — per-member health visibility (SMART log
+   LID=0x02, temperature, wear). Small, isolated, no data-path risk, and
+   currently the largest user-visible health gap.
+5. **Control bridge → uevents → `rcraidctl`** — the ioctl transport is now
+   registered and live; the remaining work is a CLI and uevents. uevents are
+   the cheap half of monitoring once state transitions are already tracked.
+6. **Multi-volume support** (the BIOS can carry multiple arrays; the
+   committed-generation parser already sees every LD record — the volume
+   layer is what's single-instance), the **writes-enabled-by-default latch**,
+   the **signing script** (docs already cover MOK enrollment), then the
+   remaining enterprise doc items (support matrix, runbook, durability
    statement) alongside.
+7. **Kernel test suite integration** — blktests/xfstests in CI so the
+   failure-handling and rebuild work above stays regression-backed. The QEMU
+   rig covers assembly and the degraded paths, but nothing exercises the
+   block layer the way blktests does.
 
 Everything else can come after.

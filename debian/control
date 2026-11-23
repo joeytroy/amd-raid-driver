@@ -1,0 +1,14 @@
+Source: amd-raid-driver-dkms
+Section: kernel
+Priority: optional
+Maintainer: Joey Troy <joey.troy@gmail.com>
+Build-Depends: debhelper-compat (= 13), dkms
+Standards-Version: 4.6.2
+
+Package: amd-raid-driver-dkms
+Architecture: all
+Depends: ${misc:Depends}, dkms, build-essential
+Description: AMD RAID driver (rcraid) via DKMS
+ This package provides the rcraid driver for AMD NVMe/SATA hardware
+ RAID arrays, managed via DKMS so it updates automatically with
+ new kernel installations.

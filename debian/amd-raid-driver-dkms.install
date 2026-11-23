@@ -1,0 +1,9 @@
+src/rc_*.c usr/src/amd-raid-driver-1.0.0/src/
+src/rc_*.h usr/src/amd-raid-driver-1.0.0/src/
+src/patch_*.c usr/src/amd-raid-driver-1.0.0/src/
+src/patch_*.h usr/src/amd-raid-driver-1.0.0/src/
+src/raid6_evenodd.h usr/src/amd-raid-driver-1.0.0/src/
+src/amd_raid_uapi.h usr/src/amd-raid-driver-1.0.0/src/
+Makefile usr/src/amd-raid-driver-1.0.0/
+dkms.conf usr/src/amd-raid-driver-1.0.0/
+docs/VERSION usr/src/amd-raid-driver-1.0.0/docs/

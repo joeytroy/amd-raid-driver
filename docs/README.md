@@ -1,31 +1,461 @@
-# AMD RAID Driver Port — Documentation
+<div align="center">
 
-Linux port of the AMD-RAID Windows driver, targeting the TRX50 chipset's
-**RAID Bottom Device** (PCI `1022:B000`, NVMe controller class `0x010802`).
+# ⚡ rcraid
 
-## The four documents
+</div>
+
+[![CI](https://github.com/joeytroy/amd-raid-driver/actions/workflows/ci.yml/badge.svg)](https://github.com/joeytroy/amd-raid-driver/actions/workflows/ci.yml)
+[![License: GPL-2.0-only](https://img.shields.io/badge/License-GPL--2.0--only-blue.svg)](LICENSE)
+[![Kernel](https://img.shields.io/badge/Kernel-%E2%89%A5%206.15-orange.svg)](#quick-start)
+[![RAID](https://img.shields.io/badge/RAID0%20%2B%20RAID1-hardware%20validated-success.svg)](#benchmarks)
+[![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](#for-developers)
+[![Donate via PayPal](https://img.shields.io/badge/Donate-PayPal-blue.svg)](https://www.paypal.com/paypalme/joeytroynm)
+
+Your RAIDXpert array becomes an ordinary block device at `/dev/rcraid0` —
+partition it, format it, mount it, benchmark it, and **boot Linux straight
+from it**.
+
+[Quick start](#quick-start) <br>
+[Supported hardware](#is-my-hardware-supported) <br>
+[Benchmarks](#benchmarks) <br>
+[Safety](#safety-first) <br>
+[Roadmap](#not-yet-supported) <br>
+[Contributing](#for-developers) <br>
+
+
+
+---
+
+> ⚠️ **First time?** Read [Safety first](#safety-first) before loading the
+> driver — the AMD chipset makes *every* NVMe in the box look like an array
+> member, including your OS disk.
+
+## At a glance
+
+| | |
+|---|---|
+| **RAID levels** | RAID0 ✅ &nbsp;·&nbsp; RAID1 ✅ &nbsp;·&nbsp; RAID10 🟡 feature-complete, validation pending &nbsp;·&nbsp; RAID5 🟡 opt-in writes, hardware-validated · RAID6 🟡 read-only |
+| **Boot from the array** | ✅ Validated on hardware for **both** levels — installer script, DKMS rebuilds, initramfs hook, UEFI fallback entry |
+| **Throughput** (2× T700, PCIe 5.0) | RAID0 **20.6 / 19.7 GB/s** · RAID1 **20.5 / 11.1 GB/s** (seq R/W — [details](#benchmarks)) |
+| **Filesystem safety** | FLUSH · FUA · DISCARD/TRIM — `fsync`, journaling, and `fstrim` behave correctly |
+| **Kernel** | ≥ 6.15, boot-tested through **Linux 7.0** (Kubuntu 26.04) and runtime-validated on **7.3.0-10-generic**; CI builds Fedora, Arch, Ubuntu 24.04 HWE and 26.04. Ubuntu 24.04 needs the HWE stack (6.17+) |
+| **Metadata** | 100 % read from the on-disk RAIDXpert config — nothing hardcoded |
+| **License** | GPL-2.0-only, clean-room under DMCA §1201(f) — aiming for mainline |
+
+---
+
+## Is my hardware supported?
+
+**Yes, if you have an AMD-RAID NVMe array** on any recent AMD platform —
+Ryzen 7000+, Ryzen AI 300 / AI Max, Threadripper 7000 / 9000 (TRX50 /
+WRX90), or the X870 / B850 / X670 / B650 chipsets. They all present the
+NVMe RAID controller as PCI `1022:B000`, which is fully implemented here.
+
+| PCI ID | Controller | Status |
+|--------|-----------|--------|
+| `1022:B000` | NVMe RAID Bottom (TRX50, WRX90, X870/X670, B850/B650, …) | ✅ **RAID0 + RAID1 read/write, boot-from-array validated** |
+| `1022:43BD` `7905` `7916` `7917` | SATA RAID (Promontory / older) | ⛔ **Not claimed** — AHCI path unimplemented, so the device stays with `ahci` |
+
+> **Heads-up for RAID1 users:** degraded mode and resync work — a member
+> failure (or hot-unplug) keeps the volume serving from the surviving
+> mirror, and a re-added member is rebuilt from the survivor while the
+> volume stays online. Degraded state is **in-memory only** (a
+> reboot/reload re-assembles the array as if in sync), so rebuild before
+> rebooting if the mirrors diverged. Details under
+> [Not yet supported](#not-yet-supported).
+
+---
+
+## What works today
+
+- **Metadata-native assembly.** Member count, member order, stripe
+  size, RAID level, and capacity all come from the on-disk RAIDXpert
+  metadata — read from the **committed** config generation, so a
+  previously deleted array on the same disks can never be assembled by
+  mistake. Nothing is hardcoded.
+- **RAID1 mirrors done right.** Reads round-robin across both members
+  (~2× single-drive throughput); writes and discards fan out to every
+  mirror and complete only when the *last* member acknowledges — an
+  `fsync` can never pass while one mirror holds stale data.
+- **Boot Linux from the array.** Validated end to end for both levels
+  and two LTS releases: Kubuntu 24.04 (kernel 6.17) and Kubuntu 26.04
+  (kernel 7.0) installed onto and booting from a 2× Crucial T700 array —
+  as RAID0 and, separately, as RAID1 — with DKMS rebuilds and an
+  initramfs hook that brings the array up before `pivot_root`.
+- **Filesystem-safe.** FLUSH, FUA, and DISCARD/TRIM are all wired up,
+  so `fsync`, journaling, and `fstrim` behave correctly.
+- **Fast — and true to each RAID level's physics.** Interrupt-driven
+  async completion with a scatterlist-native DMA path: the hardware reads
+  and writes your pages directly on the fast path (no memcpy); a small
+  bounce pool covers the rare layouts PRPs cannot encode. Numbers below.
+- **Resilient.** 30 s command timeouts, controller health tracking,
+  best-effort NVMe Abort, and automatic controller reset on the first
+  timeout — with a manual sysfs reset as a fallback.
+
+Writes are **off by the module's default** (`enable_writes=1` to opt in) —
+the `install-livecd.sh` and DKMS installers turn writes on for you; the
+read-only default only applies to a bare manual `insmod`.
+
+---
+
+## Benchmarks
+
+KDiskMark 3.3.0 on `/dev/rcraid0` — 2× Crucial T700 (PCIe 5.0) on a TRX50
+motherboard. Both runs were measured **booted from the array**, with the
+array serving `/`: the RAID0 run on Kubuntu 26.04 (Linux 7.0), the RAID1
+run on Kubuntu 24.04 (Linux 6.17).
+
+| SEQ1M Q8T1 | RAID0 (Linux 7.0) | RAID1 (Linux 6.17) |
+|---|---:|---:|
+| **Sequential read** | **20.6 GB/s** | 20.5 GB/s |
+| **Sequential write** | **19.7 GB/s** | 11.1 GB/s |
+| **Sequential read (Q1)** | 10.6 GB/s | 5.9 GB/s |
+| **Sequential write (Q1)** | 11.4 GB/s | 7.4 GB/s |
+| **Random 4K read (Q32)** | 310 K IOPS | 281 K IOPS |
+| **Random 4K write (Q32)** | 282 K IOPS | 256 K IOPS |
+
+Why the numbers look the way they do: RAID1 **reads** keep pace with
+RAID0 because both mirrors serve reads in parallel with no
+stripe-boundary splits; RAID1 **writes** are bounded by a single drive
+because every write must land on both mirrors — that's the mirror
+contract, not overhead. And the driver gets faster with the kernel for
+free: the same RAID0 array that did 19.7 / 18.7 GB/s on Linux 6.17 does
+**20.6 / 19.7 GB/s on Linux 7.0** — the interrupt-driven, zero-copy
+design rides every block-layer improvement upstream lands.
+
+### Four-member NVMe RAID 0 (read-only, hardware)
+
+A second box, measured read-only (`enable_writes=0`) with `fio` 3.41,
+`direct=1`: firmware-created RAID 0 over 4× Sabrent Rocket Q 4 TB
+(PCIe 3.0 ×4), 256 KiB chunks, 14.55 TiB, the volume holding a live XFS
+filesystem. Raw baselines are the same four drives served by `nvme`.
+
+| Workload | Raw members | RAID 0 | vs raw |
+|---|---:|---:|---:|
+| Seq 1 MiB, 128 outstanding | 13,276.0 MiB/s | 13,276.2 MiB/s | **100.0 %** |
+| Rand 4 KiB, 128 outstanding | 1,969,933 IOPS | 1,846,226 IOPS | **93.7 %** |
+
+Each member did 3,319 MiB/s sequential — pinned at its PCIe 3.0 ×4 link —
+so that array ceiling is the drives, not the driver. At QD1 a 1 MiB read
+is split across all four members: 9,239 MiB/s and 90 µs mean versus
+2,421 MiB/s and 390 µs on one drive. 4 KiB QD1 is 39.3 K IOPS against
+36.8 K raw, i.e. no measurable driver latency. Single 20 s pass per
+workload, `powersave` governor.
+
+<p align="center">
+  <img src="image/kdiskmark.png" width="480" alt="KDiskMark on the RAID0 array: 20,563 MB/s read, 19,699 MB/s write (SEQ1M Q8T1)"><br>
+  <em>KDiskMark 3.3.0 on the RAID0 array serving <code>/</code> — 2× Crucial T700 NVMe SSDs (PCIe 5.0), TRX50, Kubuntu 26.04 (Linux 7.0).</em>
+</p>
+
+---
+
+## Safety first
+
+Two things protect your data and your OS install. Understand both:
+
+1. **The driver is read-only unless writes are enabled with
+   `enable_writes=1`.** The install scripts enable writes for you; a bare
+   manual `insmod` stays read-only. On the manual path, do your first run
+   read-only and confirm the array assembles correctly before enabling
+   writes.
+
+2. **Your OS drive can masquerade as an array member.** The AMD chipset
+   shadows every NVMe as PCI `1022:b000`, including your boot SSD.
+   `rcraid-bind` therefore reads the RAIDCore metadata at LBA `0x5000`
+   first and only hands the device over if it is a real member — firmware
+   writes that header on members and nowhere else, so the check holds even
+   when every drive is the same OEM and reports the same
+   `subsystem_vendor` (issue #8). The helper also refuses any device whose
+   namespace is currently mounted. If you bind drives by hand, **never
+   unbind your OS drive**, and identify members by serial rather than by
+   slot or model string.
+
+Also note: the module is built **unsigned** unless an installer signs it.
+`install-dkms.sh` creates a MOK key when the firmware has no enrolled one,
+points DKMS at it, signs what it installs, and queues the enrolment — the
+reboot the install needs anyway completes it, because shim's MOK manager runs
+before the kernel. Without an enrolled key, **Secure Boot must be off**. The
+live-USB installer requires it off for the live session itself, then enrols
+the installed system's key at that system's first boot (see `INSTALL.md`,
+"Secure Boot").
+
+---
+
+## Quick start
+
+**Prerequisites**
+
+- BIOS in RAID mode, array already created in RAIDXpert (see `INSTALL.md`
+  for the one-time BIOS setup).
+- Secure Boot **off** for the live-USB install; the installed system's signing
+  key is enrolled at its first boot, after which Secure Boot can be switched
+  back on. If you never enable Secure Boot, no key is enrolled.
+- Kernel **≥ 6.15** (on Ubuntu 24.04 that means the HWE stack, 6.17+ —
+  the 6.8 GA kernel is too old).
+- `sudo apt install build-essential linux-headers-$(uname -r)`
+
+Pick the path that matches what you're doing:
+
+### 🅐 Install Linux *onto* the array (from a live USB)
+
+This is the recommended path for a fresh array. `install-livecd.sh` runs
+in two phases around the normal OS installer — you don't reboot until the
+very end. Full walkthrough:
+
+**1. Boot the live USB and enter the live desktop.**
+Flash a stock Ubuntu / Kubuntu / Debian / Fedora ISO, boot it, and choose
+**Try** (the live session) — *not* Install yet. Connect to the network.
+
+**2. Build and load the driver.**
+
+```sh
+sudo apt install -y git          # or: sudo dnf install -y git
+git clone https://github.com/joeytroy/amd-raid-driver.git
+cd amd-raid-driver
+sudo ./install-livecd.sh
+```
+
+The script installs build tools, compiles the module against the live
+kernel, auto-detects your array members, binds them, and loads `rcraid`.
+When it prints that **`/dev/rcraid0` is up**, it pauses and waits for you.
+
+Members are found by the RAIDCore metadata at LBA `0x5000`, so the array is
+used exactly as the UEFI RAIDXpert2 utility left it — nothing is written to
+those disks, and the level is whatever the firmware recorded, RAID 10/5/6
+included. **The array has to exist before this script runs:** with no RAIDCore
+metadata on any disk there is nothing to install onto, and it stops and says
+so rather than writing anything. There are no disk or level menus and no
+install-time creation; the only userspace writer in this tree
+(`scripts/qemu-test/mkmeta.py`, RAID 0/1 only) exists for the QEMU rig, over
+blank images.
+
+Once the volume is up the script states whether it is **writable for the
+level it found**. Read-only is a hard stop — no OS installer can write to
+it — and happens for RAID 6 (no write path) or when the driver refused to
+trust the geometry. A firmware RAID 5 volume assembles read-only until it is
+loaded with `parity_writes=1`, which the script does itself before
+continuing, so that level installs; its parity is still only meaningful for
+the regions actually written.
+
+**3. Run the OS installer — leave this terminal open.**
+Launch the distro's installer from the live desktop (*Install Kubuntu*,
+etc.) and:
+
+- ✅ **Tick "Download updates while installing."** Keep the machine online
+  for the whole run — in our testing this is what keeps the installer from
+  restarting the session and dropping the loaded driver (and the array)
+  partway through the install.
+- Point the install at **`/dev/rcraid0`** with **Manual partitioning**, not
+  "Erase disk and install": the ESP has to be a partition of the array, and
+  creating it by hand is the layout the install has been validated with.
+  Select `rcraid0 - … (/dev/rcraid0)` as the storage device, create a **GPT**
+  table, then add a **512 MiB fat32** partition mounted at **`/boot/efi`** with
+  the **`boot`** flag, and the remainder as **xfs** mounted at **`/`**. Phase 2
+  probes `/dev/rcraid0p*` for the rootfs and the ESP, so it picks up what you
+  create — and stops with an error rather than guessing if the array has no
+  ESP. Just make sure the disk you partition is `/dev/rcraid0`, **not** your OS
+  drive or the live USB.
+- Let it finish, but when it offers to reboot, **do *not* reboot.** Close
+  the installer and return to the terminal.
+
+**4. Press Enter to finish.**
+Back in the terminal, press Enter. Phase 2 finds your new rootfs on
+`/dev/rcraid0pN`, chroots in, installs DKMS + the initramfs hook against
+the *target* kernel, and writes a UEFI boot entry (plus an
+`\EFI\BOOT\BOOTX64.EFI` fallback, since installer-created entries often
+don't stick on RAIDXpert firmware).
+
+**5. Reboot.** `sudo reboot` — the system now boots from the array on its
+own. If the first boot misbehaves, hit `e` in GRUB and add
+`rd.driver.blacklist=nvme` to prove the rcraid path, then revert.
+
+> A `blacklist nvme` line in `/etc/modprobe.d` is **not** equivalent: if the
+> initramfs loads `nvme` first, the blacklist never applies and `rc_init`
+> finds no adapters. On a test rig that must keep `nvme` away, also add
+> `install nvme /bin/false`, run `update-initramfs -u`, and `modprobe -r nvme`
+> before binding (issue #15).
+
+### 🅑 Mount an array from an existing Linux install (DKMS, persistent)
+
+Survives kernel updates and comes up automatically at every boot:
+
+```sh
+sudo apt install dkms
+sudo ./install-dkms.sh
+```
+
+It detects your array members (vs. your OS drive), installs the module
+via DKMS, pins the members to the driver with a udev rule, enables writes
+by default, and adds an initramfs hook. On apt-based systems it also
+excludes kernel packages from unattended-upgrades
+(`/etc/apt/apt.conf.d/52-rcraid-kernel-hold`), so a kernel update — and
+the DKMS rebuild + initramfs regeneration it requires — is always a
+deliberate act. Reboot and `/dev/rcraid0` (plus any `/dev/rcraid0pN`
+partitions) is just there. `sudo ./uninstall-dkms.sh` reverses all of it
+(and refuses to run if the system is currently booted from the array,
+unless you pass `--force`).
+
+**After every kernel update, run `scripts/verify-boot-safety.sh` before
+rebooting.** It checks, for every installed kernel, that DKMS built the
+module and that the module is actually inside that kernel's initramfs
+(both initramfs-tools and dracut systems are supported), and tells you
+the exact fix command for any kernel that would fail to boot.
+
+### 🅒 Build and load by hand (dev iteration / one-off)
+
+<details>
+<summary>Manual unbind / insmod steps</summary>
+
+```sh
+sudo ./build.sh                        # produces rcraid.ko
+
+lspci -d 1022:b000 -k                   # find your members' BDFs
+                                        # ⚠️ do NOT include your OS drive
+
+# Unbind each array member from nvme:
+echo 0000:81:00.0 | sudo tee /sys/bus/pci/drivers/nvme/unbind
+echo 0000:82:00.0 | sudo tee /sys/bus/pci/drivers/nvme/unbind
+
+sudo insmod ./rcraid.ko                 # read-only (safest first run)
+sudo insmod ./rcraid.ko enable_writes=1 # read-write
+
+# Confirm it came up:
+sudo dmesg | grep -E 'rcraid|rc_volume' | tail -20
+lsblk /dev/rcraid0
+```
+
+Then format/mount as any disk, e.g. a fresh whole-disk XFS:
+
+```sh
+sudo mkfs.xfs -f -d su=256k,sw=<num_members> /dev/rcraid0
+sudo mount -o noatime /dev/rcraid0 /mnt/rcraid0
+```
+
+Unload with `sudo umount … && sudo rmmod rcraid`. Note the manual path
+must be repeated every reboot (path 🅑 automates it), and after `rmmod`
+the drives stay unbound until you rebind them to `nvme` or reboot.
+
+</details>
+
+Full setup, troubleshooting, and the Secure-Boot / signing details are in
+**[`INSTALL.md`](INSTALL.md)**.
+
+---
+
+## Not yet supported
+
+- **Persistent degraded state** — ⚠️ **know this before trusting the
+  mirror**: degraded mode, opt-in degraded boot (`allow_degraded=1`),
+  and resync all work (state in `/sys/block/rcraid0/rcraid/` and
+  `/sys/kernel/debug/rcraid/volume`), but degraded/resync state is
+  **in-memory only** — the driver never writes the firmware-owned
+  RAIDCore metadata. A reboot or module reload re-assembles the array
+  as if in sync, so if the mirrors have actually diverged (a member
+  failed and writes continued), let the resync finish — or rebuild the
+  array — before rebooting. On-disk state tracking requires further
+  reverse engineering of the config-ring writer and is a roadmap item.
+- **RAID10 hardware validation** — the level itself is feature-complete
+  (dispatch, per-pair failover, rebuild, degraded boot), but its only
+  `1022:B000` array-box run used metadata this driver wrote (2×2, 8 TB,
+  2026-11-13); a firmware-created array has not been assembled yet,
+  so don't put data you can't lose on it. See
+  [`VALIDATION_RAID10.md`](VALIDATION_RAID10.md). **RAID5/6** — a parity volume
+  is now identified from the LD `DeviceType`, assembles at the right capacity
+  and serves reads, but it is **read-only by default**: partial-stripe
+  read-modify-write and writes need the opt-in below. RAID 5 has an opt-in write path (`enable_writes=1 parity_writes=1`:
+  full-row parity generation plus read-modify-write for partial rows),
+  hardware-validated 2026-11-13 on a 4-member array stamped by this driver;
+  RAID 6 has none. RAID 5 also has hardware-validated degraded reads and a
+  manual parity rebuild (2026-11-13); while degraded it is read-only. Array creation and deletion are
+  **UEFI RAIDXpert2 only**: the driver's lab metadata writer is not an
+  array-lifecycle tool and must never be pointed at firmware-managed members
+  (issue #16). Vendor parity placement is settled against
+  the vendor implementation (dedicated, on member `N-1`) and the map matches
+  it; what is still owed is corroboration — no vendor-written array has been
+  read back through it, so treat that as the last open check rather than as
+  doubt about the layout. Don't write without the opt-in; there is no
+  write-hole journal, rebuild is manual, and no firmware-created parity array
+  has been tested yet (issue #6).
+- **SATA RAID** — the `43BD / 7905 / 7916 / 7917` controllers are **not
+  claimed**; the AHCI path is unimplemented, so those devices stay bound to
+  `ahci` (see #7).
+- **No array management** — create/modify the array in BIOS/RAIDXpert.
+- **Signing is installer-driven** — `install-dkms.sh` creates or reuses a MOK
+  key, signs through DKMS (including kernel-update rebuilds) and queues the
+  enrolment that the post-install reboot completes; a plain `make` build stays
+  unsigned.
+- **No retry of transient NVMe errors** — a failed command surfaces as an
+  I/O error (`BLK_STS_IOERR`) even when the drive reports it as retryable
+  (DNR=0); it isn't re-dispatched. Controller-level failures still trigger
+  the automatic reset described above.
+- **Single-request multi-stripe fan-out is intentionally disabled** —
+  requests are split at stripe boundaries (`chunk_sectors`), so each NVMe
+  command targets exactly one member. Parallelism across members comes from
+  many requests in flight at once (which is what the numbers above measure),
+  not from one request fanning out. The fan-out path is wired up but
+  unreachable by design — see
+  [`docs/IMPLEMENTATION.MD`](docs/IMPLEMENTATION.MD).
+
+The prioritized checklist lives in
+[`docs/IMPLEMENTATION.MD`](docs/IMPLEMENTATION.MD).
+
+---
+
+## For developers
+
+This is a clean-room driver reverse-engineered from AMD's publicly
+distributed Windows binaries under DMCA §1201(f) interoperability
+protections — **no AMD source code is used**. Contributions welcome:
+open a PR, add yourself to the contributor list, and sign off your
+commits (`git commit -s`). The long-term goal is mainline kernel
+inclusion.
+
+Every PR is gated by CI that not only builds against four kernel
+lines (Fedora, Arch, Ubuntu 24.04 HWE, Ubuntu 26.04) but **boots the
+driver in QEMU** against synthetic RAID0, RAID1 and RAID5 arrays
+(`scripts/qemu-test/`) — including the opt-in RAID 5 parity write path
+and a parity delete → create → reassembly cycle. The synthetic metadata is
+deliberately booby-trapped with the failure modes found during
+hardware validation — a stale deleted-array config generation, a raw
+single-disk record with a matching DeviceID — and the guest battery
+covers write/readback, module reload cycles, discard+rewrite, and a
+real `mke2fs` run (sub-page buffered writeback, the I/O pattern that
+page-aligned tests can never generate).
 
 | Doc | What's in it |
-|---|---|
-| **[STATUS.md](STATUS.md)** | Where the port stands today, the dated implementation log of how each piece was built, and the error-handling / reset design. |
-| **[IMPLEMENTATION.MD](IMPLEMENTATION.MD)** | Prioritized checklist toward a daily-driver release — blockers, missing features, polish, performance — plus the enterprise-gap roadmap beyond that. |
-| **[REVERSE_ENGINEERING.md](REVERSE_ENGINEERING.md)** | Authoritative RE reference: what the Windows driver actually does (AHCI-vs-nvme.c split, queue/geometry layout, debunked theories), the 9.3.2-vs-9.3.3 delta, and open questions. |
-| **[archive/](archive/)** | Historical docs, including the 2024 analysis that predates the corrected findings. **Contains debunked claims** — see `archive/README.md` first. |
+|-----|--------------|
+| [`docs/STATUS.md`](docs/STATUS.md) | Current state, implementation history, and the timeout / reset / dead-controller design |
+| [`docs/IMPLEMENTATION.MD`](docs/IMPLEMENTATION.MD) | Prioritized checklist toward a daily-driver release |
+| [`docs/REVERSE_ENGINEERING.md`](docs/REVERSE_ENGINEERING.md) | RE reference — Windows-driver findings, geometry, and remaining unknowns |
+| [`docs/RE_METHODOLOGY.md`](docs/RE_METHODOLOGY.md) | Clean-room process and legal record |
 
-New here? Read **REVERSE_ENGINEERING.md** for how the hardware works, then
-**STATUS.md** for what's implemented.
-
-## Repo layout
+**Repository layout**
 
 | Path | What's there |
-|---|---|
-| `rc_*.c` / `rc_linux.h` | Linux driver source |
-| `drivers/windows/trx50/` | *(removed from the tree — restore with `git checkout 69738ee -- drivers/`)* Windows drivers the RE docs reference: 9.3.2-00255 (last vulnerable release, matches the Ghidra extracts) and 9.3.3-00291 (current, CVE-2024-21962 fixed in `rccfg.sys`) |
-| `scripts/ghidra/` | Headless Ghidra scripts that produced the `ghidra_output/` extracts |
-| `docs/ghidra_output/` | Raw Ghidra extracts (decomp, call-site buckets, hex dumps) |
+|------|--------------|
+| `rc_*.c`, `rc_*.h` | The driver (SPDX `GPL-2.0-only`) |
+| `Makefile`, `build.sh`, `test_driver.sh`, `bench.sh`, `unload.sh` | Build + test helpers |
+| `scripts/qemu-test/` | QEMU functional-test rig: synthetic firmware-faithful metadata (`mkmeta.py`) + guest test battery, run by CI on every PR |
+| `docs/` | Status, open questions, Ghidra findings, decompiled extracts |
+| `drivers/` | *(removed from the tree)* AMD Windows binaries + Linux SDK used as RE input — vendor-distributed material, never compiled in. Retrievable from git history: `git checkout 69738ee -- drivers/`, or from AMD's public download pages |
+| `scripts/ghidra/` | Headless-Ghidra extraction scripts |
 
-## Running Ghidra again
+---
 
-The full command lines (headless re-import + hunt, and PyGhidra targeted
-decompiles) live in **[REVERSE_ENGINEERING.md](REVERSE_ENGINEERING.md)** under
-"Reproducing the analysis".
+## License
+
+**GPL-2.0-only** — see [`LICENSE`](LICENSE). Maintained by Joey Troy
+(`@joeytroy`).
+
+The PCI IDs, on-disk metadata layouts, and protocol behaviour are derived
+from analysis of AMD's publicly distributed Windows drivers
+(`rcbottom.sys`, `rcraid.sys`, `rccfg.sys`) under DMCA §1201(f). No AMD
+source is incorporated.
+
+### A note for AMD
+
+This is an interoperability driver for hardware you sold, so Linux owners
+can access their own data. It doesn't redistribute your binaries beyond
+what the dev team needs as reference, and it doesn't link against your
+proprietary core. We'd be glad to coordinate on documentation or hardware
+references — please open an issue.

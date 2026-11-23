@@ -7,11 +7,15 @@
 #   * warnings   — the build must be warning-clean
 #   * qemu-rig   — boots the module in QEMU against synthetic RAID0/RAID1
 #                  arrays (incl. the stale-generation decoy) and runs the
-#                  full write/readback/discard battery
+#                  full write/readback/discard battery; a RAID5 scenario
+#                  exercises the opt-in write path (full-row parity plus
+#                  partial-row read-modify-write)
 #   * spdx       — every C/H source carries an SPDX GPL-2.0-only tag
 #   * whitespace — no trailing whitespace / no conflict markers in the diff
 #   * shellcheck — every shell script in the repo, severity warning+
 #                  (the scripts can brick boots; they merge linted)
+#   * clone-urls — every documented `git clone` fetches this repository
+#                  (GITHUB_REPOSITORY), not the upstream fork
 #
 # Advisory gate (reported, does NOT block — see checkpatch job comment):
 #   * checkpatch — kernel coding-style on the PR diff
@@ -23,6 +27,8 @@ on:
     branches: [ main ]
   pull_request:
     branches: [ main ]
+  # Manual run: lets the gates be started (and re-started) without a push.
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -173,6 +179,20 @@ jobs:
           # Degraded BOOT: one member never attached; allow_degraded=1
           # assembles the volume degraded after the fallback delay.
           - { scenario: raid1-degraded-boot, level: raid1, extra: "--omit-member" }
+          # RAID5 write path (opt-in): a complete row generates P directly,
+          # then in-row, chunk-boundary and cross-row writes go through
+          # read-modify-write.  The guest helper verifies every byte.
+          - { scenario: raid5-parity-write, level: raid5,
+              extra: "--members 4 --parity-writes" }
+          # Fan-out with a mid-page non-first SG entry (issue #20): the
+          # request starts 2 KiB into a page and covers cols+1 stripes, so
+          # the column that owns chunk 0 and chunk `cols` gives one member
+          # a fragment no PRP list can encode.  64 KiB chunks keep the
+          # whole request inside max_hw_sectors / max_segments.
+          - { scenario: raid0-prp-split, level: raid0,
+              extra: "--members 4 --chunk-index 1" }
+          - { scenario: raid10-prp-split, level: raid10,
+              extra: "--members 4 --chunk-index 1" }
     steps:
       - uses: actions/checkout@v4
 
@@ -214,7 +234,17 @@ jobs:
       - name: Check SPDX headers
         run: |
           rc=0
-          for f in rc_*.c rc_*.h; do
+          mapfile -t files < <(git ls-files | grep -E '(^|/)rc_[^/]*\.[ch]$')
+          # An unmatched glob used to leave the literal pattern here, so the
+          # gate reported a missing tag on a file named "rc_*.c" and never
+          # looked at a real source.  Fail loudly if discovery finds nothing.
+          if [ "${#files[@]}" -eq 0 ]; then
+            echo "::error::no rc_*.c / rc_*.h sources found — the SPDX gate would pass vacuously"
+            exit 1
+          fi
+          echo "Checking ${#files[@]} sources:"
+          printf '  %s\n' "${files[@]}"
+          for f in "${files[@]}"; do
             if ! head -1 "$f" | grep -q 'SPDX-License-Identifier: GPL-2.0-only'; then
               echo "::error file=$f::missing 'SPDX-License-Identifier: GPL-2.0-only' on line 1"
               rc=1
@@ -265,6 +295,22 @@ jobs:
           printf '  %s\n' "${scripts[@]}"
           shellcheck --severity=warning "${scripts[@]}"
           echo "All shell scripts are shellcheck-clean (severity >= warning)."
+
+  # ---------------------------------------------------------------------------
+  # clone-urls — BLOCKING gate over every documented `git clone`.  The install
+  # instructions are followed verbatim on a live USB, and three of them still
+  # cloned the upstream fork after the installer work moved here: following one
+  # built a tree without this branch's installer, which reads as the docs being
+  # wrong about the driver.  The expected repository comes from
+  # GITHUB_REPOSITORY, so the gate is correct for forks too.
+  # ---------------------------------------------------------------------------
+  clone-urls:
+    name: clone-urls
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Every documented git clone fetches this repository
+        run: scripts/check-clone-urls.sh
 
   # ---------------------------------------------------------------------------
   # checkpatch — ADVISORY for now (continue-on-error).  Five source files

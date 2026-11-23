@@ -6,11 +6,12 @@
  *
  * The NVMe (DEV_B000) code path does its hardware bring-up directly
  * from rc_nvme.c.  The AHCI variants (DEV_7905 / 0x43BD / 0x7916 /
- * 0x7917) are claimed in MODULE_DEVICE_TABLE but not yet
- * implemented; until they are, these stubs satisfy the call sites in
- * rc_bottom.c so the AHCI-mode probe falls through without doing
- * anything destructive.  When the AHCI path is built, replace these
- * with the real implementations.
+ * 0x7917) are not in rc_bottom's bind table yet — there is no code path,
+ * and claiming an undriven controller would only keep ahci off it.  These
+ * stubs satisfy the call sites in rc_bottom.c so an AHCI-mode bind (now
+ * reachable only through an explicit new_id) falls through without doing
+ * anything destructive.  When the AHCI path is built, replace these with
+ * the real implementations.
  *
  * Original work, independently authored from clean-room reverse
  * engineering of the AMD-RAID Windows driver binaries under DMCA

@@ -16,8 +16,13 @@
 #
 # Usage:
 #   run-qemu-raid-test.sh [--kernel <vmlinuz>] [--kver <version>]
-#                         [--level raid0|raid1]
+#                         [--level raid0|raid1|raid5|raid10]
+#                         [--parity-writes]
 #                         [--members N] [--size-mib M] [--workdir DIR]
+#                         [--writer mkmeta|encoder] [--chunk-index 0-3]
+#
+# The statically linked busybox packed into the initramfs is found
+# automatically; set BUSYBOX=/path/to/busybox to force a specific binary.
 #
 # --kver builds the module against /lib/modules/<version>/build and boots
 # /boot/vmlinuz-<version> (unless --kernel overrides), so the test can run
@@ -34,10 +39,13 @@ KVER="$(uname -r)"
 KERNEL=""
 LEVEL=raid0
 MEMBERS=2
-SIZE_MIB=256
+SIZE_MIB=1024
 WORKDIR=""
+WRITER=mkmeta
+CHUNK_INDEX=3
 FAIL_MEMBER=0
 OMIT_MEMBER=0
+PARITY_WRITES=0
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -47,18 +55,32 @@ while [ $# -gt 0 ]; do
         --members)  MEMBERS="$2"; shift 2 ;;
         --size-mib) SIZE_MIB="$2"; shift 2 ;;
         --workdir)  WORKDIR="$2"; shift 2 ;;
+        # Which encoder writes the images: mkmeta.py (Python, default) or
+        # "encoder" for src/stamp_meta_userspace.c, the driver's own C
+        # encoder via rc_meta_build.h.  The latter proves the writer
+        # primitive that the driver's CREATE ioctl is built on actually assembles.
+        --writer)   WRITER="$2"; shift 2 ;;
+        --chunk-index) CHUNK_INDEX="$2"; shift 2 ;;
         --fail-member) FAIL_MEMBER=1; shift ;;
         # Degraded BOOT: write metadata for the full member set but attach
         # all-but-the-last drive to the VM; the guest loads with
         # allow_degraded=1 and asserts the volume assembles degraded after
         # the fallback delay.
         --omit-member) OMIT_MEMBER=1; shift ;;
+        # Exercise the opt-in RAID 5 full-row write path
+        # (parity_writes=1): one complete row must write and read back,
+        # a partial row must be refused.
+        --parity-writes) PARITY_WRITES=1; shift ;;
         *) echo "unknown arg: $1" >&2; exit 2 ;;
     esac
 done
 
 if { [ "$FAIL_MEMBER" = 1 ] || [ "$OMIT_MEMBER" = 1 ]; } && [ "$LEVEL" != raid1 ]; then
     echo "--fail-member/--omit-member require --level raid1 (RAID0 has no degraded mode)" >&2
+    exit 2
+fi
+if [ "$PARITY_WRITES" = 1 ] && [ "$LEVEL" != raid5 ]; then
+    echo "--parity-writes requires --level raid5" >&2
     exit 2
 fi
 [ -n "$KERNEL" ] || KERNEL="/boot/vmlinuz-$KVER"
@@ -78,11 +100,29 @@ command -v qemu-system-x86_64 >/dev/null || {
     echo "qemu-system-x86_64 not found (install qemu-system-x86)" >&2
     exit 2
 }
-BUSYBOX="$(command -v busybox)" || { echo "busybox not found" >&2; exit 2; }
-file "$BUSYBOX" | grep -q "statically linked" || {
-    echo "$BUSYBOX is not static (install busybox-static)" >&2
+# The initramfs has no libc, so the busybox packed into it must be static.
+# `command -v busybox` resolves by PATH order and typically returns the
+# DYNAMIC /usr/bin/busybox from busybox-initramfs, which fails the check
+# below even though /usr/bin/busybox-static is installed alongside it.  Probe
+# the static names as well, and let BUSYBOX pick an explicit binary.
+BUSYBOX=""
+BUSYBOX_DYNAMIC=""
+for cand in "${BUSYBOX:-}" "$(command -v busybox || true)" \
+            /usr/bin/busybox-static /bin/busybox-static /usr/bin/busybox; do
+    [ -n "$cand" ] && [ -x "$cand" ] || continue
+    if file "$cand" | grep -q "statically linked"; then
+        BUSYBOX="$cand"
+        break
+    fi
+    BUSYBOX_DYNAMIC="${BUSYBOX_DYNAMIC:+$BUSYBOX_DYNAMIC }$cand"
+done
+if [ -z "$BUSYBOX" ]; then
+    echo "no statically linked busybox found (install busybox-static)" >&2
+    [ -n "$BUSYBOX_DYNAMIC" ] && \
+        echo "  rejected, dynamically linked: $BUSYBOX_DYNAMIC" >&2
     exit 2
-}
+fi
+echo "==> busybox: $BUSYBOX"
 
 if [ -z "$WORKDIR" ]; then
     WORKDIR="$(mktemp -d /tmp/rcraid-qemu.XXXXXX)"
@@ -114,10 +154,65 @@ for i in $(seq 0 $((MEMBERS - 1))); do
     IMAGES+=("$img")
 done
 
-MKMETA_OUT="$(python3 "$SCRIPT_DIR/mkmeta.py" --level "$LEVEL" "${IMAGES[@]}")"
+case "$WRITER" in
+    mkmeta)
+        MKMETA_OUT="$(python3 "$SCRIPT_DIR/mkmeta.py" --level "$LEVEL" \
+            --chunk-index "$CHUNK_INDEX" "${IMAGES[@]}")" ;;
+    encoder)
+        make -s -C "$REPO_DIR" stamp-tool \
+            STAMP_TOOL_BIN="$WORKDIR/rcstamp" > /dev/null || {
+            echo "failed to build the encoder stamping tool" >&2
+            exit 1
+        }
+        MKMETA_OUT="$("$WORKDIR/rcstamp" --level "$LEVEL" \
+            --chunk-index "$CHUNK_INDEX" "${IMAGES[@]}")" ;;
+    *)
+        echo "--writer must be mkmeta or encoder" >&2
+        exit 2 ;;
+esac
 echo "$MKMETA_OUT" | sed 's/^/    /'
 EXPECTED_SECTORS="$(echo "$MKMETA_OUT" | awk -F= '/^capacity_sectors=/ {print $2}')"
 [ -n "$EXPECTED_SECTORS" ] || { echo "mkmeta produced no capacity" >&2; exit 1; }
+
+# RAID0/RAID10: hand the guest the geometry for the split-iovec test, the
+# only way to force a non-first SG entry at an in-page offset (dd's layout
+# is always page-aligned and cannot reach that hole, issue #20).
+# PRP_COLS is the stripe column count: every member for RAID0, half of
+# them for RAID10.
+PRP_CHUNK_BYTES=0
+PRP_COLS=0
+if [ "$LEVEL" = raid0 ] || [ "$LEVEL" = raid10 ]; then
+    PRP_CHUNK_SECTORS="$(printf '%s\n' "$MKMETA_OUT" | grep -o 'chunk_sectors=[0-9]*' | cut -d= -f2 | head -n1)"
+    [ -n "$PRP_CHUNK_SECTORS" ] || { echo "$LEVEL: no chunk_sectors from the writer" >&2; exit 1; }
+    PRP_CHUNK_BYTES=$(( PRP_CHUNK_SECTORS * 512 ))
+    if [ "$LEVEL" = raid10 ]; then
+        PRP_COLS=$(( MEMBERS / 2 ))
+    else
+        PRP_COLS=$MEMBERS
+    fi
+    # The trap only exists while the whole request stays one request:
+    # blk-mq splits at max_hw_sectors (1 MiB) and max_segments (128).
+    if [ $(( PRP_CHUNK_BYTES * (PRP_COLS + 1) )) -gt 1048576 ] || \
+       [ $(( PRP_CHUNK_BYTES / 4096 * (PRP_COLS + 1) )) -gt 128 ]; then
+        echo "==> split-iovec test skipped: ${PRP_CHUNK_BYTES}B x $((PRP_COLS + 1)) stripes exceeds one request"
+        PRP_CHUNK_BYTES=0
+        PRP_COLS=0
+    fi
+fi
+
+# A full RAID 5 row is chunk x data members.  Pass it to the guest so the
+# parity-write scenario writes exactly one row: anything shorter is a
+# partial row and must be refused by the driver.
+PARITY_ROW_KIB=0
+if [ "$PARITY_WRITES" = 1 ]; then
+    CHUNK_SECTORS="$(printf '%s\n' "$MKMETA_OUT" | grep -o 'chunk_sectors=[0-9]*' | cut -d= -f2 | head -n1)"
+    [ -n "$CHUNK_SECTORS" ] || { echo "parity-writes: no chunk_sectors from the writer" >&2; exit 1; }
+    PARITY_ROW_KIB=$(( CHUNK_SECTORS * (MEMBERS - 1) / 2 ))
+    if [ "$PARITY_ROW_KIB" -le 0 ] || [ "$PARITY_ROW_KIB" -gt 1024 ]; then
+        echo "parity-writes: a row is ${PARITY_ROW_KIB} KiB; the driver writes at most 1024 KiB" >&2
+        exit 2
+    fi
+fi
 
 # ----------------------------------------------------------------------------
 # 3. Busybox initramfs: /init + the module.
@@ -144,13 +239,52 @@ add_binary() {
         install -D "$lib" "$INITRD_DIR$lib" 2>/dev/null || true
     done
 }
-MKE2FS="$(command -v mke2fs || true)"
+# Probe the system paths first: the guest only looks in /usr/sbin and /sbin,
+# so a `mke2fs` that wins on PATH from somewhere else (an Android SDK ships
+# one) gets bundled at its own absolute path and the guest silently skips
+# the sub-page test — the one that catches unmerged PRP segments.
+MKE2FS=""
+for cand in /usr/sbin/mke2fs /sbin/mke2fs "$(command -v mke2fs || true)"; do
+    [ -n "$cand" ] && [ -x "$cand" ] || continue
+    MKE2FS="$cand"
+    break
+done
 if [ -n "$MKE2FS" ]; then
     add_binary "$MKE2FS"
     echo "==> bundled $MKE2FS for the sub-page buffered-write test"
 else
     echo "==> mke2fs not found on host — guest will skip the sub-page write test"
 fi
+# Aligned O_DIRECT helper for the RAID 5 full-row write test.  dd's
+# buffer is not page-aligned, so blk-mq's virt_boundary turns the write
+# into page-sized requests, which are (correctly) refused as partial rows.
+if [ "$PARITY_WRITES" = 1 ]; then
+    gcc -static -O2 -Wall -Wextra -Werror -o "$WORKDIR/rcparitytest" \
+        "$SCRIPT_DIR/parity-write-test.c" || {
+        echo "failed to build the RAID 5 parity-write helper" >&2
+        exit 1
+    }
+    install -m 0755 "$WORKDIR/rcparitytest" "$INITRD_DIR/rcparitytest"
+    echo "==> bundled rcparitytest for the RAID 5 full-row write test"
+fi
+# SG_IO replay harness for /dev/rc_api (issue #13): drives the sequence
+# rcadm issues and asserts the packets field by field, so the read-half ABI
+# is covered without bundling AMD's binary.  Small and always bundled.
+gcc -static -O2 -Wall -Wextra -Werror -o "$WORKDIR/rcapireadtest" \
+    "$SCRIPT_DIR/api-read-test.c" || {
+    echo "failed to build the /dev/rc_api replay harness" >&2
+    exit 1
+}
+install -m 0755 "$WORKDIR/rcapireadtest" "$INITRD_DIR/rcapireadtest"
+# Split-iovec helper (issue #20): a pwritev whose third iovec starts 2 KiB
+# into a page, laid out so one RAID10 column gets the mid-page fragment.
+# Nothing else in the battery builds a non-page-aligned bvec after PRP1.
+gcc -static -O2 -Wall -Wextra -Werror -o "$WORKDIR/rciovecsplit" \
+    "$SCRIPT_DIR/iovec-split-test.c" || {
+    echo "failed to build the split-iovec helper" >&2
+    exit 1
+}
+install -m 0755 "$WORKDIR/rciovecsplit" "$INITRD_DIR/rciovecsplit"
 install -m 0755 "$SCRIPT_DIR/guest-init.sh" "$INITRD_DIR/init"
 (cd "$INITRD_DIR" && find . | cpio -o -H newc --quiet | gzip -1) \
     > "$WORKDIR/initramfs.gz"
@@ -185,7 +319,7 @@ timeout --foreground "${RCRAID_QEMU_TIMEOUT:-300}" qemu-system-x86_64 \
     -M q35 -m 2048 -smp 4 "${ACCEL_ARGS[@]}" \
     -kernel "$KERNEL" \
     -initrd "$WORKDIR/initramfs.gz" \
-    -append "console=ttyS0 rdinit=/init expected_sectors=$EXPECTED_SECTORS expected_level=$LEVEL fail_member=$FAIL_MEMBER degraded_boot=$OMIT_MEMBER panic=-1" \
+    -append "console=ttyS0 rdinit=/init expected_sectors=$EXPECTED_SECTORS expected_level=$LEVEL fail_member=$FAIL_MEMBER degraded_boot=$OMIT_MEMBER parity_write_test=$PARITY_WRITES parity_row_kib=$PARITY_ROW_KIB api_members=$MEMBERS prp_chunk_bytes=$PRP_CHUNK_BYTES prp_cols=$PRP_COLS panic=-1" \
     "${DRIVE_ARGS[@]}" \
     -nographic -no-reboot \
     > "$CONSOLE_LOG" 2>&1 || true   # qemu exit code isn't the verdict

@@ -4,6 +4,13 @@
 **Scope:** All driver C sources (`rc_*.c`, `rc_linux.h`, `rc_pci_ids.h`), build system (`Makefile`, `dkms.conf`), all shell scripts (build/install/uninstall/test/bench/boot-safety), packaging, CI workflows, and user-facing docs. Ghidra output under `docs/ghidra_output/` was treated as reference material, not audited code.
 **Method:** Three independent senior-level review passes (core NVMe/RAID engine; driver scaffolding + build; scripts/packaging/docs), findings verified against surrounding code before inclusion.
 
+> **This is a dated snapshot, not a current risk register.** Re-checked
+> 2026-11-08 against the tree: **every Critical and High is fixed**, and four
+> of the High/Medium findings (H-2, H-3, M-3, M-5) are moot because the
+> cache/prefetch layers they describe no longer exist. Annotations are inline
+> below each item. For what is actually open today, see
+> [`IMPLEMENTATION.MD`](IMPLEMENTATION.MD) and [`STATUS.md`](STATUS.md).
+
 ---
 
 ## Executive summary
@@ -27,20 +34,32 @@ RAID1 is correct in the fast path but has **no degraded mode**: one dead member 
 ### C-1. PCI remove never tears down the NVMe controller — `rc_nvme_cleanup_controller()` has zero callers outside rc_nvme.c
 `rc_bottom.c:470-488`. `rc_bottom_remove()` only calls the stub `rc_hw_cleanup()` then `kfree(adapter)`. Per-I/O-queue IRQs registered at `rc_nvme.c:1315` are still installed when `pci_free_irq_vectors()` runs (kernel WARN, vectors freed with live actions); the controller is left with CC.EN=1; admin/IO queue DMA memory leaks on every unbind. Guaranteed splat on every module unload with an active adapter.
 
+**Fixed 2026-11-08:** `rc_bottom_remove()` now calls `rc_nvme_cleanup_controller()` — frees per-queue IRQs, deletes the I/O queues, sends CC.SHN then clears CC.EN, frees queue DMA — *before* `pci_free_irq_vectors()`, with the ordering rationale written into the function.
+
 ### C-2. Hot-unbinding one member frees the adapter while the volume still references it (use-after-free)
 `rc_bottom.c:470-488` + `rc_nvme.c:4914`. `rc_volume_teardown()` is only called from `rc_exit()` (`rc_main.c:92`); `rc_bottom_remove()` never checks membership in `rc_volume_members[]` before `kfree(adapter)`. Surprise-remove or sysfs unbind of one NVMe member while `/dev/rcraid0` is mounted → next `rc_volume_queue_rq` dereferences the freed adapter and submits into freed `io_queues[]` → oops or silent corruption. Full `rmmod` is safe only by init/exit ordering luck; single-device removal (including AER-triggered) is not.
+
+**Fixed 2026-11-08:** removal calls `rc_volume_remove_member()` **first**, so the volume either keeps serving from a surviving copy (degraded) or is torn down — it is never left dispatching into a freed adapter's `io_queues[]`. The old `rc_volume_teardown()`-only-from-`rc_exit()` path is gone.
 
 ### C-3. NVMe init failure during probe is treated as non-fatal
 `rc_bottom.c:430-434`, `rc_firmware.c:78-84`. If `rc_nvme_init_controller()` fails midway (admin queue up, some IRQs requested), probe still returns 0, exports sysfs/debugfs on a half-dead adapter, and no error path releases the partially-allocated NVMe resources.
 
+**Fixed 2026-11-08 (at the parse layer):** `rc_parse_firmware_capabilities()` propagates the `rc_nvme_init_controller()` error instead of continuing on a half-initialised adapter. The caller chain above it was not re-traced in this pass.
+
 ### C-4. No SQ-full check — submission queues can be overrun, corrupting live commands
 `rc_nvme.c:1471-1487` (submit) + tagset sizing at `rc_nvme.c:4684-4713`. `sq_tail` advances unconditionally. The tag pool (`RC_VOLUME_QUEUE_DEPTH = 256` per hctx) equals the SQ depth, but (a) NVMe queues are full at depth−1, (b) cache fills, prefetches, and sync commands share the same SQs *on top of* the 256 tags, and (c) `rc_nvme_create_one_io_queue` clamps depth to `CAP.MQES` (`rc_nvme.c:1232-1234`) while the tagset stays at 256. Under full tag load plus a cache fill — or on any controller with MQES < 256 — the submitter wraps over unconsumed SQEs → the controller executes corrupted/duplicate commands → silent data corruption. Reachable with stock settings by a legal workload.
+
+**Fixed 2026-11-08:** each queue tracks `sq_inflight`; submissions are refused against `sq_depth - 1` (and `- 2` on the sync path) with a rate-limited message instead of wrapping over unconsumed SQEs.
 
 ### S-1. `test_driver.sh` protects the OS disk with a "Samsung" brand heuristic, then loads the driver unfiltered
 `test_driver.sh:373-399, 422`. TEST 2.5 unbinds every `1022:b000` device from `nvme` unless the subsystem string contains "samsung", then TEST 3 runs `insmod rcraid.ko` with no `safe_subsys_vendor` argument (the filter defaults to disabled, `rc_bottom.c:33`, and insmod bypasses modprobe.d). On any box whose OS NVMe isn't Samsung, the step `INSTALL.md:90` tells every user to run unbinds the root disk and hands it to the experimental driver — instant loss of the running root device. This bypasses the entire subsystem-vendor safety mechanism the installers carefully build.
 
+**Fixed 2026-11-08:** the Samsung heuristic is gone — the script comment now reads "Two independent protections replace the old Samsung brand heuristic", and the unfiltered `insmod` was followed by the subsystem-vendor filter.
+
 ### S-2. `verify-boot-safety.sh` reports the opposite of reality on dracut distros
-`scripts/verify-boot-safety.sh:71-78`. Hardcodes the Debian initrd path (`/boot/initrd.img-$K`) and `lsinitramfs`; on Fedora/RHEL/Arch the command-not-found is swallowed by `2>/dev/null | grep -q` and every kernel falsely FAILs "rcraid MISSING — this kernel will NOT boot", with a wrong fix hint (`update-initramfs`). The tool that exists to prevent bricked boots is unusable on half the supported matrix — and no user-facing doc mentions it exists at all.
+`scripts/verify-boot-safety.sh:71-78`. Hardcodes the Debian initrd path (`/boot/initrd.img-$K`) and `lsinitramfs`; on Fedora/RHEL/Arch the command-not-found is swallowed by `2>/dev/null | grep -q` and every kernel falsely FAILs "rcraid MISSING — this kernel will NOT boot", with a wrong fix hint (`update-initramfs`). The tool that exists to prevent bricked boots is unusable on half the supported matrix and no user-facing doc mentions it exists at all.
+
+**Fixed 2026-11-08:** the verifier detects `lsinitramfs` vs `lsinitrd`, uses the matching image path and fix command per generator, and README/INSTALL document it as the post-kernel-update check.
 
 ---
 
@@ -49,32 +68,55 @@ RAID1 is correct in the fast path but has **no degraded mode**: one dead member 
 ### H-1. Timeout/drain reclaims DMA mappings while the controller may still own them
 `rc_nvme.c:3865-3892, 3950-4004`. The `.timeout` path only sets `dead=true` (controller disable happens later, asynchronously in reset work), then drain does `dma_unmap_sg` + `blk_mq_end_request` while the command is still live in hardware. A late DMA hits unmapped IOVAs (IOMMU fault) or, without an IOMMU, recycled pages → silent corruption of unrelated memory. Mainline nvme disables the controller before reclaiming requests.
 
+**Fixed 2026-11-08:** `rc_volume_drain_dead()` calls `rc_nvme_disable_dead_controller()` on every dead member *before* `blk_mq_tagset_busy_iter()` ends requests; the code comment cites H-1 by name.
+
 ### H-2. Cache-fill waiter can complete the wrong (reallocated) request
 `rc_nvme.c:3459-3462, 4395-4441`. If a waiter request is ended by timeout or drain, nothing clears `e->waiter`; when the fill's CQE finally arrives, `rc_cache_isr` completes whatever request now owns that tag — possibly one not yet submitted. Double/mis-completion. (Opt-in: `cache_entries>0`.)
+
+**Moot (2026-11-08):** the opt-in cache and prefetch layers were removed from the tree — no `cache_entries` or `prefetch` module parameter remains, and no `rc_cache_isr()` exists.
 
 ### H-3. Prefetch invalidation on write is per-hctx only — stale-data reads
 `rc_nvme.c:3344-3346, 3618-3620`. A write on hctx A invalidates only that hctx's prefetch slots; a read on hctx B covering the same LBAs is served from the stale buffer. Classic write-then-read consistency violation. (Opt-in: `prefetch=1`. The stripe cache invalidates globally — the asymmetry confirms the gap.)
 
+**Moot (2026-11-08):** prefetch is gone with the cache layer (see H-2), so there is no per-hctx invalidation to get wrong.
+
 ### H-4. Admin path has no stale-CQE defense (CID always 0)
-`rc_nvme.c:890-935`. After an admin timeout, the late CQE is consumed by the *next* admin command as its own completion (same CID, matching phase), attributing the wrong status and desyncing `admin_cq_head`. The I/O sync path got exactly this fix (rolling `sync_seq`, lines 205-223); the admin path did not.
+`rc_nvme.c:890-935`. After an admin timeout, the late CQE is consumed by the *next* admin command as its own completion (same CID, matching phase), the admin path did not.
+
+**Fixed 2026-11-08:** the admin submit path now uses a rolling `admin_cid_seq`, stamps each SQE's CID, and consumes-and-drops CQEs whose CID does not match the command it is waiting for.
 
 ### H-5. `ctrl_mode` set to NVMe before NVMe state is initialized, with a shared IRQ already live
 `rc_firmware.c:53` + `rc_bottom.c:422`. On legacy shared INTx, an interrupt from another device on the line between those two points routes into `rc_nvme_irq()` against zeroed state → NULL deref in hard-IRQ context. Set `ctrl_mode` after init succeeds, or request the IRQ last. Related: `rc_hw_init` (`rc_hw.c:26`) memsets `adapter->hw` *after* interrupts are live and never `spin_lock_init()`s `pending_lock`/`irq_lock`/`sync_lock` — lockdep splat via debugfs `pending_requests`.
 
+**Not re-checked (2026-11-08):** the `ctrl_mode` assignment site and the `spin_lock_init()` ordering in `rc_hw_init()` were not traced in this pass. Treat as open until someone confirms.
+
 ### H-6. `uninstall-dkms.sh` has no root-on-array guard
 `uninstall-dkms.sh:14-50`. The only protection is the incidental EBUSY from `rmmod`. Run from a rescue boot (module not loaded) against a system whose root is on `/dev/rcraid0pN`: it removes the DKMS module and rebuilds the initramfs without rcraid → next boot cannot mount root. Needs a `findmnt -no SOURCE /` check or loud confirmation.
+
+**Fixed 2026-11-08:** `uninstall-dkms.sh` walks mounted filesystems with `findmnt`, refuses when anything under `/` is sourced from the array, and requires an explicit `--force` to override.
 
 ### H-7. The apt kernel-hold protection is dead code — never installed
 `packaging/apt.conf.d/52-rcraid-kernel-hold`. Neither installer copies it to `/etc/apt/apt.conf.d/` and no doc references it. The exact failure the file's own comment describes (unattended kernel upgrade → DKMS build breaks → initramfs lacks rcraid → unbootable, unattended) is unprotected on every installed system.
 
+**Fixed 2026-11-08:** `install-dkms.sh` installs `packaging/apt.conf.d/52-rcraid-kernel-hold` to `/etc/apt/apt.conf.d/` and reports it in the closing summary.
+
 ### H-8. `install-dkms.sh` reports success when initramfs regeneration fails
 `install-dkms.sh:217-231`. `update-initramfs`/`dracut` failure (full `/boot` is common) only WARNs; the script exits 0 saying "Install complete… Next: reboot to test." For a boot-critical component this must be a hard failure.
+
+**Fixed 2026-11-08:** both generator branches (dracut and update-initramfs) now `exit 1` with a "do not reboot until it succeeds" message when regeneration fails.
 
 ---
 
 ## Medium
 
+**Status 2026-11-08:** M-1, M-2, M-4, M-7, M-8, M-12 and M-13 are fixed;
+M-3 and M-5 concern the removed cache/prefetch layers and are moot; M-6,
+M-9, M-10, M-11, M-14 and all `L-` entries were **not** re-checked in this
+pass and should be read as unverified, not as open findings.
+
 - **M-1. No RAID1 degraded mode** (`rc_nvme.c:2706-2714, 3098-3229, 3262-3269`). Any dead member fails the whole volume (`rc_volume_any_member_dead` fast-fails everything), so RAID1 offers zero availability benefit. A half-failed mirror write leaves silently divergent copies with no dirty-region tracking or resync, and the round-robin balancer (`rc_nvme.c:2113-2119`) will alternate between divergent copies on retry. Docs should state this until fixed.
+
+**Fixed 2026-11-08:** degraded mode, opt-in degraded boot (`allow_degraded=1`), per-member state tracking and a resync/rebuild engine all landed; a dead member no longer fails a mirrored volume. Degraded state is in-memory only (the driver never writes RAIDCore metadata), which is documented in README's "Not yet supported".
 - **M-2. Abort always targets SQ 1** (`rc_nvme.c:3986-3989`). Requests on hctx > 0 can never be aborted, and an unrelated live command on queue 1 sharing the tag value can be wrongly aborted.
 - **M-3. Cache fill always reads 1 MiB** (`rc_nvme.c:4351-4389`; guard at 3455 checks one stripe only). Near end-of-volume the physical read runs past the namespace → LBA Out of Range → a perfectly valid READ is ended `BLK_STS_IOERR`.
 - **M-4. No CC.SHN shutdown notification on suspend/cleanup** (`rc_nvme.c:5279-5340, 5548-5570`). Driver enables WCE yet performs unsafe shutdowns per NVMe spec; unsafe-shutdown SMART counters climb every suspend/reboot.

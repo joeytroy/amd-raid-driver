@@ -1,0 +1,5 @@
+PACKAGE_NAME="amd-raid-driver"
+PACKAGE_VERSION="1.0.0"
+BUILT_MODULE_NAME="rcraid"
+DEST_MODULE_LOCATION="/updates/dkms/"
+AUTOINSTALL="yes"

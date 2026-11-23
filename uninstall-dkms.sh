@@ -1,6 +1,6 @@
 #!/bin/bash
 # Remove rcraid DKMS module, udev rule, helper script, modprobe drop-in,
-# apt kernel-hold, and initramfs hooks.
+# apt kernel-hold, DKMS signing drop-in, and initramfs hooks.
 #
 # Refuses to run when the system is running FROM the array (root/boot on
 # /dev/rcraid*): removing the module and regenerating the initramfs would
@@ -70,6 +70,11 @@ rm -f  /usr/sbin/rcraid-bind
 rm -f  /etc/udev/rules.d/50-rcraid.rules
 rm -f  /etc/modprobe.d/rcraid.conf
 rm -f  /etc/apt/apt.conf.d/52-rcraid-kernel-hold
+
+# The signing drop-in only ever described rcraid's own key.  The key pair stays
+# put: it is enrolled in the firmware, and other modules may be signed with it
+# too — removing it would break their next rebuild.
+rm -f  /etc/dkms/framework.conf.d/rcraid-signing.conf
 
 # Pull the initramfs hook back out and regenerate so the next boot doesn't
 # try to bring up an array we no longer have a driver for.

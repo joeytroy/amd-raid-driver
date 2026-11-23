@@ -44,12 +44,22 @@ expected_sectors=""
 expected_level=""
 fail_member=0
 degraded_boot=0
+parity_write_test=0
+parity_row_kib=0
+api_members=0
+prp_chunk_bytes=0
+prp_cols=0
 for arg in $(cat /proc/cmdline); do
     case "$arg" in
         expected_sectors=*) expected_sectors="${arg#expected_sectors=}" ;;
         expected_level=*)   expected_level="${arg#expected_level=}" ;;
         fail_member=*)      fail_member="${arg#fail_member=}" ;;
         degraded_boot=*)    degraded_boot="${arg#degraded_boot=}" ;;
+        parity_write_test=*) parity_write_test="${arg#parity_write_test=}" ;;
+        parity_row_kib=*)   parity_row_kib="${arg#parity_row_kib=}" ;;
+        api_members=*)      api_members="${arg#api_members=}" ;;
+        prp_chunk_bytes=*)  prp_chunk_bytes="${arg#prp_chunk_bytes=}" ;;
+        prp_cols=*)         prp_cols="${arg#prp_cols=}" ;;
     esac
 done
 [ -n "$expected_sectors" ] || fail "no expected_sectors= on kernel cmdline"
@@ -99,8 +109,14 @@ bind_nvme_functions() {
     [ "$bound" -ge "$min_found" ] || fail "only $bound of $found NVMe functions bound to rcbottom"
 }
 
-MODARGS="enable_writes=1 allow_foreign_nvme=1"
+# meta_write_probe*: the driver verifies its own metadata write path in
+# assembly — rewrite the member's RC_MetaData block over its NVMe queues,
+# flush, read back; junk mode additionally proves the write reached media
+# by putting a different block there first and restoring the real one.
+# Disposable images only, which is what this rig is.
+MODARGS="enable_writes=1 allow_foreign_nvme=1 meta_write_probe=1 meta_write_probe_junk=1"
 [ "$degraded_boot" = "1" ] && MODARGS="$MODARGS allow_degraded=1"
+[ "$parity_write_test" = "1" ] && MODARGS="$MODARGS parity_writes=1"
 
 echo "rcraid-test: loading rcraid.ko ($MODARGS)"
 insmod /rcraid.ko $MODARGS || fail "insmod rcraid.ko"
@@ -136,6 +152,75 @@ if [ -n "$expected_level" ]; then
         fail "volume did not assemble as $want_level (decoy generation matched?)"
     fi
     echo "rcraid-test: assembled level verified: $want_level"
+fi
+
+# The metadata write path must have been exercised and verified by the
+# driver itself, on every member it assembled from.  A missing line means
+# the probe never ran; a mismatch is a FAIL inside the driver's own log.
+probe_ok=$(dmesg | grep -c "rc_meta_write_probe: .* probe complete")
+probe_members=$(dmesg | grep -c "rc_meta_write_probe: .* refusing to write")
+[ "$probe_ok" -ge 1 ] || fail "metadata write probe did not complete (see rc_meta_write_probe lines)"
+[ "$probe_members" -eq 0 ] || fail "metadata write probe refused to write on $probe_members member(s): encoder does not match media"
+if dmesg | grep -q "rc_meta_write_probe: .* mismatch\|rc_meta_write_probe: .* failed"; then
+    fail "metadata write probe reported an error"
+fi
+echo "rcraid-test: metadata write probe verified ($probe_ok member probe(s))"
+
+# /dev/rc_api read surface (issue #13): replay the SG_IO sequence rcadm
+# issues and assert the packets field by field — no AMD binary involved.
+# Skipped on the degraded scenarios: an intentionally partial member set is
+# the point there, and the harness asserts a complete one.
+if [ "$api_members" -ge 1 ] 2>/dev/null && [ "$fail_member" != "1" ] \
+        && [ "$degraded_boot" != "1" ]; then
+    mark "rc_api read surface"
+    /rcapireadtest /dev/rc_api "$api_members"
+    api_rc=$?
+    [ "$api_rc" -eq 0 ] \
+        || fail "/dev/rc_api SG_IO replay harness (exit $api_rc)"
+    echo "rcraid-test: rc_api read surface verified ($api_members member(s))"
+fi
+
+# ---------------------------------------------------------------------------
+# RAID5 fixture: parity volumes are assembly+READ only — the write path
+# deliberately does not exist, so the write/discard/mke2fs battery below
+# does not apply.  Verify the capacity, the level, the read-only flag and
+# that reads across the whole volume are served.
+# ---------------------------------------------------------------------------
+if [ "$expected_level" = "raid5" ]; then
+    # Opt-in RAID 5 write path.  A complete row generates P from the request
+    # itself; a shorter write must be read-modify-written (the driver reads
+    # the row, overlays the request, regenerates P).  Both must round-trip,
+    # including bytes outside the written range.
+    if [ "$parity_write_test" = "1" ]; then
+        mark "raid5 full-row write checks"
+        [ "$(cat /sys/block/rcraid0/ro)" = "0" ] \
+            || fail "RAID5 volume is read-only with parity_writes=1"
+        [ "$parity_row_kib" -gt 0 ] \
+            || fail "no parity_row_kib= on kernel cmdline"
+        /rcparitytest /dev/rcraid0 $((parity_row_kib * 1024)) \
+            || fail "RAID5 full-row + read-modify-write + contention test"
+        echo "rcraid-test: raid5 full-row + partial-row RMW + multi-writer contention ok"
+        dmesg -n 1 2>/dev/null
+        echo "RCRAID-TEST-PASS"
+        poweroff -f
+        exit 0
+    fi
+
+    mark "raid5 read-only checks"
+    [ "$(cat /sys/block/rcraid0/ro)" = "1" ] || fail "RAID5 volume is not read-only"
+    last_mib=$((size / 2048 - 4))
+    mid_mib=$((size / 2048 / 2))
+    for seek_mib in 0 "$mid_mib" "$last_mib"; do
+        dd if=/dev/rcraid0 of=/dev/null bs=1M skip="$seek_mib" count=4 2>/dev/null \
+            || fail "RAID5 read at ${seek_mib} MiB"
+    done
+    dmesg | grep -q "READ-ONLY" \
+        || fail "driver did not announce the parity volume read-only"
+    echo "rcraid-test: raid5 assembly + reads ok (read-only as designed)"
+    dmesg -n 1 2>/dev/null  # quiet kernel console so the marker cannot be split
+    echo "RCRAID-TEST-PASS"
+    poweroff -f
+    exit 0
 fi
 
 # ---------------------------------------------------------------------------
@@ -191,6 +276,23 @@ echo 3 > /proc/sys/vm/drop_caches
 got=$(dd if=/dev/rcraid0 bs=1M skip=33 count=4 2>/dev/null | md5sum | cut -d' ' -f1)
 [ "$got" = "$want" ] || fail "region at 33 MiB corrupted by later writes"
 
+# Split-iovec test (issue #20): a 3-stripe request whose third iovec starts
+# 2 KiB into a page gives column 0 two fragments and makes its second SG
+# entry start at an in-page offset — inexpressible as PRPs.  The driver
+# must copy such a request through its bounce buffer, for the WRITE fan-out
+# and for the multi-stripe READ copy-back.  dd cannot build this layout.
+if [ "$prp_chunk_bytes" -gt 0 ] && [ "$prp_cols" -gt 0 ]; then
+    echo "rcraid-test: split-iovec write+read (mid-page non-first SG entry)"
+    mark "split iovec start"
+    errs_before=$(dmesg | grep -c "unexpressible as PRPs")
+    /rciovecsplit /dev/rcraid0 "$prp_chunk_bytes" "$prp_cols" \
+        || fail "split-iovec write/read (PRP-inexpressible layout rejected)"
+    errs_after=$(dmesg | grep -c "unexpressible as PRPs")
+    [ "$errs_before" = "$errs_after" ] \
+        || fail "driver rejected a split-iovec request instead of bouncing it"
+    echo "rcraid-test: split-iovec layout round-tripped"
+fi
+
 # Three cycles, not one: the reload path is where the sync-metadata-read
 # vs ISR CQ race lived (the volume disk exists while the re-probed members
 # run their sync reads), and a single cycle reproduced it only sometimes.
@@ -199,6 +301,7 @@ for cycle in 1 2 3; do
     mark "reload cycle $cycle"
     rmmod rcraid || fail "rmmod (cycle $cycle)"
     insmod /rcraid.ko enable_writes=1 allow_foreign_nvme=1 \
+        meta_write_probe=1 meta_write_probe_junk=1 \
         || fail "re-insmod (cycle $cycle)"
     bind_nvme_functions
     i=0
@@ -215,6 +318,11 @@ for cycle in 1 2 3; do
     # reads raced the ISR (or the commit block failed to parse).
     if dmesg | grep -q "falling back to legacy BDF ordering"; then
         fail "a member fell back to legacy assembly during reload (cycle $cycle)"
+    fi
+    # Every reload re-runs the metadata write probe on every member; an
+    # error there would mean the write path regressed between loads.
+    if dmesg | grep -q "rc_meta_write_probe: .*mismatch\|rc_meta_write_probe: .* failed"; then
+        fail "metadata write probe failed after reload (cycle $cycle)"
     fi
 done
 

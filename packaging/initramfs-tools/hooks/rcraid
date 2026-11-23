@@ -20,6 +20,14 @@ manual_add_modules rcraid
 # Bind helper — gets the device from nvme to rcbottom inside initramfs.
 copy_exec /usr/sbin/rcraid-bind /usr/sbin
 
+# The helper reads the RAIDCore metadata at LBA 0x5000 to decide whether a
+# device is an array member (every 1022:b000 function looks identical
+# otherwise — issue #8).  Without these it cannot verify and refuses to bind.
+for tool in dd od; do
+    path=$(command -v "$tool" 2>/dev/null) || continue
+    copy_exec "$path" "$(dirname "$path")"
+done
+
 # udev rule + modprobe drop-in.
 mkdir -p "$DESTDIR/etc/udev/rules.d" "$DESTDIR/etc/modprobe.d"
 cp /etc/udev/rules.d/50-rcraid.rules "$DESTDIR/etc/udev/rules.d/50-rcraid.rules"

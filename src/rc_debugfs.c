@@ -383,4 +383,3 @@ void rc_debugfs_remove_adapter(struct rc_adapter *adapter)
         adapter->debugfs_dir = NULL;
     }
 }
-

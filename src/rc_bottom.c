@@ -56,19 +56,20 @@ MODULE_PARM_DESC(allow_foreign_nvme,
  *
  * Status of each path:
  *   0xB000  NVMe RAID Bottom    — fully implemented and validated
- *   0x43BD  Promontory SATA     — claimed, AHCI path is stub
  *
- * The remaining three SATA IDs from rcbottom.inf (0x7905 Bristol,
- * 0x7916 Summit, 0x7917 X570S) are deliberately NOT claimed: they have
- * no BAR-mapping case in rc_bottom_map_bars(), so probing them always
- * failed with "Unknown device ID" — but only AFTER the PCI core had
- * already matched the ID and thereby kept ahci/generic drivers off the
- * device.  Claiming a device we then refuse to drive strands the user's
- * SATA controller with no driver at all.  Re-add the entries (their
- * defines remain in rc_pci_ids.h) once the AHCI path actually exists.
+ * None of the four SATA-RAID IDs from rcbottom.inf is claimed.  0x7905
+ * (Bristol), 0x7916 (Summit) and 0x7917 (X570S) have no BAR-mapping case
+ * in rc_bottom_map_bars(), so probing them always failed with "Unknown
+ * device ID" — but only AFTER the PCI core had already matched the ID and
+ * thereby kept ahci/generic drivers off the device.  0x43BD (Promontory)
+ * went further: it mapped BAR5 and probed successfully, so the driver
+ * held the function with nothing but stubs behind it, and a SATA RAID
+ * array lost the disks it would still have had through ahci.  Either way,
+ * claiming a device we cannot drive strands the user's SATA controller.
+ * Re-add the entries (their defines remain in rc_pci_ids.h) together with
+ * the AHCI path; see issue #7.
  *----------------------------------------------------------------------*/
 static const struct pci_device_id rc_bottom_pci_tbl[] = {
-    { PCI_DEVICE(RC_PD_VID_AMD, RC_PD_DID_PROMONTORY)       },
     { PCI_DEVICE(RC_PD_VID_AMD, RC_PD_DID_NVME_RAID_BOTTOM) },
     { 0, }
 };
@@ -136,10 +137,13 @@ static int rc_bottom_map_bars(struct rc_adapter *adapter)
                   bar->virt);
     }
 
-    /* For device ID 0x43bd (Promontory), MMIO is in BAR5.  Checked FIRST
-     * so the precedence matches rc_classify_device() (explicit device-ID
-     * matches win over the class fallback) and the two functions can
-     * never disagree about a device's code path.
+    /* For device ID 0x43bd (Promontory), MMIO is in BAR5.  The ID is no
+     * longer in the bind table (see above), so this branch is reachable
+     * only after an explicit sysfs new_id bind; it stays so that such a
+     * bind still maps the right BAR.  Checked FIRST so the precedence
+     * matches rc_classify_device() (explicit device-ID matches win over
+     * the class fallback) and the two functions can never disagree about
+     * a device's code path.
      *
      * BAR0 (where the NVMe spec puts the controller registers) is used
      * for 0xb000 (NVMe RAID Bottom, class 0x010802) and — ONLY behind

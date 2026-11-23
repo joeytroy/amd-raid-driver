@@ -1,0 +1,10 @@
+#!/usr/bin/make -f
+
+%:
+	dh $@
+
+# Skip the default build step (DKMS packages only ship source code)
+override_dh_auto_build:
+
+# Skip the default Makefile install step entirely to stop permission errors
+override_dh_auto_install:

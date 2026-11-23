@@ -29,16 +29,16 @@ static ssize_t rc_config_read(struct file *file, char __user *buf, size_t count,
 {
     char info[] = "AMD-RAID Configuration Device\n";
     size_t len = strlen(info);
-    
+
     if (*ppos >= len)
         return 0;
-        
+
     if (count > len - *ppos)
         count = len - *ppos;
-        
+
     if (copy_to_user(buf, info + *ppos, count))
         return -EFAULT;
-        
+
     *ppos += count;
     return count;
 }
@@ -73,33 +73,33 @@ static const struct file_operations rc_config_fops = {
 int rc_config_init(void)
 {
     int err;
-    
+
     rc_printk(RC_NOTE, "rc_config_init: initializing configuration layer\n");
-    
+
     // Initialize configuration structure
     rc_state.config.misc_dev.minor = MISC_DYNAMIC_MINOR;
     rc_state.config.misc_dev.name = "rcfg";
     rc_state.config.misc_dev.fops = &rc_config_fops;
     rc_state.config.initialized = 0;
     mutex_init(&rc_state.config.lock);
-    
+
     // Register configuration device
     err = misc_register(&rc_state.config.misc_dev);
     if (err) {
         rc_printk(RC_ERROR, "rc_config_init: failed to register configuration device\n");
         return err;
     }
-    
+
     rc_state.config.initialized = 1;
     rc_printk(RC_NOTE, "rc_config_init: configuration layer initialized\n");
-    
+
     return 0;
 }
 
 void rc_config_cleanup(void)
 {
     rc_printk(RC_NOTE, "rc_config_cleanup: cleaning up configuration layer\n");
-    
+
     if (rc_state.config.initialized) {
         misc_deregister(&rc_state.config.misc_dev);
         rc_state.config.initialized = 0;

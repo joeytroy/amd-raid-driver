@@ -137,6 +137,17 @@ if [ "$CHECKED" -eq 0 ]; then
     exit 1
 fi
 
+# A queued MOK enrolment is a step at the next boot, not a build failure, but it
+# decides whether the signed module is trusted: shim's MOK manager runs before
+# the kernel, and an unanswered prompt leaves the key untrusted — a missing
+# array, which on a machine that boots from it is a failed boot.
+if command -v mokutil >/dev/null 2>&1 && mokutil --list-new 2>/dev/null | grep -q 'Subject:'; then
+    echo "MOK enrolment pending: shim will prompt on the next boot.  Answer it"
+    echo "before relying on Secure Boot — until then the signed rcraid module is"
+    echo "not trusted."
+    echo
+fi
+
 if [ "$FAIL" -eq 0 ]; then
     echo "RESULT: PASS — rcraid is present in every installed kernel's initramfs."
     exit 0

@@ -1,36 +1,160 @@
 #!/bin/sh
-# rcraid-bind <pci-bdf>
+# SPDX-License-Identifier: GPL-2.0-only
+# rcraid-bind --disk /dev/nvme1n1   |   rcraid-bind <pci-bdf>
 #
-# Hand a single AMD-RAID Bottom PCI device to the rcbottom driver.
-# Invoked by udev (see /etc/udev/rules.d/50-rcraid.rules) when the kernel
-# discovers a matching device — typically very early in boot, after nvme has
-# already grabbed the namespace.
+# Hand a single AMD-RAID Bottom device to the rcbottom driver.
 #
-# Steps:
-#   1. Pin the device to rcbottom via driver_override so nothing else can
-#      reclaim it (including any later nvme re-probe).
+# Invoked by udev (see /etc/udev/rules.d/50-rcraid.rules) when a namespace
+# appears, and by test_driver.sh / the installers for a manual bind.
+#
+# Before touching anything this verifies that the device really is an array
+# member, by reading the RAIDCore generation header firmware writes to LBA
+# 0x5000.  AMD's chipset exposes EVERY downstream NVMe behind 1022:b000, so
+# on a single-vendor box (all drives the same OEM) the subsystem_vendor value
+# cannot separate members from the drive carrying /.  The metadata can: it is
+# written on members and nowhere else.  See issue #8.
+#
+# The check is a plain read of one sector, so it cannot disturb the device.
+# Binding is what disturbs it: rc_nvme_init_controller() resets the controller
+# (CC.EN=0), and doing that to the root disk destroys the running system.
+#
+# Steps once the device is confirmed to be a member:
+#   1. Pin it to rcbottom via driver_override so nothing else can reclaim it.
 #   2. If currently bound to nvme, release it.
-#   3. Re-trigger probe so rcbottom binds.  If rcraid isn't loaded yet the
-#      probe is a no-op; modprobe rcraid is the next step and will bind then.
-#   4. Make sure the module is requested.  modprobe is idempotent — does
-#      nothing if it's already loaded.
+#   3. Re-trigger probe so rcbottom binds.
+#   4. Make sure the module is requested.
 #
 # Designed to be safe to run multiple times for the same device.
 
-set -e
+set -u
 
-dev="$1"
-[ -n "$dev" ]                              || exit 0
-[ -e "/sys/bus/pci/devices/$dev" ]         || exit 0
+say() { echo "rcraid-bind: $*" >&2; }
 
-if [ -e "/sys/bus/pci/devices/$dev/driver_override" ]; then
-    echo rcbottom > "/sys/bus/pci/devices/$dev/driver_override"
+# ---------------------------------------------------------------------------
+# RAIDCore metadata check
+#
+# Layout (docs/REVERSE_ENGINEERING.md, scripts/qemu-test/mkmeta.py): LBA 0x5000
+# holds an 8-byte checksum followed by the ASCII magic "RAIDCore".  Read the
+# magic only — validating the checksum here would duplicate the parser that
+# runs in the driver after bind, and this exists purely to decide whether
+# binding is safe at all.
+# ---------------------------------------------------------------------------
+has_raidcore_metadata() {
+    _dev="$1"
+    _magic=""
+
+    [ -b "$_dev" ] || return 1
+
+    # Two pids: the second reader needs to start at offset 8, and `od -j`
+    # fails on some inputs, so slice with dd instead.
+    _magic=$(dd if="$_dev" bs=512 skip=20480 count=1 2>/dev/null \
+             | dd bs=1 skip=8 count=8 2>/dev/null \
+             | od -An -tx1 2>/dev/null | tr -d ' \n')
+
+    # hex for "RAIDCore"
+    [ "$_magic" = "52414944436f7265" ]
+}
+
+# PCI address of a namespace, e.g. nvme1n1 -> 0000:03:00.0
+pci_of_disk() {
+    _link=$(readlink -f "/sys/class/block/$1/device" 2>/dev/null) || return 1
+    case "$_link" in
+        */nvme/*) ;;
+        *) return 1 ;;
+    esac
+    _trimmed=${_link%/nvme/*}
+    echo "${_trimmed##*/}"
+}
+
+# Any namespace of this disk currently mounted?  Belt and braces: metadata is
+# the real test, but never hand a device that is carrying a live filesystem to
+# a driver that resets it.
+disk_is_mounted() {
+    _name="$1"
+    _src=""
+    while read -r _src _rest; do
+        case "$_src" in
+            /dev/"$_name"|/dev/"$_name"p*) return 0 ;;
+        esac
+    done < /proc/mounts
+    return 1
+}
+
+# ---------------------------------------------------------------------------
+# Argument handling
+# ---------------------------------------------------------------------------
+mode=""
+dev=""
+case "${1:-}" in
+    --disk) mode=disk; dev="${2:-}" ;;
+    "")     exit 0 ;;
+    *)      mode=bdf;  dev="$1" ;;
+esac
+
+[ -n "$dev" ] || exit 0
+
+if [ "$mode" = disk ]; then
+    disk="${dev##*/}"
+    bdf=$(pci_of_disk "$disk") || {
+        say "$dev has no PCI parent — not an AMD-RAID device, ignoring"
+        exit 0
+    }
+else
+    bdf="$dev"
+    [ -e "/sys/bus/pci/devices/$bdf" ] || exit 0
+
+    # Already ours: nothing to verify or do.  (Once rcbottom owns the device
+    # nvme publishes no namespace, so the metadata below is unreadable and a
+    # re-run would otherwise look like a non-member.)
+    if [ "$(readlink -f "/sys/bus/pci/devices/$bdf/driver" 2>/dev/null)" = "/sys/bus/pci/drivers/rcbottom" ]; then
+        exit 0
+    fi
+
+    # Resolve a namespace so the metadata can be read.  A caller that passes a
+    # BDF before nvme has created the namespace cannot be verified, and
+    # binding an unverified device is exactly what this guard exists to stop.
+    disk=""
+    for _blk in /sys/class/block/nvme*n*; do
+        [ -e "$_blk" ] || continue
+        _b="${_blk##*/}"
+        case "$_b" in *p[0-9]*) continue ;; esac
+        if [ "$(pci_of_disk "$_b")" = "$bdf" ]; then
+            disk="$_b"
+            break
+        fi
+    done
+    if [ -z "$disk" ]; then
+        say "$bdf has no namespace yet — cannot verify RAIDCore metadata, not binding"
+        say "pass --disk /dev/nvmeXn1 once the namespace exists"
+        exit 0
+    fi
+    dev="/dev/$disk"
 fi
 
-if [ -e "/sys/bus/pci/drivers/nvme/$dev" ]; then
-    echo "$dev" > /sys/bus/pci/drivers/nvme/unbind 2>/dev/null || true
+# ---------------------------------------------------------------------------
+# Gates
+# ---------------------------------------------------------------------------
+if disk_is_mounted "$disk"; then
+    say "$dev is mounted — refusing to reset its controller"
+    exit 0
 fi
 
-echo "$dev" > /sys/bus/pci/drivers_probe 2>/dev/null || true
+if ! has_raidcore_metadata "$dev"; then
+    say "$dev carries no RAIDCore metadata at LBA 0x5000 — not an array member, leaving it alone"
+    exit 0
+fi
+
+# ---------------------------------------------------------------------------
+# Bind
+# ---------------------------------------------------------------------------
+if [ -e "/sys/bus/pci/devices/$bdf/driver_override" ]; then
+    echo rcbottom > "/sys/bus/pci/devices/$bdf/driver_override"
+fi
+
+if [ -e "/sys/bus/pci/drivers/nvme/$bdf" ]; then
+    echo "$bdf" > /sys/bus/pci/drivers/nvme/unbind 2>/dev/null || true
+fi
+
+echo "$bdf" > /sys/bus/pci/drivers_probe 2>/dev/null || true
 
 modprobe rcraid 2>/dev/null || true

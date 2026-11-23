@@ -59,6 +59,7 @@ static inline int scsi_add_host(struct Scsi_Host *host, struct device *dev) { re
 #include <linux/spinlock.h>
 
 #include "rc_pci_ids.h"
+#include "rc_api.h"
 
 // Driver Information.
 // The version tracks the AMD Windows release whose behavior this port
@@ -301,6 +302,22 @@ struct rc_nvme_state {
     u32            ns1_lba_bytes;     // LBA size in bytes (e.g. 512 or 4096)
     u64            ns1_nsze;          // total LBAs in the namespace
 
+    // Identify Controller identity, kept for the /dev/rc_api config
+    // packet: rcadm renders the model/serial/firmware out of the
+    // PhysicalDevice records.  Raw and space-padded, exactly as the
+    // controller returned them.
+    u16            id_vid;
+    u16            id_ssvid;
+    u8             id_model[40];      // Identify Controller MN
+    u8             id_serial[20];     // Identify Controller SN
+    u8             id_firmware[8];    // Identify Controller FR
+
+    // Verbatim copy of the active RC_LogicalDevice record, captured by
+    // rc_volume_parse_logical_device.  /dev/rc_api re-emits it so rcadm
+    // sees the firmware's own Id and element table.
+    u32            ld_raw_len;
+    u8             ld_raw[RC_API_LD_MAX];
+
     // I/O queue count granted by the controller in response to
     // Set Features Number of Queues at init.  In step 3a we create
     // this many queue pairs but blk-mq stays single-hctx (all
@@ -329,6 +346,12 @@ struct rc_nvme_state {
     // this member's config ring (LBA md_config_ring_lba + scan).  Populated
     // after rc_volume_parse_logical_device runs.
     bool           ld_valid;
+    bool           ld_record_seen;      // committed config contained at least
+                                        // one plausible LD record (even if it
+                                        // does not name this device).  A disk
+                                        // with metadata but no LD naming it is
+                                        // not an array member — it must never
+                                        // take the legacy BDF fallback.
     u32            ld_device_type;      // RC_LogicalDevice.DeviceType (raw on-disk value)
     u32            ld_first_count;      // RC_LogicalDevice.FirstCount (stripe width)
     u32            ld_second_count;     // RC_LogicalDevice.SecondCount (mirror count)
@@ -717,7 +740,21 @@ struct rc_raidcore_md {
  * derives the effective level from the counts (rc_ld_level_from()) and only
  * uses these RC_LDT_* values as its own normalized level identifiers.
  * 0x1BF7 is retained as an explicit RAID1 encoding (accepted if some
- * firmware writes it; also what our synthetic rig wrote historically). */
+ * firmware writes it; also what our synthetic rig wrote historically).
+ *
+ * RAID5/6 are the exception: a parity layout cannot be written in
+ * FirstCount x SecondCount at all ((N-1) x 1 and (N-2) x 2 never equal N),
+ * so the counts never identify a parity array and a 0x1BF6 record is never
+ * read as RAID5/6.  Only an explicit parity DeviceType selects one, which
+ * is also what keeps a four-member (2,2) record on RAID10 — the encoding
+ * confirmed on hardware — unless the DeviceType itself says RAID6
+ * (issue #3).  RAID5 (0x1BF5) is now CONFIRMED on hardware: a RAIDXpert2
+ * BIOS-created 3-disk RAID 5 (capacity = 2 x per-member user size) writes
+ * it, and the vendor dispatch code computes the parity count as
+ * (DeviceType == 0x1BFA) + 1 — so 0x1BFA, not 0x1BF5, is the dual-parity
+ * encoding.  An earlier revision had the two swapped from the dispatch-table
+ * inference.  The on-disk parity PLACEMENT is still unverified (issue #6):
+ * the driver assembles these volumes READ-ONLY. */
 #define RC_LDT_RAID0			0x1BF6u
 #define RC_LDT_RAID1			0x1BF7u
 #define RC_LDT_SINGLE			0x1BF9u	/* per-disk raw/JBOD LD published
@@ -729,7 +766,13 @@ struct rc_raidcore_md {
 						 * check and assemble a bogus
 						 * 1-member volume (the parser
 						 * skips all devices<2 records) */
-#define RC_LDT_RAID5			0x1BFAu
+#define RC_LDT_RAID5			0x1BF5u	/* CONFIRMED 2026-11-08: seen on a
+						 * BIOS-created 3-disk RAID 5
+						 * (capacity = 2 x user size).
+						 * One parity member. */
+#define RC_LDT_RAID6			0x1BFAu	/* two parity members; the vendor
+						 * dispatch derives parity count
+						 * as (devtype == 0x1BFA) + 1 */
 #define RC_LDT_RAID10			0x1BFBu
 
 /* Config-commit block — one sector at RC_MetaData.config_commit_lba
@@ -742,7 +785,10 @@ struct rc_raidcore_md {
  * assembles a DEAD array (that exact bug shipped: a deleted RAID0's record
  * shadowed the live RAID1 and presented a 2x-size striped volume).
  *
- *   +0x00 u64 — commit-block write timestamp (not consumed)
+ *   +0x00 u64 — checksum over [0x08, 0x200): the same XOR-lane-shuffle
+ *               algorithm the metadata block uses (RC_GenerateChecksum).
+ *               Vendor-written commit blocks carry it; this driver does
+ *               not validate it, but a metadata writer must compute it.
  *   +0x08 u32 — active generation start LBA (absolute, inside the ring)
  *   +0x0C u32 — active generation length in BYTES
  *   +0x10 u64 — active generation's timestamp; must equal the u64 at
@@ -750,10 +796,12 @@ struct rc_raidcore_md {
  *               commit linkage the driver validates)
  *   +0x30 u32 — generation sequence number (logged for forensics)
  *
- * The generation header sector carries the same timestamp at +0x00 plus
- * intra-generation table offsets the driver doesn't need (records are
- * located by tag scan within the generation extent). */
-#define RC_COMMIT_TS_OFFSET		0x00u
+ * The generation header sector carries the generation's own timestamp at
+ * +0x00 plus intra-generation table offsets the driver doesn't need
+ * (records are located by tag scan within the generation extent).  That
+ * shared offset is why the two-phase-commit linkage check below reads the
+ * header through RC_GEN_HEADER_TS_OFFSET, not the commit block. */
+#define RC_GEN_HEADER_TS_OFFSET		0x00u
 #define RC_COMMIT_GEN_LBA_OFFSET	0x08u
 #define RC_COMMIT_GEN_LEN_OFFSET	0x0Cu
 #define RC_COMMIT_GEN_TS_OFFSET		0x10u
@@ -778,8 +826,17 @@ struct rc_raidcore_md {
 #define RC_LD_CHUNKINDEX_OFFSET		0x110u	/* u32 — RAID0 stripe index, see
 						 * rc_volume_chunk_sectors_for() */
 #define RC_LD_ELEMENTOFFSET_OFFSET	0x04u	/* u32 — bytes from LD start to element array */
+#define RC_LD_STATE_OFFSET		0x08u	/* u32 — RC_LOGICAL_STATE_* */
 #define RC_LD_DEVICETYPE_OFFSET		0x0Cu	/* u32 — RC_LDT_* */
+#define RC_LD_ID_OFFSET			0x2Cu	/* u64 — array DeviceID (rcadm's "Id") */
 #define RC_LD_CAPACITY_OFFSET		0x50u	/* u64 — total volume sectors */
+#define RC_LD_PARENTCOUNT_OFFSET	0x74u	/* u32 — 1 for a single array */
+#define RC_LD_CACHE_OFFSET		0x80u	/* u32 — cache attribute flags */
+
+/* Values of the LD State field.  Firmware writes RC_LOGICAL_STATE_NORMAL
+ * (0x200) for a healthy array; the CLI's state enum starts at 0x200, so a
+ * zeroed field is not a valid state and renders as UNKNOWN. */
+#define RC_LOGICAL_STATE_NORMAL		0x200u
 #define RC_LD_PACKETSIZE_OFFSET		0x90u	/* u32 — LD record size including element array */
 
 /* On-disk RC_LogicalElement_LE — 64 bytes, one per member of a logical

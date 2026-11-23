@@ -1,0 +1,5 @@
+amd-raid-driver-dkms (1.0.0-1) unstable; urgency=medium
+
+  * Initial Debian package release with DKMS support.
+
+ -- Joey Troy <joey.troy@gmail.com>  Tue, 08 Sep 2026 22:15:00 -0500
