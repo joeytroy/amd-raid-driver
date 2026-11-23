@@ -282,22 +282,22 @@ static void test_evenodd_topology(void)
 static void test_raid5_parity(void)
 {
     printf("Testing RAID 5 parity...\n");
-    
+
     const int num_drives = 5;  /* 4 data + 1 parity */
     const int data_drives = num_drives - 1;
-    
+
     uint8_t *buffers[4];
     uint8_t parity[TEST_BLOCK_LEN];
-    
+
     for (int d = 0; d < data_drives; d++) {
         buffers[d] = malloc(TEST_BLOCK_LEN);
         /* Fill with known pattern */
         for (int i = 0; i < TEST_BLOCK_LEN; i++)
             buffers[d][i] = (uint8_t)(d * 73 + i * 17);
     }
-    
+
     rc_amd_generate_raid5_parity(buffers, parity, TEST_BLOCK_LEN, num_drives);
-    
+
     /* Verify P = XOR of all data */
     for (int i = 0; i < TEST_BLOCK_LEN; i++) {
         uint8_t expected = 0;
@@ -305,14 +305,14 @@ static void test_raid5_parity(void)
             expected ^= buffers[d][i];
         assert(parity[i] == expected);
     }
-    
+
     /* Test reconstruction: corrupt one drive, rebuild from parity + others */
     uint8_t *corrupted = malloc(TEST_BLOCK_LEN);
     memcpy(corrupted, buffers[2], TEST_BLOCK_LEN);
-    
+
     /* Zero out drive 2 to simulate failure */
     memset(buffers[2], 0, TEST_BLOCK_LEN);
-    
+
     /* Rebuild drive 2: parity ⊕ all other drives */
     for (int i = 0; i < TEST_BLOCK_LEN; i++) {
         uint8_t rebuilt = parity[i];
@@ -322,32 +322,32 @@ static void test_raid5_parity(void)
         }
         assert(rebuilt == corrupted[i]);
     }
-    
+
     for (int d = 0; d < data_drives; d++) free(buffers[d]);
     free(corrupted);
-    
+
     printf("  RAID 5 parity: PASS\n");
 }
 
 static void test_raid6_parity(void)
 {
     printf("Testing RAID 6 P parity and single-member rebuild...\n");
-    
+
     const int num_drives = 6;  /* 4 data + 2 parity (P+Q) */
     const int data_drives = num_drives - 2;
-    
+
     uint8_t *buffers[4];
     uint8_t p_parity[TEST_BLOCK_LEN];
     uint8_t q_parity[TEST_BLOCK_LEN];
-    
+
     for (int d = 0; d < data_drives; d++) {
         buffers[d] = malloc(TEST_BLOCK_LEN);
         for (int i = 0; i < TEST_BLOCK_LEN; i++)
             buffers[d][i] = (uint8_t)(d * 97 + i * 31);
     }
-    
+
     rc_amd_generate_raid6_parity(buffers, p_parity, q_parity, TEST_BLOCK_LEN, num_drives);
-    
+
     /* P = XOR down each byte column — the one parity the vendor also computes
      * this way (RC_RAID6_Compute_XOR).  Q is pinned by the vectors and the
      * topology test, not by re-deriving the encoder's loops here. */
@@ -357,12 +357,12 @@ static void test_raid6_parity(void)
             expected ^= buffers[d][i];
         assert(p_parity[i] == expected);
     }
-    
+
     /* Test reconstruction: lose ONE drive, rebuild from P + remaining */
     uint8_t *lost_drive = malloc(TEST_BLOCK_LEN);
     memcpy(lost_drive, buffers[1], TEST_BLOCK_LEN);
     memset(buffers[1], 0, TEST_BLOCK_LEN);
-    
+
     for (int i = 0; i < TEST_BLOCK_LEN; i++) {
         uint8_t rebuilt = p_parity[i];
         for (int d = 0; d < data_drives; d++) {
@@ -371,12 +371,12 @@ static void test_raid6_parity(void)
         }
         assert(rebuilt == lost_drive[i]);
     }
-    
+
     memcpy(buffers[1], lost_drive, TEST_BLOCK_LEN);
     free(lost_drive);
-    
+
     for (int d = 0; d < data_drives; d++) free(buffers[d]);
-    
+
     /* Degenerate geometry: one data member.  S is empty and every Q word is
      * that member's word at the same index, so Q (and P) must mirror the data
      * exactly — the single-row, dense case. */
@@ -395,7 +395,7 @@ static void test_raid6_parity(void)
         assert(memcmp(one[0], q1, RC_RAID6_UNIT_BYTES) == 0);
         free(one[0]);
     }
-    
+
     /* All-zero data must give all-zero parity: the construction is linear and
      * carries no constant term (no α^0 offset like the Reed-Solomon version). */
     {
@@ -417,7 +417,7 @@ static void test_raid6_parity(void)
         }
         for (int d = 0; d < 4; d++) free(zero[d]);
     }
-    
+
     /* Length that is not a whole 512-byte unit: P is defined everywhere, Q is
      * not, and the tail must come back zeroed rather than holding whatever the
      * caller left in the buffer. */
@@ -446,28 +446,28 @@ static void test_raid6_parity(void)
         }
         for (int d = 0; d < 3; d++) free(bufs[d]);
     }
-    
+
     printf("  RAID 6 P parity: PASS\n");
 }
 
 static void test_mapping_functions(void)
 {
     printf("Testing distributed parity mapping...\n");
-    
+
     const uint32_t chunk_sectors = 512;  /* 256 KiB stripe */
-    
+
     /* Test RAID 5 mapping for various N */
     for (int n = 3; n <= 8; n++) {
         for (uint64_t lba = 0; lba < 10000; lba += 17) {
             int target, parity;
             uint64_t phys = rc_amd_map_distributed_raid5(lba, chunk_sectors, &target, &parity, n);
-            
+
             assert(target >= 0 && target < n);
             assert(parity >= 0 && parity < n);
             assert(target != parity);
             assert(phys < UINT64_MAX);
         }
-        
+
         /* Vendor layout: parity is dedicated to the last member, data fills
          * 0..n-2 and never collides with it. */
         int parity_counts[8] = {0};
@@ -483,13 +483,13 @@ static void test_mapping_functions(void)
             assert(parity_counts[i] == 0);
         assert(parity_counts[n - 1] == n * 100);
     }
-    
+
     /* Test RAID 6 mapping for various N */
     for (int n = 4; n <= 8; n++) {
         for (uint64_t lba = 0; lba < 10000; lba += 23) {
             int target, p_mem, q_mem;
             rc_amd_map_distributed_raid6(lba, chunk_sectors, &target, &p_mem, &q_mem, n);
-            
+
             assert(target >= 0 && target < n);
             assert(p_mem >= 0 && p_mem < n);
             assert(q_mem >= 0 && q_mem < n);
@@ -497,7 +497,7 @@ static void test_mapping_functions(void)
             assert(target != q_mem);
             assert(p_mem != q_mem);
         }
-        
+
         /* Vendor layout: P and Q are dedicated to the last two members. */
         int p_counts[8] = {0}, q_counts[8] = {0};
         for (int stripe = 0; stripe < n * 100; stripe++) {
@@ -515,7 +515,7 @@ static void test_mapping_functions(void)
         for (int i = 0; i < n - 2; i++)
             assert(p_counts[i] == 0 && q_counts[i] == 0);
     }
-    
+
     printf("  Mapping functions: PASS\n");
 }
 
@@ -816,7 +816,7 @@ int main(void)
     printf("========================================\n");
     printf("RAID 5/6 Parity Math Test Harness\n");
     printf("========================================\n\n");
-    
+
     test_raid5_parity();
     test_evenodd_vectors();
     test_evenodd_topology();
@@ -824,10 +824,10 @@ int main(void)
     test_raid6_two_failure_recovery();
     test_mapping_functions();
     test_mapping_bijection();
-    
+
     printf("\n========================================\n");
     printf("ALL TESTS PASSED ✓\n");
     printf("========================================\n");
-    
+
     return 0;
 }

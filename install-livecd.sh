@@ -211,7 +211,7 @@ insmod "$SRC_DIR/rcraid.ko" "${LOAD_PARAMS[@]}"
 
 if [ -n "$MEMBER_BDFS" ]; then
     echo "⚡ Step 4: Forcing hardware bus probes across unchained PCIe ports..."
-    for bdf in $MEMBER_BDFS; do 
+    for bdf in $MEMBER_BDFS; do
         echo "    • Probing PCIe bus address: $bdf"
         echo "$bdf" > /sys/bus/pci/drivers_probe 2>/dev/null || true
     done

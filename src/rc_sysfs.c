@@ -263,4 +263,3 @@ void rc_sysfs_remove(struct rc_adapter *adapter)
     rc_printk(RC_INFO, "rc_sysfs_remove: removed sysfs entries for adapter %d\n",
               adapter->instance);
 }
-

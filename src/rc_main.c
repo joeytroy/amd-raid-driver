@@ -77,18 +77,18 @@ static void rc_proc_cleanup(void)
 static int __init rc_init(void)
 {
     int err;
-    
+
     rc_printk(RC_NOTE, "rc_init: AMD RAID Driver version %s (build %s)\n",
               RC_DRIVER_VERSION, RC_DRIVER_BUILD_REV);
     rc_printk(RC_NOTE, "rc_init: Based on Windows driver architecture\n");
-    
+
     /* Fire up the out-of-tree asynchronous execution kthread worker engine pools */
     err = rc_amd_init_async_subsystem();
     if (err) {
         rc_printk(RC_ERROR, "rc_init: failed to initialize out-of-tree async subsystem (%d)\n", err);
         return err;
     }
-    
+
     // Register block major
     rc_major = register_blkdev(0, "rcraid");
     if (rc_major < 0) {
@@ -97,13 +97,13 @@ static int __init rc_init(void)
         return rc_major;
     }
     rc_printk(RC_NOTE, "rc_init: registered block major %d\n", rc_major);
-    
+
     // Initialize debugfs
     err = rc_debugfs_init();
     if (err) {
         rc_printk(RC_WARN, "rc_init: debugfs initialization failed (non-fatal)\n");
     }
-    
+
     // Initialize rcbottom (hardware layer)
     err = rc_bottom_init();
     if (err) {
@@ -113,7 +113,7 @@ static int __init rc_init(void)
         rc_amd_exit_async_subsystem();
         return err;
     }
-    
+
     // Initialize rccfg (configuration layer)
     err = rc_config_init();
     if (err) {
@@ -139,7 +139,7 @@ static int __init rc_init(void)
         rc_amd_exit_async_subsystem();
         return err;
     }
-    
+
     /* /dev/rc_api: the vendor rcadm CLI's SG_IO config-packet surface.
      * Read-only view of the assembled volume; see src/rc_api.c. */
     err = rc_api_init();
@@ -159,7 +159,7 @@ static int __init rc_init(void)
     rc_state.initialized = 1;
     rc_printk(RC_NOTE, "rc_init: AMD RAID Driver initialized successfully\n");
     rc_printk(RC_NOTE, "rc_init: Found %d adapters\n", rc_state.num_adapters);
-    
+
     return 0;
 }
 
@@ -185,13 +185,13 @@ static void __exit rc_exit(void)
     rc_config_cleanup();
     rc_bottom_cleanup();
     rc_debugfs_cleanup();
-    
+
     // Unregister block major
     if (rc_major > 0) {
         unregister_blkdev(rc_major, "rcraid");
         rc_printk(RC_NOTE, "rc_exit: unregistered block major %d\n", rc_major);
     }
-    
+
     rc_state.initialized = 0;
     rc_printk(RC_NOTE, "rc_exit: AMD RAID Driver unloaded\n");
 }

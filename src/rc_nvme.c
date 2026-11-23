@@ -10368,12 +10368,12 @@ blk_status_t rc_amd_handle_transient_retry(struct bio *bio, int retry_count, int
     /* 0x01: Transient Timeout, 0x02: Busy Queue, 0x04: Intermittent Bus Flaky */
     if (device_status == 0x01 || device_status == 0x02 || device_status == 0x04) {
         if (retry_count < max_retries) {
-            pr_warn("rcraid: Intercepted retryable hardware timeout status (0x%X). Queueing attempt %d of %d...\\n", 
+            pr_warn("rcraid: Intercepted retryable hardware timeout status (0x%X). Queueing attempt %d of %d...\\n",
                     device_status, retry_count + 1, max_retries);
-            
+
             /* Freeze request queue and yield execution slice to allow hardware bus settle time */
             yield();
-            
+
             /* Return resource block signal to blk-mq to force a non-destructive re-dispatch query */
             return BLK_STS_RESOURCE;
         }

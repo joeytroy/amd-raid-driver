@@ -1,7 +1,7 @@
 # FEATURE PROPOSAL: Fixing Mirror Performance with Asynchronous Workers + RAID 5/6 Math Specs
 
 ## 1. The RAID 1 Performance Fix
-The driver currently processes mirrored (RAID 1) writes synchronously, which can freeze up execution queues while waiting for physical NVMe targets to respond. 
+The driver currently processes mirrored (RAID 1) writes synchronously, which can freeze up execution queues while waiting for physical NVMe targets to respond.
 
 To fix this, I have written a cleanroom background worker engine (`patch_async_worker.c`). It sets up a background helper thread (`kamd_async_worker`) that immediately handles write confirmations asynchronously, freeing up the primary Linux block layer queues to keep pushing files without pausing.
 
