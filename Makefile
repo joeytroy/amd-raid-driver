@@ -39,12 +39,13 @@ RCRAID_REV := $(shell cat $(RCRAID_SRC)/.rcraid_rev 2>/dev/null || git -C $(RCRA
 ccflags-y += -DRC_DRIVER_BUILD_REV=\"$(RCRAID_REV)\"
 
 # Driver version = the AMD Windows release this port's behavior matches,
-# read from the single-line VERSION file at the repo root.  When a new AMD
+# read from the single-line VERSION file (docs/VERSION; a staged tree may
+# still carry it at the root).  When a new AMD
 # release has been torn down with Ghidra and verified against the port
 # (docs/REVERSE_ENGINEERING.md "Version delta"), bump VERSION — no code
 # change needed.  Falls back to the rc_linux.h default if the file is
 # missing (e.g. a hand-copied source dir).
-RCRAID_VERSION := $(firstword $(shell cat $(RCRAID_SRC)/VERSION 2>/dev/null))
+RCRAID_VERSION := $(firstword $(shell cat $(RCRAID_SRC)/VERSION 2>/dev/null || cat $(RCRAID_SRC)/docs/VERSION 2>/dev/null))
 ifneq ($(RCRAID_VERSION),)
 ccflags-y += -DRC_DRIVER_VERSION=\"$(RCRAID_VERSION)\"
 endif
@@ -65,6 +66,7 @@ all:
 clean:
 	@echo "Cleaning build files..."
 	@rm -f *.o *.ko *.mod.c *.mod *.symvers *.order .*.cmd
+	@rm -f src/*.o src/.*.cmd
 	@rm -rf .tmp_versions
 	@rm -rf $(ASYNC_TEST_BIN) $(dir $(ASYNC_TEST_BIN))
 	@rm -rf $(CFGWRITE_TEST_BIN) $(dir $(CFGWRITE_TEST_BIN))

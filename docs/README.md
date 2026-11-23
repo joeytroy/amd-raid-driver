@@ -4,7 +4,7 @@
 
 </div>
 
-[![CI](https://github.com/kubuntugamer/amd-raid-driver/actions/workflows/ci.yml/badge.svg)](https://github.com/kubuntugamer/amd-raid-driver/actions/workflows/ci.yml)
+[![CI](https://github.com/joeytroy/amd-raid-driver/actions/workflows/ci.yml/badge.svg)](https://github.com/joeytroy/amd-raid-driver/actions/workflows/ci.yml)
 [![License: GPL-2.0-only](https://img.shields.io/badge/License-GPL--2.0--only-blue.svg)](LICENSE)
 [![Kernel](https://img.shields.io/badge/Kernel-%E2%89%A5%206.15-orange.svg)](#quick-start)
 [![RAID](https://img.shields.io/badge/RAID0%20%2B%20RAID1-hardware%20validated-success.svg)](#benchmarks)
@@ -210,7 +210,7 @@ Flash a stock Ubuntu / Kubuntu / Debian / Fedora ISO, boot it, and choose
 
 ```sh
 sudo apt install -y git          # or: sudo dnf install -y git
-git clone https://github.com/kubuntugamer/amd-raid-driver.git
+git clone https://github.com/joeytroy/amd-raid-driver.git
 cd amd-raid-driver
 sudo ./install-livecd.sh
 ```

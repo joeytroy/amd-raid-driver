@@ -4218,6 +4218,12 @@ static int rc_volume_rmw_alloc(u32 chunk_bytes)
 	int i;
 
 	rc_volume_rmw_free();
+	/* Publish the allocation size before the loop: the failure path
+	 * calls rc_volume_rmw_free(), which frees each buffer with this
+	 * size, so leaving it 0 until success would free the already-
+	 * allocated members with a zero length (and the DMA API would not
+	 * release them). */
+	rc_volume_rmw_bytes = chunk_bytes;
 	for (i = 0; i < rc_volume_member_count &&
 		    i < RC_VOLUME_MAX_MEMBERS; i++) {
 		struct rc_volume_rmw_buf *b = &rc_volume_rmw[i];
@@ -4239,7 +4245,6 @@ static int rc_volume_rmw_alloc(u32 chunk_bytes)
 			return -ENOMEM;
 		}
 	}
-	rc_volume_rmw_bytes = chunk_bytes;
 	return 0;
 }
 
@@ -5800,10 +5805,10 @@ static blk_status_t rc_volume_dispatch_raid10(
 	u64 member_start_lba[RC_VOLUME_MAX_MEMBERS] = {0};
 	bool member_has_data[RC_VOLUME_MAX_MEMBERS] = {0};
 	int members_with_data = 0;
-	/* READ copy choice is per logical stripe, not per bvec chunk — see
+	/* READ copy choice is per COLUMN, fixed for the whole request — see
 	 * the READ branch below for why. */
-	sector_t cur_read_stripe = (sector_t)-1;
-	int cur_read_member = -1;
+	bool read_chosen[RC_VOLUME_MAX_MEMBERS] = { false };
+	int read_member[RC_VOLUME_MAX_MEMBERS];
 	unsigned int live =
 		(unsigned int)atomic_read(&rc_volume_live_mask);
 	unsigned int wmask =
@@ -5857,36 +5862,42 @@ static blk_status_t rc_volume_dispatch_raid10(
 				if (wmask & BIT(c1))
 					targets[ntargets++] = c1;
 			} else {
-				/* Pick ONE copy per logical stripe, not per bvec
-				 * chunk.  The walk splits a stripe into several
-				 * chunks (bvec boundaries, sub-page lengths);
-				 * re-rolling the round-robin each time would
-				 * scatter that stripe across BOTH copies of the
-				 * pair.  Each member command then covers a
-				 * contiguous physical run but a non-contiguous
-				 * scatterlist, so every chunk after the first
-				 * lands in the wrong pages — observed in the QEMU
-				 * rig as duplicated pages from the second page
-				 * of each stripe on (D0,D1,D1,D2,D2,…). */
-				if (stripe_idx != cur_read_stripe) {
+				/* Pick ONE copy per COLUMN for the whole request.
+				 * The walk splits a stripe into several chunks (bvec
+				 * boundaries, sub-page lengths), so re-rolling the
+				 * round-robin per chunk scatters that stripe across
+				 * both copies — observed in the QEMU rig as
+				 * duplicated pages on (D0,D1,D1,D2,D2,…).
+				 *
+				 * Per-stripe is not enough either: a member
+				 * command covers every stripe this request places
+				 * on it as ONE physically contiguous run.  If a
+				 * column's stripes alternate copies (A, B, A),
+				 * member A's single command reads its stripes
+				 * back-to-back and files the middle stripe's data
+				 * into the third stripe's pages.  Fixing the copy
+				 * per column makes each chosen member's stripes
+				 * physically contiguous (column strides by the
+				 * member count), which is what the command assumes. */
+				if (!read_chosen[col]) {
 					bool l0 = (live & BIT(c0)) != 0;
 					bool l1 = (live & BIT(c1)) != 0;
 
-					cur_read_stripe = stripe_idx;
+					read_chosen[col] = true;
 					if (l0 && l1)
-						cur_read_member =
+						read_member[col] =
 							(atomic_inc_return(&rc_volume_rr_next) & 1)
 							? c1 : c0;
 					else if (l0)
-						cur_read_member = c0;
+						read_member[col] = c0;
 					else if (l1)
-						cur_read_member = c1;
+						read_member[col] = c1;
 					else
 						/* fatal catches first */
-						cur_read_member = -1;
+						read_member[col] = -1;
 				}
-				if (cur_read_member >= 0)
-					targets[ntargets++] = cur_read_member;
+				if (read_member[col] >= 0)
+					targets[ntargets++] = read_member[col];
 			}
 
 			if (!ntargets) {
@@ -6388,7 +6399,7 @@ static blk_status_t rc_volume_queue_rq(struct blk_mq_hw_ctx *hctx,
 		((pos + nr_sectors - 1) / rc_volume_stripe_sectors)) {
 		st = rc_volume_dispatch_multi_stripe(hctx, req, pdu, pos,
 						     nr_sectors, op, true);
-		if (st == BLK_STS_DEV_RESOURCE)
+		if (st == BLK_STS_RESOURCE || st == BLK_STS_DEV_RESOURCE)
 			return st;
 		if (st != BLK_STS_OK) {
 			blk_mq_start_request(req);
@@ -6475,9 +6486,11 @@ static blk_status_t rc_volume_queue_rq(struct blk_mq_hw_ctx *hctx,
 				st = rc_volume_dispatch_raid10(hctx, req, pdu,
 							       pos,
 							       nr_sectors, op);
-			if (st == BLK_STS_DEV_RESOURCE) {
-				/* SQ full — hand back to blk-mq untouched
-				 * for a retry (request never started). */
+			if (st == BLK_STS_RESOURCE ||
+			    st == BLK_STS_DEV_RESOURCE) {
+				/* SQ full or a bounce buffer was unavailable
+				 * — hand back to blk-mq untouched for a retry
+				 * (request never started). */
 				return st;
 			}
 			if (st != BLK_STS_OK) {
@@ -6502,9 +6515,10 @@ static blk_status_t rc_volume_queue_rq(struct blk_mq_hw_ctx *hctx,
 	    (op == REQ_OP_WRITE || op == REQ_OP_DISCARD)) {
 		st = rc_volume_dispatch_mirror(hctx, req, pdu, pos,
 					       nr_sectors, op);
-		if (st == BLK_STS_DEV_RESOURCE) {
-			/* SQ full — hand back to blk-mq untouched for a
-			 * retry (the request was never started). */
+		if (st == BLK_STS_RESOURCE || st == BLK_STS_DEV_RESOURCE) {
+			/* SQ full or a bounce buffer was unavailable —
+			 * hand back to blk-mq untouched for a retry
+			 * (the request was never started). */
 			return st;
 		}
 		if (st != BLK_STS_OK) {
@@ -6541,8 +6555,9 @@ static blk_status_t rc_volume_queue_rq(struct blk_mq_hw_ctx *hctx,
 								  pdu, pos,
 								  nr_sectors,
 								  op, false);
-		if (st == BLK_STS_DEV_RESOURCE) {
-			/* SQ full — requeue; request never started. */
+		if (st == BLK_STS_RESOURCE || st == BLK_STS_DEV_RESOURCE) {
+			/* SQ full or bounce unavailable — requeue;
+			 * request never started. */
 			return st;
 		}
 		if (st != BLK_STS_OK) {
@@ -6572,7 +6587,7 @@ static blk_status_t rc_volume_queue_rq(struct blk_mq_hw_ctx *hctx,
 		((pos + nr_sectors - 1) / rc_volume_stripe_sectors)) {
 		blk_status_t st = rc_volume_dispatch_multi_stripe_discard(
 				hctx, req, pdu, pos, nr_sectors);
-		if (st == BLK_STS_DEV_RESOURCE) {
+		if (st == BLK_STS_RESOURCE || st == BLK_STS_DEV_RESOURCE) {
 			/* SQ full — requeue; request never started. */
 			return st;
 		}
@@ -6621,6 +6636,8 @@ static blk_status_t rc_volume_queue_rq(struct blk_mq_hw_ctx *hctx,
 	/* READ/WRITE: dma_map_sg the request's bvecs onto the target member,
 	 * then build the SQE with PRPs derived from the mapped scatterlist. */
 	st = rc_volume_map_request_sg(req, pdu, member_idx);
+	if (st == BLK_STS_RESOURCE)
+		return st;   /* bounce pool drained — never started */
 	if (st != BLK_STS_OK) {
 		blk_mq_start_request(req);
 		if (rc_volume_claim_completion(pdu)) {
@@ -7322,6 +7339,10 @@ free_bufs:
 			break;
 	}
 
+	if (ret && rewritten)
+		rc_printk(RC_ERROR,
+			  "rc_volume_delete_array: aborted after rewriting %d of %u member(s) — the array is PARTIALLY deleted; rerun DELETE once the failing member is usable\n",
+			  rewritten, members);
 	if (!ret && !rewritten)
 		ret = -ENOENT;
 
@@ -7826,8 +7847,7 @@ static int rc_volume_create_disk(void)
 		 * process context.  BLOCKING tells blk-mq that queue_rq may
 		 * sleep; it is set for every parity level, even a read-only one. */
 		rc_volume_tagset.flags        =
-			(rc_volume_parity_write_ready() ||
-			 rc_volume_raid_level == RC_LDT_RAID5 ||
+			(rc_volume_raid_level == RC_LDT_RAID5 ||
 			 rc_volume_raid_level == RC_LDT_RAID6) ?
 			BLK_MQ_F_BLOCKING : 0;
 
@@ -8258,6 +8278,13 @@ static int rc_volume_resync_fn(void *arg)
 
 			nlb5 = (u32)min_t(u64, RC_RESYNC_XFER_SECTORS,
 					  total - cursor);
+			/* rc_volume_rmw[] holds one chunk per member, so the
+			 * rebuild must never XOR more than that into it.  A
+			 * 64 KiB chunk against a 128 KiB transfer used to
+			 * memset past the DMA buffer and fail for good. */
+			if (rc_volume_rmw_bytes)
+				nlb5 = min_t(u32, nlb5,
+					     rc_volume_rmw_bytes / 512u);
 			bytes5 = nlb5 * 512u;
 			if (!nlb5) {
 				rc_printk(RC_ERROR,

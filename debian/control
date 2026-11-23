@@ -1,7 +1,7 @@
 Source: amd-raid-driver-dkms
 Section: kernel
 Priority: optional
-Maintainer: Your Name <your.email@example.com>
+Maintainer: Joey Troy <joey.troy@gmail.com>
 Build-Depends: debhelper-compat (= 13), dkms
 Standards-Version: 4.6.2
 

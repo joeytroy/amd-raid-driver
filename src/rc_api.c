@@ -177,11 +177,19 @@ static bool rc_api_registered;
  * The 172-byte CREATE payload names only one device, and rcadm performs the
  * GET_CREATE_INFO query and the mutation on different opens of the device
  * (observed 2026-11-13), so file->private_data cannot carry the selection
- * across.  Keep the last query's member set at module scope and use it only
- * when the CREATE frame's DeviceCount agrees with it.
+ * across.  Keep the last query's member DEVICE IDS at module scope — not
+ * snapshot slot numbers, which move when enumeration changes — and consume
+ * them on the next CREATE.
+ *
+ * A selection is single-use and only applies when the CREATE frame's own
+ * DeviceCount agrees AND the device the frame names is one of the selected
+ * members.  That stops a stale query from stamping an unrelated disk set:
+ * querying disks 0+1 and then creating on disks 2+3 no longer matches just
+ * because the counts happen to be equal.
  */
-static u32 rc_api_create_mask;
-static u32 rc_api_create_count;
+static u64 rc_api_pending_ids[RC_API_PD_MAX];
+static u32 rc_api_pending_count;
+static DEFINE_SPINLOCK(rc_api_pending_lock);
 
 static void rc_api_put_le32(u8 *p, u32 v)
 {
@@ -647,7 +655,7 @@ static long rc_api_config_write(struct sg_io_hdr *hdr, u64 lba, u32 bytes,
 	struct rc_cfgwrite req;
 	u64 ids[RC_API_PD_MAX];
 	u8 *frame;
-	u32 nr, i, sel;
+	u32 nr;
 	int rc;
 
 	if (bytes > RC_API_WRITE_MAX) {
@@ -690,16 +698,44 @@ static long rc_api_config_write(struct sg_io_hdr *hdr, u64 lba, u32 bytes,
 		 * GET_CREATE_INFO query that precedes it.  The writer stamps
 		 * exactly the selected members, in that order — no more, no
 		 * fewer — so a 2-disk RAID 0 over four bound disks works.
+		 *
+		 * The pending selection is consumed here, whatever the outcome,
+		 * and must both match the frame's count and contain the device
+		 * the frame names.  Anything else is refused rather than passed
+		 * through to the "first N initialised disks" fallback.
 		 */
-		nr = 0;
-		sel = READ_ONCE(rc_api_create_mask);
-		if (sel && READ_ONCE(rc_api_create_count) ==
-		    req.u.create.device_count)
-			for (i = 0; i < snap->nr_members && nr < RC_API_PD_MAX;
-			     i++)
-				if (sel & (1u << i))
-					ids[nr++] = snap->member[i].device_id;
+		{
+			u64 pending[RC_API_PD_MAX];
+			u64 frame_id =
+				rc_api_get_le64(req.u.create.device_id[0]);
+			u32 pending_n, k;
+			bool frame_match = false;
+			unsigned long flags;
+
+			spin_lock_irqsave(&rc_api_pending_lock, flags);
+			pending_n = rc_api_pending_count;
+			memcpy(pending, rc_api_pending_ids, sizeof(pending));
+			rc_api_pending_count = 0;
+			spin_unlock_irqrestore(&rc_api_pending_lock, flags);
+
+			nr = 0;
+			for (k = 0; k < pending_n; k++)
+				if (frame_id && pending[k] == frame_id)
+					frame_match = true;
+			if (pending_n && pending_n == req.u.create.device_count &&
+			    frame_match) {
+				for (k = 0; k < pending_n; k++)
+					ids[k] = pending[k];
+				nr = pending_n;
+			}
+		}
 		rc_api_log_create(&req, nr);
+		if (!nr) {
+			rc_printk(RC_ERROR,
+				  "/dev/rc_api: CREATE refused — no matching GET_CREATE_INFO selection for %u device(s) and the device this frame names; refusing instead of stamping unrelated disks\n",
+				  req.u.create.device_count);
+			break;
+		}
 		rc = rc_volume_create_array(req.u.create.raid_type,
 					    req.u.create.first_count,
 					    req.u.create.second_count,
@@ -725,7 +761,7 @@ static long rc_api_config_write(struct sg_io_hdr *hdr, u64 lba, u32 bytes,
 			return 0;
 		}
 		rc_printk(RC_ERROR,
-			  "/dev/rc_api: DELETE failed (%d) — the array on disk is unchanged\n",
+			  "/dev/rc_api: DELETE failed (%d) — the array may be partially deleted; see the kernel log for the members already rewritten\n",
 			  rc);
 		break;
 	case RC_CW_TRANSFORM:
@@ -750,6 +786,7 @@ static long rc_api_get_create_info(struct file *file, struct sg_io_hdr *hdr,
 
 	if (!sess)
 		return rc_api_reject(hdr, RC_API_ASC_INVALID_FIELD);
+	memset(head, 0, sizeof(head));
 	if (copy_from_user(head, hdr->dxferp, n))
 		return -EFAULT;
 	if (n < RC_API_CR_DEVICE_LIST)
@@ -759,6 +796,9 @@ static long rc_api_get_create_info(struct file *file, struct sg_io_hdr *hdr,
 	count = rc_api_get_le32(head + RC_API_CR_DEVICE_COUNT);
 	first = rc_api_get_le32(head + RC_API_CR_FIRST_COUNT);
 	second = rc_api_get_le32(head + RC_API_CR_SECOND_COUNT);
+	if (count > RC_API_PD_MAX ||
+	    n < RC_API_CR_DEVICE_LIST + count * RC_API_CR_DEVICE_BYTES)
+		return rc_api_reject(hdr, RC_API_ASC_INVALID_FIELD);
 
 	/* Match the request's device identifiers to snapshot slots, by
 	 * DeviceID first and handle (0x10000 | slot) second. */
@@ -778,8 +818,19 @@ static long rc_api_get_create_info(struct file *file, struct sg_io_hdr *hdr,
 		if (mask & (1u << j))
 			matched++;
 
-	WRITE_ONCE(rc_api_create_mask, mask);
-	WRITE_ONCE(rc_api_create_count, count);
+	{
+		unsigned long flags;
+		u32 k = 0;
+
+		spin_lock_irqsave(&rc_api_pending_lock, flags);
+		for (j = 0; j < snap->nr_members && k < RC_API_PD_MAX; j++) {
+			if (mask & (1u << j))
+				rc_api_pending_ids[k++] =
+					snap->member[j].device_id;
+		}
+		rc_api_pending_count = k;
+		spin_unlock_irqrestore(&rc_api_pending_lock, flags);
+	}
 	sess->cr_pending = 1;
 	sess->cr_type = type;
 	sess->cr_count = count;

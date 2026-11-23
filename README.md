@@ -183,7 +183,7 @@ inventing one.
    Konsole.
 2. Clone this fork and run the entry script:
    ```bash
-   git clone https://github.com/kubuntugamer/amd-raid-driver.git
+   git clone https://github.com/joeytroy/amd-raid-driver.git
    cd amd-raid-driver
    sudo ./install-livecd.sh
    ```
@@ -295,7 +295,7 @@ in one step:
 
 ```bash
 cd ~
-git clone https://github.com/kubuntugamer/amd-raid-driver.git
+git clone https://github.com/joeytroy/amd-raid-driver.git
 cd amd-raid-driver
 sudo RCRAID_MOK_ENROLL=1 ./install-dkms.sh
 ```

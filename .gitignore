@@ -47,6 +47,22 @@ __pycache__/
 # Local hardware-run fixtures, metadata backups, and agent build tree
 .freebuff/
 
+# Reboot/dmesg/stack captures taken while validating on the array box
+.reboot-evidence/
+
+# Per-run verify state written by local data-path test passes
+local-*-verify.state
+
+# Debian packaging output (debhelper generated, never committed)
+debian/.debhelper/
+debian/debhelper-build-stamp
+debian/files
+debian/*.substvars
+debian/amd-raid-driver-dkms/
+debian/*.deb
+debian/*.buildinfo
+debian/*.changes
+
 # Local workstation session state
 sessid
 

@@ -429,8 +429,10 @@ assembled. What it settled:
   15,625,934,848, RAID 1 = 7,812,966,400, RAID 10 ×4 = 15,625,934,848. All
   four assemble `optimal` and read back. The earlier subset failures were
   `-d` selection stored in `file->private_data` while `rcadm` opens
-  `/dev/rc_api` twice; it now lives at module scope and is used only when the
-  frame's `DeviceCount` matches (`45a7d4a`).
+  `/dev/rc_api` twice; it now lives at module scope as a single-use list of
+  device IDs (`45a7d4a`). It is consumed by the next CREATE and used only
+  when the frame's `DeviceCount` matches AND the device the frame names is in
+  the list, so a stale query cannot stamp an unrelated disk set.
 - **JBOD (`0x1BF7`) and RAIDAble (`0x1BFB`) are still refused** by the
   `0x1BF6 && SecondCount == 1` gate. A subset like `-C -r0 -d 0 1` used to
   fall back to stamping every bound disk; the module-scope disk list fixes
